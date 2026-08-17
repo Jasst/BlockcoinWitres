@@ -1,6 +1,6 @@
-# ai_assistant.py
-# Когнитивный ассистент с интеграцией CognitiveMemory, планированием, автономностью.
-
+"""
+Когнитивный ассистент с интеграцией CognitiveMemory, планированием, автономностью.
+"""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -12,23 +12,20 @@ import time
 import hashlib
 import re
 from typing import Dict, Optional, Any, List, Tuple
-from collections import OrderedDict
-from datetime import datetime
+from collections import OrderedDict,defaultdict
+from datetime import datetime, timezone
 import numpy as np
 import aiohttp
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-# Импорт новой когнитивной памяти
 from memory_graph import CognitiveMemory, Fact, Episode, Goal
 
-# Конфигурация
 try:
     from config_ai import *
 except ImportError:
-    # fallback критических значений
     LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
     LM_STUDIO_API_KEY = "lm-studio"
     LM_STUDIO_TIMEOUT = 160
@@ -37,11 +34,12 @@ except ImportError:
     LM_STUDIO_VISION_SUPPORTED = False
     MEMORY_BASE_DIR = Path("ai_memory_v3")
     MEMORY_BASE_DIR.mkdir(exist_ok=True)
-    # ...
+    MAX_MESSAGE_LENGTH = 10000
+    MIN_MESSAGE_LENGTH = 1
+    DEEP_SEARCH_TOTAL_BUDGET = 15
 
 logger = logging.getLogger(__name__)
 
-# DuckDuckGo
 try:
     from ddgs import DDGS
     DDGS_AVAILABLE = True
@@ -49,19 +47,21 @@ except ImportError:
     DDGS_AVAILABLE = False
     logger.warning("⚠️ ddgs not installed")
 
-# Auth fallback
 try:
     from dependencies import require_auth
 except ImportError:
     async def require_auth():
         return "anonymous"
 
-# Утилиты
+
 def _now() -> float:
     return time.time()
 
+
 def _hash_query(q: str) -> str:
-    return hashlib.sha256(q.lower().strip().encode()).hexdigest()[:16]
+    """SHA-256 хэш запроса (32 символа — без коллизий)."""
+    return hashlib.sha256(q.lower().strip().encode()).hexdigest()[:32]
+
 
 # =====================================================================
 # 1. Поисковый кэш (LRU + TTL)
@@ -91,8 +91,9 @@ class SearchCache:
             while len(self._cache) > self.maxsize:
                 self._cache.popitem(last=False)
 
+
 # =====================================================================
-# 2. Загрузчик страниц (без изменений)
+# 2. Загрузчик страниц
 # =====================================================================
 class WebPageFetcher:
     def __init__(self, timeout: int = 15):
@@ -147,10 +148,12 @@ class WebPageFetcher:
 
     async def fetch_many(self, urls: List[str], limit: int = PARALLEL_FETCH_LIMIT) -> List[Tuple[str, str]]:
         semaphore = asyncio.Semaphore(limit)
+
         async def fetch_one(url):
             async with semaphore:
                 text = await self.fetch(url)
                 return url, text
+
         tasks = [fetch_one(u) for u in urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         out = []
@@ -163,8 +166,9 @@ class WebPageFetcher:
         if self._session and not self._session.closed:
             await self._session.close()
 
+
 # =====================================================================
-# 3. Ранжирование чанков (без изменений)
+# 3. Ранжирование чанков
 # =====================================================================
 class ChunkRanker:
     @staticmethod
@@ -202,8 +206,9 @@ class ChunkRanker:
             start += size - overlap
         return chunks
 
+
 # =====================================================================
-# 4. Умный триггер поиска (без изменений)
+# 4. Умный триггер поиска
 # =====================================================================
 SEARCH_TRIGGER_KEYWORDS = [
     'сегодня', 'сейчас', 'новости', 'курс', 'погода', 'свежие',
@@ -213,6 +218,7 @@ SEARCH_TRIGGER_KEYWORDS = [
     'где находится', 'как делается', 'пошагово', 'инструкция', 'рецепт',
     'сравнение', 'обзор', 'анализ', 'докажи', 'проверь', 'правда ли',
 ]
+
 
 def needs_search_heuristic(message: str) -> bool:
     msg_lower = message.lower()
@@ -224,9 +230,10 @@ def needs_search_heuristic(message: str) -> bool:
         return True
     return False
 
+
 def is_factual_query(message: str) -> bool:
     patterns = [
-        r'\b\d+[.,]?\d*\s*(?:USD|EUR|RUB|₽|\$|€|%|кг|км|г|м|см|мм|MB|GB|TB)\b',
+        r'\b\d+[.,]?\d*\s*(?:USD|EUR|RUB|₽|$|€|%|кг|км|г|м|см|мм|MB|GB|TB)\b',
         r'\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b',
         r'\b(?:курс|цена|стоимость|тариф|скорость|температура|вес|рост|расстояние)\b'
     ]
@@ -234,6 +241,7 @@ def is_factual_query(message: str) -> bool:
         if re.search(pat, message, re.IGNORECASE):
             return True
     return False
+
 
 # =====================================================================
 # 5. Переписывание запроса
@@ -256,6 +264,7 @@ async def rewrite_query(llm_caller, original: str) -> str:
         logger.debug(f"Query rewrite failed: {e}")
     return original
 
+
 # =====================================================================
 # 6. КОГНИТИВНЫЙ КОНТРОЛЛЕР
 # =====================================================================
@@ -264,38 +273,38 @@ class CognitiveController:
     Управляет когнитивным циклом: восприятие, память, предсказание,
     принятие решений, обучение.
     """
+
     def __init__(self, user_id: str):
         self.user_id = user_id
         self.user_dir = MEMORY_BASE_DIR / user_id
         self.user_dir.mkdir(parents=True, exist_ok=True)
 
-        # Память
         self.memory = CognitiveMemory(user_id, MEMORY_BASE_DIR)
-
-        # История диалогов (для совместимости)
-        self.history = []
+        self.history: List[Dict] = []
         self.max_history = 20
         self._load_history()
 
-        # Поиск
         self._searcher = None
         self._last_ddg_call = 0.0
         self.search_cache = SearchCache()
         self.web_fetcher = WebPageFetcher()
         self.chunk_ranker = ChunkRanker()
 
-        # Фоновые задачи
         self._consolidation_task = None
         self._planner_task = None
         self._research_task = None
         self._start_background_tasks()
 
-        # Текущее когнитивное состояние
-        self.current_working_memory: List[int] = []  # id фактов
+        self.current_working_memory: List[str] = []
         self.current_goals: List[Goal] = []
         self.last_prediction_error = 0.0
+        self._last_prepare_meta: Dict = {}
 
-        self._last_prepare_meta = {}
+        # ---- Рефлексия (самообучение) ----
+        self.prediction_history: List[Dict] = []
+        self.reflection_interval = REFLECTION_INTERVAL
+        self._last_reflection_time = time.time()
+        self._reflection_task = None  # будет создан в _start_background_tasks
 
         logger.info(f"CognitiveController initialized for {user_id[:16]}")
 
@@ -322,14 +331,13 @@ class CognitiveController:
         except Exception:
             pass
 
-    # ---------- Фоновые задачи ----------
     def _start_background_tasks(self):
         loop = asyncio.get_event_loop()
         if loop.is_running():
             self._consolidation_task = asyncio.create_task(self._periodic_consolidation())
             self._planner_task = asyncio.create_task(self._periodic_planning())
             self._research_task = asyncio.create_task(self._periodic_research())
-
+            self._reflection_task = asyncio.create_task(self._periodic_reflection())
     async def _periodic_consolidation(self):
         while True:
             await asyncio.sleep(CONSOLIDATION_INTERVAL)
@@ -337,6 +345,10 @@ class CognitiveController:
                 await self.memory.light_consolidation()
             except Exception as e:
                 logger.error(f"Light consolidation error: {e}")
+            try:
+                await self._verify_pending_contradictions()
+            except Exception as e:
+                logger.error(f"Contradiction verification error: {e}")
             await asyncio.sleep(DEEP_CONSOLIDATION_INTERVAL - CONSOLIDATION_INTERVAL)
             try:
                 await self.memory.deep_consolidation()
@@ -360,7 +372,6 @@ class CognitiveController:
                 logger.error(f"Auto research error: {e}")
 
     async def _plan_goals(self):
-        """Генерирует цели на основе истории и текущих знаний."""
         if len(self.history) < 5:
             return
         history_summary = "\n".join([f"User: {item['user']}\nAI: {item['assistant']}" for item in self.history[-10:]])
@@ -378,23 +389,17 @@ class CognitiveController:
             logger.error(f"Planning error: {e}")
 
     async def _auto_research(self):
-        """Автономное исследование на основе любопытства."""
-        # Проверяем, есть ли активные цели с низкой уверенностью
         active_goals = await self.memory.get_active_goals()
         for goal in active_goals:
             if goal.confidence < 0.5 and goal.priority > 0.4:
-                # Инициируем исследование по теме цели
                 logger.info(f"Auto-research triggered for goal: {goal.description}")
                 await self.research(goal.description)
-                # Повышаем уверенность
                 goal.confidence = min(1.0, goal.confidence + 0.2)
                 await self.memory.update_goal(goal.id, confidence=goal.confidence)
 
-    # ---------- LLM вызовы ----------
     async def _call_llm(self, messages, temp=0.7, max_tokens=2048, retries=3):
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
         payload = {"model": "local-model", "messages": messages, "temperature": temp, "max_tokens": max_tokens}
-
         for attempt in range(retries):
             try:
                 async with aiohttp.ClientSession() as session:
@@ -459,14 +464,12 @@ class CognitiveController:
             logger.error(f"Stream error: {e}")
             yield f"[Ошибка: {e}]"
 
-    # ---------- Поиск (интеграция с существующим) ----------
     async def search_ddg(self, query: str, max_results: int = 5) -> List[Dict]:
         if not self.searcher:
             return []
         elapsed = _now() - self._last_ddg_call
         if elapsed < DDG_MIN_INTERVAL:
             await asyncio.sleep(DDG_MIN_INTERVAL - elapsed)
-
         loop = asyncio.get_event_loop()
         for attempt in range(DDG_MAX_RETRIES):
             try:
@@ -477,12 +480,108 @@ class CognitiveController:
                 self._last_ddg_call = _now()
                 return [{"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")} for r in results]
             except Exception as e:
-                logger.warning(f"DDG attempt {attempt+1} failed: {e}")
+                logger.warning(f"DDG attempt {attempt + 1} failed: {e}")
                 if attempt < DDG_MAX_RETRIES - 1:
                     await asyncio.sleep((2 ** attempt) + 0.5)
                 else:
                     logger.error("DDG failed after all retries")
         return []
+
+    # =====================================================================
+    # РЕФЛЕКСИЯ (самообучение на ошибках)
+    # =====================================================================
+
+    def _compute_prediction_error(self, predicted: List[str], actual: str) -> float:
+        """
+        Оценивает, насколько предсказанные фразы (список) похожи на реальный ответ.
+        Возвращает 0 (идеально) … 1 (полное несовпадение).
+        Использует схожесть по ключевым словам из memory_graph.
+        """
+        if not predicted or not actual:
+            return 1.0
+        pred_text = " ".join(predicted)
+        # Берём метод из CognitiveMemory (он уже есть)
+        sim = self.memory._compute_similarity(pred_text, actual) if hasattr(self.memory, '_compute_similarity') else 0.0
+        # Нормализуем: если sim=1 → ошибка 0, если sim=0 → ошибка 1
+        error = 1.0 - min(1.0, sim * 1.5)
+        return max(0.0, min(1.0, error))
+
+    async def _periodic_reflection(self):
+        """Фоновая задача, запускающая рефлексию с заданным интервалом."""
+        while True:
+            await asyncio.sleep(self.reflection_interval)
+            try:
+                await self._run_reflection()
+            except Exception as e:
+                logger.error(f"Reflection error: {e}")
+
+    async def _run_reflection(self):
+        """
+        Анализирует историю ошибок, выявляет паттерны и корректирует внутренние веса/синапсы.
+        """
+        if len(self.prediction_history) < 10:
+            return
+
+        # 1. Собираем статистику – какие темы/типы вопросов дают наибольшую ошибку
+        errors_by_keyword = defaultdict(list)
+        for entry in self.prediction_history[-REFLECTION_HISTORY_SIZE:]:
+            if entry["error"] > REFLECTION_ERROR_THRESHOLD:
+                kw = CognitiveMemory._extract_keywords(entry["query"])
+                for word in kw:
+                    errors_by_keyword[word].append(entry["error"])
+
+        if not errors_by_keyword:
+            return
+
+        # 2. Выбираем топ-3 проблемных темы
+        worst_topics = sorted(errors_by_keyword.items(), key=lambda kv: sum(kv[1]) / len(kv[1]), reverse=True)[:3]
+
+        # 3. Запрашиваем у LLM анализ и рекомендации
+        prompt = (
+                "Ты — когнитивный ассистент. Проанализируй следующие темы, в которых мои предсказания часто ошибочны (ошибка > 0.6):\n\n"
+                + "\n".join([f"- {topic} (средняя ошибка: {sum(err) / len(err):.2f})" for topic, err in worst_topics])
+                + "\n\nПредложи кратко (2-3 предложения), что можно улучшить: "
+                  "какие факты добавить, какие связи усилить, какие веса поиска изменить. "
+                  "Ответь только текстом, без нумерации."
+        )
+        try:
+            analysis = await self._call_llm(
+                [{"role": "user", "content": prompt}],
+                temp=REFLECTION_LLM_TEMP,
+                max_tokens=REFLECTION_LLM_MAX_TOKENS
+            )
+        except Exception as e:
+            logger.warning(f"Reflection LLM call failed: {e}")
+            return
+
+        # 4. Применяем рекомендации (упрощённая эвристика)
+        analysis_lower = analysis.lower()
+        if "усилить свежесть" in analysis_lower or "свежие данные" in analysis_lower:
+            # Увеличиваем вес свежести
+            new_weight = min(0.35, self.memory._dynamic_weights.get("freshness", 0.15) + 0.03)
+            self.memory._dynamic_weights["freshness"] = new_weight
+            logger.info(f"[Reflection] Increased freshness weight to {new_weight:.3f}")
+
+        if "усилить граф" in analysis_lower or "ассоциативные связи" in analysis_lower:
+            new_weight = min(0.35, self.memory._dynamic_weights.get("graph", 0.20) + 0.03)
+            self.memory._dynamic_weights["graph"] = new_weight
+            logger.info(f"[Reflection] Increased graph weight to {new_weight:.3f}")
+
+        if "добавить факты" in analysis_lower or "поискать" in analysis_lower:
+            # Инициируем автоматический поиск по проблемным темам
+            for topic, _ in worst_topics:
+                logger.info(f"[Reflection] Auto-research for topic: {topic}")
+                asyncio.create_task(self.research(topic))
+
+        # 5. Очищаем историю, чтобы не анализировать одно и то же постоянно
+        self.prediction_history.clear()
+        self._last_reflection_time = time.time()
+
+    async def _quick_correction(self, query: str, predicted: List[str], actual: str):
+        """Срочная коррекция при очень высокой ошибке (например, > 0.85)."""
+        # Простой вариант: инициируем глубокий поиск по запросу
+        logger.info(f"[QuickCorrection] High error detected for: {query[:50]}...")
+        await self.research(query)
 
     def _content_has_currency_numbers(self, text: str) -> bool:
         if not text:
@@ -501,7 +600,7 @@ class CognitiveController:
         return False
 
     def _generate_alternative_queries(self, original: str, attempt: int) -> str:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if attempt == 1:
             return f"{original} {today}"
         elif attempt == 2:
@@ -520,7 +619,12 @@ class CognitiveController:
             if alt not in queries_to_try:
                 queries_to_try.append(alt)
 
+        fetched_total = 0
+        budget = getattr(self, '_deep_search_budget', DEEP_SEARCH_TOTAL_BUDGET)
+
         for q in queries_to_try:
+            if fetched_total >= budget:
+                break
             cache_key = _hash_query(q)
             cached = await self.search_cache.get(cache_key)
             if cached:
@@ -535,7 +639,10 @@ class CognitiveController:
                 continue
 
             urls = [r["url"] for r in ddg_results if r.get("url")]
-            fetched = await self.web_fetcher.fetch_many(urls[:max_results], limit=PARALLEL_FETCH_LIMIT)
+            remaining = budget - fetched_total
+            to_fetch = urls[:min(max_results, remaining)]
+            fetched = await self.web_fetcher.fetch_many(to_fetch, limit=PARALLEL_FETCH_LIMIT)
+            fetched_total += len(fetched)
 
             documents = []
             url_to_title = {r["url"]: r["title"] for r in ddg_results}
@@ -558,7 +665,6 @@ class CognitiveController:
                     all_chunks.append({"chunk": ch, "url": doc["url"], "title": doc["title"]})
 
             scored = self.chunk_ranker.score_chunks(q, [c["chunk"] for c in all_chunks])
-
             top_chunks = []
             sources_used = set()
             for score, chunk_text in scored:
@@ -578,7 +684,6 @@ class CognitiveController:
                     f"[{i}] Источник: {ch['title']}\nURL: {ch['url']}\nРелевантность: {ch['score']}\n{ch['chunk'][:600]}"
                 )
             context = "\n\n---\n\n".join(context_parts)
-
             sources = [{"title": url_to_title.get(u, u), "url": u} for u in sources_used]
 
             result_item = {
@@ -615,10 +720,6 @@ class CognitiveController:
                                 image_base64: Optional[str] = None,
                                 image_mime: Optional[str] = None,
                                 reasoning: bool = False) -> Tuple[List[Dict], Dict]:
-        """
-        Подготавливает сообщения для LLM и возвращает метаданные (источники и т.п.).
-        """
-        # Авто-поиск
         auto_search = False
         if AUTO_SEARCH_ENABLED and not web_search and needs_search_heuristic(message):
             web_search = True
@@ -628,7 +729,6 @@ class CognitiveController:
         search_context = ""
         sources = []
 
-        # Поиск в интернете (если нужно)
         if web_search and self.searcher:
             search_query = await rewrite_query(self._call_llm, message)
             max_res = 7 if is_factual_query(message) else MAX_PAGES_TO_FETCH
@@ -638,10 +738,12 @@ class CognitiveController:
                 search_meta["sources"] = search_data["sources"]
                 sources = search_data["sources"]
                 search_context = search_data["context"] or "Поиск выполнен, но полезный текст извлечь не удалось."
-
             if EXTRACT_FACTS_FROM_SEARCH and search_data.get("context"):
                 try:
-                    facts = self._extract_facts_from_text(search_data["context"])
+                    if globals().get("EXTRACT_FACTS_WITH_LLM", False):
+                        facts = await self._extract_facts_llm(search_data["context"])
+                    else:
+                        facts = self._extract_facts_from_text(search_data["context"])
                     for f in facts:
                         self.memory._add_fact(f, 'knowledge', confidence=0.6, salience=0.3)
                     await self.memory._schedule_save()
@@ -649,7 +751,6 @@ class CognitiveController:
                 except Exception as e:
                     logger.warning(f"Fact extraction error: {e}")
 
-        # Извлечение памяти
         relevant = await self.memory.retrieve_hybrid(message, top_k=7, use_graph=True)
         memory_context = ""
         if relevant:
@@ -659,16 +760,12 @@ class CognitiveController:
                 conf = fact.get("confidence", 0.5)
                 lines.append(f"- {text} (уверенность: {conf:.2f}, важность: {fact.get('importance', 1.0):.2f})")
             memory_context = "=== КОНТЕКСТ ИЗ ДОЛГОСРОЧНОЙ ПАМЯТИ ===\n" + "\n".join(lines) + "\n\n"
-            self.current_working_memory = [f["id"] for f in relevant[:3]]
+            self.current_working_memory = [f["text"] for f in relevant[:3]]
 
-        # Предсказания
         predictions = []
         if self.current_working_memory:
-            predicted_ids = await self.memory.predict_next(self.current_working_memory)
-            predictions = [self.memory.semantic_facts[pid].text for pid in predicted_ids if
-                           pid < len(self.memory.semantic_facts)]
+            predictions = await self.memory.predict_next(self.current_working_memory)
 
-        # Неопределённость
         uncertainty = 0.0
         if relevant:
             avg_conf = sum(f["confidence"] for f in relevant) / len(relevant)
@@ -676,13 +773,11 @@ class CognitiveController:
         if search_context:
             uncertainty *= 0.7
 
-        # Цели
         active_goals = await self.memory.get_active_goals()
         goal_hint = ""
         if active_goals:
             goal_hint = "Активные цели: " + ", ".join([g.description for g in active_goals[:2]])
 
-        # Построение сообщений
         messages = self._build_messages(
             message=message,
             web_search=web_search,
@@ -696,7 +791,6 @@ class CognitiveController:
             goal_hint=goal_hint
         )
 
-        # Сохраняем метаданные в объект для дальнейшего использования
         self._last_prepare_meta = {
             "search_meta": search_meta,
             "sources": sources,
@@ -711,45 +805,102 @@ class CognitiveController:
             "image_base64": image_base64,
             "image_mime": image_mime,
         }
-
         return messages, search_meta
 
-    # ---------- Когнитивный цикл ----------
     async def process_input(self, message: str, web_search: bool = False,
                             image_base64: Optional[str] = None,
                             image_mime: Optional[str] = None,
                             reasoning: bool = False) -> Tuple[str, Dict]:
-        # Команды памяти
         cmd_response = await self._handle_memory_command(message)
         if cmd_response:
             return cmd_response[0], cmd_response[1]
 
-        # Подготовка сообщений
         messages, search_meta = await self._prepare_messages(
             message, web_search, image_base64, image_mime, reasoning
         )
 
-        # Генерация ответа (не потоковая)
         response = await self._call_llm(messages)
 
-        # Сохранение истории, эпизодов, целей (как было)
         self.history.append({"role": "user", "content": message})
         if response:
             self.history.append({"role": "assistant", "content": response})
         self._save_history()
 
         if response:
-            # salience из неопределённости
             uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
             salience = 1.0 - uncertainty
             await self.memory.add_episode(message, response, salience=salience)
-            # prediction error и обновление целей (как было)
+
+        # ---- Рефлексия: запоминаем предсказание и ошибку ----
+        predictions = self._last_prepare_meta.get("predictions", [])
+        if predictions and response:
+            error = self._compute_prediction_error(predictions, response)
+            self.prediction_history.append({
+                "query": message,
+                "predicted": predictions,
+                "actual": response,
+                "error": error,
+                "timestamp": time.time()
+            })
+            if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
+                self.prediction_history.pop(0)
+            # Если ошибка очень высокая, можно инициировать быструю коррекцию (опционально)
+            if error > 0.85:
+                asyncio.create_task(self._quick_correction(message, predictions, response))
 
         return response, search_meta
 
-    # ---------- Вспомогательные методы ----------
+    async def _extract_facts_llm(self, text: str) -> List[str]:
+        prompt = (
+            "Извлеки из текста ниже список коротких, самодостаточных фактических утверждений "
+            "(проверяемые факты, а не мнения или вода). Каждый факт — отдельным пунктом, "
+            "без нумерации, без пояснений. Если фактов нет — верни пустую строку.\n\n"
+            f"ТЕКСТ:\n{text[:4000]}"
+        )
+        try:
+            raw = await self._call_llm([{"role": "user", "content": prompt}], temp=0.2, max_tokens=500)
+            if not raw or not raw.strip():
+                return []
+            facts = []
+            for line in raw.split('\n'):
+                line = line.strip().strip('-•*').strip()
+                if 15 < len(line) < 400:
+                    facts.append(line[:300])
+            return facts[:20]
+        except Exception as e:
+            logger.warning(f"LLM fact extraction failed, falling back to regex: {e}")
+            return self._extract_facts_from_text(text)
+
+    async def _verify_pending_contradictions(self, max_checks: int = 5):
+        """Использует facts_by_id для быстрого доступа."""
+        checks_done = 0
+        while self.memory.pending_contradiction_checks and checks_done < max_checks:
+            fid1, fid2 = self.memory.pending_contradiction_checks.pop(0)
+            f1 = self.memory.facts_by_id.get(fid1)
+            f2 = self.memory.facts_by_id.get(fid2)
+            if not f1 or not f2:
+                continue
+            prompt = (
+                "Эти два утверждения логически противоречат друг другу? Ответь ТОЛЬКО одним словом: "
+                "ДА или НЕТ.\n\n"
+                f"1) {f1.text[:300]}\n2) {f2.text[:300]}"
+            )
+            try:
+                verdict = await self._call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=10)
+                verdict = (verdict or "").strip().lower()
+                if verdict.startswith('да'):
+                    self.memory.confirm_contradiction(fid1, fid2)
+                else:
+                    self.memory.clear_contradiction(fid1, fid2)
+            except Exception as e:
+                logger.debug(f"Contradiction verification failed for ({fid1},{fid2}): {e}")
+                self.memory.pending_contradiction_checks.append((fid1, fid2))
+                break
+            checks_done += 1
+        if checks_done:
+            await self.memory._schedule_save()
+
     def _extract_facts_from_text(self, text: str) -> List[str]:
-        """Эвристическое извлечение фактов из текста."""
         sentences = re.split(r'[.!?]', text)
         facts = []
         for s in sentences:
@@ -763,24 +914,24 @@ class CognitiveController:
         for cmd, action in MEMORY_CONTROL_COMMANDS.items():
             if lower_msg.startswith(cmd):
                 rest = message[len(cmd):].strip()
+                if not rest:
+                    continue
+
                 if action == "store":
                     fid = self.memory._add_fact(rest, 'command', confidence=1.0, importance=1.5)
                     await self.memory._schedule_save()
                     return f"Запомнил: {rest}", {"memory": "stored", "id": fid}
+
                 elif action == "forget":
-                    to_remove = [i for i, f in enumerate(self.memory.semantic_facts) if rest.lower() in f.text.lower()]
-                    if to_remove:
-                        self.memory.semantic_facts = [f for i, f in enumerate(self.memory.semantic_facts) if
-                                                      i not in to_remove]
-                        self.memory._build_keyword_index()
-                        if self.memory.use_embeddings:
-                            self.memory.fact_embeddings = [emb for i, emb in enumerate(self.memory.fact_embeddings) if
-                                                           i not in to_remove]
-                            self.memory._rebuild_faiss_index()  # <--- заменили ручную перестройку на вызов метода
+                    # Корректное удаление через fact.id
+                    to_remove_ids = {f.id for f in self.memory.semantic_facts if rest.lower() in f.text.lower()}
+                    if to_remove_ids:
+                        removed = self.memory._remove_facts(to_remove_ids)
                         await self.memory._schedule_save()
-                        return f"Удалено {len(to_remove)} фактов о '{rest}'", {"memory": "forgot"}
+                        return f"Удалено {removed} фактов о '{rest}'", {"memory": "forgot"}
                     else:
                         return "Ничего не найдено для удаления.", {"memory": "no_match"}
+
                 elif action == "recall":
                     facts = await self.memory.retrieve_hybrid(rest, top_k=10, use_graph=True)
                     if facts:
@@ -809,9 +960,10 @@ class CognitiveController:
             system_parts.append("Перед ответом покажи рассуждения: начни с 💭 РАССУЖДЕНИЕ: и заканчивая ---, затем финальный ответ.")
         if web_search:
             system_parts.append("Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
-        system_content = "\n\n".join(system_parts)
 
+        system_content = "\n\n".join(system_parts)
         messages = [{"role": "system", "content": system_content}]
+
         for item in self.history[-self.max_history:]:
             if item.get("role") != "system":
                 messages.append(item)
@@ -821,11 +973,10 @@ class CognitiveController:
             user_blocks.append(memory_context)
         if search_context:
             user_blocks.append(
-                f"=== ДАННЫЕ ИЗ ИНТЕРНЕТА (актуальны на {datetime.now().strftime('%Y-%m-%d')}) ===\n\n"
+                f"=== ДАННЫЕ ИЗ ИНТЕРНЕТА (актуальны на {datetime.now(timezone.utc).strftime('%Y-%m-%d')}) ===\n\n"
                 f"{search_context}\n\n=== КОНЕЦ ДАННЫХ ==="
             )
         user_blocks.append(f"Вопрос пользователя: {message}")
-
         user_text = "\n\n".join(user_blocks)
 
         if image_base64 and LM_STUDIO_VISION_SUPPORTED:
@@ -840,9 +991,9 @@ class CognitiveController:
             messages.append({"role": "user", "content": user_content})
         else:
             messages.append({"role": "user", "content": user_text})
+
         return messages
 
-    # ---------- Исследовательский метод ----------
     async def research(self, goal: str) -> Dict[str, Any]:
         prompt = f"Сформулируй 3 гипотезы по вопросу: {goal}"
         hypotheses_text = await self._call_llm([{"role": "user", "content": prompt}], temp=0.8)
@@ -862,6 +1013,7 @@ class CognitiveController:
 
         evidence_text = "\n".join([f"- {e['title']}: {e['source']} (запрос: {e['query']})" for e in all_evidence[:6]])
         context = f"Вопрос: {goal}\nГипотезы: {', '.join(hypotheses)}\nИсточники:\n{evidence_text}"
+
         answer_prompt = (
             f"На основе гипотез и источников дай развёрнутый ответ. "
             f"Укажи уверенность (0-1) и аргументы.\n\n{context}"
@@ -869,7 +1021,6 @@ class CognitiveController:
         answer = await self._call_llm([{"role": "user", "content": answer_prompt}], temp=0.6)
         return {"answer": answer, "confidence": 0.7, "hypotheses": hypotheses, "evidence": all_evidence}
 
-    # ---------- Методы для совместимости с API ----------
     async def get_response(self, message: str, web_search: bool = False,
                            image_base64: str = None, image_mime: str = None,
                            reasoning: bool = False):
@@ -878,32 +1029,27 @@ class CognitiveController:
     async def stream_response(self, message: str, web_search: bool = False,
                               image_base64: str = None, image_mime: str = None,
                               reasoning: bool = False, char_by_char: bool = None):
-        # Команды памяти
         cmd_response = await self._handle_memory_command(message)
         if cmd_response:
             yield f"data: {json.dumps({'token': cmd_response[0]})}\n\n"
             yield "data: [DONE]\n\n"
             return
 
-        # Подготовка контекста (без вызова LLM)
         messages, search_meta = await self._prepare_messages(
             message, web_search, image_base64, image_mime, reasoning
         )
 
-        # Отправка источников, если есть
         if search_meta.get("sources"):
             yield f"data: {json.dumps({'sources': search_meta['sources']})}\n\n"
 
         full_response = ""
         try:
             if LM_STUDIO_USE_STREAM:
-                # Реальный стриминг от LLM
                 async for token in self._call_llm_stream(messages):
                     full_response += token
                     yield f"data: {json.dumps({'token': token})}\n\n"
-                    await asyncio.sleep(0)  # даём шанс другим задачам
+                    await asyncio.sleep(0)
             else:
-                # Резервная имитация
                 response = await self._call_llm(messages)
                 full_response = response
                 if char_by_char is None:
@@ -920,17 +1066,14 @@ class CognitiveController:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
 
-        # Сохранение истории и эпизода (после завершения генерации)
         self.history.append({"role": "user", "content": message})
         if full_response:
             self.history.append({"role": "assistant", "content": full_response})
             self._save_history()
-
             uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
             salience = 1.0 - uncertainty
             await self.memory.add_episode(message, full_response, salience=salience)
 
-            # Обновление целей (как в process_input)
             active_goals = self._last_prepare_meta.get("active_goals", [])
             for goal in active_goals:
                 if goal.description.lower() in full_response.lower():
@@ -939,9 +1082,24 @@ class CognitiveController:
                         goal.status = "completed"
                     await self.memory.update_goal(goal.id, progress=goal.progress, status=goal.status)
 
+        # ---- Рефлексия: запоминаем предсказание и ошибку ----
+        predictions = self._last_prepare_meta.get("predictions", [])
+        if predictions and full_response:
+            error = self._compute_prediction_error(predictions, full_response)
+            self.prediction_history.append({
+                "query": message,
+                "predicted": predictions,
+                "actual": full_response,
+                "error": error,
+                "timestamp": time.time()
+            })
+            if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
+                self.prediction_history.pop(0)
+            if error > 0.85:
+                asyncio.create_task(self._quick_correction(message, predictions, full_response))
+
         yield "data: [DONE]\n\n"
 
-    # ---------- Прочие методы ----------
     async def enhance_prompt(self, prompt: str) -> str:
         enhancement = await self._call_llm([
             {"role": "system", "content": "Ты — эксперт по улучшению промптов. Добавь детали, стиль, освещение, сохрани суть."},
@@ -992,11 +1150,13 @@ class CognitiveController:
             self._research_task.cancel()
         await self.memory.shutdown()
 
+
 # =====================================================================
-# Фабрика ассистентов (использует CognitiveController)
+# Фабрика ассистентов
 # =====================================================================
-_assistants = {}
+_assistants: Dict[str, CognitiveController] = {}
 _assistants_lock = asyncio.Lock()
+
 
 async def get_assistant(user_id: str):
     async with _assistants_lock:
@@ -1005,28 +1165,34 @@ async def get_assistant(user_id: str):
             logger.info(f"Создан когнитивный ассистент для {user_id[:16]}")
         return _assistants[user_id]
 
+
 # =====================================================================
-# FastAPI роутер (без изменений, использует get_assistant)
+# FastAPI роутер
 # =====================================================================
 router = APIRouter(prefix='/ai', tags=['ai'])
 
+
 class AIRequest(BaseModel):
-    message: str
+    message: str = Field(..., min_length=MIN_MESSAGE_LENGTH, max_length=MAX_MESSAGE_LENGTH)
     stream: bool = True
     web_search: bool = False
-    image_base64: Optional[str] = None
+    image_base64: Optional[str] = Field(None, max_length=MAX_IMAGE_SIZE_BASE64 * 2)
     image_mime: Optional[str] = None
     reasoning: bool = False
     char_by_char: Optional[bool] = None
 
+
 class ResearchRequest(BaseModel):
-    goal: str
+    goal: str = Field(..., min_length=1, max_length=2000)
+
 
 class ImageGenRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(..., min_length=1, max_length=2000)
+
 
 class EnhanceRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(..., min_length=1, max_length=5000)
+
 
 @router.post("/chat")
 async def chat_with_ai(body: AIRequest, address: str = Depends(require_auth)):
@@ -1054,6 +1220,7 @@ async def chat_with_ai(body: AIRequest, address: str = Depends(require_auth)):
     )
     return {"reply": response, "meta": meta}
 
+
 @router.post("/search")
 async def direct_search(body: dict, address: str = Depends(require_auth)):
     query = body.get("query", "").strip()
@@ -1062,6 +1229,7 @@ async def direct_search(body: dict, address: str = Depends(require_auth)):
     assistant = await get_assistant(address)
     result = await assistant.deep_search(query, max_results=5)
     return {"type": "search", "query": query, **result}
+
 
 @router.post("/research")
 async def research_endpoint(body: ResearchRequest, address: str = Depends(require_auth)):
@@ -1072,6 +1240,7 @@ async def research_endpoint(body: ResearchRequest, address: str = Depends(requir
     except Exception as e:
         logger.error(f"Research failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/generate_image")
 async def generate_image_endpoint(body: ImageGenRequest, address: str = Depends(require_auth)):
@@ -1086,6 +1255,7 @@ async def generate_image_endpoint(body: ImageGenRequest, address: str = Depends(
         logger.error(f"Image gen failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.post("/enhance_prompt")
 async def enhance_prompt_endpoint(body: EnhanceRequest, address: str = Depends(require_auth)):
     assistant = await get_assistant(address)
@@ -1096,21 +1266,26 @@ async def enhance_prompt_endpoint(body: EnhanceRequest, address: str = Depends(r
         logger.error(f"Enhance prompt failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.get("/global_stats")
 async def global_stats(address: str = Depends(require_auth)):
     assistant = await get_assistant(address)
     return assistant.get_stats()
 
+
 @router.post("/force_merge")
 async def force_merge(address: str = Depends(require_auth)):
     return {"status": "no-op", "message": "Global merge disabled"}
+
 
 @router.post("/apply_global")
 async def apply_global(address: str = Depends(require_auth)):
     return {"status": "no-op", "message": "Global apply disabled"}
 
+
 def start_global_merge_task():
     logger.info("Global merge task disabled")
+
 
 async def shutdown_all():
     for uid, assistant in _assistants.items():
@@ -1119,9 +1294,19 @@ async def shutdown_all():
         except Exception:
             pass
 
+
 import atexit
+
+
 def _shutdown():
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(shutdown_all())
-    loop.close()
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        loop.run_until_complete(shutdown_all())
+    except Exception as e:
+        logger.warning(f"Shutdown error: {e}")
+
+
 atexit.register(_shutdown)

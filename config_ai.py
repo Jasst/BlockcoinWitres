@@ -1,6 +1,6 @@
-# config_ai.py
-# Централизованная конфигурация для всей AI-системы (когнитивная архитектура)
-
+"""
+Централизованная конфигурация для всей AI-системы (когнитивная архитектура)
+"""
 from pathlib import Path
 
 # -------------------------------
@@ -22,16 +22,15 @@ LM_STUDIO_VISION_SUPPORTED = True
 # -------------------------------
 # Параметры памяти (многоуровневая)
 # -------------------------------
-WORKING_MEMORY_SIZE = 20           # количество последних событий в рабочей памяти
-SENSORY_BUFFER_SIZE = 5            # последние сырые входы
-EPISODIC_MAX_SIZE = 500            # максимум эпизодов (диалогов)
-SEMANTIC_MAX_FACTS = 10000         # максимум семантических фактов
+WORKING_MEMORY_SIZE = 20
+SENSORY_BUFFER_SIZE = 5
+EPISODIC_MAX_SIZE = 500
+SEMANTIC_MAX_FACTS = 10000
 ASSOCIATIVE_GRAPH_MAX_NODES = 20000
 
 # -------------------------------
 # Состояния узлов и синапсов
 # -------------------------------
-# Значения по умолчанию для новых полей Fact
 DEFAULT_IMPORTANCE = 1.0
 DEFAULT_CONFIDENCE = 0.5
 DEFAULT_NOVELTY = 0.0
@@ -40,41 +39,38 @@ DEFAULT_STABILITY = 0.5
 DEFAULT_PLASTICITY = 0.5
 DEFAULT_PREDICTION_ERROR = 0.0
 
-# Параметры синапсов
 SYNAPSE_INITIAL_WEIGHT = 0.1
 SYNAPSE_MAX_WEIGHT = 1.0
 SYNAPSE_MIN_WEIGHT = 0.01
-SYNAPSE_DECAY_RATE = 0.001          # затухание веса за шаг
-SYNAPSE_PLASTICITY_RATE = 0.01      # скорость изменения веса
+SYNAPSE_DECAY_RATE = 0.001
+SYNAPSE_PLASTICITY_RATE = 0.01
 SYNAPSE_COACTIVATION_THRESHOLD = 0.3
 
-# Hebbian / STDP
 HEBBIAN_LEARNING_RATE = 0.02
 STDP_LEARNING_RATE = 0.03
-STDP_TIME_WINDOW = 5.0              # секунды, в течение которых считается "до"
+STDP_TIME_WINDOW = 5.0
 STDP_LONG_TERM_POTENTIATION = 0.01
 STDP_LONG_TERM_DEPRESSION = 0.005
 
-# Spreading activation
 SPREADING_MAX_DEPTH = 3
 SPREADING_MAX_NODES = 50
-SPREADING_DECAY = 0.5               # затухание активации на каждом шаге
-SPREADING_THRESHOLD = 0.05          # минимальная активация для продолжения
+SPREADING_DECAY = 0.5
+SPREADING_THRESHOLD = 0.05
 
 # -------------------------------
-# Прогностическая память (переходы)
+# Прогностическая память
 # -------------------------------
-PREDICTIVE_MATRIX_MAX_SIZE = 5000   # максимум пар (A->B)
+PREDICTIVE_MATRIX_MAX_SIZE = 5000
 PREDICTIVE_LEARNING_RATE = 0.1
 PREDICTION_ERROR_THRESHOLD = 0.3
 
 # -------------------------------
 # Консолидация и сон
 # -------------------------------
-CONSOLIDATION_INTERVAL = 3600 * 2    # 2 часа (лёгкая)
-DEEP_CONSOLIDATION_INTERVAL = 3600 * 8  # 8 часов (глубокая)
+CONSOLIDATION_INTERVAL = 3600 * 2
+DEEP_CONSOLIDATION_INTERVAL = 3600 * 8
 REPLAY_BATCH_SIZE = 20
-REPLAY_MIX_RATIO = (0.4, 0.3, 0.2, 0.1)  # важные, новые, salience, ошибки
+REPLAY_MIX_RATIO = (0.4, 0.3, 0.2, 0.1)
 
 # -------------------------------
 # Любопытство и автономность
@@ -86,7 +82,7 @@ RESOURCE_BUDGET_LLM_CALLS = 100
 AUTO_RESEARCH_ENABLED = True
 
 # -------------------------------
-# Веб-поиск (существующий)
+# Веб-поиск
 # -------------------------------
 MAX_SEARCH_ITERATIONS = 3
 SEARCH_CACHE_TTL = 300
@@ -104,6 +100,7 @@ MAX_SEARCH_ATTEMPTS = 3
 ENABLE_QUERY_REWRITE = True
 EXTRACT_FACTS_FROM_SEARCH = True
 EXTRACT_FACTS_WITH_LLM = True
+DEEP_SEARCH_TOTAL_BUDGET = 15  # общий лимит страниц на deep_search
 
 # -------------------------------
 # Эмбеддинги и гибридный поиск
@@ -114,12 +111,10 @@ FAISS_NPROBE = 30
 FAISS_REBUILD_THRESHOLD = 300
 FAISS_MIN_TRAIN_VECTORS = 500
 MEMORY_USE_EMBEDDINGS = True
-
 HYBRID_WEIGHT_BM25 = 0.25
 HYBRID_WEIGHT_COSINE = 0.40
 HYBRID_WEIGHT_FRESHNESS = 0.15
-HYBRID_WEIGHT_GRAPH = 0.20         # новый вес для spreading activation
-
+HYBRID_WEIGHT_GRAPH = 0.20
 DYNAMIC_WEIGHTS_ENABLED = True
 FACTUAL_WEIGHTS = (0.35, 0.30, 0.15, 0.20)
 GENERAL_WEIGHTS = (HYBRID_WEIGHT_BM25, HYBRID_WEIGHT_COSINE, HYBRID_WEIGHT_FRESHNESS, HYBRID_WEIGHT_GRAPH)
@@ -155,9 +150,25 @@ EASYDIFFUSION_DEFAULT_HEIGHT = 512
 STREAM_CHAR_BY_CHAR = False
 STREAM_CHAR_DELAY = 0.02
 MAX_IMAGE_SIZE_BASE64 = 5 * 1024 * 1024
+MAX_MESSAGE_LENGTH = 10000
+MIN_MESSAGE_LENGTH = 1
 
 # -------------------------------
 # Кэш памяти
 # -------------------------------
 MEMORY_CACHE_TTL = 60
 MEMORY_CACHE_MAX_SIZE = 1000
+
+# -------------------------------
+# Дубликаты (light consolidation)
+# -------------------------------
+DUPLICATE_SIMILARITY_THRESHOLD = 0.92
+
+# -------------------------------
+# Рефлексия (самообучение)
+# -------------------------------
+REFLECTION_INTERVAL = 3600 * 4          # запуск рефлексии каждые 4 часа
+REFLECTION_ERROR_THRESHOLD = 0.6        # ошибка выше этого значения считается значимой
+REFLECTION_HISTORY_SIZE = 100           # сколько последних предсказаний хранить
+REFLECTION_LLM_TEMP = 0.5
+REFLECTION_LLM_MAX_TOKENS = 300

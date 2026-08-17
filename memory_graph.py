@@ -1,7 +1,7 @@
-# memory_graph.py
-# Когнитивная память: семантическая, эпизодическая, ассоциативный граф с Hebbian/STDP,
-# spreading activation, predictive transitions, противоречия, консолидация, replay.
-
+"""
+Когнитивная память: семантическая, эпизодическая, ассоциативный граф с Hebbian/STDP,
+spreading activation, predictive transitions, противоречия, консолидация, replay.
+"""
 import json
 import logging
 import time
@@ -73,20 +73,20 @@ except ImportError:
     GENERAL_WEIGHTS = (HYBRID_WEIGHT_BM25, HYBRID_WEIGHT_COSINE, HYBRID_WEIGHT_FRESHNESS, HYBRID_WEIGHT_GRAPH)
     MEMORY_CACHE_TTL = 60
     MEMORY_CACHE_MAX_SIZE = 1000
+    DUPLICATE_SIMILARITY_THRESHOLD = 0.92
+
 
 # =====================================================================
 # ДАТАКЛАССЫ
 # =====================================================================
-
 @dataclass
 class Fact:
     """Семантический факт с когнитивными состояниями."""
     id: int
     text: str
-    type: str                     # 'user', 'assistant', 'knowledge', 'command'
+    type: str
     timestamp: float
     keywords: List[str]
-    # Когнитивные состояния
     importance: float = DEFAULT_IMPORTANCE
     confidence: float = DEFAULT_CONFIDENCE
     novelty: float = DEFAULT_NOVELTY
@@ -96,9 +96,9 @@ class Fact:
     prediction_error: float = DEFAULT_PREDICTION_ERROR
     access_count: int = 0
     last_accessed: float = 0.0
-    activation: float = 0.0       # текущая активация (для spreading)
-    # Конфликты
-    contradicts: Set[int] = field(default_factory=set)  # id фактов, которым противоречит
+    activation: float = 0.0
+    contradicts: Set[int] = field(default_factory=set)
+
 
 @dataclass
 class Synapse:
@@ -111,9 +111,9 @@ class Synapse:
     confidence: float = 0.5
     coactivation_count: int = 0
     last_coactivation: float = 0.0
-    # STDP временные метки
     pre_time: float = 0.0
     post_time: float = 0.0
+
 
 @dataclass
 class Episode:
@@ -127,6 +127,7 @@ class Episode:
     prediction_error: float = 0.0
     accessed_count: int = 0
 
+
 @dataclass
 class Goal:
     """Цель с состоянием."""
@@ -138,35 +139,44 @@ class Goal:
     deadline: Optional[float] = None
     related_memory: List[int] = field(default_factory=list)
     dependencies: List[int] = field(default_factory=list)
-    status: str = "active"  # active, completed, blocked, abandoned
+    status: str = "active"
     created_at: float = field(default_factory=time.time)
+
 
 # =====================================================================
 # ОСНОВНОЙ КЛАСС КОГНИТИВНОЙ ПАМЯТИ
 # =====================================================================
-
 class CognitiveMemory:
     """
     Многоуровневая память с ассоциативным графом, Hebbian/STDP,
     spreading activation, предсказаниями, консолидацией и replay.
+
+    ВАЖНО: все операции с фактами используют fact.id (стабильный идентификатор),
+    а не индекс в списке semantic_facts. Маппинг id -> Fact хранится в facts_by_id.
     """
+
     def __init__(self, user_id: str, base_dir: Path):
         self.user_id = user_id
         self.base_dir = base_dir / user_id / "cognitive_memory"
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
         # ---- Уровни памяти ----
-        self.sensory_buffer: deque = deque(maxlen=SENSORY_BUFFER_SIZE)      # последние сырые входы
-        self.working_memory: deque = deque(maxlen=WORKING_MEMORY_SIZE)      # текущие активные элементы (id фактов)
-        self.episodic_memory: List[Episode] = []                            # эпизоды
-        self.semantic_facts: List[Fact] = []                                # семантические факты
-        self.graph: DefaultDict[int, Set[int]] = defaultdict(set)           # связи (source -> set targets)
-        self.synapses: Dict[Tuple[int, int], Synapse] = {}                  # детальные синапсы
-        self.keyword_index: DefaultDict[str, List[int]] = defaultdict(list)
+        self.sensory_buffer: deque = deque(maxlen=SENSORY_BUFFER_SIZE)
+        self.working_memory: deque = deque(maxlen=WORKING_MEMORY_SIZE)
+        self.episodic_memory: List[Episode] = []
+        self.semantic_facts: List[Fact] = []
+        self.facts_by_id: Dict[int, Fact] = {}            # ← НОВОЕ: маппинг id -> Fact
+        self.graph: DefaultDict[int, Set[int]] = defaultdict(set)
+        self.synapses: Dict[Tuple[int, int], Synapse] = {}
+        self.keyword_index: DefaultDict[str, List[int]] = defaultdict(list)  # теперь хранит fact.id
 
-        # ---- Прогностическая модель (переходы) ----
-        self.predictive_matrix: DefaultDict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
-        self.prediction_cache: Dict[str, List[int]] = {}                    # кэш предсказаний
+        # ---- Прогностическая модель ----
+        self.predictive_matrix: DefaultDict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        self.concept_examples: Dict[str, str] = {}
+        self.prediction_cache: Dict[str, List[int]] = {}
+
+        # ---- Очередь пар-кандидатов на LLM-проверку противоречий ----
+        self.pending_contradiction_checks: List[Tuple[int, int]] = []
 
         # ---- Цели ----
         self.goals: List[Goal] = []
@@ -178,6 +188,14 @@ class CognitiveMemory:
         self._lock = asyncio.Lock()
         self._dirty = False
         self._save_task = None
+
+        # ---- Динамические веса для гибридного поиска (будут изменяться рефлексией) ----
+        self._dynamic_weights = {
+            "bm25": HYBRID_WEIGHT_BM25,
+            "cosine": HYBRID_WEIGHT_COSINE,
+            "freshness": HYBRID_WEIGHT_FRESHNESS,
+            "graph": HYBRID_WEIGHT_GRAPH,
+        }
 
         # ---- Эмбеддинги ----
         self.use_embeddings = MEMORY_USE_EMBEDDINGS
@@ -201,7 +219,11 @@ class CognitiveMemory:
             self.index = None
 
         self.tfidf = TfidfVectorizer(max_features=5000, stop_words='english')
-        self._embedding_cache = {}
+        self._tfidf_dirty = True
+        self._tfidf_matrix = None
+        self._tfidf_texts_hash = None
+
+        self._embedding_cache: Dict[str, np.ndarray] = {}
         self._cache: Dict[str, Tuple[Any, float]] = {}
         self._cache_ttl = MEMORY_CACHE_TTL
         self._cache_maxsize = MEMORY_CACHE_MAX_SIZE
@@ -210,7 +232,7 @@ class CognitiveMemory:
         self._load_sync()
         logger.info(f"CognitiveMemory initialized for {user_id[:16]}")
 
-    # ---------- ЗАГРУЗКА / СОХРАНЕНИЕ ----------
+    # ==================== ЗАГРУЗКА / СОХРАНЕНИЕ ====================
     def _load_sync(self):
         facts_path = self.base_dir / "facts.json"
         if facts_path.exists():
@@ -220,7 +242,7 @@ class CognitiveMemory:
                     raw = data.get('facts', [])
                     self.semantic_facts = []
                     for fd in raw:
-                        self.semantic_facts.append(Fact(
+                        fact = Fact(
                             id=fd['id'],
                             text=fd['text'],
                             type=fd['type'],
@@ -236,7 +258,8 @@ class CognitiveMemory:
                             access_count=fd.get('access_count', 0),
                             last_accessed=fd.get('last_accessed', 0.0),
                             contradicts=set(fd.get('contradicts', [])),
-                        ))
+                        )
+                        self.semantic_facts.append(fact)
                     self._next_fact_id = data.get('next_id', len(self.semantic_facts))
             except Exception as e:
                 logger.warning(f"Load facts error: {e}")
@@ -292,6 +315,8 @@ class CognitiveMemory:
             except Exception as e:
                 logger.warning(f"Load goals error: {e}")
 
+        # Восстанавливаем маппинг id -> Fact
+        self.facts_by_id = {f.id: f for f in self.semantic_facts}
         self._build_keyword_index()
         self._rebuild_predictive_from_episodes()
 
@@ -305,6 +330,13 @@ class CognitiveMemory:
                 arr = np.load(path)
                 if arr.shape[0] > 0:
                     self.fact_embeddings = list(arr)
+                    # Гарантируем соответствие длины
+                    if len(self.fact_embeddings) != len(self.semantic_facts):
+                        logger.warning(
+                            f"Embeddings count ({len(self.fact_embeddings)}) != facts count ({len(self.semantic_facts)}). Resetting."
+                        )
+                        self.fact_embeddings = []
+                        return
                     if not self.index.is_trained and len(arr) >= FAISS_MIN_TRAIN_VECTORS:
                         self.index.train(arr.astype('float32'))
                         self.index.add(arr.astype('float32'))
@@ -324,7 +356,6 @@ class CognitiveMemory:
             synapses_path = self.base_dir / "synapses.json"
             episodes_path = self.base_dir / "episodes.json"
             goals_path = self.base_dir / "goals.json"
-
             try:
                 facts_data = []
                 for f in self.semantic_facts:
@@ -397,19 +428,20 @@ class CognitiveMemory:
         if self._dirty:
             await self._save_async()
 
-    # ---------- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ----------
+    # ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
     def _build_keyword_index(self):
+        """Перестраивает индекс ключевых слов. Хранит fact.id, а не индексы списка."""
         self.keyword_index.clear()
-        for idx, fact in enumerate(self.semantic_facts):
+        for fact in self.semantic_facts:
             for word in fact.keywords:
-                self.keyword_index[word].append(idx)
+                self.keyword_index[word].append(fact.id)
 
     @staticmethod
     def _extract_keywords(text: str) -> Set[str]:
         words = re.findall(r'\b[a-zA-Zа-яА-ЯёЁ]{3,}\b', text.lower())
-        stopwords = {'это','все','так','вот','да','нет','или','и','с','на','по','для','из','о','к','у',
-                     'же','бы','то','не','что','как','за','от','до','при','через','без','между','тоже',
-                     'также','очень','можно','нужно','будет','если','тогда','потом','который','какой'}
+        stopwords = {'это', 'все', 'так', 'вот', 'да', 'нет', 'или', 'и', 'с', 'на', 'по', 'для', 'из', 'о', 'к', 'у',
+                     'же', 'бы', 'то', 'не', 'что', 'как', 'за', 'от', 'до', 'при', 'через', 'без', 'между', 'тоже',
+                     'также', 'очень', 'можно', 'нужно', 'будет', 'если', 'тогда', 'потом', 'который', 'какой'}
         return {w for w in words if w not in stopwords}
 
     def _get_embedding(self, text: str) -> np.ndarray:
@@ -453,13 +485,11 @@ class CognitiveMemory:
             return
         vectors = np.array(self.fact_embeddings).astype('float32')
         if len(vectors) < FAISS_MIN_TRAIN_VECTORS:
-            # Слишком мало векторов – используем плоский поиск
             self.index.reset()
             self.index = faiss.IndexFlatL2(self.embedding_dim)
             self.index.add(vectors)
             self._emb_added_since_train = 0
             return
-        # Переобучаем IVF-индекс
         quantizer = faiss.IndexFlatL2(self.embedding_dim)
         new_index = faiss.IndexIVFFlat(quantizer, self.embedding_dim, FAISS_NLIST)
         new_index.train(vectors)
@@ -476,7 +506,70 @@ class CognitiveMemory:
             return 0.0
         return len(kw1 & kw2) / (len(kw1 | kw2) + 1e-6)
 
-    # ---------- ДОБАВЛЕНИЕ ФАКТОВ И СВЯЗЕЙ ----------
+    def _invalidate_tfidf_cache(self):
+        """Сбрасывает кэш TF-IDF — будет пересчитан при следующем обращении."""
+        self._tfidf_dirty = True
+        self._tfidf_matrix = None
+        self._tfidf_texts_hash = None
+
+    def _ensure_tfidf(self):
+        """Ленивая перестройка TF-IDF матрицы только при изменении корпуса."""
+        texts = [f.text for f in self.semantic_facts]
+        texts_hash = hashlib.md5("\n".join(texts[:100]).encode()).hexdigest()
+        if not self._tfidf_dirty and self._tfidf_matrix is not None and texts_hash == self._tfidf_texts_hash:
+            return
+        if not texts:
+            self._tfidf_matrix = None
+            self._tfidf_dirty = False
+            return
+        try:
+            self._tfidf_matrix = self.tfidf.fit_transform(texts)
+            self._tfidf_texts_hash = texts_hash
+            self._tfidf_dirty = False
+        except Exception as e:
+            logger.warning(f"TF-IDF rebuild failed: {e}")
+            self._tfidf_matrix = None
+
+    # ==================== УДАЛЕНИЕ ФАКТОВ (унифицированное) ====================
+    def _remove_facts(self, ids: Set[int]) -> int:
+        """
+        Корректно удаляет факты по fact.id: обновляет semantic_facts, facts_by_id,
+        эмбеддинги, синапсы, граф и keyword_index. Возвращает число удалённых.
+        """
+        if not ids:
+            return 0
+        # Определяем индексы удаляемых фактов ДО удаления (для эмбеддингов)
+        indices_to_remove = {i for i, f in enumerate(self.semantic_facts) if f.id in ids}
+
+        # Удаляем из semantic_facts
+        self.semantic_facts = [f for f in self.semantic_facts if f.id not in ids]
+        # Обновляем маппинг
+        self.facts_by_id = {f.id: f for f in self.semantic_facts}
+
+        # Удаляем эмбеддинги по индексам
+        if self.use_embeddings and self.fact_embeddings:
+            self.fact_embeddings = [emb for i, emb in enumerate(self.fact_embeddings) if i not in indices_to_remove]
+            self._rebuild_faiss_index()
+
+        # Удаляем синапсы, касающиеся удалённых фактов
+        self.synapses = {(s, t): syn for (s, t), syn in self.synapses.items()
+                         if s not in ids and t not in ids}
+        # Перестраиваем граф
+        self.graph = defaultdict(set)
+        for (src, tgt) in self.synapses:
+            self.graph[src].add(tgt)
+
+        # Чистим contradicts
+        for f in self.semantic_facts:
+            f.contradicts -= ids
+
+        # Перестраиваем keyword_index
+        self._build_keyword_index()
+        self._invalidate_tfidf_cache()
+        self._dirty = True
+        return len(indices_to_remove)
+
+    # ==================== ДОБАВЛЕНИЕ ФАКТОВ И СВЯЗЕЙ ====================
     def _add_fact(self, text: str, ftype: str, importance: float = 1.0,
                   confidence: float = 0.5, novelty: float = 0.0,
                   salience: float = 0.0) -> int:
@@ -498,12 +591,14 @@ class CognitiveMemory:
             prediction_error=0.0,
         )
         self.semantic_facts.append(fact)
-        fact_idx = len(self.semantic_facts) - 1  # индекс только что добавленного факта
+        self.facts_by_id[fid] = fact
+        fact_idx = len(self.semantic_facts) - 1
 
         for kw in fact.keywords:
-            self.keyword_index[kw].append(fact_idx)
+            self.keyword_index[kw].append(fid)
 
         # Эмбеддинг
+        emb = None
         if self.use_embeddings:
             try:
                 emb = self._get_embedding(text)
@@ -513,25 +608,71 @@ class CognitiveMemory:
                 self._emb_added_since_train += 1
                 self._train_index_if_needed()
             except Exception:
-                pass
+                emb = None
 
-        # Проверка противоречий (передаём индекс)
-        self._detect_contradictions(fact_idx)
+        # Находим похожие факты
+        similar: List[Tuple[int, float]] = []
+        if emb is not None:
+            similar = self._find_similar_by_embedding(emb, k=20, exclude_idx=fact_idx)
+        else:
+            recent_window_start = max(0, len(self.semantic_facts) - 300)
+            for other_idx in range(recent_window_start, len(self.semantic_facts)):
+                if other_idx == fact_idx:
+                    continue
+                sim = self._compute_similarity(text, self.semantic_facts[other_idx].text)
+                if sim > 0.0:
+                    similar.append((other_idx, sim))
+            similar.sort(key=lambda x: -x[1])
+            similar = similar[:20]
 
-        # Добавляем связи с похожими фактами (семантическая близость)
-        for other_idx, other in enumerate(self.semantic_facts):
-            if other.id == fid:
+        # Создаём синапсы для достаточно похожих фактов
+        similar_ids: List[int] = []
+        for other_idx, sim in similar:
+            if other_idx >= len(self.semantic_facts) or other_idx == fact_idx:
                 continue
-            sim = self._compute_similarity(text, other.text)
-            if sim > 0.4:   # порог для начальной связи
+            other = self.semantic_facts[other_idx]
+            similar_ids.append(other.id)
+            if sim > 0.45:
                 self._create_synapse(fid, other.id, weight=sim * 0.5)
                 self._create_synapse(other.id, fid, weight=sim * 0.5)
 
+        # Проверка противоречий
+        self._detect_contradictions(fid, candidate_ids=similar_ids)
         self._dirty = True
+        self._invalidate_tfidf_cache()
         return fid
 
+    def _find_similar_by_embedding(self, emb: np.ndarray, k: int = 20,
+                                   exclude_idx: Optional[int] = None) -> List[Tuple[int, float]]:
+        """
+        Возвращает top-k (fact_idx, cosine_similarity) по эмбеддингам.
+        Использует FAISS ANN-поиск, если индекс обучен.
+        """
+        if not self.fact_embeddings:
+            return []
+        n = len(self.fact_embeddings)
+        q = emb.astype('float32')
+        if self.index is not None and self.index.is_trained and n > 200:
+            try:
+                self.index.nprobe = FAISS_NPROBE
+                _, idxs = self.index.search(q.reshape(1, -1), min(k * 3, n))
+                candidates = [i for i in idxs[0].tolist() if 0 <= i < n and i != exclude_idx]
+            except Exception:
+                candidates = [i for i in range(n) if i != exclude_idx]
+        else:
+            candidates = [i for i in range(n) if i != exclude_idx]
+
+        if not candidates:
+            return []
+        q_norm = q / (np.linalg.norm(q) + 1e-8)
+        cand_matrix = np.array([self.fact_embeddings[i] for i in candidates])
+        cand_norm = cand_matrix / (np.linalg.norm(cand_matrix, axis=1, keepdims=True) + 1e-8)
+        sims = cand_norm @ q_norm
+        order = np.argsort(-sims)[:k]
+        return [(candidates[i], float(sims[i])) for i in order]
+
     def _create_synapse(self, src: int, tgt: int, weight: float = SYNAPSE_INITIAL_WEIGHT):
-        """Создаёт или обновляет синапс."""
+        """Создаёт или обновляет синапс. src/tgt — это fact.id."""
         key = (src, tgt)
         if key in self.synapses:
             syn = self.synapses[key]
@@ -548,30 +689,53 @@ class CognitiveMemory:
         self.graph[src].add(tgt)
         self._dirty = True
 
-    def _detect_contradictions(self, fact_idx: int):
-        """Находит факты, которые могут противоречить новому, по ключевым словам.
-           fact_idx – индекс в списке semantic_facts."""
-        if fact_idx >= len(self.semantic_facts):
+    def _detect_contradictions(self, fact_id: int, candidate_ids: Optional[List[int]] = None):
+        """
+        Находит подозреваемых кандидатов на противоречие среди семантически близких фактов.
+        candidate_ids — список fact.id (не индексов!).
+        """
+        fact = self.facts_by_id.get(fact_id)
+        if not fact:
             return
-        fact = self.semantic_facts[fact_idx]
         neg_words = {'не', 'нет', 'без', 'против', 'отрицает', 'опровергает'}
         has_neg = any(w in fact.text.lower() for w in neg_words)
-        if not has_neg:
+        if not has_neg or not candidate_ids:
             return
-        for other_idx, other in enumerate(self.semantic_facts):
-            if other_idx == fact_idx:
+        fact_kw = set(fact.keywords)
+        for other_id in candidate_ids:
+            other = self.facts_by_id.get(other_id)
+            if not other or other_id == fact_id:
                 continue
-            common = set(fact.keywords) & set(other.keywords)
-            if len(common) > 0 and len(common) / max(1, len(set(fact.keywords))) > 0.5:
-                fact.contradicts.add(other.id)
-                other.contradicts.add(fact.id)
-                fact.confidence *= 0.9
-                other.confidence *= 0.9
-                self._dirty = True
+            common = fact_kw & set(other.keywords)
+            if len(common) > 0 and len(common) / max(1, len(fact_kw)) > 0.5:
+                if other_id not in fact.contradicts:
+                    fact.contradicts.add(other_id)
+                    other.contradicts.add(fact_id)
+                    fact.confidence *= 0.97
+                    other.confidence *= 0.97
+                    self.pending_contradiction_checks.append((fact_id, other_id))
+                    self._dirty = True
 
-    # ---------- ЭПИЗОДЫ ----------
+    def confirm_contradiction(self, fact_id1: int, fact_id2: int):
+        f1 = self.facts_by_id.get(fact_id1)
+        f2 = self.facts_by_id.get(fact_id2)
+        if f1 and f2:
+            f1.confidence = max(0.05, f1.confidence * 0.85)
+            f2.confidence = max(0.05, f2.confidence * 0.85)
+            self._dirty = True
+
+    def clear_contradiction(self, fact_id1: int, fact_id2: int):
+        f1 = self.facts_by_id.get(fact_id1)
+        f2 = self.facts_by_id.get(fact_id2)
+        if f1 and f2:
+            f1.contradicts.discard(fact_id2)
+            f2.contradicts.discard(fact_id1)
+            f1.confidence = min(1.0, f1.confidence / 0.97)
+            f2.confidence = min(1.0, f2.confidence / 0.97)
+            self._dirty = True
+
+    # ==================== ЭПИЗОДЫ ====================
     async def add_episode(self, user_msg: str, assistant_msg: str, salience: float = 0.0):
-        """Сохраняет диалог как эпизод."""
         episode = Episode(
             id=self._next_episode_id,
             user_msg=user_msg,
@@ -584,56 +748,58 @@ class CognitiveMemory:
         self._next_episode_id += 1
         self.episodic_memory.append(episode)
         if len(self.episodic_memory) > EPISODIC_MAX_SIZE:
-            # забываем самые старые с низкой важностью
             self.episodic_memory.sort(key=lambda e: (e.importance, e.timestamp), reverse=True)
             self.episodic_memory = self.episodic_memory[:EPISODIC_MAX_SIZE]
 
-        # Добавляем факты из диалога
         user_id = self._add_fact(user_msg, 'user', importance=1.0, salience=salience)
         assistant_id = self._add_fact(assistant_msg, 'assistant', importance=1.2, salience=salience)
-        # Связываем их
         self._create_synapse(user_id, assistant_id, weight=0.8)
         self._create_synapse(assistant_id, user_id, weight=0.6)
-
-        # Обновляем предсказательную модель на основе последовательности
-        self._update_predictive(user_id, assistant_id)
-
+        self._update_predictive(user_msg, assistant_msg)
         await self._schedule_save()
 
-    # ---------- ПРЕДСКАЗАТЕЛЬНАЯ МОДЕЛЬ ----------
-    def _update_predictive(self, src_id: int, tgt_id: int):
-        """Обновляет матрицу переходов."""
-        self.predictive_matrix[src_id][tgt_id] += PREDICTIVE_LEARNING_RATE
-        # Нормализация
-        total = sum(self.predictive_matrix[src_id].values())
+    # ==================== ПРЕДСКАЗАТЕЛЬНАЯ МОДЕЛЬ ====================
+    def _concept_key(self, text: str, top_n: int = 5) -> Optional[str]:
+        kws = self._extract_keywords(text)
+        if not kws:
+            return None
+        top = sorted(kws, key=lambda w: (-len(w), w))[:top_n]
+        return "|".join(sorted(top))
+
+    def _update_predictive(self, source_text: str, target_text: str):
+        src_key = self._concept_key(source_text)
+        tgt_key = self._concept_key(target_text)
+        if not src_key or not tgt_key:
+            return
+        self.predictive_matrix[src_key][tgt_key] += PREDICTIVE_LEARNING_RATE
+        total = sum(self.predictive_matrix[src_key].values())
         if total > 0:
-            for k in self.predictive_matrix[src_id]:
-                self.predictive_matrix[src_id][k] /= total
-        # Ограничение размера
+            for k in self.predictive_matrix[src_key]:
+                self.predictive_matrix[src_key][k] /= total
+        self.concept_examples[src_key] = source_text[:200]
+        self.concept_examples[tgt_key] = target_text[:200]
         if len(self.predictive_matrix) > PREDICTIVE_MATRIX_MAX_SIZE:
-            # удаляем наименее используемые
-            pass
+            weakest = min(self.predictive_matrix.items(), key=lambda kv: sum(kv[1].values()))[0]
+            del self.predictive_matrix[weakest]
+            self.concept_examples.pop(weakest, None)
 
     def _rebuild_predictive_from_episodes(self):
-        """Перестраивает predictive matrix из эпизодов."""
         self.predictive_matrix.clear()
-        # Проходим по эпизодам и строим переходы между фактами (упрощённо)
-        # Для каждого эпизода ищем факты с типом user и assistant, создаём переходы
-        # (реализация зависит от структуры)
-        # Пока оставим заглушку
-        pass
+        self.concept_examples.clear()
+        for ep in sorted(self.episodic_memory, key=lambda e: e.timestamp):
+            self._update_predictive(ep.user_msg, ep.assistant_msg)
 
-    async def predict_next(self, current_fact_ids: List[int]) -> List[int]:
-        """Возвращает наиболее вероятные следующие факты."""
+    async def predict_next(self, current_texts: List[str], top_k: int = 5) -> List[str]:
         candidates = defaultdict(float)
-        for fid in current_fact_ids:
-            if fid in self.predictive_matrix:
-                for nxt, prob in self.predictive_matrix[fid].items():
-                    candidates[nxt] += prob
-        sorted_candidates = sorted(candidates.items(), key=lambda x: -x[1])
-        return [fid for fid, _ in sorted_candidates[:5]]
+        for text in current_texts:
+            key = self._concept_key(text)
+            if key and key in self.predictive_matrix:
+                for nxt_key, prob in self.predictive_matrix[key].items():
+                    candidates[nxt_key] += prob
+        sorted_candidates = sorted(candidates.items(), key=lambda x: -x[1])[:top_k]
+        return [self.concept_examples.get(k, k) for k, _ in sorted_candidates]
 
-    # ---------- HEBBian / STDP ОБУЧЕНИЕ ----------
+    # ==================== HEBBIAN / STDP ====================
     def _hebbian_update(self, source_id: int, target_id: int, coactivation_time: float):
         """Обновляет синапс по правилу Хебба с учётом временной задержки (STDP)."""
         key = (source_id, target_id)
@@ -641,51 +807,62 @@ class CognitiveMemory:
             return
         syn = self.synapses[key]
         dt = coactivation_time - syn.last_activation
-        # STDP: если source активировался до target (dt>0) – потенциация, иначе депрессия
         if dt > 0 and dt < STDP_TIME_WINDOW:
             delta = STDP_LEARNING_RATE * (1.0 - dt / STDP_TIME_WINDOW)
         elif dt < 0 and abs(dt) < STDP_TIME_WINDOW:
             delta = -STDP_LEARNING_RATE * 0.5 * (1.0 - abs(dt) / STDP_TIME_WINDOW)
         else:
-            delta = HEBBIAN_LEARNING_RATE * 0.1  # слабое хеббовское усиление
-
+            delta = HEBBIAN_LEARNING_RATE * 0.1
         syn.weight = min(SYNAPSE_MAX_WEIGHT, max(SYNAPSE_MIN_WEIGHT, syn.weight + delta))
         syn.last_activation = coactivation_time
         syn.coactivation_count += 1
         syn.last_coactivation = coactivation_time
-        # Обновляем уверенность
         syn.confidence = min(1.0, syn.confidence + 0.01)
         self._dirty = True
 
+    def _get_effective_weight(self, syn: Synapse, now: Optional[float] = None) -> float:
+        """Ленивое затухание: вычисляет актуальный вес синапса на текущий момент."""
+        if now is None:
+            now = time.time()
+        age = now - syn.last_activation
+        decay = 1.0 - SYNAPSE_DECAY_RATE * min(1.0, age / 86400)
+        return max(SYNAPSE_MIN_WEIGHT, syn.weight * decay)
+
     def _apply_decay(self):
-        """Ослабляет все синапсы со временем."""
+        """Мягкое затухание синапсов. Применяется только к старым синапсам."""
         now = time.time()
+        changed = 0
         for syn in self.synapses.values():
             age = now - syn.last_activation
-            decay = 1.0 - SYNAPSE_DECAY_RATE * min(1.0, age / 86400)  # за сутки ~0.001
-            syn.weight = max(SYNAPSE_MIN_WEIGHT, syn.weight * decay)
-            syn.confidence = max(0.1, syn.confidence * decay)
-        self._dirty = True
+            if age < 3600:  # не трогаем синапсы моложе часа
+                continue
+            decay = 1.0 - SYNAPSE_DECAY_RATE * min(1.0, age / 86400)
+            new_weight = max(SYNAPSE_MIN_WEIGHT, syn.weight * decay)
+            if abs(new_weight - syn.weight) > 1e-6:
+                syn.weight = new_weight
+                syn.confidence = max(0.1, syn.confidence * decay)
+                changed += 1
+        if changed:
+            self._dirty = True
 
-    # ---------- SPREADING ACTIVATION ----------
+    # ==================== SPREADING ACTIVATION ====================
     async def spread_activation(self, seed_ids: List[int], max_depth: int = SPREADING_MAX_DEPTH,
-                                max_nodes: int = SPREADING_MAX_NODES) -> Dict[int, float]:
+                               max_nodes: int = SPREADING_MAX_NODES) -> Dict[int, float]:
         """
-        Распространяет активацию от seed-узлов по графу.
-        Возвращает словарь {id: activation_score}.
+        Распространяет активацию от seed-узлов (по fact.id) по графу.
+        Возвращает словарь {fact.id: activation_score}.
         """
-        # Сброс активаций
+        now = time.time()
         for f in self.semantic_facts:
             f.activation = 0.0
 
-        # Инициализация seed
-        for sid in seed_ids:
-            if sid < len(self.semantic_facts):
-                self.semantic_facts[sid].activation = 1.0
+        valid_seeds = [sid for sid in seed_ids if sid in self.facts_by_id]
+        for sid in valid_seeds:
+            self.facts_by_id[sid].activation = 1.0
 
-        visited = set(seed_ids)
-        frontier = [(sid, 1.0, 0) for sid in seed_ids]  # (id, activation, depth)
-        activation_map = {sid: 1.0 for sid in seed_ids}
+        visited = set(valid_seeds)
+        frontier = [(sid, 1.0, 0) for sid in valid_seeds]
+        activation_map = {sid: 1.0 for sid in valid_seeds}
 
         while frontier and len(activation_map) < max_nodes:
             new_frontier = []
@@ -695,29 +872,28 @@ class CognitiveMemory:
                 for neighbor in self.graph.get(fid, set()):
                     if neighbor in visited:
                         continue
+                    if neighbor not in self.facts_by_id:
+                        continue
                     syn = self.synapses.get((fid, neighbor))
-                    weight = syn.weight if syn else 0.5
-                    # decay и ослабление
+                    weight = self._get_effective_weight(syn, now) if syn else 0.5
                     new_act = act * weight * SPREADING_DECAY
                     if new_act < SPREADING_THRESHOLD:
                         continue
                     visited.add(neighbor)
-                    # Добавляем активацию (суммируем)
                     activation_map[neighbor] = activation_map.get(neighbor, 0.0) + new_act
-                    new_frontier.append((neighbor, new_act, depth+1))
+                    new_frontier.append((neighbor, new_act, depth + 1))
             frontier = new_frontier
 
-        # Сохраняем активации в факты
         for fid, act in activation_map.items():
-            if fid < len(self.semantic_facts):
-                self.semantic_facts[fid].activation = act
-
+            if fid in self.facts_by_id:
+                self.facts_by_id[fid].activation = act
         return activation_map
 
-    # ---------- ГИБРИДНЫЙ ПОИСК С РАСПРОСТРАНЕНИЕМ ----------
+    # ==================== ГИБРИДНЫЙ ПОИСК ====================
     async def retrieve_hybrid(self, query: str, top_k: int = 5, use_graph: bool = True) -> List[Dict]:
         """
         Гибридный поиск: BM25 + косинус + свежесть + графовая активация.
+        Все операции работают через fact.id.
         """
         cache_key = f"hybrid_{query}_{top_k}_{use_graph}"
         if cache_key in self._cache:
@@ -725,84 +901,96 @@ class CognitiveMemory:
             if time.time() - ts < self._cache_ttl:
                 return result
 
+        if not self.semantic_facts:
+            return []
+
         # 1. Кандидаты через FAISS или keywords
-        candidate_indices = set()
+        candidate_ids: Set[int] = set()
         if self.use_embeddings and len(self.fact_embeddings) > 200 and self.index is not None and self.index.is_trained:
             try:
                 q_emb = self._get_embedding(query).reshape(1, -1).astype('float32')
                 self.index.nprobe = FAISS_NPROBE
                 dist, idxs = self.index.search(q_emb, min(200, len(self.fact_embeddings)))
-                # Фильтруем индексы, которые не выходят за пределы
-                valid_idxs = [i for i in idxs[0].tolist() if i < len(self.semantic_facts)]
-                candidate_indices = set(valid_idxs)
+                for i in idxs[0].tolist():
+                    if 0 <= i < len(self.semantic_facts):
+                        candidate_ids.add(self.semantic_facts[i].id)
             except Exception:
                 pass
 
-        if not candidate_indices:
+        if not candidate_ids:
             q_keywords = self._extract_keywords(query)
             for kw in q_keywords:
-                for idx in self.keyword_index.get(kw, []):
-                    if idx < len(self.semantic_facts):
-                        candidate_indices.add(idx)
-            if len(candidate_indices) < 3:
-                candidate_indices = set(range(len(self.semantic_facts)))
+                for fid in self.keyword_index.get(kw, []):
+                    if fid in self.facts_by_id:
+                        candidate_ids.add(fid)
+            if len(candidate_ids) < 3:
+                candidate_ids = set(self.facts_by_id.keys())
 
-        # 2. BM25
-        if candidate_indices:
-            texts = [self.semantic_facts[i].text for i in candidate_indices if i < len(self.semantic_facts)]
-            if len(texts) > 1:
-                try:
-                    tfidf = self.tfidf.fit_transform(texts + [query])
-                    vectors = tfidf[:-1]
-                    q_vec = tfidf[-1]
+        # Преобразуем в список и создаём индекс fact.id -> позиция
+        candidate_list = [fid for fid in candidate_ids if fid in self.facts_by_id]
+        id_to_pos = {fid: i for i, fid in enumerate(candidate_list)}
+        n_cand = len(candidate_list)
+        if n_cand == 0:
+            return []
+
+        # 2. BM25 (ленивый кэш)
+        bm25_scores = np.ones(n_cand) * 0.5
+        if n_cand > 1:
+            try:
+                self._ensure_tfidf()
+                if self._tfidf_matrix is not None:
+                    # Берём строки для кандидатов
+                    # Но tfidf обучен на всех фактах. Нужно пересчитать для подмножества.
+                    # Для простоты — переобучаем на кандидатах + запросе.
+                    texts = [self.facts_by_id[fid].text for fid in candidate_list]
+                    tfidf_local = self.tfidf.fit_transform(texts + [query])
+                    vectors = tfidf_local[:-1]
+                    q_vec = tfidf_local[-1]
                     bm25_scores = (vectors * q_vec.T).toarray().flatten()
-                except Exception:
-                    bm25_scores = np.ones(len(candidate_indices)) * 0.5
-            else:
-                bm25_scores = np.ones(len(candidate_indices)) * 0.5
-        else:
-            bm25_scores = np.zeros(0)
+            except Exception:
+                bm25_scores = np.ones(n_cand) * 0.5
 
         # 3. Косинус
+        cosine_scores = np.zeros(n_cand)
         if self.use_embeddings and self.fact_embeddings:
             try:
                 q_emb = self._get_embedding(query).reshape(1, -1)
-                # Собираем эмбеддинги только для валидных индексов
-                valid_candidates = [i for i in candidate_indices if i < len(self.fact_embeddings)]
-                if valid_candidates:
-                    cand_embs = np.array([self.fact_embeddings[i] for i in valid_candidates])
-                    if cand_embs.size > 0:
-                        q_norm = q_emb / (np.linalg.norm(q_emb) + 1e-8)
-                        cand_norm = cand_embs / (np.linalg.norm(cand_embs, axis=1, keepdims=True) + 1e-8)
-                        cosine_scores = np.dot(cand_norm, q_norm.T).flatten()
+                q_norm = q_emb / (np.linalg.norm(q_emb) + 1e-8)
+                # Собираем эмбеддинги кандидатов
+                cand_embs = []
+                for fid in candidate_list:
+                    # Находим индекс в fact_embeddings
+                    idx = next((i for i, f in enumerate(self.semantic_facts) if f.id == fid), None)
+                    if idx is not None and idx < len(self.fact_embeddings):
+                        cand_embs.append(self.fact_embeddings[idx])
                     else:
-                        cosine_scores = np.zeros(len(candidate_indices))
-                else:
-                    cosine_scores = np.zeros(len(candidate_indices))
+                        cand_embs.append(np.zeros(self.embedding_dim))
+                cand_embs_arr = np.array(cand_embs)
+                if cand_embs_arr.size > 0:
+                    cand_norm = cand_embs_arr / (np.linalg.norm(cand_embs_arr, axis=1, keepdims=True) + 1e-8)
+                    cosine_scores = np.dot(cand_norm, q_norm.T).flatten()
             except Exception:
-                cosine_scores = np.zeros(len(candidate_indices))
-        else:
-            cosine_scores = np.zeros(len(candidate_indices))
+                cosine_scores = np.zeros(n_cand)
 
         # 4. Свежесть
         now = time.time()
-        freshness = []
-        for idx in candidate_indices:
-            if idx < len(self.semantic_facts):
-                age = now - self.semantic_facts[idx].timestamp
-                freshness.append(max(0.0, 1.0 - age / (86400 * 30)))
-            else:
-                freshness.append(0.0)
+        freshness = np.array([
+            max(0.0, 1.0 - (now - self.facts_by_id[fid].timestamp) / (86400 * 30))
+            for fid in candidate_list
+        ])
 
-        # 5. Графовая активация (если включена)
-        graph_scores = np.ones(len(candidate_indices)) * 0.5
+        # 5. Графовая активация
+        graph_scores = np.ones(n_cand) * 0.5
+        activation_map: Dict[int, float] = {}
         if use_graph:
-            seed_ids = list(candidate_indices)[:10]  # возьмём топ-10 кандидатов как seeds
+            seed_ids = candidate_list[:10]
             activation_map = await self.spread_activation(seed_ids, max_depth=2, max_nodes=50)
-            for i, idx in enumerate(candidate_indices):
-                graph_scores[i] = activation_map.get(idx, 0.0)
+            for i, fid in enumerate(candidate_list):
+                if fid in activation_map:
+                    graph_scores[i] = activation_map[fid]
 
         # 6. Динамические веса
+        # 6. Динамические веса (с возможностью адаптации)
         if DYNAMIC_WEIGHTS_ENABLED:
             is_factual = bool(re.search(r'\b\d+[.,]?\d*\s*(?:USD|EUR|RUB|%|кг|км|г)\b', query))
             if is_factual:
@@ -813,36 +1001,47 @@ class CognitiveMemory:
             w_bm25, w_cos, w_fresh, w_graph = (HYBRID_WEIGHT_BM25, HYBRID_WEIGHT_COSINE,
                                                HYBRID_WEIGHT_FRESHNESS, HYBRID_WEIGHT_GRAPH)
 
+        # ---- НОВОЕ: переопределяем веса из _dynamic_weights (если они изменены) ----
+        w_bm25 = self._dynamic_weights.get("bm25", w_bm25)
+        w_cos = self._dynamic_weights.get("cosine", w_cos)
+        w_fresh = self._dynamic_weights.get("freshness", w_fresh)
+        w_graph = self._dynamic_weights.get("graph", w_graph)
+
+
         # 7. Итоговый рейтинг
-        final_scores = []
-        for i, idx in enumerate(candidate_indices):
-            if idx >= len(self.semantic_facts):
-                continue
+        final_scores: List[Tuple[float, int]] = []
+        scored_ids: Set[int] = set()
+        for i, fid in enumerate(candidate_list):
             score = (w_bm25 * bm25_scores[i] +
                      w_cos * cosine_scores[i] +
                      w_fresh * freshness[i] +
                      w_graph * graph_scores[i])
-            final_scores.append((score, idx))
+            final_scores.append((score, fid))
+            scored_ids.add(fid)
+
+        # Узлы, найденные только через spreading activation
+        if use_graph and activation_map:
+            for fid, act in activation_map.items():
+                if fid in scored_ids or fid not in self.facts_by_id:
+                    continue
+                fact_age = now - self.facts_by_id[fid].timestamp
+                fresh = max(0.0, 1.0 - fact_age / (86400 * 30))
+                score = 0.8 * (w_graph * act + w_fresh * fresh)
+                final_scores.append((score, fid))
+                scored_ids.add(fid)
 
         final_scores.sort(reverse=True, key=lambda x: x[0])
-        top_indices = [idx for _, idx in final_scores[:top_k]]
+        top_scored = final_scores[:top_k * 2]
 
-        # Расширяем соседями по графу
-        expanded = set(top_indices)
-        for idx in top_indices:
-            expanded.update(self.graph.get(idx, set()))
-
-        # Формируем результат
         max_score = final_scores[0][0] if final_scores else 1.0
         result = []
-        for idx in expanded:
-            if idx >= len(self.semantic_facts):
+        for score, fid in top_scored:
+            if fid not in self.facts_by_id:
                 continue
-            fact = self.semantic_facts[idx]
+            fact = self.facts_by_id[fid]
             fact.access_count += 1
             fact.last_accessed = now
             fact.importance = min(2.0, fact.importance + 0.01)
-            score = next((s for s, i in final_scores if i == idx), 0.0)
             confidence = min(1.0, score / (max_score + 1e-6))
             result.append({
                 "id": fact.id,
@@ -854,51 +1053,91 @@ class CognitiveMemory:
                 "importance": fact.importance,
                 "activation": fact.activation,
             })
-        result.sort(key=lambda x: x["score"], reverse=True)
-        result = result[:top_k*2]
 
         self._cache[cache_key] = (result, time.time())
         if len(self._cache) > self._cache_maxsize:
             oldest = sorted(self._cache.items(), key=lambda x: x[1][1])[0][0]
             del self._cache[oldest]
-
         return result
 
-    # ---------- КОНСОЛИДАЦИЯ ----------
+    # ==================== КОНСОЛИДАЦИЯ ====================
+    async def _find_duplicates_via_faiss(self, threshold: float = DUPLICATE_SIMILARITY_THRESHOLD) -> Set[int]:
+        """Находит дубликаты фактов через FAISS (O(n log n)). Возвращает set fact.id для удаления."""
+        if not self.use_embeddings or len(self.fact_embeddings) < 100:
+            return set()
+        try:
+            vectors = np.array(self.fact_embeddings).astype('float32')
+            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+            vectors_norm = vectors / (norms + 1e-8)
+
+            # Используем плоский индекс для точного поиска
+            index = faiss.IndexFlatIP(self.embedding_dim)
+            index.add(vectors_norm)
+            k = min(10, len(vectors))
+            _, idxs = index.search(vectors_norm, k)
+
+            to_remove: Set[int] = set()
+            for i, neighbors in enumerate(idxs):
+                if i in to_remove:
+                    continue
+                for j in neighbors[1:]:  # пропускаем самого себя
+                    if j == -1 or j <= i or j in to_remove:
+                        continue
+                    sim = float(vectors_norm[i] @ vectors_norm[j])
+                    if sim > threshold:
+                        # Удаляем тот, у которого меньше confidence
+                        fi = self.semantic_facts[i]
+                        fj = self.semantic_facts[j]
+                        if fi.confidence <= fj.confidence:
+                            to_remove.add(fi.id)
+                        else:
+                            to_remove.add(fj.id)
+            return to_remove
+        except Exception as e:
+            logger.warning(f"FAISS duplicate search failed: {e}")
+            return set()
+
+    def _find_duplicates_keyword(self, threshold: float = 0.8) -> Set[int]:
+        """Fallback: поиск дубликатов по keyword similarity (O(n²), только для небольших объёмов)."""
+        to_remove: Set[int] = set()
+        n = len(self.semantic_facts)
+        if n > 2000:
+            return to_remove  # слишком дорого
+        for i, f1 in enumerate(self.semantic_facts):
+            if f1.id in to_remove:
+                continue
+            for j in range(i + 1, n):
+                f2 = self.semantic_facts[j]
+                if f2.id in to_remove:
+                    continue
+                if self._compute_similarity(f1.text, f2.text) > threshold:
+                    if f2.confidence > f1.confidence:
+                        to_remove.add(f1.id)
+                        break
+                    else:
+                        to_remove.add(f2.id)
+        return to_remove
+
     async def light_consolidation(self):
         """Лёгкая консолидация: удаление дубликатов, ослабление связей."""
         async with self._lock:
-            # Удаление дубликатов по тексту (совпадение > 0.8)
-            to_remove = set()
-            for i, f1 in enumerate(self.semantic_facts):
-                if i in to_remove:
-                    continue
-                for j in range(i+1, len(self.semantic_facts)):
-                    if j in to_remove:
-                        continue
-                    if self._compute_similarity(f1.text, self.semantic_facts[j].text) > 0.8:
-                        if self.semantic_facts[j].confidence > f1.confidence:
-                            to_remove.add(i)
-                            break
-                        else:
-                            to_remove.add(j)
-            if to_remove:
-                self.semantic_facts = [f for i, f in enumerate(self.semantic_facts) if i not in to_remove]
-                self._rebuild_graph_after_removal(to_remove)
-                self._build_keyword_index()
-                if self.use_embeddings:
-                    self.fact_embeddings = [emb for i, emb in enumerate(self.fact_embeddings) if i not in to_remove]
-                    self._rebuild_faiss_index()  # полная перестройка
+            # Удаление дубликатов
+            if self.use_embeddings and len(self.fact_embeddings) >= 100:
+                to_remove = await self._find_duplicates_via_faiss(DUPLICATE_SIMILARITY_THRESHOLD)
+            else:
+                to_remove = self._find_duplicates_keyword(0.8)
 
-            # Ослабление синапсов (decay)
+            removed = self._remove_facts(to_remove)
+
+            # Ослабление синапсов
             self._apply_decay()
             await self._schedule_save()
-            logger.info(f"Light consolidation done for {self.user_id[:16]}")
+            logger.info(f"Light consolidation done for {self.user_id[:16]}: removed {removed} duplicates")
 
     async def deep_consolidation(self):
         """Глубокая консолидация: replay, обобщение, обнаружение противоречий."""
         async with self._lock:
-            # Replay: выбираем эпизоды для воспроизведения
+            # Replay
             if self.episodic_memory:
                 self.episodic_memory.sort(key=lambda e: (e.importance * (1 + e.salience), e.timestamp), reverse=True)
                 replay_candidates = self.episodic_memory[:REPLAY_BATCH_SIZE]
@@ -912,12 +1151,11 @@ class CognitiveMemory:
             # Проверка противоречий
             for f in self.semantic_facts:
                 if f.contradicts:
-                    for cid in f.contradicts:
-                        if cid < len(self.semantic_facts):
-                            other = self.semantic_facts[cid]
-                            if other.confidence > 0.3:
-                                f.confidence *= 0.95
-                                other.confidence *= 0.95
+                    for cid in list(f.contradicts):
+                        other = self.facts_by_id.get(cid)
+                        if other and other.confidence > 0.3:
+                            f.confidence *= 0.95
+                            other.confidence *= 0.95
 
             # Пересчёт важности
             now = time.time()
@@ -927,44 +1165,18 @@ class CognitiveMemory:
                 f.importance = 0.5 * (f.importance + recency + f.access_count / 10)
                 f.importance = min(2.0, f.importance)
 
-            # Удаление очень старых и неважных фактов (если превышен лимит)
+            # Удаление очень старых и неважных фактов
             if len(self.semantic_facts) > SEMANTIC_MAX_FACTS:
                 self.semantic_facts.sort(key=lambda f: (f.importance, f.confidence, f.timestamp), reverse=True)
-                self.semantic_facts = self.semantic_facts[:SEMANTIC_MAX_FACTS]
-                self._rebuild_graph_after_removal(set())
-                self._build_keyword_index()
-                if self.use_embeddings:
-                    self.fact_embeddings = self.fact_embeddings[:SEMANTIC_MAX_FACTS]
-                    self._rebuild_faiss_index()
+                keep = self.semantic_facts[:SEMANTIC_MAX_FACTS]
+                removed_ids = {f.id for f in self.semantic_facts[SEMANTIC_MAX_FACTS:]}
+                self.semantic_facts = keep
+                self._remove_facts(removed_ids)
 
             await self._schedule_save()
             logger.info(f"Deep consolidation done for {self.user_id[:16]}")
 
-    def _rebuild_graph_after_removal(self, removed_indices: Set[int]):
-        """Перестраивает граф и синапсы после удаления фактов."""
-        new_id_map = {}
-        new_facts = []
-        for i, f in enumerate(self.semantic_facts):
-            if i not in removed_indices:
-                new_id_map[i] = len(new_facts)
-                new_facts.append(f)
-        self.semantic_facts = new_facts
-
-        new_graph = defaultdict(set)
-        new_synapses = {}
-        for (src, tgt), syn in self.synapses.items():
-            if src in removed_indices or tgt in removed_indices:
-                continue
-            new_src = new_id_map[src]
-            new_tgt = new_id_map[tgt]
-            new_graph[new_src].add(new_tgt)
-            new_synapses[(new_src, new_tgt)] = syn
-        self.graph = new_graph
-        self.synapses = new_synapses
-        # Перестраиваем индекс ключевых слов (вызывается снаружи, но на всякий случай)
-        self._build_keyword_index()
-
-    # ---------- РАБОТА С ЦЕЛЯМИ ----------
+    # ==================== РАБОТА С ЦЕЛЯМИ ====================
     async def add_goal(self, description: str, priority: float = 0.5, related_memory: List[int] = None):
         goal = Goal(
             id=self._next_goal_id,
@@ -991,7 +1203,7 @@ class CognitiveMemory:
     async def get_active_goals(self) -> List[Goal]:
         return [g for g in self.goals if g.status == 'active']
 
-    # ---------- СТАТИСТИКА ----------
+    # ==================== СТАТИСТИКА ====================
     def get_stats(self) -> Dict:
         return {
             "semantic_facts": len(self.semantic_facts),
@@ -1004,7 +1216,7 @@ class CognitiveMemory:
             "faiss_trained": self.index.is_trained if self.index else False,
         }
 
-    # ---------- ЗАКРЫТИЕ ----------
+    # ==================== ЗАКРЫТИЕ ====================
     async def shutdown(self):
         if self._save_task:
             self._save_task.cancel()
