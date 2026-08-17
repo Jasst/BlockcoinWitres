@@ -1,0 +1,700 @@
+{% extends "base.html" %}
+
+{% block title %}Profile — Dark Messenger{% endblock %}
+
+{% block content %}
+<style>
+  /* === Полное копирование темы из wallet.html === */
+  :root {
+    --glass-bg: rgba(20, 20, 30, 0.6);
+    --glass-border: rgba(255, 255, 255, 0.08);
+    --accent-color: #6c5ce7;
+    --accent-glow: rgba(108, 92, 231, 0.4);
+    --success-color: #00b894;
+    --danger-color: #d63031;
+    --text-main: #f5f6fa;
+    --text-muted: #a4b0be;
+    --bg-primary: #0a0a0f; /* добавим для фона */
+  }
+
+  /* Общие анимации */
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  /* Применяем fadeInUp ко всем карточкам */
+  .profile-card,
+  .page-header {
+    animation: fadeInUp 0.6s ease-out;
+  }
+
+  /* Стеклянная карточка — как в wallet .glass-card */
+  .profile-card {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    padding: 24px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+    margin-bottom: 25px;
+  }
+
+  .profile-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+
+  .profile-card h3 {
+    margin-top: 0;
+    margin-bottom: 20px;
+    color: var(--text-main);
+    font-weight: 700;
+    font-size: 18px;
+  }
+
+  /* Строки профиля (как в wallet .profile-row для сети) */
+  .profile-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--glass-border);
+    gap: 15px;
+    font-size: 14px;
+  }
+
+  .profile-row:last-child {
+    border-bottom: none;
+  }
+
+  .profile-row label {
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  .profile-row .value,
+  .profile-row .status-badge {
+    color: var(--text-main);
+    font-weight: 600;
+    text-align: right;
+    word-break: break-all;
+    font-family: monospace;
+  }
+
+  .profile-value-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    justify-content: flex-end;
+    min-width: 0;
+  }
+
+  .profile-value-wrap .value {
+    font-size: 12px;
+    line-height: 1.4;
+    word-break: break-all;
+    text-align: right;
+  }
+
+  /* Поля ввода — как в wallet .input */
+  .input {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--glass-border);
+    border-radius: 50px;
+    padding: 12px 20px;
+    color: var(--text-main);
+    font-size: 14px;
+    outline: none;
+    transition: border 0.3s;
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .input:focus {
+    border-color: var(--accent-color);
+  }
+
+  .input-monospace {
+    font-family: monospace;
+  }
+
+  /* Кнопки — овальные, как .btn-action в wallet */
+  .btn-oval,
+  .btn-primary-oval,
+  .btn-action {
+    padding: 12px 24px;
+    border-radius: 50px;
+    border: none;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: var(--accent-color);
+    color: white;
+    white-space: nowrap;
+    font-size: 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .btn-oval:hover,
+  .btn-primary-oval:hover,
+  .btn-action:hover {
+    opacity: 0.9;
+    transform: translateY(-1px);
+  }
+
+  .btn-primary-oval {
+    background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
+    box-shadow: 0 4px 15px var(--accent-glow);
+  }
+
+  .btn-primary-oval:hover {
+    box-shadow: 0 6px 20px var(--accent-glow);
+  }
+
+  .btn-oval.outline,
+  .btn-action.outline {
+    background: transparent;
+    border: 1px solid var(--accent-color);
+    color: var(--accent-color);
+  }
+
+  .btn-oval.outline:hover,
+  .btn-action.outline:hover {
+    background: rgba(108, 92, 231, 0.1);
+  }
+
+  /* Иконки-кнопки */
+  .btn-icon-oval {
+    padding: 8px;
+    border-radius: 50px;
+    border: none;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+  }
+
+  .btn-icon-oval:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-main);
+  }
+
+  /* Бейджи статуса */
+  .status-badge {
+    padding: 4px 12px;
+    border-radius: 50px;
+    font-size: 12px;
+    font-weight: 600;
+    display: inline-block;
+  }
+
+  .status-success {
+    background: rgba(0, 184, 148, 0.2);
+    color: var(--success-color);
+  }
+
+  .status-warning {
+    background: rgba(214, 48, 49, 0.2);
+    color: var(--danger-color);
+  }
+
+  /* Контейнер QR */
+  .qr-container {
+    text-align: center;
+    margin-top: 10px;
+    padding: 10px;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 16px;
+  }
+
+  .qr-container #qrcode {
+    display: inline-block;
+    padding: 10px;
+    background: white;
+    border-radius: 12px;
+  }
+
+  .qr-actions {
+    margin-top: 15px;
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  /* Подсказки */
+  .text-muted {
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  .form-hint {
+    margin-top: 8px;
+  }
+  .full-width {
+    width: 100%;
+    justify-content: center;
+    margin-top: 15px;
+  }
+
+  /* Модальные окна — тоже стеклянные */
+  .modal-overlay {
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+  }
+
+  .modal {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+    color: var(--text-main);
+    max-width: 500px;
+    width: 90%;
+  }
+
+  .modal-header {
+    border-bottom: 1px solid var(--glass-border);
+    padding: 18px 24px;
+  }
+
+  .modal-header h3 {
+    margin: 0;
+    font-weight: 700;
+  }
+
+  .modal-close {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 28px;
+    cursor: pointer;
+  }
+
+  .modal-body {
+    padding: 24px;
+  }
+
+  .modal-footer {
+    padding: 16px 24px;
+    border-top: 1px solid var(--glass-border);
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+  }
+
+  .mnemonic-display {
+    background: rgba(0, 0, 0, 0.4);
+    padding: 20px;
+    border-radius: 16px;
+    font-family: monospace;
+    font-size: 16px;
+    line-height: 1.8;
+    color: var(--text-main);
+    word-break: break-word;
+    margin-bottom: 15px;
+    border: 1px solid var(--glass-border);
+  }
+
+  .status-error {
+    color: var(--danger-color);
+    font-weight: 600;
+  }
+  .accent {
+    color: var(--accent-color);
+  }
+  .text-center {
+    text-align: center;
+  }
+  .flex-row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .error {
+    color: var(--danger-color);
+    font-weight: 600;
+    margin-top: 5px;
+  }
+
+  /* Заголовок страницы */
+  .page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 25px;
+  }
+
+  .page-header h2 {
+    color: var(--text-main);
+    font-weight: 700;
+    font-size: 28px;
+    margin: 0;
+  }
+
+  .header-actions {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+
+  /* Адаптив */
+  @media (max-width: 768px) {
+    .profile-row {
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .profile-row label {
+      width: 100%;
+    }
+    .profile-value-wrap {
+      width: 100%;
+      justify-content: flex-start;
+    }
+    .profile-value-wrap .value {
+      text-align: left;
+    }
+    .header-actions {
+      flex-wrap: wrap;
+    }
+    .qr-container #qrcode {
+      transform: scale(0.85);
+    }
+  }
+</style>
+
+<div class="page-header">
+    <h2 data-i18n="profile">Profile</h2>
+    <div class="header-actions">
+        <button id="langToggle" class="btn-oval outline" data-i18n="lang_toggle" style="min-width: 60px;">EN</button>
+        <button class="btn-icon-oval" onclick="forceReload()" title="Reload page (refresh JS)">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.66 0 3-4.03 3-9s-1.34-9-3-9m0 18c-1.66 0-3-4.03-3-9s1.34-9 3-9"/>
+            </svg>
+        </button>
+        <button class="btn-icon-oval" onclick="confirmLogout(event)" title="Log out">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                <polyline points="16 17 21 12 16 7"/>
+                <line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+        </button>
+    </div>
+</div>
+
+<!-- Address Card -->
+<div class="profile-card">
+    <h3 data-i18n="your_address">Your Address</h3>
+    <div class="profile-row">
+        <label data-i18n="public_address">Public Address</label>
+        <div class="profile-value-wrap">
+            <span class="value font-mono" id="address" style="user-select: all; word-break: break-all;">{{ address|default('', true) }}</span>
+           <button class="btn-icon-oval" onclick="copyAddressToClipboard()" title="Copy" >
+    <img src="/static/icons/Copy.png" width="20" height="20" alt="Copy" style="filter: invert(1);">
+</button>
+        </div>
+    </div>
+    <div class="profile-row">
+        <label data-i18n="qr_code">QR Code</label>
+        <div class="qr-container">
+            <div id="qrcode"></div>
+            <div class="qr-actions">
+                <div class="qr-actions">
+    <button class="btn-oval outline" onclick="downloadQR()" >
+        <img src="/static/icons/Download.png" width="20" height="20" alt="Download" style="filter: invert(1);"> Download
+    </button>
+    <button class="btn-oval outline" onclick="shareQR()" >
+        <img src="/static/icons/Share.png" width="20" height="20" alt="Share" style="filter: invert(1);"> Share
+    </button>
+</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Recovery Phrase Card -->
+<div class="profile-card">
+    <h3 data-i18n="recovery_phrase">Recovery Phrase</h3>
+    <div class="profile-row">
+        <label data-i18n="mnemonic">Mnemonic</label>
+        <div class="profile-value-wrap">
+            <input type="password" id="mnemonicDisplay" class="input input-monospace" value="••••••••••••••••••••" readonly>
+            <button class="btn-oval outline" id="toggleMnemonicBtn" onclick="toggleMnemonic()" disabled >Show</button>
+           <button class="btn-icon-oval" id="copyMnemonicBtn" onclick="copyMnemonicToClipboard()" disabled title="Copy">
+    <img src="/static/icons/Copy.png" width="20" height="20" alt="Copy" style="filter: invert(1);">
+</button>
+        </div>
+    </div>
+    <p class="text-muted form-hint" data-i18n="warning_mnemonic">⚠️ Keep this phrase secret. Never share it with anyone.</p>
+    <button class="btn-primary-oval full-width" onclick="exportMnemonicSecure()" data-i18n="export_mnemonic">🔐 Export Mnemonic</button>
+</div>
+
+<!-- Security Info Card -->
+<div class="profile-card">
+    <div class="profile-row">
+        <label data-i18n="notifications">Push Notifications</label>
+        <button id="enableNotificationsBtn" class="btn-oval" data-i18n="enable_notifications">🔔 Enable</button>
+    </div>
+    <h3 data-i18n="security">Security</h3>
+    <div class="profile-row">
+        <label data-i18n="wallet_status">Wallet Status</label>
+        <span class="status-badge status-success">● Active</span>
+    </div>
+    <div class="profile-row">
+        <label data-i18n="network">Network</label>
+        <span>Mainnet</span>
+    </div>
+    <div class="profile-row">
+        <label data-i18n="mnemonic_display">Mnemonic Display</label>
+        <span class="status-badge status-warning" data-i18n="hidden_secure">Hidden (Secure)</span>
+    </div>
+    <div class="profile-row">
+        <label data-i18n="session">Session</label>
+        <span id="sessionInfo" class="font-mono">
+            <span data-i18n="active_session">Active</span>
+            <span id="sessionTime"></span>
+        </span>
+    </div>
+</div>
+
+<!-- Confirm Modal for Mnemonic Export -->
+<div id="confirmModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+        <header class="modal-header">
+            <h3>🔐 Confirm Export</h3>
+            <button class="modal-close" onclick="ModalManager.close('confirmModal')">&times;</button>
+        </header>
+        <div class="modal-body">
+            <p data-i18n="confirm_export_text">To view your mnemonic phrase, please confirm:</p>
+            <input type="text" id="confirmInput" class="input" placeholder="Type: I CONFIRM" style="text-transform: uppercase; text-align: center;">
+            <p id="confirmError" class="hidden error"></p>
+            <p class="text-muted" data-i18n="confirm_warning">⚠️ This ensures you intentionally want to view sensitive data.</p>
+        </div>
+        <footer class="modal-footer">
+            <button class="btn-oval outline" onclick="ModalManager.close('confirmModal')" data-i18n="cancel">Cancel</button>
+            <button class="btn-primary-oval" id="confirmSubmitBtn" data-i18n="confirm">Confirm</button>
+        </footer>
+    </div>
+</div>
+
+<!-- Mnemonic Modal -->
+<div id="mnemonicModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+        <header class="modal-header">
+            <h3 data-i18n="mnemonic">Mnemonic Phrase</h3>
+            <button class="modal-close" onclick="MnemonicManager.hide()">&times;</button>
+        </header>
+        <div class="modal-body">
+            <div id="modalMnemonic" class="mnemonic-display"></div>
+            <p class="status-error" style="text-align:center;" data-i18n="never_share">⚠️ NEVER SHARE THIS WITH ANYONE!</p>
+            <div class="flex-row" style="justify-content:center;">
+                <button class="btn-oval outline" onclick="copyMnemonicToClipboard()" >
+    <img src="/static/icons/Copy.png" width="20" height="20" alt="Copy" style="filter: invert(1);"> Copy
+</button>
+            </div>
+            <p class="text-muted text-center">
+                <span data-i18n="auto_clear_prefix">🔒 Auto-clear in</span>
+                <span id="clearCountdown" class="accent">30</span>
+                <span data-i18n="auto_clear_suffix">s</span>
+            </p>
+        </div>
+    </div>
+</div>
+
+<!-- Logout Confirmation Modal -->
+<div id="logoutModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+        <header class="modal-header">
+            <h3 data-i18n="confirm_logout">⚠️ Confirm Logout</h3>
+            <button class="modal-close" onclick="closeLogoutModal()">&times;</button>
+        </header>
+        <div class="modal-body">
+            <p data-i18n="logout_confirm_text">Are you sure you want to log out? Your session will be ended.</p>
+            <input type="text" id="logoutConfirmInput" class="input" placeholder="Type: LOGOUT" style="text-transform: uppercase; text-align: center;">
+            <p id="logoutError" class="hidden error"></p>
+        </div>
+        <footer class="modal-footer">
+            <button class="btn-oval outline" onclick="closeLogoutModal()" data-i18n="cancel">Cancel</button>
+            <button class="btn-primary-oval" id="logoutConfirmBtn" data-i18n="logout">Log Out</button>
+        </footer>
+    </div>
+</div>
+
+<script>
+(function() {
+  if (window._profileScriptLoaded) return;
+  window._profileScriptLoaded = true;
+
+  let secureMnemonic = null;
+
+  function t(key, opts) { return i18next.t(key, opts); }
+
+  function copyToClipboard(text, successMsg, errorMsg) {
+    if (!text) { window.NotificationManager?.showToast(errorMsg || t('nothing_to_copy'), 'error'); return; }
+    navigator.clipboard.writeText(text).then(() => window.NotificationManager?.showToast(successMsg, 'success'))
+      .catch(() => window.NotificationManager?.showToast(errorMsg || t('copy_failed'), 'error'));
+  }
+
+  function copyAddressToClipboard() {
+    const address = document.getElementById('address')?.textContent?.trim();
+    copyToClipboard(address, t('copied'), t('no_address'));
+  }
+
+  function copyMnemonicToClipboard() {
+    const text = window.MnemonicManager?._mnemonic || secureMnemonic;
+    if (!text) { window.NotificationManager?.showToast(t('export_first'), 'warning'); return; }
+    copyToClipboard(text, t('copied'), t('copy_failed'));
+  }
+
+  function initQRCode() {
+    const address = document.getElementById('address')?.textContent?.trim();
+    const qrDiv = document.getElementById('qrcode');
+    if (!address || address === 'None' || !qrDiv || typeof QRCode === 'undefined') return;
+    qrDiv.innerHTML = '';
+    try {
+      QRManager.generateQRCode(qrDiv, address);
+    } catch(e) { qrDiv.innerHTML = '<span class="text-muted">QR error</span>'; }
+  }
+
+  function downloadQR() {
+    const canvas = document.querySelector('#qrcode canvas');
+    if (!canvas) return window.NotificationManager?.showToast(t('qr_not_ready'), 'error');
+    const link = document.createElement('a');
+    link.download = `address-qr-${Date.now()}.png`;
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+    window.NotificationManager?.showToast(t('downloaded'), 'success');
+  }
+
+  async function shareQR() {
+    const address = document.getElementById('address')?.textContent?.trim();
+    if (!address) return;
+    if (navigator.share) {
+      try { await navigator.share({ title: t('your_address'), text: address }); }
+      catch(e) { if (e.name !== 'AbortError') console.error(e); }
+    } else { copyAddressToClipboard(); }
+  }
+
+  function toggleMnemonic() {
+    if (!secureMnemonic) { window.NotificationManager?.showToast(t('export_first'), 'warning'); return; }
+    const display = document.getElementById('mnemonicDisplay');
+    const btn = document.getElementById('toggleMnemonicBtn');
+    const isHidden = display.type === 'password' || display.value.includes('•••');
+    display.value = isHidden ? secureMnemonic : '••••••••••••••••••••';
+    display.type = isHidden ? 'text' : 'password';
+    btn.textContent = isHidden ? t('hide') : t('show');
+  }
+
+  function exportMnemonicSecure() {
+    ModalManager.open('confirmModal', { closeOnOverlay: false, preventEscClose: true });
+    setTimeout(() => {
+        if (window.localizePage) window.localizePage();
+        document.getElementById('confirmInput')?.focus();
+    }, 100);
+  }
+
+  function updateMnemonicUI(loaded) {
+    const display = document.getElementById('mnemonicDisplay');
+    const toggle = document.getElementById('toggleMnemonicBtn');
+    const copy = document.getElementById('copyMnemonicBtn');
+    [display, toggle, copy].forEach(el => { if (el) el.disabled = !loaded; });
+    if (display && !loaded) { display.value = '••••••••••••••••••••'; display.type = 'password'; }
+  }
+
+  async function handleMnemonicConfirm() {
+    const input = document.getElementById('confirmInput');
+    const error = document.getElementById('confirmError');
+    const value = input?.value?.trim()?.toUpperCase();
+    if (!value || !['I CONFIRM', 'CONFIRM', 'YES'].includes(value)) {
+      if (error) { error.textContent = t('type_i_confirm'); error.classList.remove('hidden'); }
+      input?.focus();
+      return;
+    }
+    const mnemonic = sessionStorage.getItem('mnemonic');
+    if (!mnemonic || mnemonic.split(/\s+/).length < 24) {
+      error.textContent = t('mnemonic_not_available');
+      window.NotificationManager?.showToast(t('session_expired'), 'error');
+      return;
+    }
+    secureMnemonic = mnemonic;
+    updateMnemonicUI(true);
+    window.MnemonicManager?.showInModal?.(secureMnemonic, 'mnemonicModal', 'modalMnemonic');
+    ModalManager.close('confirmModal');
+  }
+
+  window.confirmLogout = function(event) {
+    event?.preventDefault();
+    ModalManager.open('logoutModal', { closeOnOverlay: false });
+    document.getElementById('logoutConfirmInput').value = '';
+    document.getElementById('logoutError')?.classList.add('hidden');
+  };
+  window.closeLogoutModal = () => ModalManager.close('logoutModal');
+  window.executeLogout = () => {
+    if (window.logout) window.logout();
+    else { sessionStorage.removeItem('mnemonic'); window.location.href = '/logout'; }
+  };
+  function validateLogoutInput() {
+    const input = document.getElementById('logoutConfirmInput');
+    const value = input?.value.trim().toUpperCase();
+    if (value === 'LOGOUT' || value === 'OK') { window.executeLogout(); return true; }
+    const error = document.getElementById('logoutError');
+    if (error) { error.textContent = t('type_logout'); error.classList.remove('hidden'); }
+    input?.focus();
+    return false;
+  }
+
+  function forceReload() {
+    location.reload(true);
+  }
+  window.forceReload = forceReload;
+
+  document.addEventListener('DOMContentLoaded', () => {
+    initQRCode();
+    document.getElementById('sessionTime').textContent = ' • ' + new Date().toLocaleTimeString();
+    document.getElementById('confirmSubmitBtn')?.addEventListener('click', handleMnemonicConfirm);
+    document.getElementById('logoutConfirmBtn')?.addEventListener('click', validateLogoutInput);
+    document.getElementById('confirmInput')?.addEventListener('keypress', e => { if (e.key === 'Enter') handleMnemonicConfirm(); });
+    document.getElementById('logoutConfirmInput')?.addEventListener('keypress', e => { if (e.key === 'Enter') validateLogoutInput(); });
+
+    const enableNotificationsBtn = document.getElementById('enableNotificationsBtn');
+    if (enableNotificationsBtn) {
+        enableNotificationsBtn.addEventListener('click', async () => {
+            if (window.NotificationManager?.requestNotificationPermission) {
+                const granted = await window.NotificationManager.requestNotificationPermission();
+                if (granted) {
+                    window.NotificationManager?.showToast('Notifications enabled!', 'success');
+                } else {
+                    window.NotificationManager?.showToast('Permission denied or error', 'error');
+                }
+            } else {
+                console.warn('NotificationManager not ready');
+            }
+        });
+    }
+  });
+
+  window.copyAddressToClipboard = copyAddressToClipboard;
+  window.copyMnemonicToClipboard = copyMnemonicToClipboard;
+  window.toggleMnemonic = toggleMnemonic;
+  window.exportMnemonicSecure = exportMnemonicSecure;
+  window.downloadQR = downloadQR;
+  window.shareQR = shareQR;
+})();
+</script>
+{% endblock %}

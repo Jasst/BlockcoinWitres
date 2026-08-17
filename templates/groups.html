@@ -1,0 +1,1083 @@
+{% extends "base.html" %}
+
+{% block title %}Groups — Dark Messenger{% endblock %}
+
+{% block content %}
+<style>
+  /* === Единая тема из wallet.html === */
+  :root {
+    --glass-bg: rgba(20, 20, 30, 0.6);
+    --glass-border: rgba(255, 255, 255, 0.08);
+    --accent-color: #6c5ce7;
+    --accent-glow: rgba(108, 92, 231, 0.4);
+    --success-color: #00b894;
+    --danger-color: #d63031;
+    --text-main: #f5f6fa;
+    --text-muted: #a4b0be;
+    --bg-primary: #0a0a0f;
+  }
+
+  /* Анимация */
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .page-container {
+    animation: fadeInUp 0.6s ease-out;
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 0 15px;
+  }
+
+  .page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 25px;
+  }
+
+  .page-header h2 {
+    color: var(--text-main);
+    font-weight: 700;
+    font-size: 28px;
+    margin: 0;
+  }
+
+  /* Стеклянная карточка (группы) */
+  .groups-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .list-item {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    padding: 20px 24px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 15px;
+  }
+
+  .list-item:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+
+  .group-card .info .name {
+    color: var(--text-main);
+    font-weight: 600;
+    font-size: 18px;
+  }
+
+  .group-card .info .address {
+    color: var(--text-muted);
+    font-size: 13px;
+    font-family: monospace;
+  }
+
+  .group-card .actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  /* Кнопки — как в wallet */
+  .btn-primary-oval {
+    padding: 12px 24px;
+    border-radius: 50px;
+    border: none;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
+    color: white;
+    font-size: 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    box-shadow: 0 4px 15px var(--accent-glow);
+    white-space: nowrap;
+  }
+
+  .btn-primary-oval:hover {
+    opacity: 0.9;
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px var(--accent-glow);
+  }
+
+  .btn-primary-oval:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+  }
+
+  .btn-oval {
+    padding: 12px 24px;
+    border-radius: 50px;
+    border: none;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-main);
+    font-size: 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    border: 1px solid var(--glass-border);
+  }
+
+  .btn-oval:hover {
+    background: rgba(255, 255, 255, 0.1);
+    transform: translateY(-1px);
+  }
+
+  .btn-icon-oval {
+    padding: 8px;
+    border-radius: 50px;
+    border: none;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+  }
+
+  .btn-icon-oval:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-main);
+  }
+
+  .full-width {
+    width: 100%;
+    justify-content: center;
+  }
+
+  /* Поля ввода */
+  .input {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--glass-border);
+    border-radius: 50px;
+    padding: 12px 20px;
+    color: var(--text-main);
+    font-size: 14px;
+    outline: none;
+    transition: border 0.3s;
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .input:focus {
+    border-color: var(--accent-color);
+  }
+
+  .input-monospace {
+    font-family: monospace;
+  }
+
+  /* Модальные окна — стеклянные */
+  .modal-overlay {
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+  }
+
+  .modal {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+    color: var(--text-main);
+    max-width: 500px;
+    width: 90%;
+    margin: 20px auto;
+  }
+
+  .modal-header {
+    border-bottom: 1px solid var(--glass-border);
+    padding: 18px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .modal-header h3 {
+    margin: 0;
+    font-weight: 700;
+  }
+
+  .modal-close {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 28px;
+    cursor: pointer;
+    padding: 0 8px;
+  }
+
+  .modal-close:hover {
+    color: var(--text-main);
+  }
+
+  .modal-body {
+    padding: 24px;
+  }
+
+  .modal-footer {
+    padding: 16px 24px;
+    border-top: 1px solid var(--glass-border);
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+  }
+
+  /* Формы внутри модалок */
+  .form-group {
+    margin-bottom: 18px;
+  }
+
+  .form-group label {
+    color: var(--text-muted);
+    font-size: 14px;
+    display: block;
+    margin-bottom: 6px;
+  }
+
+  .text-secondary {
+    color: var(--text-muted);
+  }
+
+  .text-muted {
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+
+  .error {
+    color: var(--danger-color);
+    font-weight: 600;
+    margin-top: 5px;
+  }
+
+  .hidden {
+    display: none !important;
+  }
+
+  .flex-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  /* Список контактов */
+  .contacts-selector {
+    max-height: 200px;
+    overflow-y: auto;
+    padding: 4px;
+  }
+
+  .contacts-selector::-webkit-scrollbar {
+    width: 4px;
+  }
+  .contacts-selector::-webkit-scrollbar-thumb {
+    background: var(--accent-color);
+    border-radius: 50px;
+  }
+
+  .contact-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 10px;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: background 0.2s;
+    border-bottom: 1px solid var(--glass-border);
+  }
+
+  .contact-checkbox:hover {
+    background: rgba(255, 255, 255, 0.03);
+  }
+
+  .contact-checkbox input[type="checkbox"] {
+    accent-color: var(--accent-color);
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+  }
+
+  .contact-checkbox div {
+    flex: 1;
+  }
+
+  .contact-checkbox strong {
+    color: var(--text-main);
+  }
+
+  /* Выбранные участники (теги) */
+  .selected-members {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .selected-tag {
+    background: rgba(108, 92, 231, 0.2);
+    border: 1px solid var(--accent-color);
+    border-radius: 50px;
+    padding: 6px 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-main);
+    font-size: 13px;
+  }
+
+  .selected-tag button {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 16px;
+    padding: 0 4px;
+    line-height: 1;
+  }
+
+  .selected-tag button:hover {
+    color: var(--danger-color);
+  }
+
+  /* Строки деталей группы */
+  .detail-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--glass-border);
+    font-size: 14px;
+  }
+
+  .detail-row:last-child {
+    border-bottom: none;
+  }
+
+  .detail-row .font-mono {
+    font-family: monospace;
+    word-break: break-all;
+    text-align: right;
+    max-width: 60%;
+    color: var(--text-main);
+  }
+
+  /* Вкладки в деталях */
+  .detail-tabs {
+    display: flex;
+    gap: 5px;
+    margin-bottom: 15px;
+    background: var(--glass-bg);
+    padding: 5px;
+    border-radius: 50px;
+    border: 1px solid var(--glass-border);
+  }
+
+  .detail-tab {
+    flex: 1;
+    padding: 10px;
+    text-align: center;
+    border-radius: 50px;
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--text-muted);
+    transition: all 0.3s;
+    border: none;
+    background: transparent;
+    font-size: 14px;
+  }
+
+  .detail-tab.active {
+    background: var(--accent-color);
+    color: white;
+    box-shadow: 0 4px 10px var(--accent-glow);
+  }
+
+  .detail-tab:hover:not(.active) {
+    color: var(--text-main);
+    background: rgba(255, 255, 255, 0.05);
+  }
+
+  /* Списки участников */
+  .members-list {
+    max-height: 250px;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+
+  .members-list::-webkit-scrollbar {
+    width: 4px;
+  }
+  .members-list::-webkit-scrollbar-thumb {
+    background: var(--accent-color);
+    border-radius: 50px;
+  }
+
+  .member-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--glass-border);
+  }
+
+  .member-row:last-child {
+    border-bottom: none;
+  }
+
+  .member-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: var(--accent-color);
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 600;
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+
+  .member-info {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .member-info div:first-child {
+    color: var(--text-main);
+    font-weight: 500;
+  }
+
+  .member-info .text-muted {
+    font-family: monospace;
+    font-size: 12px;
+  }
+
+  .member-badge {
+    background: rgba(255, 255, 255, 0.1);
+    padding: 2px 10px;
+    border-radius: 50px;
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  /* Пустое состояние */
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+  }
+
+  .empty-state .icon {
+    font-size: 64px;
+    margin-bottom: 20px;
+  }
+
+  .empty-state p {
+    color: var(--text-muted);
+    font-size: 18px;
+    margin-bottom: 20px;
+  }
+
+  /* Адаптив */
+  @media (max-width: 768px) {
+    .page-header {
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .page-header h2 {
+      font-size: 24px;
+    }
+    .list-item {
+      flex-direction: column;
+      align-items: stretch;
+    }
+    .group-card .actions {
+      justify-content: flex-start;
+    }
+    .modal {
+      width: 95%;
+      margin: 10px auto;
+    }
+    .detail-row {
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .detail-row .font-mono {
+      max-width: 100%;
+      text-align: left;
+    }
+  }
+</style>
+
+<div class="page-container">
+  <div class="page-header">
+    <h2 data-i18n="groups">Groups</h2>
+    <button class="btn-primary-oval" onclick="openCreateModal()" data-i18n="create_group">+ New Group</button>
+  </div>
+
+  <div class="groups-grid" id="groupsList">
+    <div class="loading" data-i18n="loading">Loading groups…</div>
+  </div>
+</div>
+
+<!-- CREATE GROUP MODAL -->
+<div id="createModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal">
+    <header class="modal-header">
+      <h3 data-i18n="create_group">Create Group</h3>
+      <button class="modal-close" onclick="ModalManager.close('createModal')" aria-label="Close">&times;</button>
+    </header>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="text-secondary" data-i18n="group_name">Group Name</label>
+        <input type="text" id="groupName" class="input" placeholder="e.g. Team Alpha" maxlength="100" data-validate="name" data-i18n-placeholder="group_name">
+      </div>
+      <div class="form-group">
+        <label class="text-secondary" data-i18n="add_from_contacts">Add from Contacts</label>
+        <div id="contactsList" class="contacts-selector"></div>
+      </div>
+      <div class="form-group">
+        <label class="text-secondary" data-i18n="or_add_address">Or Add Address</label>
+        <div class="flex-row">
+          <input type="text" id="manualAddress" class="input input-monospace" placeholder="64-char hex" maxlength="64" data-i18n-placeholder="address_placeholder">
+          <button class="btn-oval" onclick="addManualAddress()" data-i18n="add">Add</button>
+        </div>
+      </div>
+      <div id="selectedSection" class="hidden">
+        <label class="text-secondary"><span data-i18n="selected">Selected</span> (<span id="memberCount">0</span>)</label>
+        <div id="selectedList" class="selected-members"></div>
+      </div>
+      <div id="createError" class="hidden error"></div>
+    </div>
+    <footer class="modal-footer">
+      <button class="btn-oval" onclick="ModalManager.close('createModal')" data-i18n="cancel">Cancel</button>
+      <button class="btn-primary-oval" id="createSubmitBtn" onclick="submitCreate()" data-i18n="create">Create</button>
+    </footer>
+  </div>
+</div>
+
+<!-- GROUP DETAILS MODAL -->
+<div id="detailModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal" style="max-width: 480px;">
+    <header class="modal-header">
+      <h3 id="detailTitle" data-i18n="group_details">Group Details</h3>
+      <button class="modal-close" onclick="ModalManager.close('detailModal')">&times;</button>
+    </header>
+    <div id="detailTabs" class="hidden detail-tabs">
+      <button class="detail-tab active" id="tabInfo" onclick="switchTab('info')" data-i18n="info">Info</button>
+      <button class="detail-tab" id="tabManage" onclick="switchTab('manage')" data-i18n="manage">Manage</button>
+    </div>
+    <div class="modal-body">
+      <div id="panelInfo">
+        <div class="detail-row"><span class="text-secondary" data-i18n="group_id">Group ID</span><span class="font-mono" id="detailId"></span></div>
+        <div class="detail-row"><span class="text-secondary" data-i18n="created_by">Created by</span><span class="font-mono" id="detailCreator"></span></div>
+        <div class="detail-row"><span class="text-secondary" data-i18n="created">Created</span><span id="detailDate"></span></div>
+        <div class="form-group">
+          <label class="text-secondary"><span data-i18n="members">Members</span> (<span id="detailCount">0</span>)</label>
+          <div id="detailMembers" class="members-list"></div>
+        </div>
+        <button class="btn-primary-oval full-width" onclick="openGroupChat()" data-i18n="open_chat">💬 Open Chat</button>
+      </div>
+      <div id="panelManage" class="hidden">
+        <div class="form-group">
+          <label class="text-secondary" data-i18n="rename_group">Rename Group</label>
+          <div class="flex-row">
+            <input type="text" id="renameInput" class="input" placeholder="New name…" maxlength="100" data-i18n-placeholder="new_name">
+            <button class="btn-oval" onclick="submitRename()" data-i18n="save">Save</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="text-secondary" data-i18n="add_member_contacts">Add Member from Contacts</label>
+          <div id="addContactsList" class="contacts-selector"></div>
+        </div>
+        <div class="form-group">
+          <label class="text-secondary" data-i18n="or_add_address">Or Add by Address</label>
+          <div class="flex-row">
+            <input type="text" id="addMemberInput" class="input input-monospace" placeholder="64-char hex" maxlength="64" data-i18n-placeholder="address_placeholder">
+            <button class="btn-oval" onclick="submitAddMember()" data-i18n="add">Add</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="text-secondary"><span data-i18n="current_members">Current Members</span> (<span id="manageCount">0</span>)</label>
+          <div id="manageMembers" class="members-list"></div>
+        </div>
+        <div id="manageError" class="hidden error"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% block scripts %}
+<script>
+(function() {
+  if (window._groupsScriptLoaded) return;
+  window._groupsScriptLoaded = true;
+
+  const MY_ADDR = "{{ address|default('', true) }}";
+  let allContacts = [];
+  let selectedMembers = {};
+  let currentGroup = null;
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m]));
+  }
+  function escapeAttr(str) {
+    return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#x27;');
+  }
+
+  function t(key, opts) { return i18next.t(key, opts); }
+
+  async function showConfirmModal(title, message) {
+    return new Promise((resolve) => {
+      const modalId = 'confirm-' + Date.now();
+      const html = `<div id="${modalId}" class="modal-overlay hidden"><div class="modal"><header class="modal-header"><h3>${escapeHtml(title)}</h3><button class="modal-close" data-close>&times;</button></header><div class="modal-body"><p>${escapeHtml(message)}</p></div><footer class="modal-footer"><button class="btn-oval" data-action="cancel">${t('cancel')}</button><button class="btn-primary-oval" data-action="confirm">${t('confirm')}</button></footer></div></div>`;
+      document.body.insertAdjacentHTML('beforeend', html);
+      const modalEl = document.getElementById(modalId);
+      const close = (result) => { ModalManager.close(modalId); modalEl.remove(); resolve(result); };
+      ModalManager.open(modalId, { closeOnOverlay: false });
+      modalEl.querySelector('[data-close]')?.addEventListener('click', () => close(false));
+      modalEl.querySelector('[data-action="cancel"]')?.addEventListener('click', () => close(false));
+      modalEl.querySelector('[data-action="confirm"]')?.addEventListener('click', () => close(true));
+    });
+  }
+
+  async function showPromptModal(title, placeholder, defaultValue = '') {
+    return new Promise((resolve) => {
+      const modalId = 'prompt-' + Date.now();
+      const html = `<div id="${modalId}" class="modal-overlay hidden"><div class="modal"><header class="modal-header"><h3>${escapeHtml(title)}</h3><button class="modal-close" data-close>&times;</button></header><div class="modal-body"><input type="text" id="prompt-input" class="input" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(defaultValue)}"></div><footer class="modal-footer"><button class="btn-oval" data-action="cancel">${t('cancel')}</button><button class="btn-primary-oval" data-action="ok">${t('ok')}</button></footer></div></div>`;
+      document.body.insertAdjacentHTML('beforeend', html);
+      const modalEl = document.getElementById(modalId);
+      const input = modalEl.querySelector('#prompt-input');
+      const close = (result) => { ModalManager.close(modalId); modalEl.remove(); resolve(result); };
+      ModalManager.open(modalId, { closeOnOverlay: false });
+      modalEl.querySelector('[data-close]')?.addEventListener('click', () => close(null));
+      modalEl.querySelector('[data-action="cancel"]')?.addEventListener('click', () => close(null));
+      modalEl.querySelector('[data-action="ok"]')?.addEventListener('click', () => close(input.value.trim()));
+      input?.focus();
+    });
+  }
+
+  async function showDeleteGroupModal(name) {
+    return new Promise((resolve) => {
+      const modalId = 'delete-group-' + Date.now();
+      const html = `<div id="${modalId}" class="modal-overlay hidden"><div class="modal"><header class="modal-header"><h3>${t('delete_group')}</h3><button class="modal-close" data-close>&times;</button></header><div class="modal-body"><p>${t('delete_group_confirm', { name: escapeHtml(name) })}<br><span style="color: var(--status-error);">⚠️ ${t('cannot_undo')}</span></p><div class="form-group"><label>${t('type_delete_confirm')}</label><input type="text" id="delete-confirm-input" class="input" placeholder="DELETE"></div></div><footer class="modal-footer"><button class="btn-oval" data-action="cancel">${t('cancel')}</button><button class="btn-primary-oval" data-action="delete">${t('delete')}</button></footer></div></div>`;
+      document.body.insertAdjacentHTML('beforeend', html);
+      const modalEl = document.getElementById(modalId);
+      const input = modalEl.querySelector('#delete-confirm-input');
+      const close = (result) => { ModalManager.close(modalId); modalEl.remove(); resolve(result); };
+      ModalManager.open(modalId, { closeOnOverlay: false });
+      modalEl.querySelector('[data-close]')?.addEventListener('click', () => close(false));
+      modalEl.querySelector('[data-action="cancel"]')?.addEventListener('click', () => close(false));
+      modalEl.querySelector('[data-action="delete"]')?.addEventListener('click', () => close(input.value.trim().toUpperCase() === 'DELETE'));
+    });
+  }
+
+  async function loadGroups() {
+    const container = document.getElementById('groupsList');
+    if (!container) return;
+    container.innerHTML = `<div class="loading">${t('loading')}</div>`;
+    try {
+      const res = await fetch('/get_groups');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Unknown');
+      if (!data.groups?.length) {
+container.innerHTML = `<div class="empty-state">
+  <div class="icon">👥</div>
+  <p data-i18n="no_groups">No groups</p>
+  <button class="btn-primary-oval" onclick="openCreateModal()" data-i18n="create_group">+ New Group</button>
+</div>`;
+ return;
+      }
+      container.innerHTML = '';
+      data.groups.forEach(g => {
+        const card = document.createElement('div');
+        card.className = 'list-item group-card';
+        card.dataset.id = g.id;
+        const isCreator = g.creator === MY_ADDR;
+        const date = g.created_at ? new Date(g.created_at * 1000).toLocaleDateString() : '—';
+        card.innerHTML = `
+          <div class="info" style="flex:1;">
+            <div class="name">${escapeHtml(g.name)}</div>
+            <div class="address font-mono">ID: ${g.id.slice(0,12)}…</div>
+            <div class="text-muted" style="font-size:12px;">${g.members.length} ${t('members').toLowerCase()} · ${date}</div>
+          </div>
+          <div class="actions">
+            <button class="btn-primary-oval" onclick="openGroupChatById('group:${escapeAttr(g.id)}', '${escapeAttr(g.name)}')">💬 ${t('chat')}</button>
+            <button class="btn-oval" onclick="openDetail('${escapeAttr(JSON.stringify(g))}')">${t('info')}</button>
+            ${isCreator ? `
+<button class="btn-icon-oval" style="color:var(--danger-color);" onclick="deleteGroup('${escapeAttr(g.id)}', '${escapeAttr(g.name)}')" title="${t('delete')}">
+    <img src="/static/icons/Remove.png" width="20" height="20" alt="Remove" style="filter: invert(1);">
+</button>` : ''}
+          </div>`;
+        container.appendChild(card);
+      });
+
+    } catch (err) {
+      console.error(err);
+      container.innerHTML = `<p class="text-muted text-center">${t('error_load')}</p>`;
+    }
+  }
+
+  async function openCreateModal() {
+    selectedMembers = {};
+    document.getElementById('groupName').value = '';
+    document.getElementById('manualAddress').value = '';
+    document.getElementById('createError')?.classList.add('hidden');
+    renderSelected();
+    ModalManager.open('createModal');
+    const listDiv = document.getElementById('contactsList');
+    listDiv.innerHTML = `<div class="loading">${t('loading_contacts')}</div>`;
+    try {
+      const res = await fetch('/get_contacts');
+      const data = await res.json();
+      allContacts = res.ok ? data.contacts : [];
+      renderContactsList();
+    } catch(e) { listDiv.innerHTML = `<p class="text-muted">${t('could_not_load')}</p>`; }
+  }
+
+  function renderContactsList() {
+    const container = document.getElementById('contactsList');
+    if (!allContacts.length) {
+      container.innerHTML = `<p class="text-muted">${t('no_contacts_yet')}</p>`;
+      return;
+    }
+    container.innerHTML = '';
+    allContacts.forEach(c => {
+      const label = document.createElement('label');
+      label.className = 'contact-checkbox';
+      label.innerHTML = `<input type="checkbox" value="${escapeAttr(c.address)}" onchange="toggleMember('${escapeAttr(c.address)}', '${escapeAttr(c.name)}', this.checked)">
+                         <div><strong>${escapeHtml(c.name)}</strong><br><span class="text-muted font-mono">${c.address.slice(0,20)}…</span></div>`;
+      container.appendChild(label);
+    });
+  }
+
+  window.toggleMember = (addr, name, checked) => {
+    if (checked) selectedMembers[addr] = name;
+    else delete selectedMembers[addr];
+    renderSelected();
+  };
+
+  window.addManualAddress = () => {
+    const input = document.getElementById('manualAddress');
+    const addr = input.value.trim().toLowerCase();
+    if (!addr || addr.length !== 64 || !/^[a-f0-9]{64}$/.test(addr)) {
+      showCreateError(t('invalid_address_64'));
+      return;
+    }
+    if (addr === MY_ADDR) { showCreateError(t('you_auto_included')); return; }
+    if (selectedMembers[addr]) { showCreateError(t('already_added')); return; }
+    selectedMembers[addr] = addr.slice(0,10)+'…';
+    input.value = '';
+    document.getElementById('createError')?.classList.add('hidden');
+    renderSelected();
+    const cb = document.querySelector(`#contactsList input[value="${addr}"]`);
+    if (cb) cb.checked = false;
+  };
+
+  function renderSelected() {
+    const count = Object.keys(selectedMembers).length;
+    const section = document.getElementById('selectedSection');
+    const listDiv = document.getElementById('selectedList');
+    document.getElementById('memberCount').textContent = count;
+    if (count === 0) { section.classList.add('hidden'); return; }
+    section.classList.remove('hidden');
+    listDiv.innerHTML = '';
+    Object.entries(selectedMembers).forEach(([addr, name]) => {
+      const tag = document.createElement('span');
+      tag.className = 'selected-tag';
+      tag.innerHTML = `${escapeHtml(name)} <button onclick="removeMember('${escapeAttr(addr)}')"><img src="/static/icons/Remove.png" width="16" height="16" alt="Remove" style="filter: invert(1);"></button>`;
+      listDiv.appendChild(tag);
+    });
+  }
+
+  window.removeMember = (addr) => {
+    delete selectedMembers[addr];
+    const cb = document.querySelector(`#contactsList input[value="${addr}"]`);
+    if (cb) cb.checked = false;
+    renderSelected();
+  };
+
+  function showCreateError(msg) {
+    const el = document.getElementById('createError');
+    el.textContent = msg;
+    el.classList.remove('hidden');
+  }
+
+  window.submitCreate = async () => {
+    const name = document.getElementById('groupName').value.trim();
+    const members = Object.keys(selectedMembers);
+    if (!name || name.length > 100) {
+      showCreateError(t('name_required'));
+      return;
+    }
+    if (!members.length) {
+      showCreateError(t('at_least_one_member'));
+      return;
+    }
+    const btn = document.getElementById('createSubmitBtn');
+    btn.disabled = true;
+    btn.textContent = t('creating');
+    try {
+      const res = await fetch('/create_group', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, members })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showCreateError(data.error || t('failed'));
+        return;
+      }
+      ModalManager.close('createModal');
+      await loadGroups();
+      if (window.wsClient && window.wsClient.isConnected) {
+        window.wsClient.send({ type: 'subscribe_group', group_id: data.group_id });
+      }
+      const confirmed = await showConfirmModal(t('group_created'), t('open_chat_now', { name }));
+      if (confirmed) {
+        openGroupChatById('group:' + data.group_id, name);
+      }
+    } catch (err) {
+      showCreateError(t('network_error'));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t('create');
+    }
+  };
+
+  window.openDetail = async (groupJson) => {
+    const g = JSON.parse(groupJson);
+    currentGroup = g;
+    const isCreator = g.creator === MY_ADDR;
+    const tabsDiv = document.getElementById('detailTabs');
+    if (isCreator) tabsDiv.classList.remove('hidden');
+    else tabsDiv.classList.add('hidden');
+    switchTab('info');
+    document.getElementById('detailTitle').textContent = g.name;
+    document.getElementById('detailId').textContent = g.id;
+    document.getElementById('detailCreator').textContent = g.creator === MY_ADDR ? g.creator + ' (' + t('you') + ')' : g.creator;
+    document.getElementById('detailDate').textContent = g.created_at ? new Date(g.created_at * 1000).toLocaleString() : '—';
+    document.getElementById('detailCount').textContent = g.members.length;
+    renderMemberList(g.members, document.getElementById('detailMembers'), false);
+    ModalManager.open('detailModal');
+  };
+
+  function renderMemberList(members, container, withRemove) {
+    container.innerHTML = '';
+    members.forEach(addr => {
+      const isMe = addr === MY_ADDR;
+      const label = isMe ? t('you') : addr.slice(0,16)+'…';
+      const row = document.createElement('div');
+      row.className = 'member-row';
+      row.innerHTML = `<div class="member-avatar">${label[0]}</div>
+                       <div class="member-info"><div>${escapeHtml(label)}</div><div class="text-muted font-mono">${addr}</div></div>
+                       ${isMe ? `<span class="member-badge">${t('me')}</span>` : ''}
+                       ${addr === currentGroup?.creator ? `<span class="member-badge">${t('owner')}</span>` : ''}
+                       ${withRemove && !isMe && addr !== currentGroup?.creator ? `
+<button class="btn-icon-oval" onclick="submitRemoveMember('${escapeAttr(addr)}')" title="${t('remove')}">
+    <img src="/static/icons/Remove.png" width="20" height="20" alt="Remove" style="filter: invert(1);">
+</button>` : ''}`;
+      container.appendChild(row);
+    });
+  }
+
+  async function loadManagePanel(g) {
+    document.getElementById('renameInput').value = g.name;
+    document.getElementById('manageCount').textContent = g.members.length;
+    renderMemberList(g.members, document.getElementById('manageMembers'), true);
+    document.getElementById('manageError')?.classList.add('hidden');
+    await loadAddContactsList(g.members);
+  }
+
+  async function loadAddContactsList(currentMembers) {
+    const container = document.getElementById('addContactsList');
+    try {
+      let contacts = allContacts;
+      if (!contacts.length) {
+        const res = await fetch('/get_contacts');
+        const data = await res.json();
+        contacts = res.ok ? data.contacts : [];
+        allContacts = contacts;
+      }
+      const available = contacts.filter(c => !currentMembers.includes(c.address));
+      if (!available.length) {
+        container.innerHTML = `<p class="text-muted">${t('all_contacts_in_group')}</p>`;
+        return;
+      }
+      container.innerHTML = '';
+      available.forEach(c => {
+        const div = document.createElement('div');
+        div.className = 'contact-add-row';
+        div.innerHTML = `<div><strong>${escapeHtml(c.name)}</strong><br><span class="text-muted">${c.address.slice(0,20)}…</span></div>
+                         <button class="btn-oval" onclick="submitAddMemberAddr('${escapeAttr(c.address)}')">+ ${t('add')}</button>`;
+        container.appendChild(div);
+      });
+    } catch(e) { container.innerHTML = `<p class="text-muted">${t('could_not_load')}</p>`; }
+  }
+
+  function showManageError(msg) {
+    const el = document.getElementById('manageError');
+    el.textContent = msg;
+    el.classList.remove('hidden');
+  }
+
+  window.submitRename = async () => {
+    if (!currentGroup) return;
+    const name = document.getElementById('renameInput').value.trim();
+    if (!name || name.length > 100) { showManageError(t('name_required')); return; }
+    try {
+      const res = await fetch('/rename_group', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ group_id: currentGroup.id, name })
+      });
+      const data = await res.json();
+      if (!res.ok) { showManageError(data.error || t('failed')); return; }
+      currentGroup.name = name;
+      document.getElementById('detailTitle').textContent = name;
+      window.NotificationManager?.showToast(t('group_renamed'), 'success');
+      await loadGroups();
+    } catch { showManageError(t('network_error')); }
+  };
+
+  window.submitAddMember = async () => {
+    const addr = document.getElementById('addMemberInput').value.trim().toLowerCase();
+    if (!addr || addr.length !== 64 || !/^[a-f0-9]{64}$/.test(addr)) { showManageError(t('invalid_address_64')); return; }
+    await submitAddMemberAddr(addr);
+    document.getElementById('addMemberInput').value = '';
+  };
+
+  window.submitAddMemberAddr = async (addr) => {
+    if (!currentGroup) return;
+    try {
+      const res = await fetch('/add_group_member', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ group_id: currentGroup.id, address: addr })
+      });
+      const data = await res.json();
+      if (!res.ok) { showManageError(data.error || t('failed')); return; }
+      currentGroup.members = data.members;
+      document.getElementById('manageCount').textContent = currentGroup.members.length;
+      document.getElementById('detailCount').textContent = currentGroup.members.length;
+      renderMemberList(currentGroup.members, document.getElementById('manageMembers'), true);
+      renderMemberList(currentGroup.members, document.getElementById('detailMembers'), false);
+      await loadAddContactsList(currentGroup.members);
+      window.NotificationManager?.showToast(t('member_added'), 'success');
+      await loadGroups();
+    } catch { showManageError(t('network_error')); }
+  };
+
+  window.submitRemoveMember = async (addr) => {
+    if (!currentGroup) return;
+    const confirmed = await showConfirmModal(t('remove_member'), t('confirm_remove_member', { addr: addr.slice(0,16)+'…' }));
+    if (!confirmed) return;
+    try {
+      const res = await fetch('/remove_group_member', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ group_id: currentGroup.id, address: addr })
+      });
+      const data = await res.json();
+      if (!res.ok) { showManageError(data.error || t('failed')); return; }
+      currentGroup.members = data.members;
+      document.getElementById('manageCount').textContent = currentGroup.members.length;
+      document.getElementById('detailCount').textContent = currentGroup.members.length;
+      renderMemberList(currentGroup.members, document.getElementById('manageMembers'), true);
+      renderMemberList(currentGroup.members, document.getElementById('detailMembers'), false);
+      await loadAddContactsList(currentGroup.members);
+      window.NotificationManager?.showToast(t('member_removed'), 'success');
+      await loadGroups();
+    } catch { showManageError(t('network_error')); }
+  };
+
+  window.switchTab = (tab) => {
+    const isInfo = tab === 'info';
+    document.getElementById('panelInfo').classList.toggle('hidden', !isInfo);
+    document.getElementById('panelManage').classList.toggle('hidden', isInfo);
+    document.getElementById('tabInfo').classList.toggle('active', isInfo);
+    document.getElementById('tabManage').classList.toggle('active', !isInfo);
+    if (!isInfo && currentGroup) loadManagePanel(currentGroup);
+  };
+
+  window.openGroupChat = () => {
+    if (!currentGroup) return;
+    openGroupChatById('group:' + currentGroup.id, currentGroup.name);
+  };
+
+  window.openGroupChatById = (addr, name) => {
+    const params = new URLSearchParams({ start_with: addr, name });
+    location.href = '/chat?' + params;
+  };
+
+  window.deleteGroup = async (id, name) => {
+    const confirmed = await showDeleteGroupModal(name);
+    if (!confirmed) return;
+    try {
+      const res = await fetch('/delete_group', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ group_id: id })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        window.NotificationManager?.showToast(t('group_deleted'), 'success');
+        await loadGroups();
+      } else if (res.status === 403) {
+        window.NotificationManager?.showToast(t('permission_denied'), 'error');
+      } else {
+        window.NotificationManager?.showToast(data.error || t('failed_delete'), 'error');
+      }
+    } catch(err) { window.NotificationManager?.showToast(t('network_error'), 'error'); }
+  };
+
+  document.addEventListener('DOMContentLoaded', () => {
+    loadGroups();
+    document.getElementById('groupName')?.addEventListener('input', () => {});
+    document.getElementById('manualAddress')?.addEventListener('keypress', e => { if (e.key === 'Enter') addManualAddress(); });
+    document.getElementById('addMemberInput')?.addEventListener('keypress', e => { if (e.key === 'Enter') submitAddMember(); });
+  });
+
+  // Expose globals
+  window.openCreateModal = openCreateModal;
+  window.openDetail = openDetail;
+  window.deleteGroup = deleteGroup;
+  window.openGroupChatById = openGroupChatById;
+  window.openGroupChat = openGroupChat;
+  window.switchTab = switchTab;
+  window.submitRename = submitRename;
+  window.submitAddMember = submitAddMember;
+  window.submitAddMemberAddr = submitAddMemberAddr;
+  window.submitRemoveMember = submitRemoveMember;
+  window.showCreateError = showCreateError;
+  window.showConfirmModal = showConfirmModal;
+})();
+</script>
+{% endblock %}
+{% endblock %}

@@ -1,0 +1,50 @@
+services:
+  nginx:
+    image: nginx:stable-alpine
+    container_name: dark-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - C:/nginx/ssl:/etc/nginx/ssl:ro
+      - C:/nginx/html:/usr/share/nginx/html:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: dark-coturn
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+      - "5349:5349"
+      - "49160-49200:49160-49200/udp"
+    volumes:
+      - ./turnserver.conf:/etc/turnserver.conf:ro
+      - C:/nginx/ssl:/etc/nginx/ssl:ro
+    command: -c /etc/turnserver.conf --verbose --log-file=stdout
+    restart: unless-stopped
+
+  db:
+    image: postgres:17-alpine   # или 18, если нужна конкретная версия
+    container_name: dark-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: zXCV123zXCV   # совпадает с вашим .env
+      POSTGRES_DB: bichat_db
+    ports:
+      - "5432:5432"   # пробрасываем порт, чтобы можно было подключаться с хоста (опционально)
+    volumes:
+      - postgres_data:/var/lib/postgresql/data   # постоянное хранилище
+      - C:/backup:/docker-entrypoint-initdb.d    # монтируем папку с дампом
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

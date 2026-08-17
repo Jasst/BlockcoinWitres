@@ -1,0 +1,403 @@
+{% extends "base.html" %}
+
+{% block title %}Wallet — Dark Messenger{% endblock %}
+
+{% block content %}
+<style>
+  /* === Настройки темы и анимаций === */
+  :root {
+    --glass-bg: rgba(20, 20, 30, 0.6);
+    --glass-border: rgba(255, 255, 255, 0.08);
+    --accent-color: #6c5ce7;
+    --accent-glow: rgba(108, 92, 231, 0.4);
+    --success-color: #00b894;
+    --danger-color: #d63031;
+    --text-main: #f5f6fa;
+    --text-muted: #a4b0be;
+  }
+
+  .wallet-wrapper {
+    max-width: 1000px;
+    margin: 0 auto;
+    animation: fadeInUp 0.6s ease-out;
+  }
+
+  /* Главный экран: Баланс + Майнинг */
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1fr 1.2fr;
+    gap: 20px;
+    margin-bottom: 25px;
+  }
+
+  @media (max-width: 768px) {
+    .hero-grid { grid-template-columns: 1fr; }
+  }
+
+  .glass-card {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    padding: 24px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+  }
+
+  .glass-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+
+  /* Баланс */
+  .balance-card { display: flex; flex-direction: column; justify-content: center; }
+  .balance-title { font-size: 14px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 10px; }
+  .balance-amount { font-size: 42px; font-weight: 800; color: var(--text-main); margin: 0; line-height: 1.1; }
+  .balance-coin { color: var(--accent-color); font-size: 18px; font-weight: 600; margin-top: 5px; }
+  .balance-sub { margin-top: 20px; padding-top: 15px; border-top: 1px solid var(--glass-border); }
+  .balance-sub-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; }
+  .balance-sub-row span:first-child { color: var(--text-muted); }
+  .balance-sub-row span:last-child { color: var(--text-main); font-weight: 600; }
+
+  /* Майнинг */
+  .mining-card { position: relative; overflow: hidden; }
+  .mining-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+  .mining-title { font-size: 18px; font-weight: 700; color: var(--text-main); display: flex; align-items: center; gap: 8px; }
+  .mining-badge { padding: 4px 12px; border-radius: 50px; font-size: 12px; font-weight: 600; background: rgba(255,255,255,0.1); color: var(--text-muted); display: flex; align-items: center; gap: 6px; transition: all 0.3s; }
+  .mining-badge.active { background: rgba(0, 184, 148, 0.2); color: var(--success-color); }
+  .pulse-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+  .mining-badge.active .pulse-dot { background: var(--success-color); animation: pulse 1.5s infinite; }
+
+  .mining-stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+  .stat-box { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 16px; text-align: center; }
+  .stat-label { display: block; font-size: 11px; color: var(--text-muted); text-transform: uppercase; }
+  .stat-value { display: block; font-size: 18px; font-weight: 700; color: var(--text-main); margin-top: 4px; }
+
+  /* Прогресс бар майнинга */
+  .mining-progress-bar { width: 100%; height: 6px; background: rgba(255,255,255,0.1); border-radius: 50px; margin-bottom: 15px; overflow: hidden; }
+  .mining-progress-bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent-color), #a29bfe); border-radius: 50px; transition: width 0.3s ease; box-shadow: 0 0 10px var(--accent-glow); }
+
+  /* Кнопки майнинга */
+  .mining-actions { display: flex; gap: 10px; }
+  .btn-mine { flex: 1; padding: 14px 20px; border: none; border-radius: 50px; font-size: 15px; font-weight: 700; cursor: pointer; transition: all 0.3s; position: relative; overflow: hidden; }
+  .btn-mine.start { background: linear-gradient(135deg, var(--accent-color), #6c5ce7); color: white; box-shadow: 0 4px 15px var(--accent-glow); }
+  .btn-mine.start:hover { transform: scale(1.02); box-shadow: 0 6px 20px var(--accent-glow); }
+  .btn-mine.stop { background: rgba(214, 48, 49, 0.2); color: var(--danger-color); border: 1px solid var(--danger-color); }
+  .btn-mine.stop:hover { background: rgba(214, 48, 49, 0.4); }
+
+  /* Вкладки */
+  .tabs-nav { display: flex; gap: 5px; margin-bottom: 20px; background: var(--glass-bg); padding: 5px; border-radius: 50px; border: 1px solid var(--glass-border); }
+  .tab-btn { flex: 1; padding: 12px; text-align: center; border-radius: 50px; cursor: pointer; font-weight: 600; color: var(--text-muted); transition: all 0.3s; border: none; background: transparent; font-size: 14px; }
+  .tab-btn.active { background: var(--accent-color); color: white; box-shadow: 0 4px 10px var(--accent-glow); }
+  .tab-btn:hover:not(.active) { color: var(--text-main); background: rgba(255,255,255,0.05); }
+
+  .tab-content { display: none; animation: fadeIn 0.4s ease; }
+  .tab-content.active { display: block; }
+
+  /* Формы внутри вкладок */
+  .form-row { display: flex; gap: 10px; margin-bottom: 15px; align-items: center; flex-wrap: wrap; }
+  .input { background: rgba(0,0,0,0.3); border: 1px solid var(--glass-border); border-radius: 50px; padding: 12px 20px; color: var(--text-main); font-size: 14px; flex: 1; min-width: 0; outline: none; transition: border 0.3s; }
+  .input:focus { border-color: var(--accent-color); }
+
+  /* Кнопки действий */
+  .btn-action { padding: 12px 24px; border-radius: 50px; border: none; font-weight: 600; cursor: pointer; transition: all 0.2s; background: var(--accent-color); color: white; white-space: nowrap; }
+  .btn-action:hover { opacity: 0.9; transform: translateY(-1px); }
+  .btn-action.outline { background: transparent; border: 1px solid var(--accent-color); color: var(--accent-color); }
+  .btn-action.danger { background: var(--danger-color); }
+
+  /* Списки и статистика */
+  .list-container {
+    max-height: 400px;
+    overflow-y: auto;
+    padding: 0 4px;
+  }
+  .list-container::-webkit-scrollbar { width: 4px; }
+  .list-container::-webkit-scrollbar-thumb { background: var(--accent-color); border-radius: 50px; }
+
+  .list-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 15px 10px;
+    border-bottom: 1px solid var(--glass-border);
+    gap: 15px;
+  }
+  .list-item:last-child { border-bottom: none; }
+  .list-item .info { flex: 1; min-width: 0; overflow: hidden; }
+
+  .profile-row { display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid var(--glass-border); font-size: 14px; gap: 15px; }
+  .profile-row:last-child { border-bottom: none; }
+  .profile-row label { color: var(--text-muted); white-space: nowrap; }
+  .profile-row .value { color: var(--text-main); font-weight: 600; font-family: monospace; text-align: right; word-break: break-all; overflow-wrap: break-word; margin-left: auto; }
+
+  .receive-address-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    min-width: 0;
+  }
+  #receiveAddress {
+    word-break: break-all;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--text-main);
+    user-select: all;
+  }
+
+  .qr-container { text-align: center; margin-top: 20px; padding: 20px; background: white; border-radius: 16px; }
+  .qr-actions { margin-top: 15px; display: flex; gap: 10px; justify-content: center; }
+
+  /* Анимации */
+  @keyframes fadeInUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(0, 184, 148, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(0, 184, 148, 0); } 100% { box-shadow: 0 0 0 0 rgba(0, 184, 148, 0); } }
+
+  .hidden { display: none !important; }
+</style>
+
+<div class="wallet-wrapper">
+
+  <!-- HERO СЕКЦИЯ: Баланс и Майнинг -->
+  <div class="hero-grid">
+    <!-- Баланс -->
+    <div class="glass-card balance-card">
+      <div class="balance-title" data-i18n="general_balance">Total Balance</div>
+      <h1 class="balance-amount" id="balanceDisplay">0.000000</h1>
+      <div class="balance-coin" data-i18n="coin_name">BlockCoin</div>
+
+      <div class="balance-sub">
+        <div class="balance-sub-row" id="stakedInfo" style="display:none;">
+          <span data-i18n="staked_label">Staked:</span>
+          <span id="stakedDisplay">0.000000</span>
+        </div>
+        <div class="balance-sub-row">
+          <span data-i18n="network_status_label">Network:</span>
+          <span style="color: var(--success-color);" data-i18n="network_connected">● Connected</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Майнинг -->
+    <div class="glass-card mining-card" id="miningCard">
+      <div class="mining-header">
+        <div class="mining-title" data-i18n="mining_title">⛏️ Mining</div>
+        <div class="mining-badge" id="miningBadge">
+          <span class="pulse-dot"></span>
+          <span id="miningBadgeText" data-i18n="mining_waiting">Waiting</span>
+        </div>
+      </div>
+
+      <div id="miningStatus" class="text-muted" style="font-size: 13px; margin-bottom: 10px; min-height: 18px;" data-i18n="mining_click_to_start">Click the button to start</div>
+
+      <div id="miningProgress" class="hidden mining-progress-bar">
+        <div class="mining-progress-bar-fill"></div>
+      </div>
+
+      <div class="mining-actions">
+        <button id="startMiningBtn" class="btn-mine start" onclick="startMining()" data-i18n="start_mining_btn">⚡ Start Mining</button>
+        <button id="stopMiningBtn" class="btn-mine stop hidden" onclick="stopMining()" data-i18n="stop_mining_btn">⏹ Stop</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ВКЛАДКИ -->
+  <div class="tabs-nav">
+    <button class="tab-btn active" onclick="switchTab('tab-stake')" data-i18n="staking_tab">🔒 Staking</button>
+    <button class="tab-btn" onclick="switchTab('tab-transfer')" data-i18n="transfer_tab">💸 Transfers</button>
+    <button class="tab-btn" onclick="switchTab('tab-history')" data-i18n="history_tab">📜 History</button>
+    <button class="tab-btn" onclick="switchTab('tab-network')" data-i18n="network_tab">🌐 Network</button>
+  </div>
+
+  <!-- Вкладка: Стейкинг -->
+  <div id="tab-stake" class="tab-content active">
+    <div class="glass-card">
+      <h3 style="margin-top:0;" data-i18n="stake_management">Stake Management</h3>
+      <div id="stakingInfo" class="text-muted" style="margin-bottom: 20px;" data-i18n="loading_staking_info">Loading staking info...</div>
+
+      <div class="form-row">
+        <input type="number" id="stakeAmount" class="input" placeholder="Amount" step="0.000001" data-i18n-placeholder="amount_placeholder">
+        <button class="btn-action" onclick="stake()" data-i18n="stake_btn">Stake</button>
+        <button class="btn-action outline" onclick="unstake()" data-i18n="unstake_btn">Unstake</button>
+      </div>
+      <div id="stakeResult" class="hidden text-muted" style="margin-top: 10px; font-weight: bold;"></div>
+    </div>
+  </div>
+
+  <!-- Вкладка: Переводы (Send/Receive) -->
+  <div id="tab-transfer" class="tab-content">
+    <div class="glass-card" style="margin-bottom: 20px;">
+      <h3 style="margin-top:0;" data-i18n="send_coins_title">📤 Send BlockCoin</h3>
+      <div class="form-row">
+        <input type="text" id="sendAddress" class="input" placeholder="Recipient address (64 hex)" maxlength="64" data-i18n-placeholder="recipient_address">
+        <button class="btn-action outline" onclick="QRManager.openForWallet()" title="Scanner" >
+    <img src="/static/icons/Cam.png" width="24" height="24" alt="Scanner" style="filter: invert(1);">
+</button>
+      </div>
+
+      <div id="qrScannerContainer" class="qr-scanner-container hidden">
+    <div class="qr-video-wrapper">
+        <video id="qrVideo" playsinline autoplay muted disablepictureinpicture></video>
+        <div class="qr-frame"></div>
+    </div>
+    <p class="text-muted" style="margin: 12px 0 8px;" data-i18n="scan_qr_hint">Point camera at QR code</p>
+    <div id="scanResult" class="scan-result hidden"></div>
+    <button class="btn-action danger" onclick="QRManager.closeScanner()" data-i18n="close_scanner_btn">Close scanner</button>
+</div>
+      <div class="form-row">
+        <input type="number" id="sendAmount" class="input" placeholder="Amount" min="0.000001" step="0.000001" data-i18n-placeholder="send_amount_placeholder">
+        <button class="btn-action" onclick="sendCoins()" data-i18n="send_btn">Send</button>
+      </div>
+      <p class="text-muted" id="sendFeeDisplay" style="font-size: 12px;"></p>
+      <div id="sendResult" class="hidden text-muted" style="margin-top: 10px; font-weight: bold;"></div>
+    </div>
+
+    <div class="glass-card">
+      <h3 style="margin-top:0;" data-i18n="receive_title">📥 Receive BlockCoin</h3>
+      <div class="profile-row" style="border: none; padding-top: 0;">
+        <label data-i18n="your_address_label">Your address:</label>
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <span class="value font-mono" id="receiveAddress" style="word-break: break-all; font-size: 12px;">{{ address|default('', true) }}</span>
+          <button class="btn-action outline" style="padding: 8px 12px;" onclick="copyAddressToClipboard()" title="Copy" >
+    <img src="/static/icons/Copy.png" width="20" height="20" alt="Copy" style="filter: invert(1);">
+</button>
+        </div>
+      </div>
+      <button id="toggleQRBtn" class="btn-action outline" style="width: 100%; margin-top: 10px;" onclick="toggleReceiveQR()" data-i18n="show_qr_btn">📱 Show QR Code</button>
+      <div id="qrBlock" class="hidden qr-container animate-fade">
+        <div id="qrcode"></div>
+        <div class="qr-actions">
+          <div class="qr-actions">
+    <button class="btn-action outline" onclick="downloadQR()" >
+        <img src="/static/icons/Download.png" width="24" height="24" alt="Download" style="filter: invert(1);"> Download
+    </button>
+    <button class="btn-action outline" onclick="shareQR()" >
+        <img src="/static/icons/Share.png" width="24" height="24" alt="Share" style="filter: invert(1);"> Share
+    </button>
+</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Вкладка: История -->
+  <div id="tab-history" class="tab-content">
+    <div class="glass-card">
+      <h3 style="margin-top:0;" data-i18n="history_title">📜 Transaction History</h3>
+      <div id="txList" class="list-container">
+        <div class="loading" data-i18n="loading_history">Loading…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Вкладка: Сеть -->
+  <div id="tab-network" class="tab-content">
+    <div class="glass-card" id="stakingCard">
+      <h3 style="margin-top:0;" data-i18n="network_stats_title">🌐 Network Statistics</h3>
+      <div class="profile-row"><label data-i18n="total_supply_label">Total Supply</label><span class="value" id="totalSupply">0.000000</span></div>
+      <div class="profile-row" id="remainingRow"><label data-i18n="remaining_supply_label">Remaining to mine</label><span class="value" id="remainingSupply">∞</span></div>
+      <div class="profile-row"><label data-i18n="staking_pool_label">Staking Pool Balance</label><span class="value" id="stakingPoolBalance">0.000000</span></div>
+      <div class="profile-row"><label data-i18n="message_fee_label">Message Fee</label><span class="value" id="messageFee">0.000000</span></div>
+      <div class="profile-row"><label data-i18n="block_reward_label">Block Reward</label><span class="value" id="blockReward">0.000000</span></div>
+      <div class="profile-row"><label data-i18n="total_blocks_label">Total Blocks</label><span class="value" id="totalBlocks">0</span></div>
+      <div class="profile-row"><label data-i18n="total_staked_label">Total Staked</label><span class="value" id="totalStaked">0.000000</span></div>
+      <div class="profile-row"><label data-i18n="difficulty_label">Difficulty</label><span class="value" id="difficulty">0</span></div>
+      <div class="profile-row"><label data-i18n="staking_fee_ratio_label">Staking Fee Ratio</label><span class="value" id="stakingFeeRatio">0%</span></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Скрипт для переключения вкладок (остаётся здесь, т.к. не использует i18n) -->
+<script>
+  function switchTab(tabId) {
+    document.querySelectorAll('.tab-content').forEach(tab => {
+      tab.classList.remove('active');
+    });
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.classList.remove('active');
+    });
+    document.getElementById(tabId).classList.add('active');
+    event.currentTarget.classList.add('active');
+  }
+</script>
+
+{% block scripts %}
+
+<script src="{{ url_for('static', path='js/wallet.js') }}" defer></script>
+
+<script>
+  (function() {
+    // Ждём загрузки DOM и готовности i18n, а также оригинальных функций из wallet.js
+    function initWalletUI() {
+      // Функция обновления статуса майнинга с использованием i18n
+      function updateMiningUI() {
+        const badge = document.getElementById('miningBadge');
+        const badgeText = document.getElementById('miningBadgeText');
+        const statusDiv = document.getElementById('miningStatus');
+        if (!badge || !badgeText || !statusDiv) return;
+
+        if (badge.classList.contains('active')) {
+          badgeText.textContent = i18next.t('mining_active');
+          statusDiv.textContent = i18next.t('mining_active');
+        } else {
+          badgeText.textContent = i18next.t('mining_waiting');
+          statusDiv.textContent = i18next.t('mining_click_to_start');
+        }
+      }
+
+      // Сохраняем оригинальные функции, если они уже определены (из wallet.js)
+      const originalStartMining = window.startMining;
+      const originalStopMining = window.stopMining;
+
+      // Переопределяем с обновлением UI
+      window.startMining = function() {
+        const badge = document.getElementById('miningBadge');
+        if (badge) badge.classList.add('active');
+        updateMiningUI();
+        if (typeof originalStartMining === 'function') {
+          originalStartMining();
+        }
+      };
+
+      window.stopMining = function() {
+        const badge = document.getElementById('miningBadge');
+        if (badge) badge.classList.remove('active');
+        updateMiningUI();
+        if (typeof originalStopMining === 'function') {
+          originalStopMining();
+        }
+      };
+
+      // Подписываемся на смену языка
+      if (i18next.on) {
+        i18next.on('languageChanged', function() {
+          updateMiningUI();
+          // Можно также обновить другие динамические элементы, если появятся
+        });
+      }
+
+      // Первоначальное обновление
+      updateMiningUI();
+    }
+
+    // Запускаем, когда i18next готов и DOM загружен
+    function runWhenReady() {
+      if (typeof i18next !== 'undefined' && i18next.isInitialized) {
+        initWalletUI();
+      } else {
+        document.addEventListener('i18next:initialized', initWalletUI);
+      }
+    }
+
+    // Если DOM уже загружен, запускаем сразу, иначе ждём
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', runWhenReady);
+    } else {
+      runWhenReady();
+    }
+  })();
+</script>
+{% endblock %}
+{% endblock %}

@@ -1,0 +1,905 @@
+{% extends "base.html" %}
+
+{% block title %}Dark Messenger{% endblock %}
+
+{% block content %}
+<style>
+  /* === Единая тема из wallet.html === */
+  :root {
+    --glass-bg: rgba(20, 20, 30, 0.6);
+    --glass-border: rgba(255, 255, 255, 0.08);
+    --accent-color: #6c5ce7;
+    --accent-glow: rgba(108, 92, 231, 0.4);
+    --success-color: #00b894;
+    --danger-color: #d63031;
+    --text-main: #f5f6fa;
+    --text-muted: #a4b0be;
+    --bg-primary: #0a0a0f;
+    --radius-md: 12px;
+  }
+
+  /* Анимация */
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  /* Основной чат-лейаут */
+  .chat-layout {
+    animation: fadeInUp 0.6s ease-out;
+    display: flex;
+    gap: 20px;
+    height: calc(100vh - 80px);
+    max-height: 800px;
+    background: transparent;
+  }
+
+  /* Панель бесед */
+  .conversations-panel {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    display: flex;
+    flex-direction: column;
+    width: 320px;
+    min-width: 280px;
+    overflow: hidden;
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+  }
+
+  .conversations-panel:hover {
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+
+  .conversations-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--glass-border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .conversations-header h3 {
+    margin: 0;
+    color: var(--text-main);
+    font-weight: 700;
+    font-size: 18px;
+  }
+
+  .conversations-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 4px;
+  }
+
+  .conversations-list::-webkit-scrollbar {
+    width: 4px;
+  }
+  .conversations-list::-webkit-scrollbar-thumb {
+    background: var(--accent-color);
+    border-radius: 50px;
+  }
+
+  /* Элемент беседы */
+  .conversation-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    border-radius: 16px;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.2s;
+    border-bottom: 1px solid var(--glass-border);
+    margin: 4px 8px;
+  }
+
+  .conversation-item:hover {
+    background: rgba(255, 255, 255, 0.05);
+    transform: translateX(4px);
+  }
+
+  .conversation-item.active {
+    background: rgba(108, 92, 231, 0.2);
+    border-left: 3px solid var(--accent-color);
+  }
+
+  .conversation-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: var(--accent-color);
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 600;
+    font-size: 16px;
+    flex-shrink: 0;
+  }
+
+  .conversation-info {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .conversation-info .name {
+    color: var(--text-main);
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .conversation-info .last-message {
+    color: var(--text-muted);
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .conversation-meta {
+    text-align: right;
+    flex-shrink: 0;
+  }
+
+  .conversation-meta .time {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .conversation-meta .unread {
+    background: var(--accent-color);
+    color: white;
+    border-radius: 50px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    display: inline-block;
+    margin-top: 4px;
+  }
+
+  /* Панель чата */
+  .chat-panel {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+    min-width: 0;
+  }
+
+  .chat-panel:hover {
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+
+  .chat-panel-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--glass-border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .chat-panel-header .title {
+    flex: 1;
+    color: var(--text-main);
+    font-weight: 600;
+    font-size: 16px;
+  }
+
+  .chat-panel-header .subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+    display: block;
+    font-weight: 400;
+  }
+
+  .chat-panel-header .actions {
+    display: flex;
+    gap: 6px;
+  }
+
+  .back-button {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 24px;
+    cursor: pointer;
+    padding: 0 4px;
+    display: none;
+  }
+
+  .back-button:hover {
+    color: var(--text-main);
+  }
+
+  /* Контейнер сообщений */
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .messages::-webkit-scrollbar {
+    width: 4px;
+  }
+  .messages::-webkit-scrollbar-thumb {
+    background: var(--accent-color);
+    border-radius: 50px;
+  }
+
+  /* Сообщения */
+  .message {
+    max-width: 70%;
+    padding: 10px 16px;
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-main);
+    word-break: break-word;
+    animation: fadeIn 0.3s ease;
+    border: 1px solid var(--glass-border);
+  }
+
+  .message.sent {
+    align-self: flex-end;
+    background: var(--accent-color);
+    color: white;
+    border: none;
+  }
+
+  .message .time {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    text-align: right;
+  }
+
+  .message.sent .time {
+    color: rgba(255, 255, 255, 0.7);
+  }
+
+  .message .image-attachment {
+    max-width: 200px;
+    border-radius: 12px;
+    cursor: pointer;
+    margin-bottom: 6px;
+  }
+
+  /* Пустое состояние */
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text-muted);
+  }
+
+  .empty-state .icon {
+    font-size: 48px;
+    margin-bottom: 16px;
+  }
+
+  .empty-state p {
+    font-size: 16px;
+  }
+
+  /* Область ввода */
+  .input-area {
+    padding: 12px 16px;
+    border-top: 1px solid var(--glass-border);
+    background: transparent;
+  }
+
+  .input-wrapper {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 50px;
+    padding: 4px 8px;
+    border: 1px solid var(--glass-border);
+  }
+
+  .input-wrapper textarea {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--text-main);
+    resize: none;
+    padding: 8px 12px;
+    font-size: 14px;
+    outline: none;
+    font-family: inherit;
+    max-height: 100px;
+    min-height: 40px;
+    line-height: 1.4;
+  }
+
+  .input-wrapper textarea::placeholder {
+    color: var(--text-muted);
+  }
+
+  .input-actions {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+
+  /* Кнопки — как в wallet */
+  .btn-primary-oval {
+    padding: 10px 20px;
+    border-radius: 50px;
+    border: none;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
+    color: white;
+    font-size: 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    box-shadow: 0 4px 15px var(--accent-glow);
+    white-space: nowrap;
+  }
+
+  .btn-primary-oval:hover:not(:disabled) {
+    opacity: 0.9;
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px var(--accent-glow);
+  }
+
+  .btn-primary-oval:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+  }
+
+  .btn-oval {
+    padding: 10px 20px;
+    border-radius: 50px;
+    border: none;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-main);
+    font-size: 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    border: 1px solid var(--glass-border);
+  }
+
+  .btn-oval:hover {
+    background: rgba(255, 255, 255, 0.1);
+    transform: translateY(-1px);
+  }
+
+  .btn-icon-oval {
+    padding: 6px;
+    border-radius: 50px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    font-size: 18px;
+  }
+
+  .btn-icon-oval:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-main);
+  }
+
+  .btn-icon-oval:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .input-actions-left,
+  .input-actions-right {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+
+  .ai-tool-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 18px;
+    padding: 4px 6px;
+    border-radius: 50px;
+    transition: background 0.2s, color 0.2s;
+  }
+
+  .ai-tool-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-main);
+  }
+
+  .ai-tool-btn[data-active="true"] {
+    color: var(--accent-color);
+  }
+
+  /* Модальные окна — стеклянные */
+  .modal-overlay {
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+  }
+
+  .modal {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+    color: var(--text-main);
+    max-width: 500px;
+    width: 90%;
+    margin: 20px auto;
+  }
+
+  .modal-header {
+    border-bottom: 1px solid var(--glass-border);
+    padding: 18px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .modal-header h3 {
+    margin: 0;
+    font-weight: 700;
+  }
+
+  .modal-close {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 28px;
+    cursor: pointer;
+    padding: 0 8px;
+  }
+
+  .modal-close:hover {
+    color: var(--text-main);
+  }
+
+  .modal-body {
+    padding: 24px;
+  }
+
+  .modal-footer {
+    padding: 16px 24px;
+    border-top: 1px solid var(--glass-border);
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+  }
+
+  .form-group {
+    margin-bottom: 16px;
+  }
+
+  .form-group label {
+    color: var(--text-muted);
+    font-size: 14px;
+    display: block;
+    margin-bottom: 6px;
+  }
+
+  .input {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--glass-border);
+    border-radius: 50px;
+    padding: 10px 16px;
+    color: var(--text-main);
+    font-size: 14px;
+    outline: none;
+    transition: border 0.3s;
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .input:focus {
+    border-color: var(--accent-color);
+  }
+
+  .input-monospace {
+    font-family: monospace;
+  }
+
+  .text-secondary {
+    color: var(--text-muted);
+  }
+  .text-muted {
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  .text-center {
+    text-align: center;
+  }
+  .hidden {
+    display: none !important;
+  }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0,0,0,0);
+    border: 0;
+  }
+
+  /* Специфично для AI чата */
+  #aiChatContainer {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: transparent;
+    border-radius: 24px;
+    overflow: hidden;
+  }
+
+  #aiChatContainer .messages {
+    background: transparent;
+  }
+
+  #aiChatContainer .input-area {
+    background: transparent;
+  }
+
+  /* Медиазапросы для адаптивности */
+  @media (max-width: 768px) {
+    .chat-layout {
+      flex-direction: column;
+      height: calc(100vh - 70px);
+      max-height: none;
+      gap: 10px;
+    }
+    .conversations-panel {
+      width: 100%;
+      min-width: unset;
+      height: 100%;
+      border-radius: 16px;
+    }
+    .chat-panel {
+      height: 100%;
+      border-radius: 16px;
+      display: none;
+    }
+    .chat-panel.active {
+      display: flex;
+    }
+    .back-button {
+      display: inline-block;
+    }
+    .message {
+      max-width: 85%;
+    }
+  }
+
+  @media (min-width: 769px) {
+    .back-button {
+      display: none !important;
+    }
+    .conversations-panel {
+      display: flex !important;
+    }
+    .chat-panel {
+      display: flex !important;
+    }
+  }
+</style>
+
+<div id="app" data-user-address="{{ address }}"></div>
+
+<div class="chat-layout">
+  <div class="conversations-panel" id="conversationsPanel">
+    <div class="conversations-header">
+      <h3 data-i18n="chats">Chats</h3>
+      <div class="header-actions">
+        <button id="aiChatBtn" class="btn-icon-oval" title="AI Assistant">🤖</button>
+        <button id="newChatBtn" class="btn-icon-oval" data-i18n="new_chat" title="New chat">＋</button>
+      </div>
+    </div>
+    <div class="conversations-list" id="conversationsList">
+      <div class="empty-state"><div class="icon">💬</div><p data-i18n="select_conversation">Select or start a conversation</p></div>
+    </div>
+  </div>
+
+  <div class="chat-panel" id="chatPanel">
+    <div class="chat-panel-header">
+      <button class="back-button" id="backToConversationsBtn" aria-label="Back">←</button>
+      <div class="title">
+        <span id="currentChatName" data-i18n="select_conversation">Select a conversation</span>
+        <span class="subtitle" id="chatSubtitle"></span>
+      </div>
+      <div class="actions">
+        <button id="addToContactsBtn" class="btn-icon-oval" disabled title="Add to contacts">
+    <img src="/static/icons/Contact.png" width="20" height="20" alt="Add contact" style="filter: invert(1);">
+</button>
+        <button id="clearConversationBtn" class="btn-icon-oval" disabled title="Clear messages" >
+    <img src="/static/icons/Remove.png" width="20" height="20" alt="Clear" style="filter: invert(1);">
+</button>
+        <button id="callButton" class="btn-icon-oval" title="Voice/Video call" style="display: none;">
+    <img src="/static/icons/Call.png" width="24" height="24" alt="Voice call" style="filter: invert(1);">
+</button>
+        <button id="videoCallButton" class="btn-icon-oval" title="Video call" style="display: none;">
+           <img src="/static/icons/Video.png" width="24" height="24" alt="Video call" style="filter: invert(1);">
+        </button>
+      </div>
+    </div>
+
+    <div class="messages" id="messagesContainer" role="log" aria-live="polite">
+      <div class="empty-state" id="emptyState"><div class="icon">👋</div><p data-i18n="select_conversation">Select a conversation to start chatting</p></div>
+    </div>
+
+    <form class="input-area" onsubmit="sendMessage(); return false;">
+      <div class="input-wrapper">
+        <textarea id="messageContent" placeholder="Type a message…" rows="1" disabled aria-label="Message input" data-i18n="type_message"></textarea>
+        <div class="input-actions">
+          <input type="file" id="imageInput" accept="image/*" class="sr-only">
+          <button type="button" class="btn-icon-oval" id="attachImageButton" disabled title="Attach image" >
+    <img src="/static/icons/Attach.png" width="20" height="20" alt="Attach" style="filter: invert(1);">
+</button>
+          <button type="button" class="btn-icon-oval" id="recordAudioButton" disabled title="Record voice message"><img src="/static/icons/Mic.png" width="20" height="20" alt="Record" style="filter: invert(1);"></button>          <button type="submit" class="btn-primary-oval" id="sendButton" disabled style="display: none;" data-i18n="send">➤</button>
+        </div>
+      </div>
+    </form>
+
+    <div id="aiChatContainer" class="hidden">
+      <div class="chat-panel-header">
+        <button class="back-button" id="closeAiFromChatBtn">←</button>
+        <div class="title">
+          <span data-i18n="ai_assistant">🤖 AI Assistant</span>
+          <span class="subtitle" id="aiStatusSubtitle" data-i18n="ai_status">Internet · Streaming</span>
+        </div>
+        <div class="actions">
+          <button type="button" id="aiClearHistoryBtn" class="btn-icon-oval" title="Clear history" ><img src="/static/icons/Remove.png" width="20" height="20" alt="Clear" style="filter: invert(1);"></button>
+        </div>
+      </div>
+      <div id="aiMessagesContainer" class="messages"></div>
+      <form class="input-area" onsubmit="return false;">
+        <div class="input-wrapper">
+          <textarea id="aiMessageInput" placeholder="Ask AI… (paste a link to read)" rows="1" data-i18n="type_message"></textarea>
+          <div class="input-actions-left">
+            <button type="button" id="aiImageGenBtn" class="ai-tool-btn" data-tooltip="Generate image" style="display: none;">🎨</button>
+            <button type="button" id="aiInternetBtn" class="ai-tool-btn" data-tooltip="Web search on/off" data-active="false">🌐</button>
+            <button type="button" id="aiReasoningBtn" class="ai-tool-btn" data-tooltip="Reasoning on/off" data-active="false">🧠</button>
+            <button type="button" id="aiResearchBtn" class="ai-tool-btn" data-tooltip="Research mode (hypotheses & verification)">🔬</button>
+          </div>
+          <div class="input-actions-right">
+            <input type="file" id="aiImageInput" accept="image/*" class="sr-only">
+            <button type="button" id="aiAttachBtn" class="btn-icon-oval" title="Attach image">
+    <img src="/static/icons/Attach.png" width="20" height="20" alt="Attach" style="filter: invert(1);">
+</button>
+            <button type="submit" id="aiSendBtn" class="btn-primary-oval" data-i18n="send">➤</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- New chat modal -->
+<div id="newChatModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal">
+    <header class="modal-header">
+      <h3 data-i18n="start_new_chat">Start New Chat</h3>
+      <button class="modal-close" onclick="closeNewChatModal()">&times;</button>
+    </header>
+    <div class="modal-body">
+      <div class="text-center">
+        <button class="btn-oval" onclick="QRManager.openForChat()" >
+    <img src="/static/icons/Cam.png" width="20" height="20" alt="Scan QR" style="filter: invert(1);"> Scan QR Code
+</button>
+        <div id="qrScannerContainerModal" class="qr-scanner-container hidden">
+    <div class="qr-video-wrapper">
+        <video id="qrVideoModal" playsinline autoplay muted disablepictureinpicture></video>
+        <div class="qr-frame"></div>
+    </div>
+    <p class="text-muted" style="margin: 12px 0 8px;" data-i18n="scan_qr">Point camera at QR code</p>
+    <div id="scanResultModal" class="scan-result hidden"></div>
+    <button class="btn-oval" onclick="QRManager.closeScanner()" data-i18n="cancel">Cancel</button>
+</div>
+
+      </div>
+      <div class="form-group">
+        <label class="text-secondary" data-i18n="select_from_contacts">Select from contacts</label>
+        <select id="newChatSelect" class="input"><option value="">-- Choose a contact --</option></select>
+      </div>
+      <div class="form-group">
+        <label class="text-secondary" data-i18n="or_enter_address">Or enter address</label>
+        <input type="text" id="newChatAddress" class="input input-monospace" placeholder="64-character hex address" maxlength="64">
+      </div>
+    </div>
+    <footer class="modal-footer">
+      <button class="btn-oval" onclick="closeNewChatModal()" data-i18n="cancel">Cancel</button>
+      <button class="btn-primary-oval" id="startNewChatBtn" onclick="startNewChat()" data-i18n="start_chat">Start Chat</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Image modal -->
+<div id="imageModal" class="modal-overlay hidden">
+  <div class="modal" style="max-width:90vw;max-height:90vh;background:transparent;border:none;box-shadow:none;">
+    <button class="modal-close" onclick="closeImageModal()" style="position:absolute;top:16px;right:16px;color:var(--text-primary);z-index:1;">&times;</button>
+    <img id="modalImage" src="" alt="Full size" style="max-width:100%;max-height:90vh;border-radius:var(--radius-md);">
+    <div class="text-center" style="margin-top:16px;">
+      <button class="btn-primary-oval" id="downloadImageBtn" data-i18n="download">Download</button>
+    </div>
+  </div>
+</div>
+
+<script>window.process = window.process || { env: {} };</script>
+
+
+<script src="{{ url_for('static', path='js/ui.js') }}"></script>
+<script src="{{ url_for('static', path='js/actions.js') }}"></script>
+<!-- call-manager.js загружается из base.html с defer -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="{{ url_for('static', path='js/AiChat.js') }}" defer></script>
+
+<script>
+// Adaptive logic (improved)
+(function() {
+  const conversationsPanel = document.getElementById('conversationsPanel');
+  const chatPanel = document.getElementById('chatPanel');
+  const backBtn = document.getElementById('backToConversationsBtn');
+
+  function isMobile() { return window.innerWidth < 768; }
+
+  if (!isMobile()) {
+    conversationsPanel.style.display = 'flex';
+    chatPanel.style.display = 'flex';
+  }
+
+  window.showConversationsList = function() {
+    if (!isMobile()) return;
+    conversationsPanel.style.display = 'flex';
+    chatPanel.style.display = 'none';
+    document.body.classList.remove('chat-open');
+  };
+
+  window.showChatPanel = function() {
+    if (!isMobile()) return;
+    conversationsPanel.style.display = 'none';
+    chatPanel.style.display = 'flex';
+    document.body.classList.add('chat-open');
+  };
+
+  if (backBtn) {
+    backBtn.addEventListener('click', () => {
+      if (window.State?.currentChatAddress === 'ai_bot') {
+        const firstConv = document.querySelector('.conversation-item');
+        if (firstConv?.dataset.address) {
+          window.selectConversation(firstConv.dataset.address, '', firstConv.dataset.isGroup === '1');
+        } else {
+          if (isMobile()) window.showConversationsList();
+        }
+      } else {
+        if (isMobile()) window.showConversationsList();
+      }
+    });
+  }
+
+  const originalSelect = window.selectConversation;
+  if (originalSelect) {
+    window.selectConversation = function(address, name, isGroup) {
+      originalSelect(address, name, isGroup);
+      if (isMobile() && address) {
+        if (address === 'ai_bot' || (address && address !== '')) {
+          window.showChatPanel();
+        }
+      }
+      const callBtn = document.getElementById('callButton');
+const videoBtn = document.getElementById('videoCallButton');
+if (!isGroup && address && address !== window.State?.userAddress && address !== 'ai_bot') {
+    const displayName = name || (address ? address.slice(0, 10) + '…' : '');
+    callBtn.style.display = 'inline-flex';
+    callBtn.onclick = () => window.CallManager?.makeCall(address, false, displayName);
+    videoBtn.style.display = 'inline-flex';
+    videoBtn.onclick = () => window.CallManager?.makeCall(address, true, displayName);
+} else {
+    callBtn.style.display = 'none';
+    videoBtn.style.display = 'none';
+}
+    };
+  }
+
+  window.addEventListener('resize', () => {
+    if (!isMobile()) {
+      conversationsPanel.style.display = 'flex';
+      chatPanel.style.display = 'flex';
+      document.body.classList.remove('chat-open');
+    } else {
+      const activeChat = window.State?.currentChatAddress;
+      if (!activeChat || activeChat === '') {
+        window.showConversationsList();
+      } else {
+        window.showChatPanel();
+      }
+    }
+  });
+
+  const closeAiBtn = document.getElementById('closeAiFromChatBtn');
+  if (closeAiBtn) {
+    closeAiBtn.addEventListener('click', () => {
+      if (window.State?.currentChatAddress === 'ai_bot') {
+        const firstConv = document.querySelector('.conversation-item');
+        if (firstConv?.dataset.address) {
+          window.selectConversation(firstConv.dataset.address, '', firstConv.dataset.isGroup === '1');
+        } else {
+          if (isMobile()) window.showConversationsList();
+        }
+      } else {
+        if (isMobile()) window.showConversationsList();
+      }
+    });
+  }
+
+  if (isMobile() && !window.location.search.includes('start_with')) {
+    window.showConversationsList();
+  }
+  if (window.location.search.includes('start_with')) {
+    setTimeout(() => { if (isMobile()) window.showChatPanel(); }, 200);
+  }
+
+  document.addEventListener('DOMContentLoaded', function() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const startWith = urlParams.get('start_with');
+    const startName = urlParams.get('name');
+    if (startWith) {
+      const trySelect = (attempt = 1) => {
+        if (typeof window.selectConversation === 'function') {
+          window.selectConversation(
+            startWith,
+            startName || (startWith.startsWith('group:') ? 'Group' : startWith.slice(0, 10) + '…'),
+            startWith.startsWith('group:')
+          );
+        } else if (attempt <= 3) {
+          setTimeout(() => trySelect(attempt + 1), 500);
+        }
+      };
+      setTimeout(() => trySelect(), 300);
+    }
+
+    if (window.CallManager && typeof window.CallManager.init === 'function' && !window.CallManager._initialized) {
+      window.CallManager.init().then(() => { window.CallManager._initialized = true; });
+    }
+  });
+})();
+</script>
+{% endblock %}

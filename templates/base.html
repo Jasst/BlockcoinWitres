@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <link rel="manifest" href="/manifest.json">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
+  <meta name="description" content="Decentralized encrypted messenger">
+  <meta name="theme-color" content="#0a0a0a">
+  <meta name="color-scheme" content="dark">
+  <meta name="user-address" content="{{ address|default('', true) }}">
+
+  <title>{% block title %}Dark Messenger{% endblock %}</title>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/2.4.1/purify.min.js"></script>
+  <link rel="icon" href="{{ url_for('static', path='favicon.ico') }}" type="image/x-icon">
+  <link rel="apple-touch-icon" href="{{ url_for('static', path='icon-192.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+
+  <!-- Единый стиль для всех страниц (дополнение к style.css) -->
+  <style>
+    /* === Единая тема (дублируем переменные для надёжности) === */
+    :root {
+      --glass-bg: rgba(20, 20, 30, 0.6);
+      --glass-border: rgba(255, 255, 255, 0.08);
+      --accent-color: #6c5ce7;
+      --accent-glow: rgba(108, 92, 231, 0.4);
+      --success-color: #00b894;
+      --danger-color: #d63031;
+      --text-main: #f5f6fa;
+      --text-muted: #a4b0be;
+      --bg-primary: #0a0a0f;
+    }
+
+    /* Анимации */
+    @keyframes fadeInUp {
+      from { opacity: 0; transform: translateY(20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ---------- НАВИГАЦИЯ (bottom-nav) ---------- */
+    .bottom-nav {
+      background: var(--glass-bg);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border-top: 1px solid var(--glass-border);
+      box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.3);
+      display: flex;
+      justify-content: space-around;
+      padding: 8px 0 env(safe-area-inset-bottom);
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 1000;
+      transition: transform 0.3s ease;
+    }
+
+    .bottom-nav-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      padding: 6px 12px;
+      border-radius: 50px;
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 11px;
+      font-weight: 500;
+      transition: color 0.2s, background 0.2s, transform 0.2s;
+      min-width: 56px;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+    }
+
+    .bottom-nav-item .nav-icon {
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .bottom-nav-item .nav-icon svg {
+      stroke: currentColor;
+      fill: none;
+    }
+
+    .bottom-nav-item .nav-label {
+      font-size: 10px;
+      line-height: 1.2;
+      letter-spacing: 0.3px;
+    }
+
+    .bottom-nav-item:hover {
+      color: var(--text-main);
+      background: rgba(255, 255, 255, 0.05);
+      transform: translateY(-2px);
+    }
+
+    .bottom-nav-item.active {
+      color: var(--accent-color);
+      background: rgba(108, 92, 231, 0.15);
+      box-shadow: 0 0 20px var(--accent-glow);
+    }
+
+    .bottom-nav-item.active .nav-icon svg {
+      stroke: var(--accent-color);
+      fill: var(--accent-color);
+    }
+
+    /* ---------- МОДАЛЬНЫЕ ОКНА ЗВОНКОВ ---------- */
+    .modal-overlay {
+      background: rgba(0, 0, 0, 0.7);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: fixed;
+      inset: 0;
+      z-index: 2000;
+      padding: 20px;
+    }
+
+    .modal-overlay.hidden {
+      display: none !important;
+    }
+
+    .call-modal {
+      background: var(--glass-bg);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--glass-border);
+      border-radius: 24px;
+      box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+      color: var(--text-main);
+      max-width: 340px;
+      width: 90%;
+      padding: 24px 20px 20px;
+      text-align: center;
+      position: relative;
+    }
+
+    .call-modal .call-avatar {
+      font-size: 56px;
+      margin-bottom: 8px;
+    }
+
+    .call-modal .call-name {
+      font-size: 20px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .call-modal .call-status {
+      font-size: 14px;
+      color: var(--text-muted);
+      margin-bottom: 20px;
+    }
+
+    .call-modal .call-actions-row {
+      display: flex;
+      justify-content: center;
+      gap: 16px;
+      margin-top: 12px;
+    }
+
+    .call-control-btn {
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      border: none;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text-main);
+      font-size: 24px;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.2s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .call-control-btn:hover {
+      background: rgba(255, 255, 255, 0.15);
+      transform: scale(1.05);
+    }
+
+    .call-control-btn.call-end-btn {
+      background: var(--danger-color);
+      color: white;
+      box-shadow: 0 4px 15px rgba(214, 48, 49, 0.4);
+    }
+
+    .call-control-btn.call-end-btn:hover {
+      background: #c0392b;
+      transform: scale(1.08);
+    }
+
+    .call-control-btn.call-reject-btn {
+      background: var(--danger-color);
+      color: white;
+    }
+
+    .call-control-btn.call-accept-btn {
+      background: var(--success-color);
+      color: white;
+    }
+
+    .call-minimize-btn {
+      position: absolute;
+      top: 12px;
+      right: 16px;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 20px;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 50px;
+      transition: background 0.2s;
+    }
+
+    .call-minimize-btn:hover {
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    /* ---------- УВЕДОМЛЕНИЯ ---------- */
+    #notification-container {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      z-index: 3000;
+      max-width: 360px;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      pointer-events: none;
+    }
+
+    #notification-container .notification {
+      background: var(--glass-bg);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--glass-border);
+      border-radius: 16px;
+      padding: 14px 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+      color: var(--text-main);
+      pointer-events: auto;
+      animation: fadeInUp 0.3s ease;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    #notification-container .notification .icon {
+      font-size: 24px;
+      flex-shrink: 0;
+    }
+
+    #notification-container .notification .content {
+      flex: 1;
+      font-size: 14px;
+    }
+
+    #notification-container .notification .content .title {
+      font-weight: 600;
+    }
+
+    #notification-container .notification .close-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 18px;
+      padding: 0 4px;
+    }
+
+    #notification-container .notification .close-btn:hover {
+      color: var(--text-main);
+    }
+
+    /* ---------- АДАПТИВНОСТЬ ---------- */
+    @media (max-width: 768px) {
+      .bottom-nav-item {
+        min-width: 48px;
+        padding: 4px 8px;
+      }
+      .bottom-nav-item .nav-label {
+        font-size: 9px;
+      }
+      .call-modal {
+        padding: 20px 16px;
+      }
+      #notification-container {
+        top: 10px;
+        right: 10px;
+        max-width: calc(100% - 20px);
+      }
+    }
+
+    /* Общие стили для кнопок (если нужны в base) */
+    .btn-primary-oval {
+      padding: 12px 24px;
+      border-radius: 50px;
+      border: none;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
+      color: white;
+      font-size: 14px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      box-shadow: 0 4px 15px var(--accent-glow);
+      white-space: nowrap;
+    }
+
+    .btn-primary-oval:hover {
+      opacity: 0.9;
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px var(--accent-glow);
+    }
+
+    .btn-oval {
+      padding: 12px 24px;
+      border-radius: 50px;
+      border: 1px solid var(--glass-border);
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text-main);
+      font-size: 14px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .btn-oval:hover {
+      background: rgba(255, 255, 255, 0.1);
+      transform: translateY(-1px);
+    }
+
+    /* Скрытый класс для пропуска навигации */
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0,0,0,0);
+      border: 0;
+    }
+  </style>
+
+  {% block head_extra %}{% endblock %}
+  <style>
+  body:not(.i18n-ready) {
+    visibility: hidden;
+  }
+  body.i18n-ready {
+    visibility: visible;
+  }
+</style>
+  <script>
+  setTimeout(() => {
+    if (!document.body.classList.contains('i18n-ready')) {
+      document.body.classList.add('i18n-ready');
+      console.warn('i18n fallback: page shown after timeout');
+    }
+  }, 3000);
+</script>
+  <!-- В base.html, перед </body> или в head -->
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="{{ url_for('static', path='js/qr-manager.js') }}" defer></script>
+</head>
+
+<body>
+  <a href="#main" class="sr-only">Skip to main content</a>
+
+  <div class="app-container">
+    <div class="content-wrapper">
+      {% block content %}{% endblock %}
+    </div>
+
+    {% if request.path not in ['/', '/login'] %}
+    <nav class="bottom-nav" aria-label="Main navigation">
+      <a href="/chat" class="bottom-nav-item {% if request.path == '/chat' %}active{% endif %}" data-nav="chat">
+        <span class="nav-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            <circle cx="8" cy="10" r="1.5" fill="currentColor" stroke="none"/>
+            <circle cx="12" cy="10" r="1.5" fill="currentColor" stroke="none"/>
+            <circle cx="16" cy="10" r="1.5" fill="currentColor" stroke="none"/>
+          </svg>
+        </span>
+        <span class="nav-label" data-i18n="chats">Chats</span>
+      </a>
+      <!-- НОВАЯ ССЫЛКА НА ЗВОНКИ -->
+      <a href="/calls" class="bottom-nav-item {% if request.path == '/calls' %}active{% endif %}" data-nav="calls">
+  <span class="nav-icon">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/>
+    </svg>
+  </span>
+  <span class="nav-label" data-i18n="calls">Calls</span>
+</a>
+      <a href="/contacts" class="bottom-nav-item {% if request.path == '/contacts' %}active{% endif %}" data-nav="contacts">
+        <span class="nav-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="8" r="4"/>
+            <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
+          </svg>
+        </span>
+        <span class="nav-label" data-i18n="contacts">Contacts</span>
+      </a>
+      <a href="/groups" class="bottom-nav-item {% if request.path == '/groups' %}active{% endif %}" data-nav="groups">
+        <span class="nav-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="8" cy="7" r="3"/>
+            <circle cx="16" cy="5" r="2.5"/>
+            <path d="M2 20c0-3.314 2.686-6 6-6" class="person-left"/>
+            <path d="M14 20c0-2.761 2.239-5 5-5" class="person-right"/>
+            <path d="M18 12h0.5a2.5 2.5 0 0 1 2.5 2.5V20"/>
+          </svg>
+        </span>
+        <span class="nav-label" data-i18n="groups">Groups</span>
+      </a>
+      <a href="/wallet" class="bottom-nav-item {% if request.path == '/wallet' %}active{% endif %}" data-nav="wallet">
+        <span class="nav-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="12" r="9"/>
+            <path d="M12 7v10M9 9.5c0-.828 1.12-1.5 3-1.5s3 .672 3 1.5-1.12 1.5-3 1.5"/>
+            <path d="M9 14.5c0 .828 1.12 1.5 3 1.5s3-.672 3-1.5"/>
+          </svg>
+        </span>
+        <span class="nav-label" data-i18n="wallet">Wallet</span>
+      </a>
+      <a href="/profile" class="bottom-nav-item {% if request.path == '/profile' %}active{% endif %}" data-nav="profile">
+        <span class="nav-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+          </svg>
+        </span>
+        <span class="nav-label" data-i18n="profile">Profile</span>
+      </a>
+    </nav>
+    {% endif %}
+  </div>
+
+  <!-- Modal for active call -->
+<div id="callModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal call-modal" style="max-width: 340px; text-align: center;">
+    <button class="call-minimize-btn" id="callCollapseBtn" data-i18n-title="call_minimize">—</button>
+
+    <!-- ВИДЕО-КОНТЕЙНЕР (отдельный блок) -->
+      <div class="call-video-container" style="position: relative; width: 100%; aspect-ratio: 1/1; background: #000; border-radius: 12px; overflow: hidden; margin-bottom: 16px; display: none;">      <video id="remoteVideo" autoplay playsinline style="width: 100%; height: 100%; object-fit: cover;"></video>
+     <video id="localVideo" autoplay muted playsinline style="position: absolute; bottom: 10px; right: 10px; width: 120px; height: 90px; object-fit: cover; border-radius: 8px; border: 2px solid var(--glass-border);"></video>    </div>
+
+    <div class="call-avatar" id="callAvatar">👤</div>
+    <div class="call-name" id="callPartnerName"></div>
+    <div class="call-status" id="callStatusText"></div>
+
+    <!-- РЯД КНОПОК (каждая — отдельно) -->
+    <div class="call-actions-row">
+      <button class="call-control-btn" id="callMuteBtn" data-i18n-title="call_mute_microphone">
+    <img src="/static/icons/Mic.png" width="28" height="28" alt="Mute" style="filter: invert(1);">
+</button>
+      <button class="call-control-btn call-end-btn" id="callEndBtn" data-i18n-title="call_end">
+    <img src="/static/icons/Call.png" width="28" height="28" alt="Call" style="filter: invert(1);">
+</button>
+      <button class="call-control-btn" id="callSpeakerBtn" data-i18n-title="call_speaker">🎧</button>
+      <button class="call-control-btn" id="callVideoToggleBtn" style="display: none;" title="Turn off camera">
+    <img src="/static/icons/Video.png" width="24" height="24" alt="Video" style="filter: invert(1);">
+</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal for incoming call -->
+<div id="incomingCallModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal call-modal" style="max-width: 300px; text-align: center;">
+    <div class="call-avatar">📞</div>
+    <div class="call-name" data-i18n="incoming_call">Incoming call</div>
+    <div class="call-status"><span data-i18n="call_from">from</span> <strong id="incomingCallerName"></strong></div>
+    <div class="call-actions-row">
+      <button class="call-control-btn call-reject-btn" id="rejectCallBtn" data-i18n-title="call_reject">
+    <img src="/static/icons/EndCall.png" width="28" height="28" alt="Reject" style="filter: invert(1);">
+</button>
+      <button class="call-control-btn call-accept-btn" id="acceptCallBtn" data-i18n-title="call_accept">
+    <img src="/static/icons/AddCall.png" width="28" height="28" alt="Accept" style="filter: invert(1);">
+</button>
+    </div>
+  </div>
+</div>
+
+
+
+  <div id="notification-container" aria-live="polite" aria-atomic="true"></div>
+  <script src="{{ url_for('static', path='js/WebSocketClient.js') }}" defer></script>
+  <script src="{{ url_for('static', path='js/common.js') }}" defer></script>
+  <script src="{{ url_for('static', path='js/wordlist.js') }}"></script>
+  <script src="{{ url_for('static', path='js/crypto-client.js') }}" defer></script>
+  <script src="{{ url_for('static', path='js/Audio_client.js') }}" defer></script>
+  <script src="{{ url_for('static', path='js/notification-manager.js') }}" defer></script>
+  <script src="{{ url_for('static', path='js/mnemonic-manager.js') }}" defer></script>
+  <script src="{{ url_for('static', path='js/storage-encryption.js') }}" defer></script>
+  <script src="{{ url_for('static', path='js/call-manager.js') }}" defer></script>
+  <script src="{{ url_for('static', path='js/core.js') }}" defer></script>
+
+
+  <script>
+    window.logout = async function() {
+      localStorage.removeItem('encrypted_mnemonic');
+      sessionStorage.removeItem('mnemonic');
+      if (window.wsClient) window.wsClient.disconnect();
+      window.location.href = '/login';
+    };
+
+    (function() {
+      if (window._globalInitDone) return;
+      window._globalInitDone = true;
+
+      document.addEventListener('DOMContentLoaded', async function() {
+        const metaAddress = document.querySelector('meta[name="user-address"]')?.content;
+        if (metaAddress && metaAddress !== 'None' && metaAddress !== '') {
+          if (window.State) window.State.userAddress = metaAddress;
+          else window.userAddress = metaAddress;
+        } else {
+          try {
+            const res = await fetch('/check_session');
+            const data = await res.json();
+            if (data.authenticated && data.address) {
+              if (window.State) window.State.userAddress = data.address;
+              else window.userAddress = data.address;
+            }
+          } catch(e) { console.debug('Session check failed', e); }
+        }
+
+        if (window.State && window.State.userAddress && typeof window.initWebSocket === 'function') {
+          if (!window.wsClient || !window.wsClient.isConnected) {
+            await window.initWebSocket();
+          }
+        }
+
+        if (window.startHeartbeat && !window._heartbeatStarted) {
+          window.startHeartbeat();
+          window._heartbeatStarted = true;
+        }
+        if (window.startStatusPolling && !window._statusPollingStarted) {
+          window.startStatusPolling();
+          window._statusPollingStarted = true;
+        }
+        if (window.startUserStatusPolling && !window._userStatusPollingStarted) {
+          window.startUserStatusPolling();
+          window._userStatusPollingStarted = true;
+        }
+
+        // Push: инициализируем если разрешение уже дано
+        // (если нет — пользователь нажимает "Enable" в профиле)
+        if (Notification.permission === 'granted' && window.initPushNotifications) {
+          window.initPushNotifications().catch(e => console.warn('[Push] init error:', e));
+        }
+      });
+    })();
+  </script>
+
+  <script>
+  // ИСПРАВЛЕНИЕ: SW должен быть зарегистрирован из КОРНЯ (/sw.js), а не из /static/sw.js
+  // Из /static/sw.js scope = /static/ — push для /chat и других страниц не работает
+  // sw.js нужно скопировать/отдавать по пути /sw.js (корень сайта)
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' })
+      .then(reg => {
+        console.log('[SW] Registered, scope:', reg.scope);
+        reg.update(); // проверяем обновление при каждой загрузке
+      })
+      .catch(err => console.error('[SW] Registration failed:', err));
+  }
+</script>
+
+<script src="https://unpkg.com/i18next@21.10.0/dist/umd/i18next.min.js"></script>
+<script src="https://unpkg.com/i18next-browser-languagedetector@7.0.0/dist/umd/i18nextBrowserLanguageDetector.min.js"></script>
+<script src="https://unpkg.com/i18next-http-backend@1.4.1/i18nextHttpBackend.min.js"></script>
+<script src="{{ url_for('static', path='js/i18n.js') }}" defer></script>
+<script>
+(function() {
+    // Глобальный обработчик для кнопки переключения языка (работает всегда)
+    document.body.addEventListener('click', function(e) {
+        const btn = e.target.closest('#langToggle');
+        if (!btn) return;
+        e.preventDefault();
+        const current = (typeof i18next !== 'undefined' && i18next.language) || localStorage.getItem('app_lang') || 'en';
+        const newLang = current === 'ru' ? 'en' : 'ru';
+        if (typeof window.changeLanguage === 'function') {
+            window.changeLanguage(newLang);
+        } else {
+            // fallback – перезагрузка с параметром
+            window.location.href = window.location.pathname + '?lang=' + newLang;
+        }
+    });
+})();
+</script>
+  
+  {% block scripts %}{% endblock %}
+</body>
+
+</html>
