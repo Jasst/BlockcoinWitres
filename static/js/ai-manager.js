@@ -197,23 +197,61 @@ function _clearAiHistory() {
             .then((confirmed) => {
                 if (confirmed) {
                     const sessionId = _currentAiSessionId;
+                    // 1. Удаляем историю сообщений
                     localStorage.removeItem('ai_chat_history_' + sessionId);
-                    if (_aiMessagesContainer) {
-                        _aiMessagesContainer.innerHTML = '';
-                        _displayWelcome();
-                    }
-                    // Удаляем сессию из списка
+
+                    // 2. Удаляем сессию из списка (из localStorage и из DOM)
                     removeAiSession(sessionId);
-                    // Возвращаемся к первому обычному чату или переключаемся на другой
+
+                    // 3. Переключаемся на первый обычный чат (если есть)
                     const firstConv = document.querySelector('.conversation-item:not([data-address^="ai_"])');
                     if (firstConv?.dataset.address) {
                         window.selectConversation(firstConv.dataset.address, '', firstConv.dataset.isGroup === '1');
                     } else {
-                        // Если нет обычных чатов, создаём новую AI-сессию
-                        const newId = createAiSession();
-                        window.selectConversation(newId, 'AI Chat', false);
+                        // 4. Если обычных чатов нет – переходим в пустое состояние
+                        // Сбрасываем текущий чат в State
+                        if (window.State) {
+                            window.State.currentChatAddress = '';
+                            window.State.currentChatIsGroup = false;
+                            window.State.currentChatPartnerAddress = '';
+                        }
+
+                        // Показываем пустое состояние в основном контейнере сообщений
+                        const mainContainer = document.getElementById('messagesContainer');
+                        if (mainContainer) {
+                            mainContainer.innerHTML = `
+                                <div class="empty-state">
+                                    <div class="icon">👋</div>
+                                    <p data-i18n="select_conversation">Select a conversation to start chatting</p>
+                                </div>
+                            `;
+                            mainContainer.style.display = 'flex';
+                        }
+
+                        // Скрываем AI-контейнер, показываем обычные элементы чата
+                        const aiContainer = document.getElementById('aiChatContainer');
+                        if (aiContainer) aiContainer.classList.add('hidden');
+
+                        const mainChatHeader = document.querySelector('.chat-panel .chat-panel-header:not(#aiChatContainer .chat-panel-header)');
+                        const mainInputArea = document.querySelector('.chat-panel .input-area:not(#aiChatContainer .input-area)');
+                        if (mainChatHeader) mainChatHeader.style.display = 'flex';
+                        if (mainInputArea) mainInputArea.style.display = 'flex';
+
+                        // Обновляем заголовок чата
+                        const nameEl = document.getElementById('currentChatName');
+                        if (nameEl) nameEl.textContent = 'Select a conversation';
+                        const subtitleEl = document.getElementById('chatSubtitle');
+                        if (subtitleEl) subtitleEl.textContent = '';
+
+                        // Снимаем активность со всех элементов в списке
+                        document.querySelectorAll('.conversation-item').forEach(item => item.classList.remove('active'));
+
+                        // Если мобильное устройство – показываем список бесед
+                        if (window.innerWidth < 768 && typeof window.showConversationsList === 'function') {
+                            window.showConversationsList();
+                        }
                     }
-                    _showToast('Chat cleared and removed', 'success');
+                    _showToast('Chat deleted', 'success');
                 }
             });
     }
