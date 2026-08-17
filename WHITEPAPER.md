@@ -1,388 +1,225 @@
 # Global Cognitive Network
 
-## A Distributed, Verifiable Memory and Knowledge Layer for Artificial Intelligence
+## A Distributed, Verifiable Knowledge and Memory Layer for Artificial Intelligence
 
 **Project:** BlockcoinWitres
-**Document:** Whitepaper
-**Version:** 0.1 — Concept
-**Status:** Research / Experimental
+**Architecture:** Global Cognitive Network (GCN)
+**Version:** 0.4 — Research Concept
+**Status:** Research / Experimental / Pre-Prototype
 **Date:** August 2026
 
 ---
 
-# Abstract
+# 1. Abstract
 
-Краткое описание всей идеи на одной странице.
+Global Cognitive Network (GCN) is an experimental architecture for persistent, distributed and verifiable machine knowledge.
 
-Современные AI-системы обладают мощными моделями, но их память и знания в основном привязаны к конкретной модели, серверу или организации.
+Its central hypothesis is:
 
-Предлагается исследовать альтернативную архитектуру:
+> **AI knowledge does not have to remain permanently coupled to the model that produced it.**
 
-> **распределённый глобальный слой знаний и памяти, независимый от конкретной AI-модели и устройства.**
+GCN separates:
 
-Система объединяет:
+* intelligence;
+* memory;
+* knowledge;
+* identity;
+* computation;
+* storage;
+* verification.
 
-* distributed knowledge graph;
-* persistent AI memory;
-* peer-to-peer networking;
-* cryptographic provenance;
-* versioned knowledge;
-* consensus / verification;
-* vector and semantic representations;
-* AI Adapter Protocol.
+AI systems interact with the network through a model-independent **AI Adapter Protocol**.
 
-Основная идея:
+Knowledge is represented as versioned objects and events containing provenance, evidence, relationships, contradictions and cryptographic identifiers.
+
+Semantic embeddings may be used for retrieval, but they are not the canonical representation of knowledge.
+
+Blockchain is optional. It may provide identity anchoring, timestamps, state roots or public proofs, while knowledge itself can remain in distributed storage.
+
+GCN does not claim to create AGI or machine consciousness.
+
+The research question is:
+
+> **Can independent AI systems contribute to, verify, retrieve and build upon persistent shared knowledge without sharing their models, local memory or execution environments?**
+
+---
+
+# 2. Problem
+
+Current AI systems generally keep knowledge inside isolated combinations of:
+
+* model parameters;
+* application databases;
+* vector stores;
+* local memory;
+* user context.
+
+As a result, knowledge produced by one system is difficult to transfer to another as structured, persistent and verifiable knowledge.
+
+RAG improves information retrieval, while databases provide persistence, but neither necessarily provides a common knowledge layer containing:
+
+* provenance;
+* evidence;
+* relationships;
+* contradictions;
+* version history;
+* cryptographic integrity;
+* cross-model interoperability.
+
+GCN investigates this missing layer.
+
+---
+
+# 3. Core Concept
+
+GCN treats an AI model as a participant in a larger knowledge system rather than as the sole location of machine knowledge.
 
 ```text
 AI Model
-   ↓
+   │
+   ▼
 AI Adapter
-   ↓
-Global Knowledge Protocol
-   ↓
-Distributed Knowledge Network
-   ↓
-Shared Machine Memory
+   │
+   ▼
+GCN Protocol
+   │
+   ├── Knowledge Graph
+   ├── Evidence
+   ├── Memory
+   ├── Vector Index
+   └── Trust / Proof
+            │
+            ▼
+      Distributed Storage
 ```
+
+The participating systems do not need to share:
+
+* the same model;
+* embedding model;
+* programming language;
+* operating system;
+* hardware;
+* organization.
+
+The network provides a common representation and protocol.
 
 ---
 
-# 1. Introduction
+# 4. Architecture
 
-## 1.1 The current state of AI
+GCN consists of several logically independent layers.
 
-Современные AI-модели обладают огромным количеством параметров, но их знания и память остаются в значительной степени локальными.
+### Intelligence
 
-Разные модели:
+The AI model performs reasoning, interpretation and generation.
 
-```text
-Model A → Memory A
+### Memory
 
-Model B → Memory B
+Stores experiences and locally maintained information.
 
-Model C → Memory C
-```
+### Knowledge
 
-Даже если они решают одну и ту же задачу, их опыт не является общим.
+Represents structured claims, concepts, entities, observations and relationships.
 
-## 1.2 The problem
+### Identity
 
-Основные проблемы:
+Identifies agents and nodes through cryptographic identities.
 
-1. фрагментация знаний;
-2. потеря контекста;
-3. отсутствие общей долговременной памяти;
-4. зависимость памяти от конкретного AI;
-5. сложность проверки происхождения знаний;
-6. невозможность легко переносить память между моделями;
-7. повторное открытие уже известных другим агентам знаний.
+### Computation
 
-## 1.3 The hypothesis
+Remains local to participating systems.
 
-Можно ли отделить:
+### Storage
 
-```text
-Intelligence
-Memory
-Knowledge
-Computation
-Identity
-```
+Stores knowledge objects, events and associated data.
 
-друг от друга?
+### Verification
 
-И сделать память независимым распределённым слоем?
+Provides integrity, provenance and state verification.
+
+This separation allows the model, hardware or node implementation to change without necessarily destroying accumulated knowledge.
 
 ---
 
-# 2. Vision
+# 5. Knowledge Model
 
-## 2.1 Global Cognitive Network
-
-Предлагается концепция Global Cognitive Network (GCN).
-
-GCN — это не одна нейросеть и не один сервер.
-
-Это распределённая инфраструктура, в которой множество AI-агентов и устройств могут использовать общее пространство машинных знаний.
+GCN distinguishes between an **observation**, a **claim**, its **evidence**, and the resulting **knowledge state**.
 
 ```text
-                 GLOBAL KNOWLEDGE
-                       NETWORK
-                          │
-        ┌─────────────────┼─────────────────┐
-        │                 │                 │
-       PC               Phone             Robot
-        │                 │                 │
-       AI                 AI                AI
-        └─────────────────┼─────────────────┘
-                          │
-                    AI ADAPTER
+Observation
+     │
+     ▼
+Claim
+     │
+     ▼
+Evidence
+     │
+     ▼
+Verification
+     │
+     ▼
+Knowledge State
 ```
 
-## 2.2 Model independence
+An observation is information obtained from a source, experiment, API, sensor, agent or interaction.
 
-Сеть не должна зависеть от конкретной LLM.
+A claim is an assertion made by an agent.
 
-Возможные клиенты:
+Evidence may support or contradict a claim.
 
-* LLM;
-* локальные модели;
-* автономные агенты;
-* роботы;
-* мобильные устройства;
-* серверы;
-* специализированные AI-системы.
+A knowledge state represents the current interpretation of the claim together with its history and supporting information.
 
-## 2.3 Shared knowledge, independent intelligence
+Therefore:
 
-Модели могут различаться, но иметь доступ к общему пространству знаний.
+> **A claim is not automatically knowledge.**
 
 ---
 
-# 3. Core Principles
+# 6. Knowledge Objects
 
-## 3.1 Memory is separate from the model
+The canonical unit of GCN is the **Knowledge Object**.
 
-Память не должна быть полностью заперта внутри весов нейросети.
+Objects may represent:
 
-## 3.2 Knowledge is separate from computation
+* claims;
+* concepts;
+* entities;
+* observations;
+* relationships;
+* procedures;
+* evidence;
+* hypotheses;
+* memory events.
 
-Знание должно существовать независимо от машины, которая его обрабатывает.
-
-## 3.3 History is verifiable
-
-Изменения знаний должны оставлять криптографически проверяемый след.
-
-## 3.4 Knowledge is versioned
-
-Знание может изменяться.
-
-Старые версии не должны бесследно исчезать.
-
-## 3.5 No single point of failure
-
-Система не должна зависеть от единственного сервера.
-
-## 3.6 Any compatible AI can participate
-
-Для подключения используется стандартизированный AI Adapter.
-
----
-
-# 4. System Architecture
-
-Общая архитектура:
-
-```text
-┌─────────────────────────────┐
-│          AI MODEL           │
-└──────────────┬──────────────┘
-               │
-               ▼
-┌─────────────────────────────┐
-│        AI ADAPTER           │
-└──────────────┬──────────────┘
-               │
-               ▼
-┌─────────────────────────────┐
-│   GLOBAL KNOWLEDGE PROTOCOL │
-└──────────────┬──────────────┘
-               │
-       ┌───────┴────────┐
-       │                │
-       ▼                ▼
-Knowledge Graph     Vector Index
-       │                │
-       └───────┬────────┘
-               ▼
-┌─────────────────────────────┐
-│ DISTRIBUTED STORAGE / P2P   │
-└──────────────┬──────────────┘
-               │
-               ▼
-┌─────────────────────────────┐
-│ CRYPTOGRAPHIC TRUST LAYER   │
-└─────────────────────────────┘
-```
-
----
-
-# 5. Knowledge Objects
-
-Что является единицей глобального знания?
-
-Предлагается концепция:
-
-```text
-Knowledge Object
-```
-
-Пример:
+Example:
 
 ```json
 {
-  "id": "kg:...",
+  "id": "kg:7f91...",
+  "type": "claim",
   "subject": "Python",
   "predicate": "used_for",
   "object": "machine_learning",
+  "author": "did:node:abc123",
+  "created": "2026-08-18T00:00:00Z",
+  "evidence": ["ev:123", "ev:456"],
   "confidence": 0.98,
-  "sources": [],
-  "created": "...",
-  "version": 1
+  "version": 3,
+  "content_hash": "...",
+  "signature": "..."
 }
 ```
 
-## 5.1 Facts
-
-Факты.
-
-## 5.2 Concepts
-
-Понятия.
-
-## 5.3 Relationships
-
-Связи между объектами.
-
-## 5.4 Observations
-
-Наблюдения.
-
-## 5.5 Hypotheses
-
-Гипотезы.
-
-## 5.6 Procedures
-
-Процедурные знания.
-
-## 5.7 Evidence
-
-Доказательства и источники.
+The schema is intentionally experimental and remains an open research question.
 
 ---
 
-# 6. Machine Memory
+# 7. Knowledge State and Events
 
-Память рассматривается как отдельный слой.
+Knowledge is not treated as a permanently fixed value.
 
-## 6.1 Episodic memory
-
-События и опыт.
-
-## 6.2 Semantic memory
-
-Факты и понятия.
-
-## 6.3 Associative memory
-
-Связи между знаниями.
-
-## 6.4 Procedural memory
-
-Навыки и процедуры.
-
-## 6.5 Working memory
-
-Текущий контекст AI.
-
-## 6.6 Global memory
-
-Знания, доступные нескольким независимым узлам.
-
----
-
-# 7. Memory Graph
-
-Граф является структурой отношений между знаниями.
-
-```text
-             Python
-              │
-       ┌──────┼──────┐
-       ▼      ▼      ▼
- Programming AI    Software
-       │
-       ▼
- Machine Learning
-```
-
-Граф позволяет выполнять:
-
-* associative retrieval;
-* semantic traversal;
-* relationship discovery;
-* context expansion;
-* knowledge consolidation.
-
----
-
-# 8. Semantic and Vector Layer
-
-Векторы используются для семантического поиска.
-
-Важно:
-
-> **Embedding не является заменой исходному знанию.**
-
-Embedding используется как индекс семантического пространства.
-
-```text
-Text / Knowledge
-       ↓
-Embedding
-       ↓
-Vector Index
-       ↓
-Semantic Retrieval
-       ↓
-Knowledge Objects
-```
-
-Само знание должно сохраняться отдельно.
-
----
-
-# 9. Distributed Storage
-
-Blockchain не должен использоваться как гигантское хранилище текстов.
-
-Предлагается разделить:
-
-```text
-CONTENT
-   ↓
-Distributed Storage
-
-PROOF
-   ↓
-Blockchain / Merkle Structure
-```
-
-В blockchain могут храниться:
-
-* content hash;
-* object ID;
-* version;
-* timestamp;
-* source hash;
-* signatures;
-* Merkle roots;
-* memory events.
-
----
-
-# 10. Blockchain and Cryptographic Provenance
-
-## 10.1 Why blockchain?
-
-Blockchain используется как слой доверия и истории.
-
-Не как основной storage.
-
-## 10.2 Memory events
-
-Каждое существенное изменение памяти может быть событием:
+Changes are represented as events:
 
 ```text
 CREATE
@@ -391,25 +228,316 @@ LINK
 UNLINK
 MERGE
 SPLIT
+SUPPORT
+CONTRADICT
+VERIFY
+RETRACT
 REINFORCE
 DECAY
-REJECT
-RETRACT
 ```
 
-## 10.3 Immutable history
+Example lifecycle:
 
-История событий должна быть проверяемой.
+```text
+Observation A
+      │
+      ▼
+    Claim
+      │
+      ▼
+  Evidence B
+      │
+      ▼
+Confidence ↑
+      │
+      ▼
+  Evidence C
+      │
+      ▼
+Confidence ↓
+      │
+      ▼
+ Retraction
+```
 
-## 10.4 Mutable knowledge
+This produces:
 
-Само знание может эволюционировать.
+```text
+Immutable History
+       +
+Mutable Knowledge State
+```
+
+Historical states remain reconstructable rather than being silently overwritten.
 
 ---
 
-# 11. Merkle State
+# 8. Contradictory Knowledge
 
-Для больших объёмов знаний предлагается использовать Merkle structures.
+GCN does not require conflicting claims to be automatically deleted.
+
+```text
+Claim A
+   │
+   └── contradicts ──► Claim B
+```
+
+Both claims may remain available together with:
+
+* provenance;
+* evidence;
+* timestamps;
+* confidence;
+* verification history;
+* temporal context.
+
+The consuming AI can then determine which claim is appropriate for a particular context.
+
+This treats disagreement as information rather than corruption.
+
+---
+
+# 9. Memory Model
+
+GCN distinguishes several forms of machine memory.
+
+### Working Memory
+
+Temporary information required for current reasoning.
+
+### Episodic Memory
+
+Records of events and experiences.
+
+### Semantic Memory
+
+Generalized concepts and facts extracted from experience.
+
+### Associative Memory
+
+Relationships between concepts, entities, events and experiences.
+
+### Procedural Memory
+
+Knowledge describing how tasks can be performed.
+
+### Global Knowledge
+
+Information explicitly published for use by other systems.
+
+Local memory does not automatically become global knowledge.
+
+---
+
+# 10. Knowledge Graph
+
+Knowledge Objects can form a graph:
+
+```text
+              Python
+                │
+        ┌───────┼────────┐
+        ▼       ▼        ▼
+ Programming    AI     Software
+        │
+        ▼
+ Machine Learning
+```
+
+Graph traversal can support:
+
+* associative retrieval;
+* relationship discovery;
+* context expansion;
+* knowledge consolidation;
+* contradiction detection.
+
+The graph is the structural representation of relationships, not merely a visualization layer.
+
+---
+
+# 11. Semantic and Hybrid Retrieval
+
+Embeddings may be used as retrieval indexes.
+
+They are not the canonical representation of knowledge.
+
+```text
+Knowledge Objects
+       │
+       ▼
+   Embeddings
+       │
+       ▼
+  Vector Index
+       │
+       ▼
+Semantic Retrieval
+```
+
+GCN combines semantic retrieval with graph and trust signals:
+
+```text
+                    Query
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+   Semantic Search          Graph Search
+          │                       │
+          └───────────┬───────────┘
+                      ▼
+                Knowledge Rank
+                      │
+                      ▼
+                Evidence Check
+                      │
+                      ▼
+                Context Builder
+                      │
+                      ▼
+                     AI
+```
+
+Ranking may incorporate:
+
+```text
+semantic relevance
++ graph relevance
++ provenance
++ evidence
++ verification
++ recency
+- contradiction
+```
+
+The objective is to retrieve not only relevant information, but information whose origin and state can be evaluated.
+
+---
+
+# 12. Provenance, Integrity and Trust
+
+GCN explicitly separates **integrity** from **truth**.
+
+```text
+Integrity ≠ Truth
+```
+
+Cryptography can establish:
+
+* who signed an object;
+* whether its content changed;
+* whether an event is authentic;
+* whether a history is consistent;
+* whether a Merkle proof is valid.
+
+Cryptography cannot prove that a real-world statement is true.
+
+Truth estimation may instead depend on:
+
+* evidence;
+* independent observations;
+* reproducibility;
+* source quality;
+* temporal consistency;
+* domain-specific validation;
+* contradiction analysis.
+
+---
+
+# 13. Knowledge Passport
+
+A **Knowledge Passport** provides a compact view of an object's provenance and state.
+
+```text
+Knowledge Passport
+
+ID:
+kg:7f91...
+
+Author:
+did:node:abc123
+
+Version:
+7
+
+Confidence:
+0.98
+
+Evidence:
+4
+
+Independent Verification:
+3
+
+Contradictions:
+0
+
+Content Hash:
+...
+
+Verification:
+Valid
+```
+
+It allows an AI to evaluate both:
+
+> **What is known?**
+
+and:
+
+> **Why should it be trusted?**
+
+---
+
+# 14. Distributed State
+
+GCN is designed for independent nodes.
+
+```text
+Node A ───── Node B
+   │             │
+   │             │
+   └──── Node C ─┘
+```
+
+Nodes may provide:
+
+* peer discovery;
+* authentication;
+* synchronization;
+* partial replication;
+* knowledge exchange;
+* state verification.
+
+A node does not need to store the entire global knowledge state.
+
+## Partial Replication
+
+GCN separates:
+
+```text
+Global Logical State
+```
+
+from:
+
+```text
+Local Physical Storage
+```
+
+A node may store only:
+
+* local knowledge;
+* domain-specific knowledge;
+* frequently accessed objects;
+* cached objects;
+* selected historical states.
+
+---
+
+# 15. Merkle State
+
+Large knowledge states can be represented using Merkle structures.
 
 ```text
                  GLOBAL ROOT
@@ -419,336 +547,72 @@ RETRACT
            H11  H12       H21  H22
 ```
 
-Global Root представляет криптографическое состояние большого набора знаний.
+Merkle structures can provide:
 
-Изменение одного объекта изменяет соответствующую ветку и конечный root.
+* state verification;
+* partial synchronization;
+* compact proofs;
+* distributed snapshots.
 
----
-
-# 12. Knowledge Provenance
-
-Система должна сохранять происхождение знания.
-
-```text
-SOURCE
-   ↓
-OBSERVATION
-   ↓
-INFERENCE
-   ↓
-KNOWLEDGE
-   ↓
-REVISION
-   ↓
-CURRENT STATE
-```
-
-AI должен потенциально иметь возможность ответить:
-
-> Почему это знание существует?
-
-> Откуда оно получено?
-
-> Какие источники его подтверждают?
-
-> Какие источники ему противоречат?
-
----
-
-# 13. Knowledge Evolution
-
-Глобальная память не должна считать первое полученное утверждение абсолютной истиной.
-
-Пример:
-
-```text
-Observation A
-      ↓
-Hypothesis A
-      ↓
-Evidence B
-      ↓
-Confidence ↑
-      ↓
-Evidence C
-      ↓
-Confidence ↓
-      ↓
-Retraction
-```
-
-## 13.1 Confidence
-
-Каждое знание может иметь уровень уверенности.
-
-## 13.2 Contradictions
-
-Система должна сохранять противоречия.
-
-## 13.3 Retraction
-
-Ошибочное знание может быть помечено как опровергнутое.
-
-## 13.4 Historical state
-
-Историческая версия не удаляется.
-
----
-
-# 14. P2P Knowledge Network
-
-Сеть должна позволять независимым узлам обмениваться знаниями.
-
-```text
-Node A ───── Node B
-   │             │
-   │             │
-   └──── Node C ─┘
-```
-
-Возможные функции:
-
-* peer discovery;
-* synchronization;
-* partial replication;
-* knowledge exchange;
-* state verification.
-
----
-
-# 15. Global State
-
-Не требуется, чтобы каждое устройство хранило всю мировую память.
-
-Вместо этого:
-
-```text
-Global Knowledge State
-          │
-     ┌────┼────┐
-     ▼    ▼    ▼
-   Node A Node B Node C
-```
-
-Каждый узел может хранить подмножество данных.
-
-Но узлы могут проверять принадлежность объектов глобальному состоянию.
+A node can therefore verify selected objects without possessing the complete global state.
 
 ---
 
 # 16. AI Adapter Protocol
 
-AI Adapter является интерфейсом между моделью и сетью.
+The **AI Adapter Protocol** is the model-independent interface between an AI system and GCN.
 
-Пример:
-
-```python
-brain.connect()
-
-brain.query("What is known about X")
-
-brain.remember(
-    knowledge,
-    source=source
-)
-
-brain.verify(knowledge_id)
-
-brain.related("concept")
-```
-
-## 16.1 Query
-
-Поиск знаний.
-
-## 16.2 Remember
-
-Публикация нового знания.
-
-## 16.3 Verify
-
-Проверка происхождения.
-
-## 16.4 Retrieve
-
-Получение контекста.
-
-## 16.5 Synchronize
-
-Синхронизация локальной памяти.
-
----
-
-# 17. From Knowledge to Language
-
-Вектор сам по себе не превращается обратно в исходный текст.
-
-Поэтому архитектура должна выглядеть следующим образом:
+Conceptual operations include:
 
 ```text
-User Question
-      ↓
-Embedding
-      ↓
-Vector Search
-      ↓
-Knowledge Graph
-      ↓
-Relevant Knowledge
-      ↓
-Context Construction
-      ↓
-LLM
-      ↓
-Natural Language
+connect()
+query()
+retrieve()
+publish()
+verify()
+explain()
+relate()
+subscribe()
+synchronize()
 ```
 
-LLM является интерпретатором знаний, а не единственным хранилищем знаний.
+### Query
+
+Find relevant knowledge.
+
+### Retrieve
+
+Return knowledge objects and evidence.
+
+### Publish
+
+Publish observations, claims or other objects.
+
+### Verify
+
+Validate integrity and provenance.
+
+### Explain
+
+Return origin and history.
+
+### Relate
+
+Explore graph relationships.
+
+### Synchronize
+
+Synchronize selected knowledge with a local node.
+
+The protocol is independent of the underlying AI architecture.
 
 ---
 
-# 18. The "AI in the Air" Concept
+# 17. Privacy and Security
 
-Долгосрочная концепция:
+Global knowledge does not imply global publication.
 
-> AI может существовать не как одна программа на одном компьютере, а как распределённая система памяти, знаний, вычислений и агентов.
-
-```text
-                  GLOBAL AI LAYER
-                         ☁
-          ┌──────────────┼──────────────┐
-          │              │              │
-        Memory        Knowledge       Skills
-          │              │              │
-          └──────────────┼──────────────┘
-                         │
-                     Protocol
-                         │
-             ┌───────────┼───────────┐
-             │           │           │
-            PC         Phone        Robot
-```
-
-Физически система состоит из множества узлов.
-
-Логически она может восприниматься как единое пространство машинного знания.
-
----
-
-# 19. Collective Intelligence
-
-Если множество независимых AI-агентов могут:
-
-```text
-observe
-   ↓
-publish
-   ↓
-verify
-   ↓
-connect
-   ↓
-learn
-   ↓
-share
-```
-
-возникает возможность коллективного накопления машинного опыта.
-
-Это не означает существования единого сознания.
-
-Это означает существование **общего пространства знаний**, доступного множеству искусственных интеллектов.
-
----
-
-# 20. Security Model
-
-Необходимые механизмы:
-
-* cryptographic identities;
-* digital signatures;
-* content hashes;
-* access control;
-* provenance;
-* spam resistance;
-* Sybil resistance;
-* malicious node detection;
-* data integrity.
-
----
-
-# 21. The Central Problem: Trust
-
-Главный вопрос сети:
-
-> Как определить, чему следует доверять?
-
-Blockchain решает:
-
-> Был ли объект изменён?
-
-Но не решает:
-
-> Является ли утверждение истинным?
-
-Поэтому необходим отдельный слой:
-
-```text
-Cryptographic Integrity
-        +
-Evidence
-        +
-Source Reputation
-        +
-Independent Verification
-        +
-Confidence
-        +
-Contradiction Detection
-```
-
----
-
-# 22. What Blockchain Does Not Solve
-
-Blockchain не делает информацию истинной.
-
-Blockchain не создаёт интеллект.
-
-Blockchain не заменяет AI.
-
-Blockchain не заменяет distributed storage.
-
-Blockchain не решает проблему качества знаний.
-
-Он предоставляет один из механизмов:
-
-> **verifiable history and state integrity.**
-
----
-
-# 23. Scalability
-
-Глобальная система не должна хранить всё на каждом узле.
-
-Возможные механизмы:
-
-* sharding;
-* partial replication;
-* caching;
-* content addressing;
-* Merkle synchronization;
-* distributed storage;
-* semantic indexing;
-* local knowledge caches.
-
----
-
-# 24. Privacy
-
-Глобальная память не означает глобальную публикацию всего.
-
-Необходимо разделить:
+GCN distinguishes:
 
 ```text
 PUBLIC KNOWLEDGE
@@ -757,213 +621,457 @@ PERSONAL DATA
 ENCRYPTED DATA
 ```
 
-Частная память пользователя не должна автоматически становиться глобальным знанием.
+Potential privacy mechanisms include:
 
----
+* encryption;
+* access control;
+* selective disclosure;
+* private knowledge domains;
+* zero-knowledge proofs.
 
-# 25. Failure Scenarios
+Security threats include:
 
-Система должна учитывать:
-
-* corrupted nodes;
-* malicious agents;
 * false information;
-* conflicting knowledge;
-* network partitions;
-* unavailable nodes;
-* poisoned memory;
+* memory poisoning;
+* malicious agents;
 * compromised keys;
-* outdated information.
+* replay attacks;
+* spam;
+* Sybil attacks;
+* outdated knowledge;
+* network partitions.
+
+Potential defenses include:
+
+* digital signatures;
+* content hashes;
+* provenance;
+* rate limiting;
+* access control;
+* reputation;
+* anomaly detection;
+* independent verification.
+
+The number of identities must not be treated as evidence of truth.
+
+```text
+Number of identities
+        ≠
+Independent evidence
+```
 
 ---
 
-# 26. Experimental Implementation
+# 18. Blockchain
 
-`BlockcoinWitres` является экспериментальным прототипом некоторых компонентов этой концепции.
+Blockchain is optional.
 
-Текущая реализация может служить основой для исследования:
+It may be used for:
+
+* identity anchoring;
+* timestamps;
+* state roots;
+* event ordering;
+* authorization;
+* public proofs.
+
+Knowledge itself can remain in distributed storage.
 
 ```text
+GCN
+ │
+ ├── P2P
+ ├── Knowledge Graph
+ ├── Distributed Storage
+ ├── Vector Index
+ ├── Merkle State
+ │
+ └── Blockchain
+        optional
+```
+
+Therefore:
+
+> **Blockchain is an implementation option for the trust layer, not the definition of GCN.**
+
+Blockchain cannot:
+
+* make information true;
+* create intelligence;
+* replace AI;
+* replace distributed storage;
+* solve knowledge quality.
+
+---
+
+# 19. Positioning
+
+## GCN vs RAG
+
+Traditional RAG:
+
+```text
+Documents
+   ↓
+Embeddings
+   ↓
+Vector Search
+   ↓
+Context
+   ↓
+LLM
+```
+
+GCN:
+
+```text
+Observations
+   ↓
+Claims
+   ↓
+Evidence
+   ↓
+Knowledge Objects
+   +
+Graph
+   +
+Vector Index
+   +
+Provenance
+   +
+Version History
+   ↓
+Knowledge Ranking
+   ↓
 AI
-+
-Memory Graph
-+
-Blockchain
-+
-Distributed Architecture
 ```
+
+GCN therefore treats retrieved information as structured, persistent and provenance-aware knowledge rather than simply retrieved text.
+
+## GCN vs Database
+
+A database primarily represents stored data.
+
+GCN additionally represents:
+
+* origin;
+* evidence;
+* relationships;
+* contradictions;
+* versions;
+* verification history.
+
+Its purpose is not to replace databases, but to define a machine-oriented knowledge layer above or across storage systems.
 
 ---
 
-# 27. Minimal Global Network Experiment
+# 20. Knowledge Persistence
 
-Первый эксперимент не требует глобального Интернета.
-
-Достаточно:
+The central persistence experiment is:
 
 ```text
-Node A
-Node B
-Node C
+AI A
+ │
+ └── discovers X
+          │
+          ▼
+         GCN
+          │
+     AI A removed
+          │
+          ▼
+         AI B
+          │
+          ▼
+      retrieves X
+          │
+          ▼
+        verifies
 ```
 
-Каждый узел:
+If AI B can retrieve and use X without access to AI A's:
 
-1. хранит локальную память;
-2. создаёт knowledge events;
-3. вычисляет hashes;
-4. обменивается объектами;
-5. проверяет состояние;
-6. синхронизирует изменения;
-7. подключает AI через Adapter.
+* model;
+* memory;
+* hardware;
+* execution environment,
 
-Ключевой экспериментальный вопрос:
-
-> Может ли независимый AI получить знание, созданное другим AI, проверить его происхождение и использовать его без копирования первой AI-модели?
+then the experiment demonstrates that the knowledge itself persisted independently of the original model.
 
 ---
 
-# 28. Roadmap
+# 21. Minimal Multi-Agent Experiment
 
-## Phase 1 — Local Memory
-
-```text
-Memory Graph
-```
-
-## Phase 2 — Cryptographic Memory
+A stronger experiment introduces independent verification.
 
 ```text
-Memory Events
-+
-Hashes
-+
-Merkle Root
+AI A
+ │
+ └── discovers X
+       │
+       ▼
+      GCN
+       │
+ ┌─────┼─────┐
+ ▼     ▼     ▼
+AI B  AI C  AI D
+ │     │     │
+verify test  retrieve
 ```
 
-## Phase 3 — Multi-node Network
+Possible result:
 
 ```text
-Node A ↔ Node B ↔ Node C
+A → Claim X
+B → supports X
+C → supports X
+D → contradicts X
 ```
 
-## Phase 4 — Knowledge Protocol
-
-Стандартизированный формат Knowledge Objects.
-
-## Phase 5 — AI Adapter
-
-Подключение разных AI-моделей.
-
-## Phase 6 — Distributed Knowledge
-
-Частичная репликация и синхронизация.
-
-## Phase 7 — Global Cognitive Network
-
-Эксперимент с большим количеством независимых узлов.
+The system should preserve the competing evidence and produce an updated knowledge state rather than silently selecting one claim.
 
 ---
 
-# 29. Limitations
+# 22. Evaluation
 
-Эта концепция не утверждает, что:
+GCN should be evaluated experimentally.
 
-* она создаст AGI;
-* глобальное знание автоматически станет истинным;
-* blockchain необходим для каждой части системы;
-* единый AI должен существовать;
-* текущий прототип уже является глобальной сетью.
+### Knowledge Transfer
 
-Это исследовательская архитектура.
+Can AI B retrieve and use knowledge created by AI A?
 
----
+### Model Independence
 
-# 30. Open Questions
+Does knowledge remain usable after replacing the original model?
 
-Ключевые вопросы для дальнейшего исследования:
+### Verification
 
-1. Какой формат должен иметь универсальный Knowledge Object?
-2. Как согласовывать противоречивые знания?
-3. Как бороться с ложными знаниями?
-4. Как оценивать источники?
-5. Как распределять вычисления?
-6. Как хранить огромные объёмы semantic vectors?
-7. Как синхронизировать частичные графы?
-8. Как защищать приватную память?
-9. Нужен ли blockchain или достаточно Merkle/P2P архитектуры?
-10. Как сделать AI Adapter универсальным?
-11. Можно ли создать стандарт Global Knowledge Protocol?
-12. Может ли коллективная память привести к новым формам машинного интеллекта?
+Can nodes detect:
 
----
+* modified objects;
+* invalid signatures;
+* broken event history;
+* invalid Merkle proofs?
 
-# 31. Long-Term Vision
+### Conflict Representation
 
-Конечная идея проекта:
+Can contradictory claims coexist without loss of provenance?
+
+### Retrieval Quality
+
+Does:
 
 ```text
-                GLOBAL COGNITIVE NETWORK
-                           │
-          ┌────────────────┼────────────────┐
-          │                │                │
-        Memory          Knowledge         Skills
-          │                │                │
-          └────────────────┼────────────────┘
-                           │
-                    AI ADAPTER
-                           │
-             ┌─────────────┼─────────────┐
-             │             │             │
-            AI A          AI B          AI C
-             │             │             │
-           Device        Device        Device
+Graph + Vector + Provenance
 ```
 
-Модели могут меняться.
+outperform:
 
-Устройства могут меняться.
+```text
+Vector Search
+```
 
-Организации могут меняться.
+alone?
 
-Но глобальное пространство знаний может продолжать существовать.
+### Synchronization Cost
+
+Measure:
+
+* bandwidth;
+* storage;
+* CPU;
+* latency.
+
+### Poisoning Resistance
+
+Measure how easily malicious knowledge can influence retrieval and downstream reasoning.
 
 ---
 
-# 32. Final Statement
+# 23. Current Prototype
 
-The purpose of this project is not to claim that a Global Cognitive Network already exists.
+`BlockcoinWitres` is an experimental implementation exploring selected GCN concepts.
 
-The purpose is to explore whether artificial intelligence can eventually have a **shared, persistent, distributed and verifiable memory layer** that is independent of any single model, device or organization.
+Current work includes experimental components for:
 
-The fundamental hypothesis is:
+* AI memory;
+* associative memory graphs;
+* structured knowledge relationships;
+* local retrieval;
+* persistent machine memory;
+* AI integration.
 
-> **Intelligence does not have to be contained entirely inside a model.**
+The following remain research targets:
 
-A model can be an interpreter.
+* standardized GCN protocol;
+* interoperable AI Adapter;
+* multi-node synchronization;
+* cryptographic identity;
+* distributed state;
+* Merkle synchronization;
+* large-scale P2P operation;
+* federation.
 
-A device can be a node.
+This document describes the target architecture, not a claim that all components are already implemented.
 
-Memory can be distributed.
+---
 
-Knowledge can be versioned.
+# 24. Roadmap
 
-History can be verifiable.
+## Phase 1 — Local Knowledge
 
-And AI systems could potentially become participants in a shared machine knowledge space.
+Implement:
+
+* Knowledge Objects;
+* Claims;
+* Evidence;
+* Memory Graph;
+* local retrieval.
+
+**Goal:** persistent structured machine memory.
+
+## Phase 2 — Cryptographic Knowledge
+
+Implement:
+
+* content hashes;
+* signed events;
+* object identity;
+* version history;
+* Merkle roots.
+
+**Goal:** verifiable knowledge history.
+
+## Phase 3 — Two Nodes
 
 ```text
-Many Models
-     +
-Many Devices
-     +
-Many Agents
-     ↓
-Shared Knowledge
-     ↓
-Collective Machine Memory
-     ↓
-Global Cognitive Network
+Node A ↔ Node B
 ```
 
-**This project is an experiment toward that possibility.**
+Implement:
+
+* P2P communication;
+* synchronization;
+* signatures;
+* verification.
+
+**Goal:** Node B can receive and verify knowledge created by Node A.
+
+## Phase 4 — Independent AI
+
+Connect heterogeneous AI systems through the same adapter.
+
+**Goal:** knowledge transfer without sharing the original model or memory.
+
+## Phase 5 — Knowledge Evolution
+
+Implement:
+
+* support;
+* contradiction;
+* verification;
+* retraction;
+* confidence updates.
+
+**Goal:** preserve and evolve competing knowledge states.
+
+## Phase 6 — Distributed State
+
+Implement:
+
+* partial replication;
+* Merkle synchronization;
+* node discovery;
+* state proofs.
+
+**Goal:** verifiable distributed knowledge without full replication.
+
+## Phase 7 — Multi-Agent Network
+
+Connect larger numbers of independent AI systems.
+
+**Goal:** measure whether shared persistent knowledge provides measurable advantages over isolated systems.
+
+---
+
+# 25. Open Research Questions
+
+1. What should the canonical Knowledge Object format be?
+2. How should evidence be represented?
+3. How should confidence be calculated?
+4. How should contradictory claims be ranked?
+5. How should source reliability be measured?
+6. How can false information be detected?
+7. How can Sybil attacks be resisted?
+8. How should private memory interact with public knowledge?
+9. How should partial graphs synchronize?
+10. How should semantic indexes be distributed?
+11. How should knowledge be ranked?
+12. When is blockchain actually useful?
+13. When are Merkle structures sufficient?
+14. How should AI Adapter compatibility be standardized?
+15. Can knowledge survive model replacement?
+16. Can independently operated AI systems contribute to the same evolving knowledge state?
+17. Does graph-based shared memory improve reasoning?
+18. Does collective machine experience provide measurable advantages over isolated AI systems?
+
+---
+
+# 26. Non-Goals
+
+GCN is not intended to be:
+
+* an AGI;
+* a replacement for neural networks;
+* a blockchain-based AI;
+* a universal truth oracle;
+* a machine consciousness system.
+
+It is an experimental architecture for persistent, interoperable and verifiable machine knowledge.
+
+---
+
+# 27. Conclusion
+
+GCN proposes a separation between intelligence and persistent machine knowledge.
+
+```text
+Model       → intelligence
+Node        → computation
+Memory      → experience
+Knowledge   → structured information
+Graph       → relationships
+Evidence    → support
+Provenance  → history
+Cryptography→ integrity
+Protocol    → interoperability
+```
+
+The core hypothesis is that knowledge produced by one AI may remain available, verifiable and usable by another AI without transferring the original model or execution environment.
+
+The fundamental experiment is therefore:
+
+```text
+AI A
+ ↓
+learns X
+ ↓
+publishes X
+ ↓
+AI B verifies X
+ ↓
+AI C retrieves X
+ ↓
+AI C builds upon X
+```
+
+If this can be demonstrated reliably, it would provide experimental evidence that machine knowledge can persist and move between independent AI systems.
+
+GCN therefore does not attempt to create intelligence by itself.
+
+It attempts to investigate whether **persistent shared machine knowledge can become infrastructure for heterogeneous AI systems**.
+
+> **Intelligence may remain distributed while knowledge becomes interoperable.**
+
+**GCN — Research Concept**
+**BlockcoinWitres — Experimental Implementation**
