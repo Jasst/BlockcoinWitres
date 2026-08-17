@@ -107,6 +107,31 @@ body {
     font-size: 0.95em;
     opacity: 0.9;
 }
+/* Добавьте в конец style.css */
+.reasoning-block details {
+    display: block;
+}
+.reasoning-block details summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--accent, #6c63ff);
+    outline: none;
+    user-select: none;
+    padding: 4px 0;
+}
+.reasoning-block details summary::-webkit-details-marker {
+    color: var(--accent, #6c63ff);
+}
+.reasoning-block details[open] summary {
+    margin-bottom: 8px;
+}
+.reasoning-block .reasoning-content {
+    padding: 8px 12px;
+    font-size: 0.95em;
+    opacity: 0.9;
+    border-left: 2px solid var(--border-color);
+    margin-left: 4px;
+}
 
 /* ===== Animations ===== */
 @keyframes fadeIn {

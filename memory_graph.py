@@ -443,6 +443,32 @@ class CognitiveMemory:
         self._emb_added_since_train = 0
         logger.info(f"FAISS retrained on {vectors.shape[0]} vectors")
 
+    def _rebuild_faiss_index(self):
+        """Полностью перестраивает FAISS-индекс на основе текущих эмбеддингов."""
+        if not self.use_embeddings or self.index is None:
+            return
+        if not self.fact_embeddings:
+            self.index.reset()
+            self._emb_added_since_train = 0
+            return
+        vectors = np.array(self.fact_embeddings).astype('float32')
+        if len(vectors) < FAISS_MIN_TRAIN_VECTORS:
+            # Слишком мало векторов – используем плоский поиск
+            self.index.reset()
+            self.index = faiss.IndexFlatL2(self.embedding_dim)
+            self.index.add(vectors)
+            self._emb_added_since_train = 0
+            return
+        # Переобучаем IVF-индекс
+        quantizer = faiss.IndexFlatL2(self.embedding_dim)
+        new_index = faiss.IndexIVFFlat(quantizer, self.embedding_dim, FAISS_NLIST)
+        new_index.train(vectors)
+        new_index.set_direct_map_type(faiss.INDIRECT)
+        new_index.add(vectors)
+        self.index = new_index
+        self._emb_added_since_train = 0
+        logger.info(f"FAISS index rebuilt with {len(vectors)} vectors")
+
     def _compute_similarity(self, text1: str, text2: str) -> float:
         kw1 = self._extract_keywords(text1)
         kw2 = self._extract_keywords(text2)
@@ -472,8 +498,10 @@ class CognitiveMemory:
             prediction_error=0.0,
         )
         self.semantic_facts.append(fact)
+        fact_idx = len(self.semantic_facts) - 1  # индекс только что добавленного факта
+
         for kw in fact.keywords:
-            self.keyword_index[kw].append(len(self.semantic_facts)-1)
+            self.keyword_index[kw].append(fact_idx)
 
         # Эмбеддинг
         if self.use_embeddings:
@@ -487,8 +515,8 @@ class CognitiveMemory:
             except Exception:
                 pass
 
-        # Проверка противоречий (упрощённо – по keywords)
-        self._detect_contradictions(fid)
+        # Проверка противоречий (передаём индекс)
+        self._detect_contradictions(fact_idx)
 
         # Добавляем связи с похожими фактами (семантическая близость)
         for other_idx, other in enumerate(self.semantic_facts):
@@ -520,23 +548,23 @@ class CognitiveMemory:
         self.graph[src].add(tgt)
         self._dirty = True
 
-    def _detect_contradictions(self, fact_id: int):
-        """Находит факты, которые могут противоречить новому, по ключевым словам."""
-        fact = self.semantic_facts[fact_id]
-        # Простейшая эвристика: если есть отрицание или противопоставление
+    def _detect_contradictions(self, fact_idx: int):
+        """Находит факты, которые могут противоречить новому, по ключевым словам.
+           fact_idx – индекс в списке semantic_facts."""
+        if fact_idx >= len(self.semantic_facts):
+            return
+        fact = self.semantic_facts[fact_idx]
         neg_words = {'не', 'нет', 'без', 'против', 'отрицает', 'опровергает'}
         has_neg = any(w in fact.text.lower() for w in neg_words)
         if not has_neg:
             return
-        for other in self.semantic_facts:
-            if other.id == fact_id:
+        for other_idx, other in enumerate(self.semantic_facts):
+            if other_idx == fact_idx:
                 continue
-            # Если пересечение ключевых слов > 50%, считаем потенциальным противоречием
             common = set(fact.keywords) & set(other.keywords)
             if len(common) > 0 and len(common) / max(1, len(set(fact.keywords))) > 0.5:
                 fact.contradicts.add(other.id)
                 other.contradicts.add(fact.id)
-                # Понижаем уверенность обоих
                 fact.confidence *= 0.9
                 other.confidence *= 0.9
                 self._dirty = True
@@ -704,7 +732,9 @@ class CognitiveMemory:
                 q_emb = self._get_embedding(query).reshape(1, -1).astype('float32')
                 self.index.nprobe = FAISS_NPROBE
                 dist, idxs = self.index.search(q_emb, min(200, len(self.fact_embeddings)))
-                candidate_indices = set(idxs[0].tolist())
+                # Фильтруем индексы, которые не выходят за пределы
+                valid_idxs = [i for i in idxs[0].tolist() if i < len(self.semantic_facts)]
+                candidate_indices = set(valid_idxs)
             except Exception:
                 pass
 
@@ -712,13 +742,14 @@ class CognitiveMemory:
             q_keywords = self._extract_keywords(query)
             for kw in q_keywords:
                 for idx in self.keyword_index.get(kw, []):
-                    candidate_indices.add(idx)
+                    if idx < len(self.semantic_facts):
+                        candidate_indices.add(idx)
             if len(candidate_indices) < 3:
                 candidate_indices = set(range(len(self.semantic_facts)))
 
         # 2. BM25
         if candidate_indices:
-            texts = [self.semantic_facts[i].text for i in candidate_indices]
+            texts = [self.semantic_facts[i].text for i in candidate_indices if i < len(self.semantic_facts)]
             if len(texts) > 1:
                 try:
                     tfidf = self.tfidf.fit_transform(texts + [query])
@@ -736,11 +767,16 @@ class CognitiveMemory:
         if self.use_embeddings and self.fact_embeddings:
             try:
                 q_emb = self._get_embedding(query).reshape(1, -1)
-                cand_embs = np.array([self.fact_embeddings[i] for i in candidate_indices])
-                if cand_embs.size > 0:
-                    q_norm = q_emb / (np.linalg.norm(q_emb) + 1e-8)
-                    cand_norm = cand_embs / (np.linalg.norm(cand_embs, axis=1, keepdims=True) + 1e-8)
-                    cosine_scores = np.dot(cand_norm, q_norm.T).flatten()
+                # Собираем эмбеддинги только для валидных индексов
+                valid_candidates = [i for i in candidate_indices if i < len(self.fact_embeddings)]
+                if valid_candidates:
+                    cand_embs = np.array([self.fact_embeddings[i] for i in valid_candidates])
+                    if cand_embs.size > 0:
+                        q_norm = q_emb / (np.linalg.norm(q_emb) + 1e-8)
+                        cand_norm = cand_embs / (np.linalg.norm(cand_embs, axis=1, keepdims=True) + 1e-8)
+                        cosine_scores = np.dot(cand_norm, q_norm.T).flatten()
+                    else:
+                        cosine_scores = np.zeros(len(candidate_indices))
                 else:
                     cosine_scores = np.zeros(len(candidate_indices))
             except Exception:
@@ -752,22 +788,22 @@ class CognitiveMemory:
         now = time.time()
         freshness = []
         for idx in candidate_indices:
-            age = now - self.semantic_facts[idx].timestamp
-            freshness.append(max(0.0, 1.0 - age / (86400 * 30)))
+            if idx < len(self.semantic_facts):
+                age = now - self.semantic_facts[idx].timestamp
+                freshness.append(max(0.0, 1.0 - age / (86400 * 30)))
+            else:
+                freshness.append(0.0)
 
         # 5. Графовая активация (если включена)
         graph_scores = np.ones(len(candidate_indices)) * 0.5
         if use_graph:
-            # Инициируем активацию от seed – семантические ближайшие
             seed_ids = list(candidate_indices)[:10]  # возьмём топ-10 кандидатов как seeds
             activation_map = await self.spread_activation(seed_ids, max_depth=2, max_nodes=50)
-            # для каждого кандидата берём активацию
             for i, idx in enumerate(candidate_indices):
                 graph_scores[i] = activation_map.get(idx, 0.0)
 
         # 6. Динамические веса
         if DYNAMIC_WEIGHTS_ENABLED:
-            # классифицируем запрос
             is_factual = bool(re.search(r'\b\d+[.,]?\d*\s*(?:USD|EUR|RUB|%|кг|км|г)\b', query))
             if is_factual:
                 w_bm25, w_cos, w_fresh, w_graph = FACTUAL_WEIGHTS
@@ -780,6 +816,8 @@ class CognitiveMemory:
         # 7. Итоговый рейтинг
         final_scores = []
         for i, idx in enumerate(candidate_indices):
+            if idx >= len(self.semantic_facts):
+                continue
             score = (w_bm25 * bm25_scores[i] +
                      w_cos * cosine_scores[i] +
                      w_fresh * freshness[i] +
@@ -798,6 +836,8 @@ class CognitiveMemory:
         max_score = final_scores[0][0] if final_scores else 1.0
         result = []
         for idx in expanded:
+            if idx >= len(self.semantic_facts):
+                continue
             fact = self.semantic_facts[idx]
             fact.access_count += 1
             fact.last_accessed = now
@@ -837,7 +877,6 @@ class CognitiveMemory:
                     if j in to_remove:
                         continue
                     if self._compute_similarity(f1.text, self.semantic_facts[j].text) > 0.8:
-                        # Оставляем с большей уверенностью
                         if self.semantic_facts[j].confidence > f1.confidence:
                             to_remove.add(i)
                             break
@@ -847,15 +886,9 @@ class CognitiveMemory:
                 self.semantic_facts = [f for i, f in enumerate(self.semantic_facts) if i not in to_remove]
                 self._rebuild_graph_after_removal(to_remove)
                 self._build_keyword_index()
-                # перестроим эмбеддинги
                 if self.use_embeddings:
                     self.fact_embeddings = [emb for i, emb in enumerate(self.fact_embeddings) if i not in to_remove]
-                    self.index.reset()
-                    if len(self.fact_embeddings) >= FAISS_MIN_TRAIN_VECTORS:
-                        self._train_index_if_needed()
-                    elif self.fact_embeddings:
-                        # добавляем без обучения
-                        self.index.add(np.array(self.fact_embeddings).astype('float32'))
+                    self._rebuild_faiss_index()  # полная перестройка
 
             # Ослабление синапсов (decay)
             self._apply_decay()
@@ -867,23 +900,18 @@ class CognitiveMemory:
         async with self._lock:
             # Replay: выбираем эпизоды для воспроизведения
             if self.episodic_memory:
-                # Сортировка по важности + салиенс
                 self.episodic_memory.sort(key=lambda e: (e.importance * (1 + e.salience), e.timestamp), reverse=True)
                 replay_candidates = self.episodic_memory[:REPLAY_BATCH_SIZE]
-                # Для каждого эпизода – повторная активация связей
                 for ep in replay_candidates:
-                    # Находим факты, соответствующие сообщениям (упрощённо)
                     user_facts = [f for f in self.semantic_facts if f.text == ep.user_msg]
                     ass_facts = [f for f in self.semantic_facts if f.text == ep.assistant_msg]
                     if user_facts and ass_facts:
                         self._hebbian_update(user_facts[0].id, ass_facts[0].id, ep.timestamp)
                         self._hebbian_update(ass_facts[0].id, user_facts[0].id, ep.timestamp)
 
-            # Обобщение: если несколько фактов очень похожи, объединяем (уже сделано в light)
             # Проверка противоречий
             for f in self.semantic_facts:
                 if f.contradicts:
-                    # Снижаем уверенность конфликтующих
                     for cid in f.contradicts:
                         if cid < len(self.semantic_facts):
                             other = self.semantic_facts[cid]
@@ -905,13 +933,15 @@ class CognitiveMemory:
                 self.semantic_facts = self.semantic_facts[:SEMANTIC_MAX_FACTS]
                 self._rebuild_graph_after_removal(set())
                 self._build_keyword_index()
+                if self.use_embeddings:
+                    self.fact_embeddings = self.fact_embeddings[:SEMANTIC_MAX_FACTS]
+                    self._rebuild_faiss_index()
 
             await self._schedule_save()
             logger.info(f"Deep consolidation done for {self.user_id[:16]}")
 
     def _rebuild_graph_after_removal(self, removed_indices: Set[int]):
         """Перестраивает граф и синапсы после удаления фактов."""
-        # Переиндексация
         new_id_map = {}
         new_facts = []
         for i, f in enumerate(self.semantic_facts):
@@ -919,7 +949,7 @@ class CognitiveMemory:
                 new_id_map[i] = len(new_facts)
                 new_facts.append(f)
         self.semantic_facts = new_facts
-        # Обновляем граф
+
         new_graph = defaultdict(set)
         new_synapses = {}
         for (src, tgt), syn in self.synapses.items():
@@ -931,6 +961,8 @@ class CognitiveMemory:
             new_synapses[(new_src, new_tgt)] = syn
         self.graph = new_graph
         self.synapses = new_synapses
+        # Перестраиваем индекс ключевых слов (вызывается снаружи, но на всякий случай)
+        self._build_keyword_index()
 
     # ---------- РАБОТА С ЦЕЛЯМИ ----------
     async def add_goal(self, description: str, priority: float = 0.5, related_memory: List[int] = None):

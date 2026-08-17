@@ -768,17 +768,15 @@ class CognitiveController:
                     await self.memory._schedule_save()
                     return f"Запомнил: {rest}", {"memory": "stored", "id": fid}
                 elif action == "forget":
-                    # удаляем факты, содержащие rest (упрощённо)
                     to_remove = [i for i, f in enumerate(self.memory.semantic_facts) if rest.lower() in f.text.lower()]
                     if to_remove:
-                        self.memory.semantic_facts = [f for i, f in enumerate(self.memory.semantic_facts) if i not in to_remove]
+                        self.memory.semantic_facts = [f for i, f in enumerate(self.memory.semantic_facts) if
+                                                      i not in to_remove]
                         self.memory._build_keyword_index()
-                        # перестроить эмбеддинги (упрощённо)
                         if self.memory.use_embeddings:
-                            self.memory.fact_embeddings = [emb for i, emb in enumerate(self.memory.fact_embeddings) if i not in to_remove]
-                            self.memory.index.reset()
-                            if self.memory.fact_embeddings:
-                                self.memory.index.add(np.array(self.memory.fact_embeddings).astype('float32'))
+                            self.memory.fact_embeddings = [emb for i, emb in enumerate(self.memory.fact_embeddings) if
+                                                           i not in to_remove]
+                            self.memory._rebuild_faiss_index()  # <--- заменили ручную перестройку на вызов метода
                         await self.memory._schedule_save()
                         return f"Удалено {len(to_remove)} фактов о '{rest}'", {"memory": "forgot"}
                     else:
