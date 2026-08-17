@@ -1078,16 +1078,18 @@ class CognitiveMemory:
 
             to_remove: Set[int] = set()
             for i, neighbors in enumerate(idxs):
-                if i in to_remove:
+                fi = self.semantic_facts[i]
+                if fi.id in to_remove:
                     continue
                 for j in neighbors[1:]:  # пропускаем самого себя
-                    if j == -1 or j <= i or j in to_remove:
+                    if j == -1 or j <= i:
+                        continue
+                    fj = self.semantic_facts[j]
+                    if fj.id in to_remove:
                         continue
                     sim = float(vectors_norm[i] @ vectors_norm[j])
                     if sim > threshold:
                         # Удаляем тот, у которого меньше confidence
-                        fi = self.semantic_facts[i]
-                        fj = self.semantic_facts[j]
                         if fi.confidence <= fj.confidence:
                             to_remove.add(fi.id)
                         else:
