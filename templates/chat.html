@@ -628,6 +628,7 @@
     <div class="conversations-header">
       <h3 data-i18n="chats">Chats</h3>
       <div class="header-actions">
+        <!-- Кнопка "Новый AI чат" добавлена в header -->
         <button id="aiChatBtn" class="btn-icon-oval" title="AI Assistant">🤖</button>
         <button id="newChatBtn" class="btn-icon-oval" data-i18n="new_chat" title="New chat">＋</button>
       </div>
@@ -646,16 +647,16 @@
       </div>
       <div class="actions">
         <button id="addToContactsBtn" class="btn-icon-oval" disabled title="Add to contacts">
-    <img src="/static/icons/Contact.png" width="20" height="20" alt="Add contact" style="filter: invert(1);">
-</button>
-        <button id="clearConversationBtn" class="btn-icon-oval" disabled title="Clear messages" >
-    <img src="/static/icons/Remove.png" width="20" height="20" alt="Clear" style="filter: invert(1);">
-</button>
+          <img src="/static/icons/Contact.png" width="20" height="20" alt="Add contact" style="filter: invert(1);">
+        </button>
+        <button id="clearConversationBtn" class="btn-icon-oval" disabled title="Clear messages">
+          <img src="/static/icons/Remove.png" width="20" height="20" alt="Clear" style="filter: invert(1);">
+        </button>
         <button id="callButton" class="btn-icon-oval" title="Voice/Video call" style="display: none;">
-    <img src="/static/icons/Call.png" width="24" height="24" alt="Voice call" style="filter: invert(1);">
-</button>
+          <img src="/static/icons/Call.png" width="24" height="24" alt="Voice call" style="filter: invert(1);">
+        </button>
         <button id="videoCallButton" class="btn-icon-oval" title="Video call" style="display: none;">
-           <img src="/static/icons/Video.png" width="24" height="24" alt="Video call" style="filter: invert(1);">
+          <img src="/static/icons/Video.png" width="24" height="24" alt="Video call" style="filter: invert(1);">
         </button>
       </div>
     </div>
@@ -669,14 +670,18 @@
         <textarea id="messageContent" placeholder="Type a message…" rows="1" disabled aria-label="Message input" data-i18n="type_message"></textarea>
         <div class="input-actions">
           <input type="file" id="imageInput" accept="image/*" class="sr-only">
-          <button type="button" class="btn-icon-oval" id="attachImageButton" disabled title="Attach image" >
-    <img src="/static/icons/Attach.png" width="20" height="20" alt="Attach" style="filter: invert(1);">
-</button>
-          <button type="button" class="btn-icon-oval" id="recordAudioButton" disabled title="Record voice message"><img src="/static/icons/Mic.png" width="20" height="20" alt="Record" style="filter: invert(1);"></button>          <button type="submit" class="btn-primary-oval" id="sendButton" disabled style="display: none;" data-i18n="send">➤</button>
+          <button type="button" class="btn-icon-oval" id="attachImageButton" disabled title="Attach image">
+            <img src="/static/icons/Attach.png" width="20" height="20" alt="Attach" style="filter: invert(1);">
+          </button>
+          <button type="button" class="btn-icon-oval" id="recordAudioButton" disabled title="Record voice message">
+            <img src="/static/icons/Mic.png" width="20" height="20" alt="Record" style="filter: invert(1);">
+          </button>
+          <button type="submit" class="btn-primary-oval" id="sendButton" disabled style="display: none;" data-i18n="send">➤</button>
         </div>
       </div>
     </form>
 
+    <!-- ========== AI ЧАТ ========== -->
     <div id="aiChatContainer" class="hidden">
       <div class="chat-panel-header">
         <button class="back-button" id="closeAiFromChatBtn">←</button>
@@ -685,7 +690,14 @@
           <span class="subtitle" id="aiStatusSubtitle" data-i18n="ai_status">Internet · Streaming</span>
         </div>
         <div class="actions">
-          <button type="button" id="aiClearHistoryBtn" class="btn-icon-oval" title="Clear history" ><img src="/static/icons/Remove.png" width="20" height="20" alt="Clear" style="filter: invert(1);"></button>
+          <!-- Кнопка "Новый AI чат" (добавлена и в header, но здесь она более логична) -->
+          <button type="button" id="aiNewChatBtn" class="btn-icon-oval" title="New AI chat">➕</button>
+          <!-- Кнопка очистки истории (удаляет сессию) -->
+          <button type="button" id="aiClearHistoryBtn" class="btn-icon-oval" title="Clear history">
+            <img src="/static/icons/Remove.png" width="20" height="20" alt="Clear" style="filter: invert(1);">
+          </button>
+          <!-- Кнопка "Стоп" (по умолчанию скрыта) -->
+
         </div>
       </div>
       <div id="aiMessagesContainer" class="messages"></div>
@@ -699,15 +711,18 @@
             <button type="button" id="aiResearchBtn" class="ai-tool-btn" data-tooltip="Research mode (hypotheses & verification)">🔬</button>
           </div>
           <div class="input-actions-right">
-            <input type="file" id="aiImageInput" accept="image/*" class="sr-only">
-            <button type="button" id="aiAttachBtn" class="btn-icon-oval" title="Attach image">
+  <input type="file" id="aiImageInput" accept="image/*" class="sr-only">
+  <button type="button" id="aiAttachBtn" class="btn-icon-oval" title="Attach image">
     <img src="/static/icons/Attach.png" width="20" height="20" alt="Attach" style="filter: invert(1);">
-</button>
-            <button type="submit" id="aiSendBtn" class="btn-primary-oval" data-i18n="send">➤</button>
-          </div>
+  </button>
+  <button type="submit" id="aiSendBtn" class="btn-primary-oval" data-i18n="send">➤</button>
+  <!-- Новая кнопка стоп – будет видна только во время генерации -->
+  <button type="button" id="aiStopBtn" class="btn-icon-oval stop-btn" title="Stop generation" style="display:none;">⏹</button>
+</div>
         </div>
       </form>
     </div>
+    <!-- ===== КОНЕЦ AI ЧАТА ===== -->
   </div>
 </div>
 
@@ -720,19 +735,18 @@
     </header>
     <div class="modal-body">
       <div class="text-center">
-        <button class="btn-oval" onclick="QRManager.openForChat()" >
-    <img src="/static/icons/Cam.png" width="20" height="20" alt="Scan QR" style="filter: invert(1);"> Scan QR Code
-</button>
+        <button class="btn-oval" onclick="QRManager.openForChat()">
+          <img src="/static/icons/Cam.png" width="20" height="20" alt="Scan QR" style="filter: invert(1);"> Scan QR Code
+        </button>
         <div id="qrScannerContainerModal" class="qr-scanner-container hidden">
-    <div class="qr-video-wrapper">
-        <video id="qrVideoModal" playsinline autoplay muted disablepictureinpicture></video>
-        <div class="qr-frame"></div>
-    </div>
-    <p class="text-muted" style="margin: 12px 0 8px;" data-i18n="scan_qr">Point camera at QR code</p>
-    <div id="scanResultModal" class="scan-result hidden"></div>
-    <button class="btn-oval" onclick="QRManager.closeScanner()" data-i18n="cancel">Cancel</button>
-</div>
-
+          <div class="qr-video-wrapper">
+            <video id="qrVideoModal" playsinline autoplay muted disablepictureinpicture></video>
+            <div class="qr-frame"></div>
+          </div>
+          <p class="text-muted" style="margin: 12px 0 8px;" data-i18n="scan_qr">Point camera at QR code</p>
+          <div id="scanResultModal" class="scan-result hidden"></div>
+          <button class="btn-oval" onclick="QRManager.closeScanner()" data-i18n="cancel">Cancel</button>
+        </div>
       </div>
       <div class="form-group">
         <label class="text-secondary" data-i18n="select_from_contacts">Select from contacts</label>
@@ -763,7 +777,7 @@
 
 <script>window.process = window.process || { env: {} };</script>
 
-
+<!-- Подключаем скрипты (основные уже в base.html, но оставляем для наглядности) -->
 <script src="{{ url_for('static', path='js/ui.js') }}"></script>
 <script src="{{ url_for('static', path='js/actions.js') }}"></script>
 <!-- call-manager.js загружается из base.html с defer -->
@@ -771,6 +785,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="{{ url_for('static', path='js/AiChat.js') }}" defer></script>
+<script src="{{ url_for('static', path='js/ai-manager.js') }}" defer></script>
 
 <script>
 // Adaptive logic (improved)
@@ -825,17 +840,17 @@
         }
       }
       const callBtn = document.getElementById('callButton');
-const videoBtn = document.getElementById('videoCallButton');
-if (!isGroup && address && address !== window.State?.userAddress && address !== 'ai_bot') {
-    const displayName = name || (address ? address.slice(0, 10) + '…' : '');
-    callBtn.style.display = 'inline-flex';
-    callBtn.onclick = () => window.CallManager?.makeCall(address, false, displayName);
-    videoBtn.style.display = 'inline-flex';
-    videoBtn.onclick = () => window.CallManager?.makeCall(address, true, displayName);
-} else {
-    callBtn.style.display = 'none';
-    videoBtn.style.display = 'none';
-}
+      const videoBtn = document.getElementById('videoCallButton');
+      if (!isGroup && address && address !== window.State?.userAddress && address !== 'ai_bot') {
+        const displayName = name || (address ? address.slice(0, 10) + '…' : '');
+        callBtn.style.display = 'inline-flex';
+        callBtn.onclick = () => window.CallManager?.makeCall(address, false, displayName);
+        videoBtn.style.display = 'inline-flex';
+        videoBtn.onclick = () => window.CallManager?.makeCall(address, true, displayName);
+      } else {
+        callBtn.style.display = 'none';
+        videoBtn.style.display = 'none';
+      }
     };
   }
 

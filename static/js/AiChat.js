@@ -1,4 +1,5 @@
 // AiChat.js — исправленное: изображение в сообщении не пропадает после отправки
+// Исправлен attachReasoningToggle для мобильных устройств
 (function() {
     if (window._aiChatLoaded) return;
     window._aiChatLoaded = true;
@@ -21,6 +22,7 @@
     let aiClearHistoryBtn = null;
     let closeAiChatBtn = null;
     let aiImageGenBtn = null;
+    let aiStopBtn = null;          // добавлено
 
     const CONFIG = {
         historyMaxLength: 200,
@@ -30,14 +32,14 @@
         searchEndpoint: '/ai/search',
     };
 
-    // ========== ФУНКЦИЯ ДЛЯ ОБРАБОТКИ БЛОКА reasoning ==========
+    // ========== ФУНКЦИЯ ДЛЯ ОБРАБОТКИ БЛОКА reasoning (исправлена для мобильных) ==========
     function attachReasoningToggle(container) {
         if (!container) return;
         container.querySelectorAll('.reasoning-block details').forEach(details => {
             const summary = details.querySelector('summary');
             if (summary && !summary._listenerAttached) {
                 summary._listenerAttached = true;
-                summary.addEventListener('click', function(e) {
+                const toggle = function(e) {
                     e.preventDefault();
                     const isOpen = details.getAttribute('open') !== null;
                     if (isOpen) {
@@ -45,7 +47,10 @@
                     } else {
                         details.setAttribute('open', 'open');
                     }
-                });
+                };
+                summary.addEventListener('click', toggle);
+                summary.addEventListener('touchstart', toggle, { passive: false });
+                summary.addEventListener('pointerdown', toggle);
             }
         });
     }
@@ -290,7 +295,7 @@
             if (markdownBody) {
                 enhanceCodeBlocks(markdownBody);
                 addImageDownloadButtons(markdownBody);
-                attachReasoningToggle(markdownBody);  // теперь функция видна
+                attachReasoningToggle(markdownBody);
             }
         }
         aiMessagesContainer.appendChild(msgDiv);
@@ -408,6 +413,7 @@
             if (aiInternetBtn) aiInternetBtn.disabled = true;
             if (aiReasoningBtn) aiReasoningBtn.disabled = true;
             if (aiClearHistoryBtn) aiClearHistoryBtn.disabled = true;
+            if (aiStopBtn) aiStopBtn.disabled = true;
 
             const originalText = messageText;
             aiMessageInput.value = '';
@@ -424,6 +430,7 @@
                 if (aiInternetBtn) aiInternetBtn.disabled = false;
                 if (aiReasoningBtn) aiReasoningBtn.disabled = false;
                 if (aiClearHistoryBtn) aiClearHistoryBtn.disabled = false;
+                if (aiStopBtn) aiStopBtn.disabled = false;
                 aiMessageInput.focus();
                 isSending = false;
             }
@@ -437,6 +444,7 @@
         currentStreamingMessage = null;
         currentStreamingText = '';
         isSending = true;
+        if (aiStopBtn) aiStopBtn.style.display = 'inline-flex';
 
         const urlMatch = messageText.match(/https?:\/\/[^\s]+/);
         const urlToFetch = urlMatch ? urlMatch[0] : null;
@@ -590,6 +598,7 @@
             currentStreamingMessage = null;
             currentStreamingText = '';
             isSending = false;
+            if (aiStopBtn) aiStopBtn.style.display = 'none';
         }
     }
 
@@ -680,6 +689,25 @@
     // ========== Настройка UI ==========
     function setupAiUI() {
         if (!aiSendBtn) return;
+
+        // Кнопка "Стоп" – показывается во время генерации
+        aiStopBtn = document.getElementById('aiStopBtn');
+        if (aiStopBtn) {
+            aiStopBtn.onclick = () => {
+                if (currentStreamReader) {
+                    try { currentStreamReader.cancel(); } catch(e) {}
+                    currentStreamReader = null;
+                }
+                if (currentStreamingMessage) {
+                    const errDiv = currentStreamingMessage.querySelector('.content .markdown-body');
+                    if (errDiv) errDiv.textContent = '⏹ Ответ прерван пользователем.';
+                }
+                if (aiStopBtn) aiStopBtn.style.display = 'none';
+                isSending = false;
+                showToast('Генерация остановлена', 'warning');
+            };
+            aiStopBtn.style.display = 'none';
+        }
 
         aiSendBtn.onclick = async () => {
             const text = aiMessageInput ? aiMessageInput.value.trim() : '';
@@ -916,6 +944,7 @@
         aiImageInput = document.getElementById('aiImageInput');
         aiClearHistoryBtn = document.getElementById('aiClearHistoryBtn');
         closeAiChatBtn = document.getElementById('closeAiChatBtn');
+        // aiStopBtn уже определён в setupAiUI
         if (!aiMessagesContainer) return;
         loadAiHistory();
         setupAiUI();
