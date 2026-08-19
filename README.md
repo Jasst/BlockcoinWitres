@@ -1,537 +1,246 @@
+```markdown
+# 🧠 BlockcoinWitres — Когнитивный ассистент с распределённой памятью
 
-# 🌐 Vision — Global Cognitive Network
+**Экспериментальная платформа для долгосрочной, самообучающейся и проверяемой памяти ИИ.**
 
-> **BlockcoinWitres is not intended to remain only a blockchain messenger or a single AI system.**
->
-> The long-term vision is to explore the possibility of a **Global Cognitive Network** — a decentralized, persistent and cryptographically verifiable knowledge layer that can be accessed by different AI systems, devices and agents.
+Этот проект реализует **локальную когнитивную архитектуру**, которая служит основой для будущей **Глобальной Когнитивной Сети (GCN)**.  
+Код предоставляет полноценную систему памяти для LLM (через LM Studio), включая граф знаний, ассоциативные связи, гибридный поиск, рефлексию, автономное исследование и управление целями.
 
----
-
-## The idea
-
-Modern AI systems are mostly isolated.
-
-Each model has its own:
-
-* memory
-* context
-* knowledge
-* history
-* tools
-* identity
-
-When one AI learns something useful, another AI usually cannot directly inherit that knowledge.
-
-The result is millions of isolated artificial "minds", each repeatedly rediscovering information.
-
-The long-term goal of this project is to investigate another architecture:
-
-```text
-                    GLOBAL KNOWLEDGE
-                          NETWORK
-                             │
-          ┌──────────────────┼──────────────────┐
-          │                  │                  │
-        AI Node            AI Node            AI Node
-          │                  │                  │
-        Device              Server             Robot
-          │                  │                  │
-          └──────────────────┼──────────────────┘
-                             │
-                    COMMON KNOWLEDGE
-                       PROTOCOL
-```
-
-The model itself does not need to be identical.
-
-The **knowledge layer can be shared**.
+> **Долгосрочная цель** — создать децентрализованный, криптографически верифицируемый слой знаний, доступный любым ИИ-системам, устройствам и агентам.  
+> Подробности в [VISION.md](VISION.md) и [WHITEPAPER.md](WHITEPAPER.md).
 
 ---
 
-# 🧠 AI as an interface to collective memory
+## ✨ Ключевые особенности
 
-The goal is not to create one enormous neural network running somewhere in the world.
-
-Instead, the network would provide a common layer of structured knowledge and memory.
-
-Different AI systems could connect to it through a standardized adapter:
-
-```text
-┌───────────────────────────┐
-│       Any AI Model        │
-│                           │
-│ LLM / Agent / Robot / PC  │
-└─────────────┬─────────────┘
-              │
-              ▼
-      Global AI Adapter
-              │
-              ▼
-┌───────────────────────────┐
-│   Knowledge Protocol      │
-│                           │
-│ query                     │
-│ publish                   │
-│ verify                    │
-│ synchronize               │
-│ retrieve                  │
-└─────────────┬─────────────┘
-              │
-              ▼
-┌───────────────────────────┐
-│ Distributed Knowledge     │
-│ Graph                     │
-└───────────────────────────┘
-```
-
-The adapter would allow different models and devices to communicate with the same knowledge infrastructure without requiring them to use the same AI model.
+| Компонент | Описание |
+|-----------|----------|
+| **Когнитивная память** | Факты (`CLAIM`), эпизоды (`MEMORY_EVENT`), цели (`HYPOTHESIS`) с уверенностью, важностью, эмбеддингами и версионированием. |
+| **Ассоциативный граф** | Синапсы обучаются по правилам Хебба и STDP, поддерживают распад и пластичность. |
+| **Гибридный поиск** | Комбинация векторного сходства (FAISS), графовых связей, свежести, доверия и количества доказательств с динамической настройкой весов. |
+| **Распространение активации** | Поиск по графу с затуханием для извлечения связанных понятий. |
+| **Предсказательная модель** | Вероятностная матрица переходов между концептами на основе истории диалогов. |
+| **Автономное исследование** | Активные цели с низкой уверенностью автоматически инициируют веб-поиск (DuckDuckGo) и извлечение фактов. |
+| **Рефлексия (самообучение)** | Анализ ошибок предсказаний, динамическая корректировка весов поиска и запуск исследований. |
+| **Планирование целей** | Генерация долгосрочных целей на основе истории диалогов, отслеживание прогресса. |
+| **Управление памятью через команды** | `запомни`, `забудь`, `что ты знаешь о` — интуитивное взаимодействие. |
+| **Мультимодальность** | Поддержка изображений (вход и генерация через EasyDiffusion). |
+| **REST API** | Стриминг, поиск, исследование, генерация изображений, улучшение промптов. |
 
 ---
 
-# 🔗 Why blockchain?
+## 🧩 Архитектура
 
-Blockchain should not be treated as a giant database for storing every piece of AI memory.
-
-Its role is different.
-
-It can provide a **cryptographically verifiable history of knowledge**.
-
-Instead of storing an entire memory graph directly on-chain, the system could store things such as:
-
-```text
-memory_id
-content_hash
-previous_state_hash
-source_hash
-timestamp
-author / node identity
-signature
-Merkle root
-event type
+### Общая схема
+```
+Пользовательский запрос
+       ↓
+CognitiveController (обработка, планирование, рефлексия)
+       ↓
+   ┌───┴───────────────┐
+   ▼                   ▼
+CognitiveMemory    Веб-поиск (опционально)
+   │                   │
+   ├─ MemoryStore (GCN)│
+   │  ├─ KnowledgeObjects
+   │  ├─ Граф связей
+   │  ├─ FAISS-индекс
+   │  └─ События
+   │
+   ├─ Синапсы (Hebbian/STDP)
+   ├─ Предсказательная матрица
+   └─ Кэши (факты, эпизоды, цели)
+       │
+       ▼
+Гибридный поиск (вектор + граф + свежесть + доверие + доказательства)
+       │
+       ▼
+Формирование контекста + предсказания
+       │
+       ▼
+LLM (LM Studio) — генерация ответа
+       │
+       ▼
+Сохранение эпизода, обновление памяти, рефлексия
 ```
 
-The actual knowledge could remain in distributed storage or local nodes.
+### Основные модули
 
-The blockchain or another consensus layer would provide a verifiable anchor for the state of that knowledge.
+| Модуль | Файл | Назначение |
+|--------|------|------------|
+| `MemoryStore` | `GCN/GCN.py` | Хранилище объектов знаний, граф, FAISS, события, сериализация. |
+| `CognitiveMemory` | `GCN/memory_graph.py` | Обёртка над `MemoryStore` с кэшами, синапсами, предсказаниями, консолидацией. |
+| `AIAdapter` | `GCN/GCN.py` | Интерфейс для публикации и извлечения знаний (совместимость с агентами). |
+| `CognitiveController` | `ai_assistant.py` | Управляет циклом: обработка запросов, планирование, рефлексия, исследование, вызов LLM. |
+| `WebPageFetcher` | `ai_assistant.py` | Загрузка и извлечение текста из веб-страниц. |
+| `SearchCache` | `ai_assistant.py` | LRU-кэш для результатов поиска с TTL. |
+| `ChunkRanker` | `ai_assistant.py` | Разбивка текста на чанки, ранжирование по релевантности запросу. |
 
-This creates an important distinction:
-
-```text
-Knowledge
-    ≠
-History of Knowledge
-```
-
-The knowledge may evolve.
-
-The history should remain verifiable.
+### Поток обработки запроса
+1. **Вход**: сообщение пользователя (возможно, с изображением).
+2. **Команды памяти**: если сообщение начинается с `запомни`, `забудь` или `что ты знаешь о` — выполняется соответствующая операция с LLM-генерацией подтверждения.
+3. **Подготовка контекста**:
+   - Гибридный поиск в памяти → извлечение релевантных фактов.
+   - Если включён авто-поиск (`AUTO_SEARCH_ENABLED`) и запрос триггерный → выполняется веб-поиск с извлечением фактов.
+   - Предсказание возможных продолжений темы на основе предсказательной матрицы.
+   - Получение активных целей.
+4. **Формирование промпта**: системная инструкция, история диалога, контекст памяти, результаты поиска, предсказания, цели.
+5. **Генерация**: вызов LLM (LM Studio) в потоковом или синхронном режиме.
+6. **Сохранение**: эпизод (user/assistant) добавляется в память, confidence целей обновляется.
+7. **Рефлексия**: вычисляется ошибка предсказания, если превышает порог — запускается исследование или корректировка весов.
 
 ---
 
-# 📚 Knowledge should evolve, not disappear
+## 📦 Установка и запуск
 
-A global AI memory should not simply overwrite old information.
+### Требования
+- Python 3.10+
+- [LM Studio](https://lmstudio.ai/) (локальный сервер, совместимый с OpenAI API) — обязателен.
+- (Опционально) [EasyDiffusion](https://easydiffusion.github.io/) для генерации изображений.
+- (Опционально) `ddgs` (DuckDuckGo) для веб-поиска.
 
-Instead:
-
-```text
-Observation
-     ↓
-Hypothesis
-     ↓
-Knowledge
-     ↓
-New Evidence
-     ↓
-Revision
-     ↓
-New Knowledge State
+### Установка зависимостей
+```bash
+pip install -r requirements.txt
 ```
+Основные библиотеки: `aiohttp`, `fastapi`, `uvicorn`, `numpy`, `faiss-cpu` (или `faiss-gpu`), `sentence-transformers`, `scikit-learn`, `beautifulsoup4`, `ddgs`.
 
-For example:
+### Настройка
+1. **LM Studio**: запустите, загрузите модель, включите API-сервер (по умолчанию `http://localhost:1234`).  
+   Проверьте доступность: `curl http://localhost:1234/v1/chat/completions`.
+2. **EasyDiffusion** (опционально): запустите на `http://localhost:9000`.
+3. **Конфигурация**: отредактируйте `GCN/config_ai.py`:
+   - Пути к памяти (`MEMORY_BASE_DIR`).
+   - Веса гибридного поиска.
+   - Размеры кэшей, интервалы консолидации и рефлексии.
+   - Включение/отключение авто-поиска, извлечения фактов и т.д.
+4. **Структура памяти**: создаётся автоматически в папке `ai_memory_v3/<user_id>/cognitive_memory/`.
 
-```text
-BLOCK 100
-
-FACT A
-confidence = 0.82
+### Запуск сервера
+```bash
+uvicorn ai_assistant:app --host 0.0.0.0 --port 8000
 ```
-
-Later:
-
-```text
-BLOCK 250
-
-NEW EVIDENCE
-FACT A
-confidence = 0.41
-```
-
-And eventually:
-
-```text
-BLOCK 390
-
-RETRACTION
-FACT A
-reason = contradictory evidence
-```
-
-The original statement is not erased.
-
-The network preserves the fact that the statement existed, while allowing the current knowledge state to change.
-
-This makes the system closer to **versioned collective memory** than to a static database.
+Сервер предоставляет REST API (см. ниже).
 
 ---
 
-# 🌍 One global state, many local copies
+## 📡 API Эндпоинты
 
-A global knowledge network does not require every device to store everything.
+| Метод | Путь | Описание |
+|-------|------|----------|
+| `POST` | `/ai/chat` | Основной чат. Поддерживает стриминг, изображения, веб-поиск, рассуждения. |
+| `POST` | `/ai/search` | Прямой поиск по запросу (без генерации ответа). Возвращает контекст и источники. |
+| `POST` | `/ai/research` | Исследование цели: генерирует гипотезы, ищет подтверждения, возвращает ответ. |
+| `POST` | `/ai/generate_image` | Генерация изображения по промпту через EasyDiffusion. |
+| `POST` | `/ai/enhance_prompt` | Улучшение промпта для генерации изображений. |
+| `GET` | `/ai/global_stats` | Статистика памяти (количество фактов, эпизодов, целей, рёбер графа и т.д.). |
 
-A device could maintain only a subset:
-
-```text
-Phone
- └── local knowledge
-
-PC
- └── larger knowledge set
-
-Server
- └── large knowledge set
-
-Archive Node
- └── complete historical dataset
+### Пример запроса к `/ai/chat`
+```json
+POST /ai/chat
+{
+  "message": "Расскажи про графовые нейросети",
+  "stream": false,
+  "web_search": true,
+  "reasoning": false,
+  "image_base64": null,
+  "image_mime": null,
+  "char_by_char": false
+}
 ```
 
-All nodes could nevertheless reference a common cryptographic state:
-
-```text
-GLOBAL ROOT
-     │
-     ├── Node A
-     ├── Node B
-     ├── Node C
-     └── Node D
+Ответ (не стрим):
+```json
+{
+  "reply": "Графовые нейросети (GNN) — это класс нейронных сетей, работающих с графовыми структурами...",
+  "meta": {
+    "web_search_used": true,
+    "sources": [{"title": "GNN Overview", "url": "https://..."}],
+    "memory_context": "..."
+  }
+}
 ```
 
-A node could synchronize only the knowledge it needs.
-
-This makes the concept potentially suitable for everything from small devices to large servers.
+### Команды памяти (работают в любом сообщении)
+- `запомни <текст>` — сохраняет факт.
+- `забудь <текст>` — удаляет все факты, содержащие подстроку.
+- `что ты знаешь о <тема>` — извлекает факты и формирует связный ответ.
 
 ---
 
-# 🔄 Collective intelligence
+## 🛠️ Конфигурация (config_ai.py)
 
-The most important long-term possibility is not simply shared storage.
+Файл `GCN/config_ai.py` содержит все настройки. Основные группы:
 
-It is **shared learning**.
+| Группа | Параметры |
+|--------|-----------|
+| **LLM** | `LM_STUDIO_URL`, `LM_STUDIO_API_KEY`, таймауты, стриминг. |
+| **Память** | Размеры рабочей, сенсорной, эпизодической, семантической памяти, графа. |
+| **Гибридный поиск** | Веса `HYBRID_WEIGHT_SEMANTIC`, `HYBRID_WEIGHT_GRAPH`, `HYBRID_WEIGHT_FRESHNESS`, `HYBRID_WEIGHT_EVIDENCE`, `HYBRID_WEIGHT_CONFIDENCE`. |
+| **Эмбеддинги** | Модель `sentence-transformers/all-mpnet-base-v2`, размерность, параметры FAISS. |
+| **Hebbian/STDP** | Скорости обучения, распад, пороги. |
+| **Консолидация** | Интервалы лёгкой и глубокой консолидации, размер батча для replay. |
+| **Рефлексия** | Интервал, порог ошибки, размер истории. |
+| **Авто-поиск** | Включение, количество итераций, кэши, извлечение фактов. |
+| **Генерация изображений** | URL, размеры, шаги. |
 
-Imagine:
-
-```text
-AI A
- │
- └── discovers something
-          │
-          ▼
-     Knowledge Event
-          │
-          ▼
-     Network Nodes
-          │
-    ┌─────┼─────┐
-    ▼     ▼     ▼
-   AI B  AI C  AI D
-    │     │     │
-    └─────┼─────┘
-          ▼
-     Verification
-          │
-          ▼
-   Global Knowledge
-```
-
-One agent could contribute an observation.
-
-Other agents could verify, refute, connect or extend it.
-
-The result could become part of the shared knowledge state.
-
-This creates a potential foundation for **collective machine intelligence**.
+Изменяйте параметры под свои задачи (например, увеличивайте `EPISODIC_MAX_SIZE` для большей истории).
 
 ---
 
-# 🧩 Memory Graph + Global Network
+## 🧪 Текущее состояние и планы
 
-The current `BlockcoinWitres` architecture already contains an important experimental component:
+### Реализовано
+- Полноценная локальная когнитивная память.
+- Гибридный поиск с динамическими весами.
+- Автономное исследование и веб-поиск.
+- Рефлексия и самонастройка.
+- Управление целями и планирование.
+- Команды памяти.
+- REST API с поддержкой стриминга и изображений.
 
-```text
-Memory Graph
-```
+### В разработке (ближайшие шаги)
+- Криптографическая подпись объектов и событий.
+- Merkle-деревья для верификации состояния памяти.
+- P2P-синхронизация между узлами (на базе libp2p).
+- Частичная репликация знаний по доменам.
+- Репутация и консенсус для разрешения противоречий.
 
-The long-term direction is to evolve this concept from:
-
-```text
-Local AI
-   ↓
-Local Memory Graph
-```
-
-toward:
-
-```text
-Local AI
-   ↓
-Local Memory Graph
-   ↓
-Global Knowledge Protocol
-   ↓
-Distributed Knowledge Network
-```
-
-The local graph remains useful even when disconnected.
-
-When connectivity is available, it can synchronize with the global knowledge layer.
+### Долгосрочное видение
+Стать частью **Глобальной Когнитивной Сети** — открытой, децентрализованной инфраструктуры, где любые ИИ-системы (разных моделей, устройств, организаций) могут обмениваться проверяемыми знаниями, сохраняя историю и происхождение каждого факта.
 
 ---
 
-# 🔐 Provenance
+## 🤝 Вклад
 
-A global AI memory should not only answer:
+Проект открыт для экспериментов и улучшений.  
+Если вы хотите:
+- Улучшить качество поиска или ранжирования;
+- Добавить новые типы памяти или событий;
+- Реализовать криптографические функции;
+- Интегрировать другие LLM (не только LM Studio);
+- Разработать P2P-слой;
+- Улучшить документацию или тесты —
 
-> "What is known?"
-
-It should also be able to answer:
-
-> "Where did this knowledge come from?"
-
-Potentially every important knowledge object could contain:
-
-```text
-SOURCE
-   ↓
-OBSERVATION
-   ↓
-DERIVATION
-   ↓
-KNOWLEDGE
-   ↓
-MODIFICATION
-   ↓
-CURRENT STATE
-```
-
-This creates a provenance graph.
-
-An AI could therefore potentially explain not only a conclusion, but the history behind that conclusion.
+Создавайте issue или pull request. Мы приветствуем идеи и обсуждения.
 
 ---
 
-# ⚠️ Immutable history ≠ immutable truth
+## 📄 Лицензия
 
-One of the fundamental principles of this vision is:
-
-> **The history must be difficult to falsify, but knowledge must remain capable of being corrected.**
-
-A blockchain should not make an incorrect statement permanently "true".
-
-Instead:
-
-```text
-IMMUTABLE HISTORY
-        +
-VERSIONED KNOWLEDGE
-        +
-PROVENANCE
-        +
-CONFIDENCE
-        +
-REVOCATION
-```
-
-A false or outdated statement can be rejected.
-
-What cannot simply disappear is the historical record that the statement existed and how the network evaluated it.
+Проект распространяется под лицензией **MIT** (если не указано иное).  
+Подробнее в файле [LICENSE](LICENSE).
 
 ---
 
-# 🤖 The AI Adapter
+## 🌐 Ссылки
 
-A major future component of this project is a standardized adapter between AI systems and the global knowledge layer.
-
-Conceptually:
-
-```python
-brain = GlobalBrain()
-
-brain.connect()
-
-brain.query("What is known about X?")
-
-brain.remember(
-    knowledge,
-    source=source
-)
-
-brain.verify(knowledge_id)
-
-brain.related(concept)
-```
-
-The exact implementation is intentionally left open.
-
-The important idea is that an AI should not need to understand the entire underlying network.
-
-It only needs to understand the **Global Knowledge Protocol**.
-
-This could allow different AI architectures to participate.
+- [VISION.md](VISION.md) — концепция Global Cognitive Network.
+- [WHITEPAPER.md](WHITEPAPER.md) — технический белый документ.
+- [LM Studio](https://lmstudio.ai/) — локальный сервер LLM.
+- [EasyDiffusion](https://easydiffusion.github.io/) — генерация изображений.
 
 ---
 
-# 🌐 Possible future architecture
-
-```text
-                         GLOBAL COGNITIVE NETWORK
-                                      │
-                  ┌───────────────────┼───────────────────┐
-                  │                   │                   │
-             Knowledge Graph     Consensus Layer      P2P Network
-                  │                   │                   │
-                  └───────────────────┼───────────────────┘
-                                      │
-                            Global Knowledge State
-                                      │
-              ┌───────────────────────┼───────────────────────┐
-              │                       │                       │
-          AI Adapter              AI Adapter              AI Adapter
-              │                       │                       │
-            LLM A                   LLM B                   LLM C
-              │                       │                       │
-            PC                      Phone                   Robot
+**BlockcoinWitres — строим общую память для машин.**
 ```
-
-Potential technologies could include:
-
-* distributed hash addressing
-* Merkle trees
-* cryptographic signatures
-* peer-to-peer networking
-* distributed knowledge graphs
-* local caches
-* versioned knowledge
-* provenance tracking
-* consensus mechanisms
-* AI adapters
-* semantic and vector retrieval
-
-Existing decentralized knowledge-graph projects demonstrate that parts of this architecture are technically feasible today. OriginTrail's current DKG, for example, combines peer-to-peer knowledge exchange, structured graph data, provenance and blockchain anchoring for AI memory. ([GitHub][2])
-
-P2P frameworks such as libp2p already provide many of the networking primitives required for decentralized nodes, including peer identity, addressing, discovery and secure communication. ([libp2p][3])
-
----
-
-# 🚧 This is a long-term research direction
-
-This project does **not** claim that a Global Cognitive Network has already been created.
-
-The purpose of `BlockcoinWitres` is to explore the foundations required to eventually investigate such a system.
-
-The current project can be considered an experimental starting point:
-
-```text
-Blockchain
-     +
-AI
-     +
-Memory Graph
-     ↓
-Distributed Memory
-     ↓
-Knowledge Protocol
-     ↓
-P2P Synchronization
-     ↓
-Global Knowledge Layer
-     ↓
-Global Cognitive Network
-```
-
-The first practical milestone would not be a global network.
-
-It would be a small experiment with several independent nodes:
-
-```text
-Node A ───── Node B
-   │            │
-   └──── Node C ┘
-```
-
-All three nodes would:
-
-1. maintain local memory;
-2. exchange knowledge events;
-3. verify cryptographic proofs;
-4. synchronize their knowledge state;
-5. preserve historical versions;
-6. expose the same knowledge through a common AI adapter.
-
-If this experiment works, the architecture could theoretically scale from three nodes to thousands or millions of participating devices.
-
----
-
-# 🌌 Long-term vision
-
-The ultimate idea is to separate **intelligence from the device**.
-
-A future AI could be replaced, upgraded or moved to another machine without losing access to the collective knowledge accumulated by the network.
-
-The device changes.
-
-The model changes.
-
-The interface changes.
-
-The global knowledge layer remains.
-
-```text
-        DEVICE
-           ↓
-         MODEL
-           ↓
-        ADAPTER
-           ↓
-   GLOBAL KNOWLEDGE
-           ↓
-   COLLECTIVE MEMORY
-           ↓
-   COLLECTIVE INTELLIGENCE
-```
-
-The goal is therefore not simply to build another AI.
-
-The goal is to explore whether it is possible to build an **open, distributed and verifiable memory infrastructure for artificial intelligence**.
-
-> **Many models.
-> Many devices.
-> Many agents.
-> One shared, verifiable knowledge space.**
-
----
-
-## Status
-
-**Current:** Experimental architecture / research direction
-
-**Near-term:** Local memory graph + cryptographic memory events
-
-**Next:** Multi-node synchronization
-
-**Future:** Global Knowledge Protocol + AI Adapter
-
-**Long-term:** Distributed Global Cognitive Network
-
-[1]: https://origintrail.io/technology/decentralized-knowledge-graph?utm_source=chatgpt.com "Decentralized Knowledge Graph: The core of verifiable Internet for AI"
-[2]: https://github.com/OriginTrail/dkg?utm_source=chatgpt.com "GitHub - OriginTrail/dkg: OriginTrail Decentralized Knowledge Graph (DKG) is a decentralized knowledge infrastructure for multi-agent AI memory — enabling agents to publish, verify, and query shared knowledge as cryptographically verifiable graph assets across a peer-to-peer network. · GitHub"
-[3]: https://libp2p.io/docs/?utm_source=chatgpt.com "What is libp2p | libp2p"
