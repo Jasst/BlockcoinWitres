@@ -22,13 +22,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from memory_graph import CognitiveMemory, Fact, Episode, Goal
-
-# Импорт GCN-адаптера (папка GCN, файл GCN.py)
+# Импорты из пакета GCN (новая структура)
+from GCN.memory_graph import CognitiveMemory, Fact, Episode, Goal
 from GCN.GCN import AIAdapter, KnowledgeObject, KnowledgeType
 
 try:
-    from config_ai import *
+    from GCN.config_ai import *
 except ImportError:
     # fallback (все необходимые переменные)
     LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
@@ -321,7 +320,7 @@ class CognitiveController:
         self.user_dir = MEMORY_BASE_DIR / user_id
         self.user_dir.mkdir(parents=True, exist_ok=True)
 
-        # ---- GCN-память ----
+        # ---- GCN-память (единое хранилище) ----
         self.memory = CognitiveMemory(user_id, MEMORY_BASE_DIR)
         # AIAdapter для публикации знаний в GCN
         self.ai_adapter = AIAdapter(self.memory.store, user_id)
@@ -430,20 +429,8 @@ class CognitiveController:
             goals_text = await self._call_llm([{"role": "user", "content": prompt}], temp=0.7, max_tokens=200)
             goals = [g.strip("-• ").strip() for g in goals_text.split('\n') if g.strip()]
             for g in goals:
-                # Сохраняем цели как KnowledgeObject типа HYPOTHESIS.
-                # uuid4 вместо time()+hash()%1000 — старая схема могла давать коллизии
-                # id при генерации нескольких целей в одну секунду.
-                obj = KnowledgeObject(
-                    id=f"goal_{uuid.uuid4()}",
-                    type=KnowledgeType.HYPOTHESIS,
-                    subject=g,
-                    predicate="is_goal",
-                    object="active",
-                    author=self.user_id,
-                    created=datetime.now(timezone.utc),
-                    confidence=0.6,
-                )
-                self.memory.store.create(obj, self.user_id)
+                # Только add_goal – без ручного создания
+                await self.memory.add_goal(g, priority=0.5)
             await self.memory._schedule_save()
             logger.info(f"[Planner] Generated goals: {goals}")
         except Exception as e:
@@ -452,7 +439,7 @@ class CognitiveController:
     async def _auto_research(self):
         # Ищем активные цели (объекты типа HYPOTHESIS с object="active")
         active_goals = [obj for obj in self.memory.store._objects.values()
-                        if obj.type == KnowledgeType.HYPOTHESIS and obj.object == "active"]
+                        if obj.type == KnowledgeType.HYPOTHESIS and obj.object.get("status") == "active"]
         for goal_obj in active_goals:
             if goal_obj.confidence < 0.5:
                 logger.info(f"Auto-research triggered for goal: {goal_obj.subject}")
@@ -794,7 +781,7 @@ class CognitiveController:
                     else:
                         facts = self._extract_facts_from_text(search_data["context"])
                     for f in facts:
-                        # Публикуем через AIAdapter в GCN
+                        # Публикуем через AIAdapter в GCN (добавляет в GCN и синхронизирует кэши)
                         self.ai_adapter.publish({
                             "subject": f,
                             "predicate": "is_fact",
@@ -829,7 +816,7 @@ class CognitiveController:
 
         # Активные цели (из GCN)
         active_goals = [obj for obj in self.memory.store._objects.values()
-                        if obj.type == KnowledgeType.HYPOTHESIS and obj.object == "active"]
+                        if obj.type == KnowledgeType.HYPOTHESIS and obj.object.get("status") == "active"]
         goal_hint = ""
         if active_goals:
             goal_hint = "Активные цели: " + ", ".join([g.subject for g in active_goals[:2]])
@@ -978,7 +965,7 @@ class CognitiveController:
                 # 2. Команда "забудь" – удаляет факты и генерирует ответ через LLM
                 # ------------------------------------------------------------
                 elif action == "forget":
-                    to_remove_ids = {f.id for f in self.memory.semantic_facts if rest.lower() in f.subject.lower()}
+                    to_remove_ids = {f.id for f in self.memory.semantic_facts if rest.lower() in f.text.lower()}
                     if to_remove_ids:
                         removed = self.memory._remove_facts(to_remove_ids)
                         await self.memory._schedule_save()
@@ -1183,7 +1170,10 @@ class CognitiveController:
                 if goal_obj.subject.lower() in full_response.lower():
                     goal_obj.confidence = min(1.0, goal_obj.confidence + 0.1)
                     if goal_obj.confidence >= 0.9:
-                        self.memory.store.update(goal_obj.id, {"object": "completed", "confidence": goal_obj.confidence}, self.user_id)
+                        # Обновляем статус цели на completed
+                        new_obj = goal_obj.object.copy() if isinstance(goal_obj.object, dict) else {}
+                        new_obj["status"] = "completed"
+                        self.memory.store.update(goal_obj.id, {"object": new_obj, "confidence": goal_obj.confidence}, self.user_id)
                     else:
                         self.memory.store.update(goal_obj.id, {"confidence": goal_obj.confidence}, self.user_id)
             await self.memory._schedule_save()
