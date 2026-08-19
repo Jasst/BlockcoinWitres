@@ -1,5 +1,5 @@
 """
-Централизованная конфигурация для всей AI-системы (когнитивная архитектура)
+Централизованная конфигурация для всей AI-системы (когнитивная архитектура + GCN)
 """
 from pathlib import Path
 
@@ -20,49 +20,38 @@ LM_STUDIO_USE_STREAM = True
 LM_STUDIO_VISION_SUPPORTED = True
 
 # -------------------------------
-# Параметры памяти (многоуровневая)
+# Параметры памяти (GCN)
 # -------------------------------
 WORKING_MEMORY_SIZE = 20
 SENSORY_BUFFER_SIZE = 5
 EPISODIC_MAX_SIZE = 500
 SEMANTIC_MAX_FACTS = 10000
 ASSOCIATIVE_GRAPH_MAX_NODES = 20000
-
-# -------------------------------
-# Состояния узлов и синапсов
-# -------------------------------
-DEFAULT_IMPORTANCE = 1.0
 DEFAULT_CONFIDENCE = 0.5
-DEFAULT_NOVELTY = 0.0
-DEFAULT_SALIENCE = 0.0
-DEFAULT_STABILITY = 0.5
-DEFAULT_PLASTICITY = 0.5
-DEFAULT_PREDICTION_ERROR = 0.0
-
-SYNAPSE_INITIAL_WEIGHT = 0.1
-SYNAPSE_MAX_WEIGHT = 1.0
-SYNAPSE_MIN_WEIGHT = 0.01
-SYNAPSE_DECAY_RATE = 0.001
-SYNAPSE_PLASTICITY_RATE = 0.01
-SYNAPSE_COACTIVATION_THRESHOLD = 0.3
-
-HEBBIAN_LEARNING_RATE = 0.02
-STDP_LEARNING_RATE = 0.03
-STDP_TIME_WINDOW = 5.0
-STDP_LONG_TERM_POTENTIATION = 0.01
-STDP_LONG_TERM_DEPRESSION = 0.005
-
-SPREADING_MAX_DEPTH = 3
-SPREADING_MAX_NODES = 50
-SPREADING_DECAY = 0.5
-SPREADING_THRESHOLD = 0.05
+DEFAULT_IMPORTANCE = 1.0
 
 # -------------------------------
-# Прогностическая память
+# Гибридный поиск (GCN)
 # -------------------------------
-PREDICTIVE_MATRIX_MAX_SIZE = 5000
-PREDICTIVE_LEARNING_RATE = 0.1
-PREDICTION_ERROR_THRESHOLD = 0.3
+HYBRID_WEIGHT_SEMANTIC = 0.40      # вес семантического (эмбеддинги)
+HYBRID_WEIGHT_GRAPH = 0.30         # вес графовых связей
+HYBRID_WEIGHT_FRESHNESS = 0.15     # вес свежести
+HYBRID_WEIGHT_EVIDENCE = 0.10      # вес количества доказательств
+HYBRID_WEIGHT_CONFIDENCE = 0.05    # вес доверия
+DYNAMIC_WEIGHTS_ENABLED = True
+
+# -------------------------------
+# Эмбеддинги (заглушка – можно подключить SentenceTransformer)
+# -------------------------------
+EMBEDDING_DIM = 128                # размерность векторов (для демо)
+USE_EMBEDDINGS = True
+
+# -------------------------------
+# GCN-специфичные параметры
+# -------------------------------
+GCN_STATE_FILENAME = "gcn_state.json"  # имя файла для сохранения состояния
+GCN_AUTO_VERIFY = True                 # автоматически проверять противоречия при связывании
+GCN_EVIDENCE_THRESHOLD = 0.6           # минимальное доверие для использования как evidence
 
 # -------------------------------
 # Консолидация и сон
@@ -100,24 +89,7 @@ MAX_SEARCH_ATTEMPTS = 3
 ENABLE_QUERY_REWRITE = True
 EXTRACT_FACTS_FROM_SEARCH = True
 EXTRACT_FACTS_WITH_LLM = True
-DEEP_SEARCH_TOTAL_BUDGET = 15  # общий лимит страниц на deep_search
-
-# -------------------------------
-# Эмбеддинги и гибридный поиск
-# -------------------------------
-EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
-FAISS_NLIST = 200
-FAISS_NPROBE = 30
-FAISS_REBUILD_THRESHOLD = 300
-FAISS_MIN_TRAIN_VECTORS = 500
-MEMORY_USE_EMBEDDINGS = True
-HYBRID_WEIGHT_BM25 = 0.25
-HYBRID_WEIGHT_COSINE = 0.40
-HYBRID_WEIGHT_FRESHNESS = 0.15
-HYBRID_WEIGHT_GRAPH = 0.20
-DYNAMIC_WEIGHTS_ENABLED = True
-FACTUAL_WEIGHTS = (0.35, 0.30, 0.15, 0.20)
-GENERAL_WEIGHTS = (HYBRID_WEIGHT_BM25, HYBRID_WEIGHT_COSINE, HYBRID_WEIGHT_FRESHNESS, HYBRID_WEIGHT_GRAPH)
+DEEP_SEARCH_TOTAL_BUDGET = 15
 
 # -------------------------------
 # Планировщик целей

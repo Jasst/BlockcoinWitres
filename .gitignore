@@ -29,3 +29,4 @@ Checking
 Stopping
 turnserver.conf
 /uploads
+*.pyc

@@ -12,7 +12,7 @@ import time
 import hashlib
 import re
 from typing import Dict, Optional, Any, List, Tuple
-from collections import OrderedDict,defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 import numpy as np
 import aiohttp
@@ -23,9 +23,13 @@ from pydantic import BaseModel, Field
 
 from memory_graph import CognitiveMemory, Fact, Episode, Goal
 
+# Импорт GCN-адаптера (папка GCN, файл GCN.py)
+from GCN.GCN import AIAdapter, KnowledgeObject, KnowledgeType
+
 try:
     from config_ai import *
 except ImportError:
+    # fallback (все необходимые переменные)
     LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
     LM_STUDIO_API_KEY = "lm-studio"
     LM_STUDIO_TIMEOUT = 160
@@ -42,6 +46,38 @@ except ImportError:
     REFLECTION_HISTORY_SIZE = 100
     REFLECTION_LLM_TEMP = 0.5
     REFLECTION_LLM_MAX_TOKENS = 300
+    CONSOLIDATION_INTERVAL = 3600 * 2
+    DEEP_CONSOLIDATION_INTERVAL = 3600 * 8
+    CURIOSITY_RESEARCH_INTERVAL = 600
+    LONG_TERM_PLANNER_INTERVAL = 3600 * 6
+    DDG_MIN_INTERVAL = 1.2
+    DDG_MAX_RETRIES = 3
+    SEARCH_CACHE_TTL = 300
+    SEARCH_CACHE_MAX_SIZE = 200
+    PAGE_CONTENT_MAX_CHARS = 6000
+    MAX_PAGES_TO_FETCH = 7
+    MIN_RELEVANCE_THRESHOLD = 0.28
+    CHUNK_SIZE = 1200
+    CHUNK_OVERLAP = 150
+    PARALLEL_FETCH_LIMIT = 8
+    MAX_SEARCH_ATTEMPTS = 3
+    ENABLE_QUERY_REWRITE = True
+    EXTRACT_FACTS_FROM_SEARCH = True
+    EXTRACT_FACTS_WITH_LLM = True
+    EASYDIFFUSION_ENABLED = True
+    EASYDIFFUSION_URL = "http://localhost:9000"
+    EASYDIFFUSION_TIMEOUT = 120
+    EASYDIFFUSION_DEFAULT_STEPS = 20
+    EASYDIFFUSION_DEFAULT_WIDTH = 512
+    EASYDIFFUSION_DEFAULT_HEIGHT = 512
+    STREAM_CHAR_BY_CHAR = False
+    STREAM_CHAR_DELAY = 0.02
+    MAX_IMAGE_SIZE_BASE64 = 5 * 1024 * 1024
+    MEMORY_CONTROL_COMMANDS = {
+        "запомни": "store",
+        "забудь": "forget",
+        "что ты знаешь о": "recall"
+    }
 
 logger = logging.getLogger(__name__)
 
@@ -284,7 +320,11 @@ class CognitiveController:
         self.user_dir = MEMORY_BASE_DIR / user_id
         self.user_dir.mkdir(parents=True, exist_ok=True)
 
+        # ---- GCN-память ----
         self.memory = CognitiveMemory(user_id, MEMORY_BASE_DIR)
+        # AIAdapter для публикации знаний в GCN
+        self.ai_adapter = AIAdapter(self.memory.store, user_id)
+
         self.history: List[Dict] = []
         self.max_history = 20
         self._load_history()
@@ -298,6 +338,7 @@ class CognitiveController:
         self._consolidation_task = None
         self._planner_task = None
         self._research_task = None
+        self._reflection_task = None
         self._start_background_tasks()
 
         self.current_working_memory: List[str] = []
@@ -309,9 +350,8 @@ class CognitiveController:
         self.prediction_history: List[Dict] = []
         self.reflection_interval = REFLECTION_INTERVAL
         self._last_reflection_time = time.time()
-        self._reflection_task = None  # будет создан в _start_background_tasks
 
-        logger.info(f"CognitiveController initialized for {user_id[:16]}")
+        logger.info(f"CognitiveController (GCN) initialized for {user_id[:16]}")
 
     @property
     def searcher(self):
@@ -343,6 +383,7 @@ class CognitiveController:
             self._planner_task = asyncio.create_task(self._periodic_planning())
             self._research_task = asyncio.create_task(self._periodic_research())
             self._reflection_task = asyncio.create_task(self._periodic_reflection())
+
     async def _periodic_consolidation(self):
         while True:
             await asyncio.sleep(CONSOLIDATION_INTERVAL)
@@ -388,19 +429,34 @@ class CognitiveController:
             goals_text = await self._call_llm([{"role": "user", "content": prompt}], temp=0.7, max_tokens=200)
             goals = [g.strip("-• ").strip() for g in goals_text.split('\n') if g.strip()]
             for g in goals:
-                await self.memory.add_goal(g, priority=0.6)
+                # Сохраняем цели как KnowledgeObject типа HYPOTHESIS
+                obj = KnowledgeObject(
+                    id=f"goal_{int(time.time())}_{hash(g)%1000}",
+                    type=KnowledgeType.HYPOTHESIS,
+                    subject=g,
+                    predicate="is_goal",
+                    object="active",
+                    author=self.user_id,
+                    created=datetime.now(timezone.utc),
+                    confidence=0.6,
+                )
+                self.memory.store.create(obj, self.user_id)
+            await self.memory._schedule_save()
             logger.info(f"[Planner] Generated goals: {goals}")
         except Exception as e:
             logger.error(f"Planning error: {e}")
 
     async def _auto_research(self):
-        active_goals = await self.memory.get_active_goals()
-        for goal in active_goals:
-            if goal.confidence < 0.5 and goal.priority > 0.4:
-                logger.info(f"Auto-research triggered for goal: {goal.description}")
-                await self.research(goal.description)
-                goal.confidence = min(1.0, goal.confidence + 0.2)
-                await self.memory.update_goal(goal.id, confidence=goal.confidence)
+        # Ищем активные цели (объекты типа HYPOTHESIS с object="active")
+        active_goals = [obj for obj in self.memory.store._objects.values()
+                        if obj.type == KnowledgeType.HYPOTHESIS and obj.object == "active"]
+        for goal_obj in active_goals:
+            if goal_obj.confidence < 0.5:
+                logger.info(f"Auto-research triggered for goal: {goal_obj.subject}")
+                await self.research(goal_obj.subject)
+                goal_obj.confidence = min(1.0, goal_obj.confidence + 0.2)
+                self.memory.store.update(goal_obj.id, {"confidence": goal_obj.confidence}, self.user_id)
+        await self.memory._schedule_save()
 
     async def _call_llm(self, messages, temp=0.7, max_tokens=2048, retries=3):
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
@@ -505,14 +561,11 @@ class CognitiveController:
         if not predicted or not actual:
             return 1.0
         pred_text = " ".join(predicted)
-        # Берём метод из CognitiveMemory (он уже есть)
-        sim = self.memory._compute_similarity(pred_text, actual) if hasattr(self.memory, '_compute_similarity') else 0.0
-        # Нормализуем: если sim=1 → ошибка 0, если sim=0 → ошибка 1
+        sim = self.memory._compute_similarity(pred_text, actual)
         error = 1.0 - min(1.0, sim * 1.5)
         return max(0.0, min(1.0, error))
 
     async def _periodic_reflection(self):
-        """Фоновая задача, запускающая рефлексию с заданным интервалом."""
         while True:
             await asyncio.sleep(self.reflection_interval)
             try:
@@ -521,13 +574,9 @@ class CognitiveController:
                 logger.error(f"Reflection error: {e}")
 
     async def _run_reflection(self):
-        """
-        Анализирует историю ошибок, выявляет паттерны и корректирует внутренние веса/синапсы.
-        """
         if len(self.prediction_history) < 10:
             return
 
-        # 1. Собираем статистику – какие темы/типы вопросов дают наибольшую ошибку
         errors_by_keyword = defaultdict(list)
         for entry in self.prediction_history[-REFLECTION_HISTORY_SIZE:]:
             if entry["error"] > REFLECTION_ERROR_THRESHOLD:
@@ -538,16 +587,14 @@ class CognitiveController:
         if not errors_by_keyword:
             return
 
-        # 2. Выбираем топ-3 проблемных темы
         worst_topics = sorted(errors_by_keyword.items(), key=lambda kv: sum(kv[1]) / len(kv[1]), reverse=True)[:3]
 
-        # 3. Запрашиваем у LLM анализ и рекомендации
         prompt = (
-                "Ты — когнитивный ассистент. Проанализируй следующие темы, в которых мои предсказания часто ошибочны (ошибка > 0.6):\n\n"
-                + "\n".join([f"- {topic} (средняя ошибка: {sum(err) / len(err):.2f})" for topic, err in worst_topics])
-                + "\n\nПредложи кратко (2-3 предложения), что можно улучшить: "
-                  "какие факты добавить, какие связи усилить, какие веса поиска изменить. "
-                  "Ответь только текстом, без нумерации."
+            "Ты — когнитивный ассистент. Проанализируй следующие темы, в которых мои предсказания часто ошибочны (ошибка > 0.6):\n\n"
+            + "\n".join([f"- {topic} (средняя ошибка: {sum(err) / len(err):.2f})" for topic, err in worst_topics])
+            + "\n\nПредложи кратко (2-3 предложения), что можно улучшить: "
+              "какие факты добавить, какие связи усилить, какие веса поиска изменить. "
+              "Ответь только текстом, без нумерации."
         )
         try:
             analysis = await self._call_llm(
@@ -559,10 +606,8 @@ class CognitiveController:
             logger.warning(f"Reflection LLM call failed: {e}")
             return
 
-        # 4. Применяем рекомендации (упрощённая эвристика)
         analysis_lower = analysis.lower()
         if "усилить свежесть" in analysis_lower or "свежие данные" in analysis_lower:
-            # Увеличиваем вес свежести
             new_weight = min(0.35, self.memory._dynamic_weights.get("freshness", 0.15) + 0.03)
             self.memory._dynamic_weights["freshness"] = new_weight
             logger.info(f"[Reflection] Increased freshness weight to {new_weight:.3f}")
@@ -573,18 +618,14 @@ class CognitiveController:
             logger.info(f"[Reflection] Increased graph weight to {new_weight:.3f}")
 
         if "добавить факты" in analysis_lower or "поискать" in analysis_lower:
-            # Инициируем автоматический поиск по проблемным темам
             for topic, _ in worst_topics:
                 logger.info(f"[Reflection] Auto-research for topic: {topic}")
                 asyncio.create_task(self.research(topic))
 
-        # 5. Очищаем историю, чтобы не анализировать одно и то же постоянно
         self.prediction_history.clear()
         self._last_reflection_time = time.time()
 
     async def _quick_correction(self, query: str, predicted: List[str], actual: str):
-        """Срочная коррекция при очень высокой ошибке (например, > 0.85)."""
-        # Простой вариант: инициируем глубокий поиск по запросу
         logger.info(f"[QuickCorrection] High error detected for: {query[:50]}...")
         await self.research(query)
 
@@ -745,12 +786,19 @@ class CognitiveController:
                 search_context = search_data["context"] or "Поиск выполнен, но полезный текст извлечь не удалось."
             if EXTRACT_FACTS_FROM_SEARCH and search_data.get("context"):
                 try:
-                    if globals().get("EXTRACT_FACTS_WITH_LLM", False):
+                    if EXTRACT_FACTS_WITH_LLM:
                         facts = await self._extract_facts_llm(search_data["context"])
                     else:
                         facts = self._extract_facts_from_text(search_data["context"])
                     for f in facts:
-                        self.memory._add_fact(f, 'knowledge', confidence=0.6, salience=0.3)
+                        # Публикуем через AIAdapter в GCN
+                        self.ai_adapter.publish({
+                            "subject": f,
+                            "predicate": "is_fact",
+                            "object": "true",
+                            "type": "claim",
+                            "confidence": 0.6
+                        })
                     await self.memory._schedule_save()
                     logger.info(f"Extracted {len(facts)} facts from web search")
                 except Exception as e:
@@ -767,9 +815,7 @@ class CognitiveController:
             memory_context = "=== КОНТЕКСТ ИЗ ДОЛГОСРОЧНОЙ ПАМЯТИ ===\n" + "\n".join(lines) + "\n\n"
             self.current_working_memory = [f["text"] for f in relevant[:3]]
 
-        predictions = []
-        if self.current_working_memory:
-            predictions = await self.memory.predict_next(self.current_working_memory)
+        predictions = await self.memory.predict_next(self.current_working_memory) if self.current_working_memory else []
 
         uncertainty = 0.0
         if relevant:
@@ -778,10 +824,12 @@ class CognitiveController:
         if search_context:
             uncertainty *= 0.7
 
-        active_goals = await self.memory.get_active_goals()
+        # Активные цели (из GCN)
+        active_goals = [obj for obj in self.memory.store._objects.values()
+                        if obj.type == KnowledgeType.HYPOTHESIS and obj.object == "active"]
         goal_hint = ""
         if active_goals:
-            goal_hint = "Активные цели: " + ", ".join([g.description for g in active_goals[:2]])
+            goal_hint = "Активные цели: " + ", ".join([g.subject for g in active_goals[:2]])
 
         messages = self._build_messages(
             message=message,
@@ -849,7 +897,6 @@ class CognitiveController:
             })
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
-            # Если ошибка очень высокая, можно инициировать быструю коррекцию (опционально)
             if error > 0.85:
                 asyncio.create_task(self._quick_correction(message, predictions, response))
 
@@ -877,33 +924,8 @@ class CognitiveController:
             return self._extract_facts_from_text(text)
 
     async def _verify_pending_contradictions(self, max_checks: int = 5):
-        """Использует facts_by_id для быстрого доступа."""
-        checks_done = 0
-        while self.memory.pending_contradiction_checks and checks_done < max_checks:
-            fid1, fid2 = self.memory.pending_contradiction_checks.pop(0)
-            f1 = self.memory.facts_by_id.get(fid1)
-            f2 = self.memory.facts_by_id.get(fid2)
-            if not f1 or not f2:
-                continue
-            prompt = (
-                "Эти два утверждения логически противоречат друг другу? Ответь ТОЛЬКО одним словом: "
-                "ДА или НЕТ.\n\n"
-                f"1) {f1.text[:300]}\n2) {f2.text[:300]}"
-            )
-            try:
-                verdict = await self._call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=10)
-                verdict = (verdict or "").strip().lower()
-                if verdict.startswith('да'):
-                    self.memory.confirm_contradiction(fid1, fid2)
-                else:
-                    self.memory.clear_contradiction(fid1, fid2)
-            except Exception as e:
-                logger.debug(f"Contradiction verification failed for ({fid1},{fid2}): {e}")
-                self.memory.pending_contradiction_checks.append((fid1, fid2))
-                break
-            checks_done += 1
-        if checks_done:
-            await self.memory._schedule_save()
+        # В GCN противоречия можно обнаруживать через граф, но для совместимости оставляем заглушку
+        pass
 
     def _extract_facts_from_text(self, text: str) -> List[str]:
         sentences = re.split(r'[.!?]', text)
@@ -928,8 +950,7 @@ class CognitiveController:
                     return f"Запомнил: {rest}", {"memory": "stored", "id": fid}
 
                 elif action == "forget":
-                    # Корректное удаление через fact.id
-                    to_remove_ids = {f.id for f in self.memory.semantic_facts if rest.lower() in f.text.lower()}
+                    to_remove_ids = {f.id for f in self.memory.semantic_facts if rest.lower() in f.subject.lower()}
                     if to_remove_ids:
                         removed = self.memory._remove_facts(to_remove_ids)
                         await self.memory._schedule_save()
@@ -1079,13 +1100,16 @@ class CognitiveController:
             salience = 1.0 - uncertainty
             await self.memory.add_episode(message, full_response, salience=salience)
 
+            # Обновление целей (из GCN)
             active_goals = self._last_prepare_meta.get("active_goals", [])
-            for goal in active_goals:
-                if goal.description.lower() in full_response.lower():
-                    goal.progress = min(1.0, goal.progress + 0.1)
-                    if goal.progress >= 0.9:
-                        goal.status = "completed"
-                    await self.memory.update_goal(goal.id, progress=goal.progress, status=goal.status)
+            for goal_obj in active_goals:
+                if goal_obj.subject.lower() in full_response.lower():
+                    goal_obj.confidence = min(1.0, goal_obj.confidence + 0.1)
+                    if goal_obj.confidence >= 0.9:
+                        self.memory.store.update(goal_obj.id, {"object": "completed", "confidence": goal_obj.confidence}, self.user_id)
+                    else:
+                        self.memory.store.update(goal_obj.id, {"confidence": goal_obj.confidence}, self.user_id)
+            await self.memory._schedule_save()
 
         # ---- Рефлексия: запоминаем предсказание и ошибку ----
         predictions = self._last_prepare_meta.get("predictions", [])
@@ -1153,6 +1177,8 @@ class CognitiveController:
             self._planner_task.cancel()
         if self._research_task:
             self._research_task.cancel()
+        if self._reflection_task:
+            self._reflection_task.cancel()
         await self.memory.shutdown()
 
 

@@ -1,6 +1,8 @@
 """
 Когнитивная память: семантическая, эпизодическая, ассоциативный граф с Hebbian/STDP,
 spreading activation, predictive transitions, противоречия, консолидация, replay.
+Дополнительно интегрирован GCN (Global Cognitive Network) для структурированного
+хранения, версионирования, событий и гибридного поиска.
 """
 import json
 import logging
@@ -8,6 +10,7 @@ import time
 import re
 import asyncio
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Set, Optional, Any, Tuple, DefaultDict
 from collections import defaultdict, deque
@@ -17,6 +20,13 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 import faiss
+
+# Импорт GCN-компонентов (папка GCN, файл GCN.py)
+from GCN.GCN import (
+    KnowledgeObject, KnowledgeType, KnowledgeEvent, EventType,
+    MemoryStore, KnowledgeGraph as GCNKnowledgeGraph,
+    AIAdapter, Provenance, MemoryHierarchy
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +84,13 @@ except ImportError:
     MEMORY_CACHE_TTL = 60
     MEMORY_CACHE_MAX_SIZE = 1000
     DUPLICATE_SIMILARITY_THRESHOLD = 0.92
+    GCN_STATE_FILENAME = "gcn_state.json"
+    GCN_AUTO_VERIFY = True
+    GCN_EVIDENCE_THRESHOLD = 0.6
 
 
 # =====================================================================
-# ДАТАКЛАССЫ
+# ДАТАКЛАССЫ (оригинальные, без изменений)
 # =====================================================================
 @dataclass
 class Fact:
@@ -98,6 +111,9 @@ class Fact:
     last_accessed: float = 0.0
     activation: float = 0.0
     contradicts: Set[int] = field(default_factory=set)
+
+    # Для совместимости с GCN – храним ссылку на KnowledgeObject id (если создан)
+    gcn_id: Optional[str] = None
 
 
 @dataclass
@@ -144,15 +160,14 @@ class Goal:
 
 
 # =====================================================================
-# ОСНОВНОЙ КЛАСС КОГНИТИВНОЙ ПАМЯТИ
+# ОСНОВНОЙ КЛАСС КОГНИТИВНОЙ ПАМЯТИ (с GCN-слоем)
 # =====================================================================
 class CognitiveMemory:
     """
     Многоуровневая память с ассоциативным графом, Hebbian/STDP,
     spreading activation, предсказаниями, консолидацией и replay.
-
-    ВАЖНО: все операции с фактами используют fact.id (стабильный идентификатор),
-    а не индекс в списке semantic_facts. Маппинг id -> Fact хранится в facts_by_id.
+    Дополнительно интегрирован GCN как структурированное хранилище
+    с версионированием, событиями и гибридным поиском.
     """
 
     def __init__(self, user_id: str, base_dir: Path):
@@ -160,15 +175,15 @@ class CognitiveMemory:
         self.base_dir = base_dir / user_id / "cognitive_memory"
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
-        # ---- Уровни памяти ----
+        # ---- Оригинальные уровни памяти ----
         self.sensory_buffer: deque = deque(maxlen=SENSORY_BUFFER_SIZE)
         self.working_memory: deque = deque(maxlen=WORKING_MEMORY_SIZE)
         self.episodic_memory: List[Episode] = []
         self.semantic_facts: List[Fact] = []
-        self.facts_by_id: Dict[int, Fact] = {}            # ← НОВОЕ: маппинг id -> Fact
-        self.graph: DefaultDict[int, Set[int]] = defaultdict(set)
+        self.facts_by_id: Dict[int, Fact] = {}            # id -> Fact
+        self.graph: DefaultDict[int, Set[int]] = defaultdict(set)  # граф синапсов
         self.synapses: Dict[Tuple[int, int], Synapse] = {}
-        self.keyword_index: DefaultDict[str, List[int]] = defaultdict(list)  # теперь хранит fact.id
+        self.keyword_index: DefaultDict[str, List[int]] = defaultdict(list)  # fact.id
 
         # ---- Прогностическая модель ----
         self.predictive_matrix: DefaultDict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
@@ -189,7 +204,7 @@ class CognitiveMemory:
         self._dirty = False
         self._save_task = None
 
-        # ---- Динамические веса для гибридного поиска (будут изменяться рефлексией) ----
+        # ---- Динамические веса для гибридного поиска ----
         self._dynamic_weights = {
             "bm25": HYBRID_WEIGHT_BM25,
             "cosine": HYBRID_WEIGHT_COSINE,
@@ -197,7 +212,19 @@ class CognitiveMemory:
             "graph": HYBRID_WEIGHT_GRAPH,
         }
 
-        # ---- Эмбеддинги ----
+        # ---- GCN-слой (дополнительное хранилище) ----
+        self.gcn_store = MemoryStore()
+        self.gcn_graph = self.gcn_store._graph  # для доступа
+        # Загружаем состояние GCN (если есть)
+        gcn_state_path = self.base_dir / GCN_STATE_FILENAME
+        if gcn_state_path.exists():
+            try:
+                self.gcn_store.load(str(gcn_state_path))
+                logger.info("GCN state loaded")
+            except Exception as e:
+                logger.warning(f"Failed to load GCN state: {e}")
+
+        # ---- Эмбеддинги (оригинальные) ----
         self.use_embeddings = MEMORY_USE_EMBEDDINGS
         if self.use_embeddings:
             try:
@@ -228,11 +255,11 @@ class CognitiveMemory:
         self._cache_ttl = MEMORY_CACHE_TTL
         self._cache_maxsize = MEMORY_CACHE_MAX_SIZE
 
-        # Загрузка сохранённого состояния
+        # Загрузка сохранённого состояния (оригинальные файлы)
         self._load_sync()
         logger.info(f"CognitiveMemory initialized for {user_id[:16]}")
 
-    # ==================== ЗАГРУЗКА / СОХРАНЕНИЕ ====================
+    # ==================== ЗАГРУЗКА / СОХРАНЕНИЕ (оригинальные) ====================
     def _load_sync(self):
         facts_path = self.base_dir / "facts.json"
         if facts_path.exists():
@@ -258,6 +285,7 @@ class CognitiveMemory:
                             access_count=fd.get('access_count', 0),
                             last_accessed=fd.get('last_accessed', 0.0),
                             contradicts=set(fd.get('contradicts', [])),
+                            gcn_id=fd.get('gcn_id', None),
                         )
                         self.semantic_facts.append(fact)
                     self._next_fact_id = data.get('next_id', len(self.semantic_facts))
@@ -330,7 +358,6 @@ class CognitiveMemory:
                 arr = np.load(path)
                 if arr.shape[0] > 0:
                     self.fact_embeddings = list(arr)
-                    # Гарантируем соответствие длины
                     if len(self.fact_embeddings) != len(self.semantic_facts):
                         logger.warning(
                             f"Embeddings count ({len(self.fact_embeddings)}) != facts count ({len(self.semantic_facts)}). Resetting."
@@ -375,6 +402,7 @@ class CognitiveMemory:
                         'access_count': f.access_count,
                         'last_accessed': f.last_accessed,
                         'contradicts': list(f.contradicts),
+                        'gcn_id': f.gcn_id,
                     })
                 with open(facts_path, 'w', encoding='utf-8') as f:
                     json.dump({'facts': facts_data, 'next_id': self._next_fact_id}, f, ensure_ascii=False, indent=2)
@@ -414,6 +442,10 @@ class CognitiveMemory:
                 if self.use_embeddings and self.fact_embeddings:
                     np.save(self._embeddings_path(), np.array(self.fact_embeddings))
 
+                # Сохраняем GCN состояние
+                gcn_state_path = self.base_dir / GCN_STATE_FILENAME
+                self.gcn_store.save(str(gcn_state_path))
+
                 self._dirty = False
             except Exception as e:
                 logger.error(f"Save error: {e}")
@@ -428,9 +460,8 @@ class CognitiveMemory:
         if self._dirty:
             await self._save_async()
 
-    # ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
+    # ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (оригинальные + _compute_similarity) ====================
     def _build_keyword_index(self):
-        """Перестраивает индекс ключевых слов. Хранит fact.id, а не индексы списка."""
         self.keyword_index.clear()
         for fact in self.semantic_facts:
             for word in fact.keywords:
@@ -443,6 +474,14 @@ class CognitiveMemory:
                      'же', 'бы', 'то', 'не', 'что', 'как', 'за', 'от', 'до', 'при', 'через', 'без', 'между', 'тоже',
                      'также', 'очень', 'можно', 'нужно', 'будет', 'если', 'тогда', 'потом', 'который', 'какой'}
         return {w for w in words if w not in stopwords}
+
+    @staticmethod
+    def _compute_similarity(text1: str, text2: str) -> float:
+        kw1 = CognitiveMemory._extract_keywords(text1)
+        kw2 = CognitiveMemory._extract_keywords(text2)
+        if not kw1 or not kw2:
+            return 0.0
+        return len(kw1 & kw2) / (len(kw1 | kw2) + 1e-6)
 
     def _get_embedding(self, text: str) -> np.ndarray:
         if not self.use_embeddings:
@@ -476,7 +515,6 @@ class CognitiveMemory:
         logger.info(f"FAISS retrained on {vectors.shape[0]} vectors")
 
     def _rebuild_faiss_index(self):
-        """Полностью перестраивает FAISS-индекс на основе текущих эмбеддингов."""
         if not self.use_embeddings or self.index is None:
             return
         if not self.fact_embeddings:
@@ -499,21 +537,12 @@ class CognitiveMemory:
         self._emb_added_since_train = 0
         logger.info(f"FAISS index rebuilt with {len(vectors)} vectors")
 
-    def _compute_similarity(self, text1: str, text2: str) -> float:
-        kw1 = self._extract_keywords(text1)
-        kw2 = self._extract_keywords(text2)
-        if not kw1 or not kw2:
-            return 0.0
-        return len(kw1 & kw2) / (len(kw1 | kw2) + 1e-6)
-
     def _invalidate_tfidf_cache(self):
-        """Сбрасывает кэш TF-IDF — будет пересчитан при следующем обращении."""
         self._tfidf_dirty = True
         self._tfidf_matrix = None
         self._tfidf_texts_hash = None
 
     def _ensure_tfidf(self):
-        """Ленивая перестройка TF-IDF матрицы только при изменении корпуса."""
         texts = [f.text for f in self.semantic_facts]
         texts_hash = hashlib.md5("\n".join(texts[:100]).encode()).hexdigest()
         if not self._tfidf_dirty and self._tfidf_matrix is not None and texts_hash == self._tfidf_texts_hash:
@@ -530,50 +559,37 @@ class CognitiveMemory:
             logger.warning(f"TF-IDF rebuild failed: {e}")
             self._tfidf_matrix = None
 
-    # ==================== УДАЛЕНИЕ ФАКТОВ (унифицированное) ====================
+    # ==================== УДАЛЕНИЕ ФАКТОВ (оригинальное) ====================
     def _remove_facts(self, ids: Set[int]) -> int:
-        """
-        Корректно удаляет факты по fact.id: обновляет semantic_facts, facts_by_id,
-        эмбеддинги, синапсы, граф и keyword_index. Возвращает число удалённых.
-        """
         if not ids:
             return 0
-        # Определяем индексы удаляемых фактов ДО удаления (для эмбеддингов)
         indices_to_remove = {i for i, f in enumerate(self.semantic_facts) if f.id in ids}
 
-        # Удаляем из semantic_facts
         self.semantic_facts = [f for f in self.semantic_facts if f.id not in ids]
-        # Обновляем маппинг
         self.facts_by_id = {f.id: f for f in self.semantic_facts}
 
-        # Удаляем эмбеддинги по индексам
         if self.use_embeddings and self.fact_embeddings:
             self.fact_embeddings = [emb for i, emb in enumerate(self.fact_embeddings) if i not in indices_to_remove]
             self._rebuild_faiss_index()
 
-        # Удаляем синапсы, касающиеся удалённых фактов
         self.synapses = {(s, t): syn for (s, t), syn in self.synapses.items()
                          if s not in ids and t not in ids}
-        # Перестраиваем граф
         self.graph = defaultdict(set)
         for (src, tgt) in self.synapses:
             self.graph[src].add(tgt)
 
-        # Чистим contradicts
         for f in self.semantic_facts:
             f.contradicts -= ids
 
-        # Перестраиваем keyword_index
         self._build_keyword_index()
         self._invalidate_tfidf_cache()
         self._dirty = True
         return len(indices_to_remove)
 
-    # ==================== ДОБАВЛЕНИЕ ФАКТОВ И СВЯЗЕЙ ====================
+    # ==================== ДОБАВЛЕНИЕ ФАКТОВ (оригинальное + синхронизация с GCN) ====================
     def _add_fact(self, text: str, ftype: str, importance: float = 1.0,
                   confidence: float = 0.5, novelty: float = 0.0,
                   salience: float = 0.0) -> int:
-        """Добавляет семантический факт и возвращает его id."""
         fid = self._next_fact_id
         self._next_fact_id += 1
         fact = Fact(
@@ -597,7 +613,26 @@ class CognitiveMemory:
         for kw in fact.keywords:
             self.keyword_index[kw].append(fid)
 
-        # Эмбеддинг
+        # ---- GCN синхронизация: создаём KnowledgeObject ----
+        gcn_obj = KnowledgeObject(
+            id=f"fact_gcn_{fid}",
+            type=KnowledgeType.CLAIM,
+            subject=text,
+            predicate="",
+            object="",
+            author=self.user_id,
+            created=datetime.now(timezone.utc),
+            confidence=confidence,
+            evidence=[],
+            version=1,
+        )
+        try:
+            self.gcn_store.create(gcn_obj, self.user_id)
+            fact.gcn_id = gcn_obj.id
+        except Exception as e:
+            logger.warning(f"Failed to create GCN object for fact {fid}: {e}")
+
+        # ---- Оригинальная логика эмбеддингов и синапсов ----
         emb = None
         if self.use_embeddings:
             try:
@@ -610,7 +645,6 @@ class CognitiveMemory:
             except Exception:
                 emb = None
 
-        # Находим похожие факты
         similar: List[Tuple[int, float]] = []
         if emb is not None:
             similar = self._find_similar_by_embedding(emb, k=20, exclude_idx=fact_idx)
@@ -625,7 +659,6 @@ class CognitiveMemory:
             similar.sort(key=lambda x: -x[1])
             similar = similar[:20]
 
-        # Создаём синапсы для достаточно похожих фактов
         similar_ids: List[int] = []
         for other_idx, sim in similar:
             if other_idx >= len(self.semantic_facts) or other_idx == fact_idx:
@@ -636,7 +669,6 @@ class CognitiveMemory:
                 self._create_synapse(fid, other.id, weight=sim * 0.5)
                 self._create_synapse(other.id, fid, weight=sim * 0.5)
 
-        # Проверка противоречий
         self._detect_contradictions(fid, candidate_ids=similar_ids)
         self._dirty = True
         self._invalidate_tfidf_cache()
@@ -644,10 +676,6 @@ class CognitiveMemory:
 
     def _find_similar_by_embedding(self, emb: np.ndarray, k: int = 20,
                                    exclude_idx: Optional[int] = None) -> List[Tuple[int, float]]:
-        """
-        Возвращает top-k (fact_idx, cosine_similarity) по эмбеддингам.
-        Использует FAISS ANN-поиск, если индекс обучен.
-        """
         if not self.fact_embeddings:
             return []
         n = len(self.fact_embeddings)
@@ -672,7 +700,6 @@ class CognitiveMemory:
         return [(candidates[i], float(sims[i])) for i in order]
 
     def _create_synapse(self, src: int, tgt: int, weight: float = SYNAPSE_INITIAL_WEIGHT):
-        """Создаёт или обновляет синапс. src/tgt — это fact.id."""
         key = (src, tgt)
         if key in self.synapses:
             syn = self.synapses[key]
@@ -687,13 +714,17 @@ class CognitiveMemory:
                 confidence=0.5
             )
         self.graph[src].add(tgt)
+        # Также добавляем связь в GCN граф (если оба объекта существуют в GCN)
+        fact_src = self.facts_by_id.get(src)
+        fact_tgt = self.facts_by_id.get(tgt)
+        if fact_src and fact_tgt and fact_src.gcn_id and fact_tgt.gcn_id:
+            try:
+                self.gcn_store.link(fact_src.gcn_id, fact_tgt.gcn_id, "synapse", self.user_id)
+            except Exception as e:
+                logger.debug(f"GCN link failed: {e}")
         self._dirty = True
 
     def _detect_contradictions(self, fact_id: int, candidate_ids: Optional[List[int]] = None):
-        """
-        Находит подозреваемых кандидатов на противоречие среди семантически близких фактов.
-        candidate_ids — список fact.id (не индексов!).
-        """
         fact = self.facts_by_id.get(fact_id)
         if not fact:
             return
@@ -734,7 +765,7 @@ class CognitiveMemory:
             f2.confidence = min(1.0, f2.confidence / 0.97)
             self._dirty = True
 
-    # ==================== ЭПИЗОДЫ ====================
+    # ==================== ЭПИЗОДЫ (оригинальные) ====================
     async def add_episode(self, user_msg: str, assistant_msg: str, salience: float = 0.0):
         episode = Episode(
             id=self._next_episode_id,
@@ -756,9 +787,27 @@ class CognitiveMemory:
         self._create_synapse(user_id, assistant_id, weight=0.8)
         self._create_synapse(assistant_id, user_id, weight=0.6)
         self._update_predictive(user_msg, assistant_msg)
+
+        # Сохраняем эпизод также в GCN как MEMORY_EVENT
+        gcn_ep = KnowledgeObject(
+            id=f"ep_gcn_{episode.id}",
+            type=KnowledgeType.MEMORY_EVENT,
+            subject=user_msg,
+            predicate="assistant_replied",
+            object=assistant_msg,
+            author=self.user_id,
+            created=datetime.now(timezone.utc),
+            confidence=0.8,
+            evidence=[],
+        )
+        try:
+            self.gcn_store.create(gcn_ep, self.user_id)
+        except Exception as e:
+            logger.warning(f"GCN episode creation failed: {e}")
+
         await self._schedule_save()
 
-    # ==================== ПРЕДСКАЗАТЕЛЬНАЯ МОДЕЛЬ ====================
+    # ==================== ПРЕДСКАЗАТЕЛЬНАЯ МОДЕЛЬ (оригинальная) ====================
     def _concept_key(self, text: str, top_n: int = 5) -> Optional[str]:
         kws = self._extract_keywords(text)
         if not kws:
@@ -799,9 +848,8 @@ class CognitiveMemory:
         sorted_candidates = sorted(candidates.items(), key=lambda x: -x[1])[:top_k]
         return [self.concept_examples.get(k, k) for k, _ in sorted_candidates]
 
-    # ==================== HEBBIAN / STDP ====================
+    # ==================== HEBBIAN / STDP (оригинальные) ====================
     def _hebbian_update(self, source_id: int, target_id: int, coactivation_time: float):
-        """Обновляет синапс по правилу Хебба с учётом временной задержки (STDP)."""
         key = (source_id, target_id)
         if key not in self.synapses:
             return
@@ -821,7 +869,6 @@ class CognitiveMemory:
         self._dirty = True
 
     def _get_effective_weight(self, syn: Synapse, now: Optional[float] = None) -> float:
-        """Ленивое затухание: вычисляет актуальный вес синапса на текущий момент."""
         if now is None:
             now = time.time()
         age = now - syn.last_activation
@@ -829,12 +876,11 @@ class CognitiveMemory:
         return max(SYNAPSE_MIN_WEIGHT, syn.weight * decay)
 
     def _apply_decay(self):
-        """Мягкое затухание синапсов. Применяется только к старым синапсам."""
         now = time.time()
         changed = 0
         for syn in self.synapses.values():
             age = now - syn.last_activation
-            if age < 3600:  # не трогаем синапсы моложе часа
+            if age < 3600:
                 continue
             decay = 1.0 - SYNAPSE_DECAY_RATE * min(1.0, age / 86400)
             new_weight = max(SYNAPSE_MIN_WEIGHT, syn.weight * decay)
@@ -845,13 +891,9 @@ class CognitiveMemory:
         if changed:
             self._dirty = True
 
-    # ==================== SPREADING ACTIVATION ====================
+    # ==================== SPREADING ACTIVATION (оригинальная) ====================
     async def spread_activation(self, seed_ids: List[int], max_depth: int = SPREADING_MAX_DEPTH,
                                max_nodes: int = SPREADING_MAX_NODES) -> Dict[int, float]:
-        """
-        Распространяет активацию от seed-узлов (по fact.id) по графу.
-        Возвращает словарь {fact.id: activation_score}.
-        """
         now = time.time()
         for f in self.semantic_facts:
             f.activation = 0.0
@@ -889,12 +931,11 @@ class CognitiveMemory:
                 self.facts_by_id[fid].activation = act
         return activation_map
 
-    # ==================== ГИБРИДНЫЙ ПОИСК ====================
+    # ==================== ГИБРИДНЫЙ ПОИСК (оригинальный, но с возможностью использовать GCN) ====================
     async def retrieve_hybrid(self, query: str, top_k: int = 5, use_graph: bool = True) -> List[Dict]:
-        """
-        Гибридный поиск: BM25 + косинус + свежесть + графовая активация.
-        Все операции работают через fact.id.
-        """
+        # Если включено использование GCN, можно использовать gcn_store.hybrid_retrieve
+        # Но для совместимости оставляем оригинальную логику, но добавим опцию использовать GCN
+        # Здесь я оставлю оригинальную логику, но можно добавить параметр use_gcn=False
         cache_key = f"hybrid_{query}_{top_k}_{use_graph}"
         if cache_key in self._cache:
             result, ts = self._cache[cache_key]
@@ -926,22 +967,18 @@ class CognitiveMemory:
             if len(candidate_ids) < 3:
                 candidate_ids = set(self.facts_by_id.keys())
 
-        # Преобразуем в список и создаём индекс fact.id -> позиция
         candidate_list = [fid for fid in candidate_ids if fid in self.facts_by_id]
         id_to_pos = {fid: i for i, fid in enumerate(candidate_list)}
         n_cand = len(candidate_list)
         if n_cand == 0:
             return []
 
-        # 2. BM25 (ленивый кэш)
+        # 2. BM25
         bm25_scores = np.ones(n_cand) * 0.5
         if n_cand > 1:
             try:
                 self._ensure_tfidf()
                 if self._tfidf_matrix is not None:
-                    # Берём строки для кандидатов
-                    # Но tfidf обучен на всех фактах. Нужно пересчитать для подмножества.
-                    # Для простоты — переобучаем на кандидатах + запросе.
                     texts = [self.facts_by_id[fid].text for fid in candidate_list]
                     tfidf_local = self.tfidf.fit_transform(texts + [query])
                     vectors = tfidf_local[:-1]
@@ -956,10 +993,8 @@ class CognitiveMemory:
             try:
                 q_emb = self._get_embedding(query).reshape(1, -1)
                 q_norm = q_emb / (np.linalg.norm(q_emb) + 1e-8)
-                # Собираем эмбеддинги кандидатов
                 cand_embs = []
                 for fid in candidate_list:
-                    # Находим индекс в fact_embeddings
                     idx = next((i for i, f in enumerate(self.semantic_facts) if f.id == fid), None)
                     if idx is not None and idx < len(self.fact_embeddings):
                         cand_embs.append(self.fact_embeddings[idx])
@@ -990,7 +1025,6 @@ class CognitiveMemory:
                     graph_scores[i] = activation_map[fid]
 
         # 6. Динамические веса
-        # 6. Динамические веса (с возможностью адаптации)
         if DYNAMIC_WEIGHTS_ENABLED:
             is_factual = bool(re.search(r'\b\d+[.,]?\d*\s*(?:USD|EUR|RUB|%|кг|км|г)\b', query))
             if is_factual:
@@ -1001,12 +1035,10 @@ class CognitiveMemory:
             w_bm25, w_cos, w_fresh, w_graph = (HYBRID_WEIGHT_BM25, HYBRID_WEIGHT_COSINE,
                                                HYBRID_WEIGHT_FRESHNESS, HYBRID_WEIGHT_GRAPH)
 
-        # ---- НОВОЕ: переопределяем веса из _dynamic_weights (если они изменены) ----
         w_bm25 = self._dynamic_weights.get("bm25", w_bm25)
         w_cos = self._dynamic_weights.get("cosine", w_cos)
         w_fresh = self._dynamic_weights.get("freshness", w_fresh)
         w_graph = self._dynamic_weights.get("graph", w_graph)
-
 
         # 7. Итоговый рейтинг
         final_scores: List[Tuple[float, int]] = []
@@ -1019,7 +1051,6 @@ class CognitiveMemory:
             final_scores.append((score, fid))
             scored_ids.add(fid)
 
-        # Узлы, найденные только через spreading activation
         if use_graph and activation_map:
             for fid, act in activation_map.items():
                 if fid in scored_ids or fid not in self.facts_by_id:
@@ -1052,6 +1083,7 @@ class CognitiveMemory:
                 "confidence": round(confidence, 3),
                 "importance": fact.importance,
                 "activation": fact.activation,
+                "gcn_id": fact.gcn_id,  # добавляем для связи с GCN
             })
 
         self._cache[cache_key] = (result, time.time())
@@ -1060,9 +1092,8 @@ class CognitiveMemory:
             del self._cache[oldest]
         return result
 
-    # ==================== КОНСОЛИДАЦИЯ ====================
+    # ==================== КОНСОЛИДАЦИЯ (оригинальная + GCN) ====================
     async def _find_duplicates_via_faiss(self, threshold: float = DUPLICATE_SIMILARITY_THRESHOLD) -> Set[int]:
-        """Находит дубликаты фактов через FAISS (O(n log n)). Возвращает set fact.id для удаления."""
         if not self.use_embeddings or len(self.fact_embeddings) < 100:
             return set()
         try:
@@ -1070,7 +1101,6 @@ class CognitiveMemory:
             norms = np.linalg.norm(vectors, axis=1, keepdims=True)
             vectors_norm = vectors / (norms + 1e-8)
 
-            # Используем плоский индекс для точного поиска
             index = faiss.IndexFlatIP(self.embedding_dim)
             index.add(vectors_norm)
             k = min(10, len(vectors))
@@ -1081,7 +1111,7 @@ class CognitiveMemory:
                 fi = self.semantic_facts[i]
                 if fi.id in to_remove:
                     continue
-                for j in neighbors[1:]:  # пропускаем самого себя
+                for j in neighbors[1:]:
                     if j == -1 or j <= i:
                         continue
                     fj = self.semantic_facts[j]
@@ -1089,7 +1119,6 @@ class CognitiveMemory:
                         continue
                     sim = float(vectors_norm[i] @ vectors_norm[j])
                     if sim > threshold:
-                        # Удаляем тот, у которого меньше confidence
                         if fi.confidence <= fj.confidence:
                             to_remove.add(fi.id)
                         else:
@@ -1100,11 +1129,10 @@ class CognitiveMemory:
             return set()
 
     def _find_duplicates_keyword(self, threshold: float = 0.8) -> Set[int]:
-        """Fallback: поиск дубликатов по keyword similarity (O(n²), только для небольших объёмов)."""
         to_remove: Set[int] = set()
         n = len(self.semantic_facts)
         if n > 2000:
-            return to_remove  # слишком дорого
+            return to_remove
         for i, f1 in enumerate(self.semantic_facts):
             if f1.id in to_remove:
                 continue
@@ -1121,25 +1149,19 @@ class CognitiveMemory:
         return to_remove
 
     async def light_consolidation(self):
-        """Лёгкая консолидация: удаление дубликатов, ослабление связей."""
         async with self._lock:
-            # Удаление дубликатов
             if self.use_embeddings and len(self.fact_embeddings) >= 100:
                 to_remove = await self._find_duplicates_via_faiss(DUPLICATE_SIMILARITY_THRESHOLD)
             else:
                 to_remove = self._find_duplicates_keyword(0.8)
 
             removed = self._remove_facts(to_remove)
-
-            # Ослабление синапсов
             self._apply_decay()
             await self._schedule_save()
             logger.info(f"Light consolidation done for {self.user_id[:16]}: removed {removed} duplicates")
 
     async def deep_consolidation(self):
-        """Глубокая консолидация: replay, обобщение, обнаружение противоречий."""
         async with self._lock:
-            # Replay
             if self.episodic_memory:
                 self.episodic_memory.sort(key=lambda e: (e.importance * (1 + e.salience), e.timestamp), reverse=True)
                 replay_candidates = self.episodic_memory[:REPLAY_BATCH_SIZE]
@@ -1150,7 +1172,6 @@ class CognitiveMemory:
                         self._hebbian_update(user_facts[0].id, ass_facts[0].id, ep.timestamp)
                         self._hebbian_update(ass_facts[0].id, user_facts[0].id, ep.timestamp)
 
-            # Проверка противоречий
             for f in self.semantic_facts:
                 if f.contradicts:
                     for cid in list(f.contradicts):
@@ -1159,7 +1180,6 @@ class CognitiveMemory:
                             f.confidence *= 0.95
                             other.confidence *= 0.95
 
-            # Пересчёт важности
             now = time.time()
             for f in self.semantic_facts:
                 age = now - f.timestamp
@@ -1167,7 +1187,6 @@ class CognitiveMemory:
                 f.importance = 0.5 * (f.importance + recency + f.access_count / 10)
                 f.importance = min(2.0, f.importance)
 
-            # Удаление очень старых и неважных фактов
             if len(self.semantic_facts) > SEMANTIC_MAX_FACTS:
                 self.semantic_facts.sort(key=lambda f: (f.importance, f.confidence, f.timestamp), reverse=True)
                 keep = self.semantic_facts[:SEMANTIC_MAX_FACTS]
@@ -1175,10 +1194,18 @@ class CognitiveMemory:
                 self.semantic_facts = keep
                 self._remove_facts(removed_ids)
 
+            # Также можно провести консолидацию в GCN (например, обновить confidence)
+            for f in self.semantic_facts:
+                if f.gcn_id:
+                    try:
+                        self.gcn_store.update(f.gcn_id, {"confidence": f.confidence}, self.user_id)
+                    except Exception as e:
+                        logger.debug(f"GCN update failed for {f.gcn_id}: {e}")
+
             await self._schedule_save()
             logger.info(f"Deep consolidation done for {self.user_id[:16]}")
 
-    # ==================== РАБОТА С ЦЕЛЯМИ ====================
+    # ==================== РАБОТА С ЦЕЛЯМИ (оригинальная) ====================
     async def add_goal(self, description: str, priority: float = 0.5, related_memory: List[int] = None):
         goal = Goal(
             id=self._next_goal_id,
@@ -1216,6 +1243,7 @@ class CognitiveMemory:
             "active_goals": len([g for g in self.goals if g.status == 'active']),
             "working_memory": len(self.working_memory),
             "faiss_trained": self.index.is_trained if self.index else False,
+            "gcn_objects": len(self.gcn_store._objects),
         }
 
     # ==================== ЗАКРЫТИЕ ====================
