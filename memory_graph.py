@@ -259,6 +259,13 @@ class CognitiveMemory:
         self._load_sync()
         logger.info(f"CognitiveMemory initialized for {user_id[:16]}")
 
+    @property
+    def store(self) -> MemoryStore:
+        """Алиас на gcn_store. ai_assistant.py (AIAdapter, CognitiveController) обращается
+        к нему как self.memory.store — без этого алиаса конструктор падает с AttributeError,
+        так как единственный реальный атрибут называется gcn_store."""
+        return self.gcn_store
+
     # ==================== ЗАГРУЗКА / СОХРАНЕНИЕ (оригинальные) ====================
     def _load_sync(self):
         facts_path = self.base_dir / "facts.json"
@@ -565,6 +572,15 @@ class CognitiveMemory:
             return 0
         indices_to_remove = {i for i, f in enumerate(self.semantic_facts) if f.id in ids}
 
+        # Раньше удалённые факты оставляли осиротевшие KnowledgeObject'ы в gcn_store —
+        # retract() снимает их из активных индексов, сохраняя событие в логе.
+        for f in self.semantic_facts:
+            if f.id in ids and f.gcn_id:
+                try:
+                    self.gcn_store.retract(f.gcn_id, self.user_id, reason="duplicate_removed")
+                except Exception as e:
+                    logger.debug(f"GCN retract failed for {f.gcn_id}: {e}")
+
         self.semantic_facts = [f for f in self.semantic_facts if f.id not in ids]
         self.facts_by_id = {f.id: f for f in self.semantic_facts}
 
@@ -714,15 +730,27 @@ class CognitiveMemory:
                 confidence=0.5
             )
         self.graph[src].add(tgt)
-        # Также добавляем связь в GCN граф (если оба объекта существуют в GCN)
+        self._sync_synapse_to_gcn(src, tgt)
+        self._dirty = True
+
+    def _sync_synapse_to_gcn(self, src: int, tgt: int):
+        """Отражает текущий вес синапса src->tgt в GCN-графе. Раньше связь в GCN
+        создавалась только один раз (при первом _create_synapse) и больше никогда не
+        обновлялась, из-за чего gcn_store расходился с реальными весами по мере
+        Hebbian-обучения и затухания. set_relation_weight обновляет вес существующего
+        ребра, не плодя дубликаты."""
+        syn = self.synapses.get((src, tgt))
+        if syn is None:
+            return
         fact_src = self.facts_by_id.get(src)
         fact_tgt = self.facts_by_id.get(tgt)
         if fact_src and fact_tgt and fact_src.gcn_id and fact_tgt.gcn_id:
             try:
-                self.gcn_store.link(fact_src.gcn_id, fact_tgt.gcn_id, "synapse", self.user_id)
+                self.gcn_store.set_relation_weight(
+                    fact_src.gcn_id, fact_tgt.gcn_id, "synapse", syn.weight, self.user_id
+                )
             except Exception as e:
-                logger.debug(f"GCN link failed: {e}")
-        self._dirty = True
+                logger.debug(f"GCN synapse sync failed: {e}")
 
     def _detect_contradictions(self, fact_id: int, candidate_ids: Optional[List[int]] = None):
         fact = self.facts_by_id.get(fact_id)
@@ -866,6 +894,7 @@ class CognitiveMemory:
         syn.coactivation_count += 1
         syn.last_coactivation = coactivation_time
         syn.confidence = min(1.0, syn.confidence + 0.01)
+        self._sync_synapse_to_gcn(source_id, target_id)
         self._dirty = True
 
     def _get_effective_weight(self, syn: Synapse, now: Optional[float] = None) -> float:
@@ -878,7 +907,7 @@ class CognitiveMemory:
     def _apply_decay(self):
         now = time.time()
         changed = 0
-        for syn in self.synapses.values():
+        for (src, tgt), syn in self.synapses.items():
             age = now - syn.last_activation
             if age < 3600:
                 continue
@@ -887,6 +916,7 @@ class CognitiveMemory:
             if abs(new_weight - syn.weight) > 1e-6:
                 syn.weight = new_weight
                 syn.confidence = max(0.1, syn.confidence * decay)
+                self._sync_synapse_to_gcn(src, tgt)
                 changed += 1
         if changed:
             self._dirty = True

@@ -144,3 +144,63 @@ REFLECTION_ERROR_THRESHOLD = 0.6        # ошибка выше этого зн�
 REFLECTION_HISTORY_SIZE = 100           # сколько последних предсказаний хранить
 REFLECTION_LLM_TEMP = 0.5
 REFLECTION_LLM_MAX_TOKENS = 300
+
+# -------------------------------
+# Когнитивные дефолты фактов (memory_graph.Fact)
+# -------------------------------
+DEFAULT_NOVELTY = 0.0
+DEFAULT_SALIENCE = 0.0
+DEFAULT_STABILITY = 0.5
+DEFAULT_PLASTICITY = 0.5
+DEFAULT_PREDICTION_ERROR = 0.0
+
+# -------------------------------
+# Синапсы / Hebbian / STDP (memory_graph.Synapse)
+# -------------------------------
+SYNAPSE_INITIAL_WEIGHT = 0.1
+SYNAPSE_MAX_WEIGHT = 1.0
+SYNAPSE_MIN_WEIGHT = 0.01
+SYNAPSE_DECAY_RATE = 0.001
+SYNAPSE_PLASTICITY_RATE = 0.01
+SYNAPSE_COACTIVATION_THRESHOLD = 0.3
+HEBBIAN_LEARNING_RATE = 0.02
+STDP_LEARNING_RATE = 0.03
+STDP_TIME_WINDOW = 5.0
+STDP_LONG_TERM_POTENTIATION = 0.01
+STDP_LONG_TERM_DEPRESSION = 0.005
+
+# -------------------------------
+# Spreading activation
+# -------------------------------
+SPREADING_MAX_DEPTH = 3
+SPREADING_MAX_NODES = 50
+SPREADING_DECAY = 0.5
+SPREADING_THRESHOLD = 0.05
+
+# -------------------------------
+# Предсказательная матрица
+# -------------------------------
+PREDICTIVE_MATRIX_MAX_SIZE = 5000
+PREDICTIVE_LEARNING_RATE = 0.1
+PREDICTION_ERROR_THRESHOLD = 0.3
+
+# -------------------------------
+# Эмбеддинги для CognitiveMemory (SentenceTransformer + FAISS)
+# -------------------------------
+MEMORY_USE_EMBEDDINGS = True
+EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
+FAISS_NLIST = 200
+FAISS_NPROBE = 30
+FAISS_REBUILD_THRESHOLD = 300
+FAISS_MIN_TRAIN_VECTORS = 500
+
+# -------------------------------
+# Гибридный поиск (memory_graph.retrieve_hybrid)
+# Отдельная схема весов от HYBRID_WEIGHT_SEMANTIC/GRAPH/... выше (те теперь
+# реально используются в GCN.hybrid_retrieve) — эта используется
+# для BM25/cosine/freshness/graph ранжирования по фактам в CognitiveMemory.
+# -------------------------------
+HYBRID_WEIGHT_BM25 = 0.25
+HYBRID_WEIGHT_COSINE = 0.40
+FACTUAL_WEIGHTS = (0.35, 0.30, 0.15, 0.20)   # (bm25, cosine, freshness, graph) для запросов с числами/единицами
+GENERAL_WEIGHTS = (HYBRID_WEIGHT_BM25, HYBRID_WEIGHT_COSINE, HYBRID_WEIGHT_FRESHNESS, HYBRID_WEIGHT_GRAPH)

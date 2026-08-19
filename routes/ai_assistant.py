@@ -2,6 +2,7 @@
 Когнитивный ассистент с интеграцией CognitiveMemory, планированием, автономностью.
 """
 import sys
+import uuid
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -429,9 +430,11 @@ class CognitiveController:
             goals_text = await self._call_llm([{"role": "user", "content": prompt}], temp=0.7, max_tokens=200)
             goals = [g.strip("-• ").strip() for g in goals_text.split('\n') if g.strip()]
             for g in goals:
-                # Сохраняем цели как KnowledgeObject типа HYPOTHESIS
+                # Сохраняем цели как KnowledgeObject типа HYPOTHESIS.
+                # uuid4 вместо time()+hash()%1000 — старая схема могла давать коллизии
+                # id при генерации нескольких целей в одну секунду.
                 obj = KnowledgeObject(
-                    id=f"goal_{int(time.time())}_{hash(g)%1000}",
+                    id=f"goal_{uuid.uuid4()}",
                     type=KnowledgeType.HYPOTHESIS,
                     subject=g,
                     predicate="is_goal",
