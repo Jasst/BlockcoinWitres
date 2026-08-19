@@ -34,7 +34,7 @@ from GCN.GCN import (
 logger = logging.getLogger(__name__)
 
 try:
-    from config_ai import *
+    from GCN.config_ai import *
 except ImportError:
     # fallback значения (критические)
     WORKING_MEMORY_SIZE = 20
@@ -90,6 +90,9 @@ except ImportError:
     GCN_STATE_FILENAME = "gcn_state.json"
     GCN_AUTO_VERIFY = True
     GCN_EVIDENCE_THRESHOLD = 0.6
+    HYBRID_WEIGHT_SEMANTIC = 0.40
+    HYBRID_WEIGHT_CONFIDENCE = 0.05
+    HYBRID_WEIGHT_EVIDENCE = 0.10
 
 
 # =====================================================================
@@ -224,6 +227,9 @@ class CognitiveMemory:
             "cosine": HYBRID_WEIGHT_COSINE,
             "freshness": HYBRID_WEIGHT_FRESHNESS,
             "graph": HYBRID_WEIGHT_GRAPH,
+            "semantic": HYBRID_WEIGHT_SEMANTIC,  # добавить
+            "confidence": HYBRID_WEIGHT_CONFIDENCE,  # добавить
+            "evidence": HYBRID_WEIGHT_EVIDENCE,  # добавить
         }
 
         # ---- Вспомогательные структуры ----

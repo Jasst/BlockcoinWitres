@@ -29,7 +29,7 @@ except ImportError:
     faiss = None
 
 try:
-    from config_ai import (
+    from GCN.config_ai import (
         HYBRID_WEIGHT_SEMANTIC, HYBRID_WEIGHT_GRAPH, HYBRID_WEIGHT_FRESHNESS,
         HYBRID_WEIGHT_EVIDENCE, HYBRID_WEIGHT_CONFIDENCE,
         FAISS_NLIST, FAISS_NPROBE, FAISS_MIN_TRAIN_VECTORS,
@@ -607,18 +607,20 @@ class MemoryStore:
             return [t for _, t in self._graph.get_neighbors(start_id, relation)]
 
     def hybrid_retrieve(
-        self,
-        query_vector: Optional[List[float]] = None,
-        query_text: Optional[str] = None,
-        embedder_func: Optional[Callable[[str], List[float]]] = None,
-        start_node: Optional[str] = None,
-        top_k: int = 10,
-        alpha: float = 0.7,   # баланс между семантикой и графом
-        weights: Optional[Dict[str, float]] = None  # <--- добавить
+            self,
+            query_vector: Optional[List[float]] = None,
+            query_text: Optional[str] = None,
+            embedder_func: Optional[Callable[[str], List[float]]] = None,
+            start_node: Optional[str] = None,
+            top_k: int = 10,
+            alpha: float = 0.7,
+            weights: Optional[Dict[str, float]] = None
     ) -> List[KnowledgeObject]:
         """
         Гибридный поиск: объединяет семантический (вектор) и графовый (стартовый узел).
         Если передан query_text, а вектора нет, и embedder_func задан – генерирует вектор.
+        weights – словарь с ключами: semantic, graph, freshness, confidence, evidence.
+        Если не передан, используются глобальные константы.
         """
         # Генерируем вектор из текста
         if query_text and query_vector is None and embedder_func:
@@ -626,6 +628,15 @@ class MemoryStore:
                 query_vector = embedder_func(query_text)
             except Exception:
                 pass
+
+        # Извлекаем веса из переданного словаря или используем глобальные
+        if weights is None:
+            weights = {}
+        sem_weight = weights.get('semantic', HYBRID_WEIGHT_SEMANTIC)
+        graph_weight = weights.get('graph', HYBRID_WEIGHT_GRAPH)
+        freshness_weight = weights.get('freshness', HYBRID_WEIGHT_FRESHNESS)
+        confidence_weight = weights.get('confidence', HYBRID_WEIGHT_CONFIDENCE)
+        evidence_weight = weights.get('evidence', HYBRID_WEIGHT_EVIDENCE)
 
         candidates = set()
         scores = {}
@@ -635,7 +646,7 @@ class MemoryStore:
             sem_results = self.semantic_search(query_vector, top_k=top_k * 3)
             for obj_id, sim in sem_results:
                 candidates.add(obj_id)
-                scores[obj_id] = scores.get(obj_id, 0.0) + sim * HYBRID_WEIGHT_SEMANTIC
+                scores[obj_id] = scores.get(obj_id, 0.0) + sim * sem_weight
 
         # 2. Графовый поиск
         if start_node:
@@ -645,7 +656,7 @@ class MemoryStore:
                     continue
                 candidates.add(obj_id)
                 edge_weight = self._graph.get_relation_weight(start_node, "synapse", obj_id) or 1.0
-                scores[obj_id] = scores.get(obj_id, 0.0) + HYBRID_WEIGHT_GRAPH * min(1.0, edge_weight)
+                scores[obj_id] = scores.get(obj_id, 0.0) + graph_weight * min(1.0, edge_weight)
 
         # 3. Дополнительные факторы (свежесть, уверенность, количество доказательств)
         now = datetime.now(timezone.utc)
@@ -656,9 +667,9 @@ class MemoryStore:
                 continue
             age_days = (now - obj.created).days
             recency = max(0.0, 1.0 - age_days / 365.0) if age_days < 365 else 0.0
-            scores[obj_id] = scores.get(obj_id, 0.0) + recency * HYBRID_WEIGHT_FRESHNESS
-            scores[obj_id] += obj.confidence * HYBRID_WEIGHT_CONFIDENCE
-            scores[obj_id] += min(len(obj.evidence), 5) / 5 * HYBRID_WEIGHT_EVIDENCE
+            scores[obj_id] = scores.get(obj_id, 0.0) + recency * freshness_weight
+            scores[obj_id] += obj.confidence * confidence_weight
+            scores[obj_id] += min(len(obj.evidence), 5) / 5 * evidence_weight
 
         sorted_ids = sorted(candidates, key=lambda x: scores.get(x, 0.0), reverse=True)
         return [self._objects[oid] for oid in sorted_ids[:top_k]]

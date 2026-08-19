@@ -608,6 +608,23 @@ class CognitiveController:
             self.memory._dynamic_weights["graph"] = new_weight
             logger.info(f"[Reflection] Increased graph weight to {new_weight:.3f}")
 
+        # Новые блоки для semantic, confidence, evidence
+        if "усилить семантику" in analysis_lower or "эмбеддинги" in analysis_lower:
+            new_weight = min(0.6, self.memory._dynamic_weights.get("semantic", 0.40) + 0.03)
+            self.memory._dynamic_weights["semantic"] = new_weight
+            logger.info(f"[Reflection] Increased semantic weight to {new_weight:.3f}")
+
+        if "усилить доверие" in analysis_lower or "уверенность" in analysis_lower:
+            new_weight = min(0.20, self.memory._dynamic_weights.get("confidence", 0.05) + 0.02)
+            self.memory._dynamic_weights["confidence"] = new_weight
+            logger.info(f"[Reflection] Increased confidence weight to {new_weight:.3f}")
+
+        if "усилить доказательства" in analysis_lower or "факты" in analysis_lower:
+            new_weight = min(0.25, self.memory._dynamic_weights.get("evidence", 0.10) + 0.02)
+            self.memory._dynamic_weights["evidence"] = new_weight
+            logger.info(f"[Reflection] Increased evidence weight to {new_weight:.3f}")
+
+        # Блок авто-исследования остаётся без изменений
         if "добавить факты" in analysis_lower or "поискать" in analysis_lower:
             for topic, _ in worst_topics:
                 logger.info(f"[Reflection] Auto-research for topic: {topic}")
@@ -1177,7 +1194,7 @@ class CognitiveController:
                         self.memory.store.update(goal_obj.id, {"object": new_obj, "confidence": goal_obj.confidence}, self.user_id)
                     else:
                         self.memory.store.update(goal_obj.id, {"confidence": goal_obj.confidence}, self.user_id)
-                        self.memory._sync_goal_from_gcn(goal_obj.id)  # <--- добавить
+                    self.memory._sync_goal_from_gcn(goal_obj.id)  # <--- добавить
             await self.memory._schedule_save()
 
         # ---- Рефлексия: запоминаем предсказание и ошибку ----
