@@ -410,7 +410,18 @@ class MemoryStore:
             "last_accessed": None,
             "local_id": local_id  # ✅ сохраняем
         }
-        obj = KnowledgeObject(...)
+        obj = KnowledgeObject(
+            id=f"fact_{uuid.uuid4()}",
+            type=KnowledgeType.CLAIM,
+            subject=text,
+            predicate="is_fact",
+            object=meta,
+            author=author,
+            created=datetime.now(timezone.utc),
+            confidence=confidence,
+            evidence=[],
+            version=1
+        )
         obj_id = self.create(obj, author)
         if embedding is not None:
             self.set_embedding(obj_id, embedding)
@@ -602,7 +613,8 @@ class MemoryStore:
         embedder_func: Optional[Callable[[str], List[float]]] = None,
         start_node: Optional[str] = None,
         top_k: int = 10,
-        alpha: float = 0.7   # баланс между семантикой и графом
+        alpha: float = 0.7,   # баланс между семантикой и графом
+        weights: Optional[Dict[str, float]] = None  # <--- добавить
     ) -> List[KnowledgeObject]:
         """
         Гибридный поиск: объединяет семантический (вектор) и графовый (стартовый узел).

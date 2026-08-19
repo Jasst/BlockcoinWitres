@@ -158,6 +158,7 @@ class Goal:
     dependencies: List[int] = field(default_factory=list)
     status: str = "active"
     created_at: float = field(default_factory=time.time)
+    gcn_id: Optional[str] = None  # <--- добавить
 
 
 # =====================================================================
@@ -337,7 +338,9 @@ class CognitiveMemory:
                 confidence=obj.confidence,
                 progress=meta.get("progress", 0.0),
                 status=meta.get("status", "active"),
-                created_at=obj.created.timestamp()
+                created_at=obj.created.timestamp(),
+                gcn_id = obj.id
+
             )
             self.goals.append(goal)
             max_goal_id = max(max_goal_id, gid)
@@ -419,7 +422,7 @@ class CognitiveMemory:
 
         # Поиск похожих для создания синапсов
         if emb is not None:
-            similar = self._find_similar_by_embedding(np.array(emb), k=20, exclude_idx=len(self.semantic_facts) - 1)
+            similar = self._find_similar_by_embedding(np.array(emb), k=20, exclude_id=fid)
         else:
             similar = self._find_similar_keyword(fid, top_k=20)
 
@@ -438,7 +441,7 @@ class CognitiveMemory:
         return fid
 
     def _find_similar_by_embedding(self, emb: np.ndarray, k: int = 20,
-                                   exclude_idx: Optional[int] = None) -> List[Tuple[int, float]]:
+                                   exclude_id: Optional[int] = None) -> List[Tuple[int, float]]:
         """Ищет похожие факты по эмбеддингу (локально, используя FAISS или косинус)."""
         if not self.semantic_facts or len(self.semantic_facts) < 2:
             return []
@@ -450,7 +453,7 @@ class CognitiveMemory:
         out = []
         for gcn_id, sim in results:
             fact = self._find_fact_by_gcn_id(gcn_id)
-            if fact and fact.id != exclude_idx:
+            if fact and fact.id != exclude_id:
                 out.append((fact.id, sim))
         return out[:k]
 
@@ -755,7 +758,8 @@ class CognitiveMemory:
         gcn_results = self.gcn_store.hybrid_retrieve(
             query_vector=query_vector,
             start_node=None,  # можно передать стартовый узел, если есть
-            top_k=top_k * 2
+            top_k=top_k * 2,
+            weights = self._dynamic_weights
         )
 
         # Преобразуем в формат, ожидаемый ai_assistant.py
@@ -799,6 +803,21 @@ class CognitiveMemory:
             oldest = sorted(self._cache.items(), key=lambda x: x[1][1])[0][0]
             del self._cache[oldest]
         return result
+
+    def _sync_goal_from_gcn(self, gcn_id: str):
+        """Обновляет локальный Goal по данным из GCN."""
+        obj = self.gcn_store.get(gcn_id)
+        if not obj or obj.type != KnowledgeType.HYPOTHESIS:
+            return
+        for g in self.goals:
+            if g.gcn_id == gcn_id:
+                g.description = obj.subject
+                g.confidence = obj.confidence
+                meta = obj.object if isinstance(obj.object, dict) else {}
+                g.status = meta.get("status", g.status)
+                g.priority = meta.get("priority", g.priority)
+                g.progress = meta.get("progress", g.progress)
+                break
 
     # ==================== КОНСОЛИДАЦИЯ ====================
     async def _find_duplicates_via_faiss(self, threshold: float = DUPLICATE_SIMILARITY_THRESHOLD) -> Set[int]:
@@ -922,7 +941,6 @@ class CognitiveMemory:
     # ==================== РАБОТА С ЦЕЛЯМИ ====================
     async def add_goal(self, description: str, priority: float = 0.5, related_memory: List[int] = None):
         gcn_id = self.gcn_store.add_goal(description, self.user_id, priority=priority)
-        # Добавляем в локальный список
         gid = self._next_goal_id
         self._next_goal_id += 1
         goal = Goal(
@@ -932,27 +950,32 @@ class CognitiveMemory:
             confidence=0.5,
             related_memory=related_memory or [],
             status='active',
-            created_at=time.time()
+            created_at=time.time(),
+            gcn_id=gcn_id  # <--- добавить
         )
         self.goals.append(goal)
         await self._schedule_save()
         return gid
 
     async def update_goal(self, goal_id: int, **kwargs):
+        # ищем локальную цель по id
         for g in self.goals:
             if g.id == goal_id:
                 for k, v in kwargs.items():
                     if hasattr(g, k):
                         setattr(g, k, v)
-                # Обновляем в GCN (находим соответствующий объект)
-                for obj in self.gcn_store.get_active_goals(self.user_id):
-                    if obj.subject == g.description:  # приблизительно
-                        # Обновляем confidence и статус
-                        self.gcn_store.update(obj.id, {"confidence": g.confidence}, self.user_id)
-                        meta = obj.object if isinstance(obj.object, dict) else {}
-                        meta["status"] = g.status
-                        self.gcn_store.update(obj.id, {"object": meta}, self.user_id)
-                        break
+                # обновляем в GCN по gcn_id
+                if g.gcn_id:
+                    obj = self.gcn_store.get(g.gcn_id)
+                    if obj:
+                        # обновляем confidence и статус
+                        if 'confidence' in kwargs:
+                            self.gcn_store.update(obj.id, {"confidence": g.confidence}, self.user_id)
+                        if 'status' in kwargs:
+                            meta = obj.object if isinstance(obj.object, dict) else {}
+                            meta["status"] = g.status
+                            self.gcn_store.update(obj.id, {"object": meta}, self.user_id)
+                        # если нужно обновить другие поля, добавьте аналогично
                 await self._schedule_save()
                 return
 

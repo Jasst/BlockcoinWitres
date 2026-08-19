@@ -446,6 +446,7 @@ class CognitiveController:
                 await self.research(goal_obj.subject)
                 goal_obj.confidence = min(1.0, goal_obj.confidence + 0.2)
                 self.memory.store.update(goal_obj.id, {"confidence": goal_obj.confidence}, self.user_id)
+                self.memory._sync_goal_from_gcn(goal_obj.id)  # <--- добавить
         await self.memory._schedule_save()
 
     async def _call_llm(self, messages, temp=0.7, max_tokens=2048, retries=3):
@@ -1176,6 +1177,7 @@ class CognitiveController:
                         self.memory.store.update(goal_obj.id, {"object": new_obj, "confidence": goal_obj.confidence}, self.user_id)
                     else:
                         self.memory.store.update(goal_obj.id, {"confidence": goal_obj.confidence}, self.user_id)
+                        self.memory._sync_goal_from_gcn(goal_obj.id)  # <--- добавить
             await self.memory._schedule_save()
 
         # ---- Рефлексия: запоминаем предсказание и ошибку ----
