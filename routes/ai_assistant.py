@@ -947,28 +947,102 @@ class CognitiveController:
                 if not rest:
                     continue
 
+                # ------------------------------------------------------------
+                # 1. Команда "запомни" – сохраняет факт и генерирует ответ через LLM
+                # ------------------------------------------------------------
                 if action == "store":
                     fid = self.memory._add_fact(rest, 'command', confidence=1.0, importance=1.5)
                     await self.memory._schedule_save()
-                    return f"Запомнил: {rest}", {"memory": "stored", "id": fid}
 
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию. "
+                                "Подтверди, что ты запомнил, кратко и естественно, возможно, с уточнением или перефразировкой, "
+                                "чтобы показать понимание."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Запомни: {rest}"
+                        }
+                    ]
+                    response = await self._call_llm(messages, temp=0.5, max_tokens=150)
+                    if response:
+                        return response, {"memory": "stored", "id": fid}
+                    else:
+                        return f"Запомнил: {rest}", {"memory": "stored", "id": fid}
+
+                # ------------------------------------------------------------
+                # 2. Команда "забудь" – удаляет факты и генерирует ответ через LLM
+                # ------------------------------------------------------------
                 elif action == "forget":
                     to_remove_ids = {f.id for f in self.memory.semantic_facts if rest.lower() in f.subject.lower()}
                     if to_remove_ids:
                         removed = self.memory._remove_facts(to_remove_ids)
                         await self.memory._schedule_save()
-                        return f"Удалено {removed} фактов о '{rest}'", {"memory": "forgot"}
+
+                        messages = [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил забыть информацию. "
+                                    "Подтверди, что ты удалил соответствующие факты, кратко и естественно."
+                                )
+                            },
+                            {
+                                "role": "user",
+                                "content": f"Забудь: {rest} (удалено {removed} фактов)"
+                            }
+                        ]
+                        response = await self._call_llm(messages, temp=0.5, max_tokens=150)
+                        if response:
+                            return response, {"memory": "forgot", "count": removed}
+                        else:
+                            return f"Удалено {removed} фактов о '{rest}'", {"memory": "forgot"}
                     else:
                         return "Ничего не найдено для удаления.", {"memory": "no_match"}
 
+                # ------------------------------------------------------------
+                # 3. Команда "что ты знаешь о" – улучшенная версия с LLM
+                # ------------------------------------------------------------
                 elif action == "recall":
-                    facts = await self.memory.retrieve_hybrid(rest, top_k=10, use_graph=True)
-                    if facts:
+                    facts = await self.memory.retrieve_hybrid(rest, top_k=7, use_graph=True)
+
+                    if not facts:
+                        return "Ничего не найдено по вашему запросу.", {"memory": "no_recall"}
+
+                    context_lines = []
+                    for f in facts[:5]:
+                        context_lines.append(f"- {f['text']}")
+                    context = "\n".join(context_lines)
+
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты — AI-ассистент с когнитивной памятью. На основе предоставленных фактов дай связный, "
+                                "естественный ответ на русском языке. Не перечисляй факты списком, а объедини их в единое "
+                                "объяснение. Если фактов недостаточно или они не относятся к вопросу, честно скажи об этом."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Вопрос: {rest}\n\nФакты из памяти:\n{context}"
+                        }
+                    ]
+
+                    response = await self._call_llm(messages, temp=0.6, max_tokens=500)
+
+                    if not response:
                         answer = "Вот что я знаю:\n" + "\n".join(
-                            f"- {f['text']} (уверенность: {f.get('confidence', 0.5):.2f})" for f in facts)
-                        return answer, {"memory": "recalled"}
-                    else:
-                        return "Ничего не найдено.", {"memory": "no_recall"}
+                            f"- {f['text']} (уверенность: {f.get('confidence', 0.5):.2f})" for f in facts[:5]
+                        )
+                        return answer, {"memory": "recalled_fallback"}
+
+                    return response, {"memory": "recalled"}
+
         return None
 
     def _build_messages(self, message: str, web_search: bool, search_context: str,

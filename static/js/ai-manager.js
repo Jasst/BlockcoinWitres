@@ -502,48 +502,67 @@ function _clearAiHistory() {
         }
     }
     function _displayAiMessage(text, isUser, imagePreview = null, saveToStorage = true) {
-        if (!_aiMessagesContainer) return;
-        const msgDiv = document.createElement('div');
-        msgDiv.className = `message ${isUser ? 'sent' : 'received'} animate-fade`;
-        const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        let imageHtml = '';
-        if (imagePreview) {
-            imageHtml = `<img src="${_escapeHtml(imagePreview)}" alt="Attached" style="max-width:200px;max-height:150px;border-radius:8px;margin-bottom:8px;cursor:pointer;" onclick="window.openImageModal && window.openImageModal('${_escapeHtml(imagePreview)}')">`;
-        }
-        if (isUser) {
-            msgDiv.innerHTML = `
-                <div class="avatar">👤</div>
-                <div class="content">
-                    ${imageHtml}
-                    <div class="markdown-body">${_escapeHtml(text)}</div>
-                    <div class="meta"><span>${time}</span></div>
-                </div>`;
-        } else {
-            const html = _renderMarkdown(text);
-            msgDiv.innerHTML = `
-                <div class="avatar">🤖</div>
-                <div class="content">
-                    ${imageHtml}
-                    <div class="markdown-body">${html}</div>
-                    <div class="meta"><span>${time}</span></div>
-                </div>`;
-            const markdownBody = msgDiv.querySelector('.markdown-body');
-            if (markdownBody) {
-                _enhanceCodeBlocks(markdownBody);
-                _addImageDownloadButtons(markdownBody);
-                _attachReasoningToggle(markdownBody);
-            }
-        }
-        _aiMessagesContainer.appendChild(msgDiv);
-        _aiMessagesContainer.scrollTop = _aiMessagesContainer.scrollHeight;
-        if (saveToStorage && text && !text.includes('Привет! Я AI-ассистент')) {
-            _saveAiMessage(isUser ? 'user' : 'assistant', text, _currentAiSessionId);
-        }
-        return msgDiv;
+    // <-- ИЗМЕНЕНИЕ: проверка и инициализация контейнера
+    if (!_aiMessagesContainer) {
+        _aiMessagesContainer = document.getElementById('aiMessagesContainer');
+        if (!_aiMessagesContainer) return; // если всё ещё нет – выходим
     }
+    // <-- КОНЕЦ ИЗМЕНЕНИЯ
+
+    const msgDiv = document.createElement('div');
+    msgDiv.className = `message ${isUser ? 'sent' : 'received'} animate-fade`;
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    let imageHtml = '';
+    if (imagePreview) {
+        imageHtml = `<img src="${_escapeHtml(imagePreview)}" alt="Attached" style="max-width:200px;max-height:150px;border-radius:8px;margin-bottom:8px;cursor:pointer;" onclick="window.openImageModal && window.openImageModal('${_escapeHtml(imagePreview)}')">`;
+    }
+    if (isUser) {
+        msgDiv.innerHTML = `
+            <div class="avatar">👤</div>
+            <div class="content">
+                ${imageHtml}
+                <div class="markdown-body">${_escapeHtml(text)}</div>
+                <div class="meta"><span>${time}</span></div>
+            </div>`;
+    } else {
+        const html = _renderMarkdown(text);
+        msgDiv.innerHTML = `
+            <div class="avatar">🤖</div>
+            <div class="content">
+                ${imageHtml}
+                <div class="markdown-body">${html}</div>
+                <div class="meta"><span>${time}</span></div>
+            </div>`;
+        const markdownBody = msgDiv.querySelector('.markdown-body');
+        if (markdownBody) {
+            _enhanceCodeBlocks(markdownBody);
+            _addImageDownloadButtons(markdownBody);
+            _attachReasoningToggle(markdownBody);
+        }
+    }
+    _aiMessagesContainer.appendChild(msgDiv);
+    _aiMessagesContainer.scrollTop = _aiMessagesContainer.scrollHeight;
+    if (saveToStorage && text && !text.includes('Привет! Я AI-ассистент')) {
+        _saveAiMessage(isUser ? 'user' : 'assistant', text, _currentAiSessionId);
+    }
+    return msgDiv;
+}
 
     // ─── основная отправка ───
     async function _sendToAi(messageText, imageFile) {
+    // Проверка контейнера
+    if (!_aiMessagesContainer) {
+        _aiMessagesContainer = document.getElementById('aiMessagesContainer');
+        if (!_aiMessagesContainer && _currentAiSessionId) {
+            _initAiChatSession(_currentAiSessionId);
+            _aiMessagesContainer = document.getElementById('aiMessagesContainer');
+        }
+        if (!_aiMessagesContainer) {
+            _showToast('Ошибка: контейнер чата не найден', 'error');
+            return;
+        }
+    }
+
     if (_isSending) { _showToast('Подождите, предыдущий запрос обрабатывается', 'warning'); return; }
     if (!messageText.trim() && !imageFile) { _showToast('Введите сообщение или выберите изображение', 'warning'); return; }
 
@@ -566,7 +585,6 @@ function _clearAiHistory() {
     const isResearch = researchKeywords.some(kw => messageText.toLowerCase().includes(kw));
 
     if (isResearch && !imageFile) {
-        // Блокируем UI (без скрытия кнопок – используем disable)
         _aiMessageInput.disabled = true;
         _aiSendBtn.disabled = true;
         _aiAttachBtn.disabled = true;
@@ -607,7 +625,6 @@ function _clearAiHistory() {
     _currentStreamingText = '';
     _isSending = true;
 
-    // <-- ПЕРЕКЛЮЧЕНИЕ КНОПОК (скрываем отправку, показываем стоп)
     if (_aiSendBtn) _aiSendBtn.style.display = 'none';
     if (_aiStopBtn) _aiStopBtn.style.display = 'inline-flex';
 
@@ -703,14 +720,18 @@ function _clearAiHistory() {
                             firstTokenReceived = true;
                         }
                         _currentStreamingText += data.token;
-                        if (!window._aiUpdatePending) {
-                            window._aiUpdatePending = true;
-                            requestAnimationFrame(() => {
-                                markdownBody.textContent = _currentStreamingText;
-                                window._aiUpdatePending = false;
-                            });
+
+                        // Обновляем DOM с debounce (не чаще 50 мс)
+                        if (!window._aiUpdateTimer) {
+                            window._aiUpdateTimer = setTimeout(() => {
+                                markdownBody.innerHTML = _renderMarkdown(_currentStreamingText);
+                                _enhanceCodeBlocks(markdownBody);
+                                _addImageDownloadButtons(markdownBody);
+                                _attachReasoningToggle(markdownBody);
+                                if (_aiMessagesContainer) _aiMessagesContainer.scrollTop = _aiMessagesContainer.scrollHeight;
+                                window._aiUpdateTimer = null;
+                            }, 50);
                         }
-                        if (_aiMessagesContainer) _aiMessagesContainer.scrollTop = _aiMessagesContainer.scrollHeight;
                     } else if (data.error) {
                         markdownBody.textContent = '❌ ' + data.error;
                         firstTokenReceived = true;
@@ -721,6 +742,12 @@ function _clearAiHistory() {
                     }
                 } catch(e) {}
             }
+        }
+
+        // Принудительно обновляем после завершения стрима (если есть таймер)
+        if (window._aiUpdateTimer) {
+            clearTimeout(window._aiUpdateTimer);
+            window._aiUpdateTimer = null;
         }
 
         if (!firstTokenReceived) {
@@ -770,7 +797,6 @@ function _clearAiHistory() {
         _isSending = false;
         _currentAbortController = null;
 
-        // <-- ВОССТАНАВЛИВАЕМ КНОПКИ (показываем отправку, скрываем стоп)
         if (_aiSendBtn) _aiSendBtn.style.display = 'inline-flex';
         if (_aiStopBtn) _aiStopBtn.style.display = 'none';
     }

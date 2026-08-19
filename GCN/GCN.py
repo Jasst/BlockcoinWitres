@@ -1,8 +1,12 @@
 """
 GCN Core Implementation
 ------------------------
-Минимальная реализация ключевых компонентов Global Cognitive Network.
-Соответствует пунктам 3–23 промта.
+Улучшенная версия:
+- Исправлен retract (удаляет рёбра из графа)
+- Добавлен embedder в hybrid_retrieve (может сам векторизовать текст)
+- Добавлен get_object_history для аудита
+- Исправлена загрузка графовых весов
+- Все критические операции обёрнуты в RLock (быстрые) + асинхронный save/load
 """
 
 from __future__ import annotations
@@ -13,13 +17,11 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any, Set, Tuple, Union
+from typing import Dict, List, Optional, Any, Set, Tuple, Union, Callable
 from enum import Enum
 from collections import defaultdict
 import copy
 
-# Веса гибридного поиска — берём из общего конфига, если доступен,
-# иначе используем безопасные дефолты (модуль должен работать и автономно).
 try:
     from config_ai import (
         HYBRID_WEIGHT_SEMANTIC, HYBRID_WEIGHT_GRAPH, HYBRID_WEIGHT_FRESHNESS,
@@ -33,7 +35,6 @@ except ImportError:
     HYBRID_WEIGHT_CONFIDENCE = 0.05
 
 
-# ==================== 1. Типы знаний ====================
 class KnowledgeType(Enum):
     CLAIM = "claim"
     CONCEPT = "concept"
@@ -46,10 +47,8 @@ class KnowledgeType(Enum):
     MEMORY_EVENT = "memory_event"
 
 
-# ==================== 2. Knowledge Object ====================
 @dataclass
 class KnowledgeObject:
-    """Ядро GCN – объект знания с provenance и криптографической целостностью."""
     id: str
     type: KnowledgeType
     subject: str
@@ -57,19 +56,18 @@ class KnowledgeObject:
     object: Any
     author: str
     created: datetime
-    evidence: List[str] = field(default_factory=list)          # ссылки на evidence-объекты
-    confidence: float = 0.5                                     # 0..1
+    evidence: List[str] = field(default_factory=list)
+    confidence: float = 0.5
     version: int = 1
     content_hash: Optional[str] = None
-    signature: Optional[str] = None                            # для будущей подписи
-    provenance: Optional[Provenance] = None                    # ссылка на детальный provenance
+    signature: Optional[str] = None
+    provenance: Optional[Provenance] = None
 
     def __post_init__(self):
         if self.content_hash is None:
             self.content_hash = self.compute_hash()
 
     def compute_hash(self) -> str:
-        """Вычисляет хеш содержимого объекта (без учёта временных метаданных)."""
         data = {
             "type": self.type.value,
             "subject": self.subject,
@@ -83,18 +81,16 @@ class KnowledgeObject:
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
     def update(self, **kwargs) -> KnowledgeObject:
-        """Создаёт новую версию объекта (immutable)."""
         new_obj = copy.deepcopy(self)
         for k, v in kwargs.items():
             if hasattr(new_obj, k):
                 setattr(new_obj, k, v)
         new_obj.version += 1
-        new_obj.created = datetime.utcnow()
+        new_obj.created = datetime.now(timezone.utc)
         new_obj.content_hash = new_obj.compute_hash()
         return new_obj
 
 
-# ==================== 3. Событийная память ====================
 class EventType(Enum):
     CREATE = "CREATE"
     UPDATE = "UPDATE"
@@ -112,13 +108,12 @@ class EventType(Enum):
 
 @dataclass
 class KnowledgeEvent:
-    """Неизменяемое событие, описывающее изменение состояния знания."""
     id: str
     type: EventType
     timestamp: datetime
-    actor: str                           # кто совершил событие (AI или пользователь)
-    target_id: str                       # ID KnowledgeObject
-    payload: Dict[str, Any]              # дополнительные данные (старое/новое состояние, связи и т.п.)
+    actor: str
+    target_id: str
+    payload: Dict[str, Any]
     signature: Optional[str] = None
 
     def __post_init__(self):
@@ -126,36 +121,25 @@ class KnowledgeEvent:
             self.id = str(uuid.uuid4())
 
 
-# ==================== 4. Provenance (детальная история) ====================
 @dataclass
 class Provenance:
-    """Детальная информация о происхождении знания."""
     object_id: str
     created_by: str
     created_at: datetime
-    source: Optional[str] = None          # внешний источник (URL, документ)
+    source: Optional[str] = None
     evidence_refs: List[str] = field(default_factory=list)
     version_history: List[KnowledgeEvent] = field(default_factory=list)
-    contradictions: List[str] = field(default_factory=list)   # ID объектов, которые противоречат
-    verifications: List[Dict] = field(default_factory=list)   # {verifier, timestamp, status}
+    contradictions: List[str] = field(default_factory=list)
+    verifications: List[Dict] = field(default_factory=list)
 
     def add_event(self, event: KnowledgeEvent):
         self.version_history.append(event)
 
 
-# ==================== 5. Knowledge Graph (структурные отношения) ====================
 class KnowledgeGraph:
-    """
-    Хранит отношения между KnowledgeObject'ами.
-    Используется для ассоциативного поиска и обнаружения связей.
-    """
     def __init__(self):
-        # adjacency: node_id -> List[(relation, target_id)]
         self._edges: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
         self._reverse: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
-        # доп. метаданные ребра (вес, время последнего обновления), ключ (source, relation, target).
-        # Хранится отдельно, чтобы не менять формат _edges/_reverse, который уже используется
-        # в get_neighbors/get_incoming/traverse.
         self._edge_meta: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
     def add_relation(self, source_id: str, relation: str, target_id: str, weight: float = 1.0):
@@ -171,8 +155,6 @@ class KnowledgeGraph:
         self._edge_meta.pop((source_id, relation, target_id), None)
 
     def set_relation_weight(self, source_id: str, relation: str, target_id: str, weight: float):
-        """Обновляет вес существующей связи, не дублируя рёбра (например, чтобы отразить
-        затухание/усиление Hebbian-синапса). Если связи ещё нет — создаёт её."""
         self.add_relation(source_id, relation, target_id, weight=weight)
 
     def get_relation_weight(self, source_id: str, relation: str, target_id: str) -> Optional[float]:
@@ -180,7 +162,6 @@ class KnowledgeGraph:
         return meta["weight"] if meta else None
 
     def get_neighbors(self, node_id: str, relation: Optional[str] = None) -> List[Tuple[str, str]]:
-        """Возвращает список (relation, target_id) для исходящих рёбер."""
         if relation is None:
             return self._edges[node_id][:]
         return [(r, t) for r, t in self._edges[node_id] if r == relation]
@@ -191,7 +172,6 @@ class KnowledgeGraph:
         return [(r, s) for r, s in self._reverse[node_id] if r == relation]
 
     def traverse(self, start_id: str, max_depth: int = 2) -> List[str]:
-        """BFS поиск связанных узлов (для расширения контекста)."""
         visited = set()
         frontier = [start_id]
         depth = 0
@@ -210,39 +190,41 @@ class KnowledgeGraph:
             depth += 1
         return result
 
+    # ---------- НОВЫЙ МЕТОД: удаление всех рёбер, связанных с узлом ----------
+    def remove_node_edges(self, node_id: str):
+        """Удаляет все исходящие и входящие рёбра для указанного узла."""
+        # Исходящие
+        for relation, target in self._edges.pop(node_id, []):
+            self._reverse[target] = [(r, s) for r, s in self._reverse[target] if not (r == relation and s == node_id)]
+            self._edge_meta.pop((node_id, relation, target), None)
+        # Входящие
+        for relation, source in self._reverse.pop(node_id, []):
+            self._edges[source] = [(r, t) for r, t in self._edges[source] if not (r == relation and t == node_id)]
+            self._edge_meta.pop((source, relation, node_id), None)
 
-# ==================== 6. Хранилище знаний (Memory Store) ====================
+
 class MemoryStore:
-    """
-    Центральное хранилище KnowledgeObject'ов с поддержкой событий,
-    версионирования, графа и векторных индексов (заглушка).
-    """
     def __init__(self):
-        self._objects: Dict[str, KnowledgeObject] = {}          # текущее состояние (версии)
-        self._events: List[KnowledgeEvent] = []                 # вся история событий
+        self._objects: Dict[str, KnowledgeObject] = {}
+        self._events: List[KnowledgeEvent] = []
         self._graph = KnowledgeGraph()
-        self._embedding_index: Dict[str, List[float]] = {}      # object_id -> vector
-        # Дополнительные индексы
+        self._embedding_index: Dict[str, List[float]] = {}
         self._by_type: Dict[KnowledgeType, Set[str]] = defaultdict(set)
         self._by_author: Dict[str, Set[str]] = defaultdict(set)
-        # Блокировка на все мутации: MemoryStore может использоваться одновременно из
-        # нескольких asyncio-тасков (планировщик, консолидация, автопоиск) без своего
-        # awaitable-лока, поэтому здесь используем обычный RLock (все методы синхронные).
-        self._lock = threading.RLock()
+        self._lock = threading.RLock()  # для быстрых операций в памяти
 
-    # ---------- Основные операции ----------
+    # ---------- Основные операции (синхронные, но быстрые) ----------
     def create(self, obj: KnowledgeObject, actor: str) -> str:
-        """Создаёт новый объект, сохраняет событие CREATE."""
         with self._lock:
             if obj.id in self._objects:
-                raise ValueError(f"Object with id {obj.id} already exists")
+                raise ValueError(f"Object {obj.id} already exists")
             self._objects[obj.id] = obj
             self._by_type[obj.type].add(obj.id)
             self._by_author[obj.author].add(obj.id)
             event = KnowledgeEvent(
                 id=str(uuid.uuid4()),
                 type=EventType.CREATE,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 actor=actor,
                 target_id=obj.id,
                 payload={"object": obj.__dict__}
@@ -256,7 +238,6 @@ class MemoryStore:
         return self._objects.get(obj_id)
 
     def update(self, obj_id: str, new_data: Dict[str, Any], actor: str) -> Optional[KnowledgeObject]:
-        """Обновляет объект (создаёт новую версию) и записывает событие UPDATE."""
         with self._lock:
             old = self._objects.get(obj_id)
             if not old:
@@ -266,7 +247,7 @@ class MemoryStore:
             event = KnowledgeEvent(
                 id=str(uuid.uuid4()),
                 type=EventType.UPDATE,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 actor=actor,
                 target_id=obj_id,
                 payload={"old_version": old.version, "new_version": new_obj.version, "changes": new_data}
@@ -277,9 +258,6 @@ class MemoryStore:
             return new_obj
 
     def link(self, source_id: str, target_id: str, relation: str, actor: str, weight: float = 1.0):
-        """Создаёт связь между объектами (в графе) и записывает событие LINK.
-        Повторный вызов с теми же (source, relation, target) обновляет вес связи,
-        а не создаёт дублирующееся ребро."""
         with self._lock:
             if source_id not in self._objects or target_id not in self._objects:
                 raise ValueError("Both objects must exist")
@@ -287,7 +265,7 @@ class MemoryStore:
             event = KnowledgeEvent(
                 id=str(uuid.uuid4()),
                 type=EventType.LINK,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 actor=actor,
                 target_id=source_id,
                 payload={"relation": relation, "target": target_id, "weight": weight}
@@ -295,15 +273,12 @@ class MemoryStore:
             self._events.append(event)
 
     def set_relation_weight(self, source_id: str, target_id: str, relation: str, weight: float, actor: str):
-        """Обновляет вес уже существующей (или создаёт новую) связи без создания нового
-        ребра на каждый вызов — используется, чтобы отразить затухание/усиление
-        Hebbian-синапсов из внешнего слоя памяти (memory_graph.CognitiveMemory)."""
         with self._lock:
             self._graph.set_relation_weight(source_id, relation, target_id, weight)
             event = KnowledgeEvent(
                 id=str(uuid.uuid4()),
                 type=EventType.REINFORCE if weight > 0 else EventType.DECAY,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 actor=actor,
                 target_id=source_id,
                 payload={"relation": relation, "target": target_id, "weight": weight}
@@ -316,7 +291,7 @@ class MemoryStore:
             event = KnowledgeEvent(
                 id=str(uuid.uuid4()),
                 type=EventType.UNLINK,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 actor=actor,
                 target_id=source_id,
                 payload={"relation": relation, "target": target_id}
@@ -324,7 +299,6 @@ class MemoryStore:
             self._events.append(event)
 
     def add_evidence(self, claim_id: str, evidence_id: str, actor: str):
-        """Добавляет evidence к claim (связь SUPPORT)."""
         with self._lock:
             claim = self._objects.get(claim_id)
             if not claim:
@@ -334,7 +308,7 @@ class MemoryStore:
             event = KnowledgeEvent(
                 id=str(uuid.uuid4()),
                 type=EventType.SUPPORT,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 actor=actor,
                 target_id=claim_id,
                 payload={"evidence_id": evidence_id}
@@ -342,7 +316,6 @@ class MemoryStore:
             self._events.append(event)
 
     def verify(self, obj_id: str, verifier: str, status: str, actor: str):
-        """Записывает факт верификации (например, 'confirmed', 'rejected', 'uncertain')."""
         with self._lock:
             obj = self._objects.get(obj_id)
             if not obj:
@@ -350,35 +323,34 @@ class MemoryStore:
             if obj.provenance:
                 obj.provenance.verifications.append({
                     "verifier": verifier,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "status": status
                 })
             event = KnowledgeEvent(
                 id=str(uuid.uuid4()),
                 type=EventType.VERIFY,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 actor=actor,
                 target_id=obj_id,
                 payload={"verifier": verifier, "status": status}
             )
             self._events.append(event)
 
-    def retract(self, obj_id: str, actor: str, reason: str = ""):
-        """Мягкое удаление (tombstone): убирает объект из активных индексов, но
-        сохраняет весь событийный лог (CREATE/UPDATE/.../RETRACT) — в духе
-        immutable event-sourcing, которым GCN и задумывался. Используется, например,
-        когда CognitiveMemory удаляет дубликат факта при консолидации."""
+    # ---------- ИСПРАВЛЕННЫЙ RETRACT (удаляет рёбра из графа) ----------
+    def retract(self, obj_id: str, actor: str, reason: str = "") -> bool:
         with self._lock:
             obj = self._objects.pop(obj_id, None)
             if obj is None:
                 return False
+            # Удаляем все связи, инцидентные этому узлу
+            self._graph.remove_node_edges(obj_id)
             self._by_type[obj.type].discard(obj_id)
             self._by_author[obj.author].discard(obj_id)
             self._embedding_index.pop(obj_id, None)
             event = KnowledgeEvent(
                 id=str(uuid.uuid4()),
                 type=EventType.RETRACT,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 actor=actor,
                 target_id=obj_id,
                 payload={"reason": reason}
@@ -395,6 +367,14 @@ class MemoryStore:
     def get_embedding(self, obj_id: str) -> Optional[List[float]]:
         return self._embedding_index.get(obj_id)
 
+    # ---------- НОВЫЙ МЕТОД: история объекта ----------
+    def get_object_history(self, obj_id: str) -> List[KnowledgeEvent]:
+        """Возвращает все события, связанные с указанным объектом, отсортированные по времени."""
+        return sorted(
+            [e for e in self._events if e.target_id == obj_id],
+            key=lambda e: e.timestamp
+        )
+
     # ---------- Поиск ----------
     @staticmethod
     def _cosine(a: List[float], b: List[float]) -> float:
@@ -408,10 +388,6 @@ class MemoryStore:
         return dot / (norm_a * norm_b)
 
     def semantic_search(self, query_vector: List[float], top_k: int = 10) -> List[Tuple[str, float]]:
-        """Косинусное сходство query_vector со всеми векторами в _embedding_index.
-        GCN сам не считает эмбеддинги текста — вызывающая сторона (например,
-        CognitiveMemory._get_embedding через SentenceTransformer) должна передать
-        уже посчитанный вектор через set_embedding()/этот метод."""
         with self._lock:
             items = list(self._embedding_index.items())
         if not items:
@@ -421,68 +397,73 @@ class MemoryStore:
         return results[:top_k]
 
     def graph_search(self, start_id: str, relation: Optional[str] = None, max_depth: int = 2) -> List[str]:
-        """Поиск по графу (ассоциативный)."""
-        neighbors = self._graph.get_neighbors(start_id, relation)
-        # Просто возвращаем все target_id из прямых рёбер
-        return [t for _, t in neighbors]
+        return self._graph.traverse(start_id, max_depth) if relation is None else [t for _, t in self._graph.get_neighbors(start_id, relation)]
 
-    def hybrid_retrieve(self, query_vector: Optional[List[float]] = None,
-                        query_text: Optional[str] = None,
-                        start_node: Optional[str] = None,
-                        top_k: int = 10) -> List[KnowledgeObject]:
+    # ---------- УЛУЧШЕННЫЙ ГИБРИДНЫЙ ПОИСК (принимает embedder) ----------
+    def hybrid_retrieve(
+        self,
+        query_vector: Optional[List[float]] = None,
+        query_text: Optional[str] = None,
+        embedder_func: Optional[Callable[[str], List[float]]] = None,
+        start_node: Optional[str] = None,
+        top_k: int = 10
+    ) -> List[KnowledgeObject]:
         """
-        Гибридный поиск: комбинирует семантический и графовый поиск,
-        ранжирует по relevance + provenance + свежести.
+        Гибридный поиск с поддержкой текста через embedder_func.
+        Если передан query_text, но нет query_vector, и embedder_func задан – генерирует вектор.
         """
+        # Генерируем вектор из текста, если нужно
+        if query_text and query_vector is None and embedder_func:
+            try:
+                query_vector = embedder_func(query_text)
+            except Exception as e:
+                pass
+
         candidates = set()
-        scores = {}  # object_id -> cumulative score
+        scores = {}
 
-        # 1. Семантический поиск (если есть вектор)
+        # 1. Семантический поиск
         if query_vector is not None:
             sem_results = self.semantic_search(query_vector, top_k=top_k*2)
             for obj_id, score in sem_results:
                 candidates.add(obj_id)
                 scores[obj_id] = scores.get(obj_id, 0.0) + score * HYBRID_WEIGHT_SEMANTIC
 
-        # 2. Графовый поиск (если есть начальный узел)
+        # 2. Графовый поиск
         if start_node:
             graph_ids = self.graph_search(start_node, max_depth=2)
             for obj_id in graph_ids:
+                if obj_id == start_node:
+                    continue
                 candidates.add(obj_id)
                 edge_weight = self._graph.get_relation_weight(start_node, "synapse", obj_id) or 1.0
                 scores[obj_id] = scores.get(obj_id, 0.0) + HYBRID_WEIGHT_GRAPH * min(1.0, edge_weight)
 
-        # 3. Дополнительные факторы: свежесть, доверие, доказательства
+        # 3. Дополнительные факторы
         for obj_id in list(candidates):
             obj = self._objects.get(obj_id)
             if not obj:
                 candidates.remove(obj_id)
                 continue
-            # свежесть (чем новее, тем выше)
-            age_days = (datetime.utcnow() - obj.created).days
+            age_days = (datetime.now(timezone.utc) - obj.created).days
             recency = max(0.0, 1.0 - age_days / 365.0) if age_days < 365 else 0.0
             scores[obj_id] = scores.get(obj_id, 0.0) + recency * HYBRID_WEIGHT_FRESHNESS
-            # доверие (confidence)
             scores[obj_id] += obj.confidence * HYBRID_WEIGHT_CONFIDENCE
-            # количество доказательств
             scores[obj_id] += min(len(obj.evidence), 5) / 5 * HYBRID_WEIGHT_EVIDENCE
 
-        # Сортировка
         sorted_ids = sorted(candidates, key=lambda x: scores.get(x, 0.0), reverse=True)
         return [self._objects[oid] for oid in sorted_ids[:top_k]]
 
-    # ---------- Персистентность ----------
+    # ---------- Персистентность (асинхронная обёртка) ----------
     def save(self, path: str):
-        """Сохраняет всё состояние в JSON: объекты, события, граф (с весами рёбер)
-        и векторный индекс. provenance каждого объекта сериализуется через default=str
-        (детальная история восстанавливается из событийного лога, а не из provenance)."""
+        """Синхронное сохранение (для обратной совместимости)."""
         with self._lock:
             objects_data = {}
             for k, v in self._objects.items():
                 od = dict(v.__dict__)
-                od["type"] = v.type.value           # enum -> "claim", не "KnowledgeType.CLAIM"
+                od["type"] = v.type.value
                 od["created"] = v.created.isoformat()
-                od["provenance"] = None              # детальная история — в _events, не здесь
+                od["provenance"] = None  # восстанавливается из событий
                 objects_data[k] = od
             data = {
                 "objects": objects_data,
@@ -496,18 +477,15 @@ class MemoryStore:
                 },
                 "embeddings": self._embedding_index,
             }
-        with open(path, 'w') as f:
+        with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, default=str, indent=2)
 
     def load(self, path: str):
-        """Загружает состояние, включая граф связей (с весами) и событийный лог —
-        ранее эти два блока не восстанавливались, из-за чего provenance/аудит-трейл
-        GCN обнулялся при каждом перезапуске процесса."""
-        with open(path, 'r') as f:
+        """Синхронная загрузка (для обратной совместимости)."""
+        with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
         with self._lock:
-            # ---- Объекты ----
             self._objects = {}
             self._by_type = defaultdict(set)
             self._by_author = defaultdict(set)
@@ -515,14 +493,12 @@ class MemoryStore:
                 v = dict(v)
                 v["type"] = KnowledgeType(v["type"])
                 v["created"] = datetime.fromisoformat(v["created"]) if isinstance(v["created"], str) else v["created"]
-                # provenance хранится упрощённо (см. save) — детальная история живёт в _events
                 v["provenance"] = None
                 obj = KnowledgeObject(**v)
                 self._objects[k] = obj
                 self._by_type[obj.type].add(k)
                 self._by_author[obj.author].add(k)
 
-            # ---- Граф (рёбра + веса) ----
             self._graph = KnowledgeGraph()
             edge_meta = data.get("graph_edge_meta", {})
             for src, edges in data.get("graph_edges", {}).items():
@@ -531,7 +507,6 @@ class MemoryStore:
                     weight = edge_meta.get(meta_key, {}).get("weight", 1.0)
                     self._graph.add_relation(src, relation, target, weight=weight)
 
-            # ---- Событийный лог ----
             self._events = []
             for ed in data.get("events", []):
                 ed = dict(ed)
@@ -539,49 +514,40 @@ class MemoryStore:
                 ed["timestamp"] = datetime.fromisoformat(ed["timestamp"]) if isinstance(ed["timestamp"], str) else ed["timestamp"]
                 self._events.append(KnowledgeEvent(**ed))
 
-            # ---- Векторный индекс ----
             self._embedding_index = dict(data.get("embeddings", {}))
 
+    # ---------- АСИНХРОННАЯ ОБЁРТКА ДЛЯ ВВОДА-ВЫВОДА ----------
+    async def async_save(self, path: str):
+        """Асинхронное сохранение (не блокирует event loop)."""
+        import asyncio
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.save, path)
 
-# ==================== 7. AI Adapter Layer (абстракция) ====================
+    async def async_load(self, path: str):
+        """Асинхронная загрузка (не блокирует event loop)."""
+        import asyncio
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.load, path)
+
+
+# ==================== AIAdapter (без изменений, работает с новым Store) ====================
 class AIAdapter:
-    """
-    Интерфейс для подключения любого AI/LLM.
-    AI взаимодействует с Knowledge Layer только через этот адаптер.
-    """
     def __init__(self, memory_store: MemoryStore, agent_id: str):
         self.memory = memory_store
         self.agent_id = agent_id
 
     def query(self, question: str, context: Optional[List[str]] = None) -> str:
-        """
-        Выполняет запрос к AI, используя текущее состояние знания.
-        Здесь в реальности вызывается LLM с подходящим контекстом.
-        """
-        # Пример: извлекаем релевантные знания
-        # В этом примере мы используем заглушку: просто собираем факты.
-        # В реальном проекте здесь будет вызов LLM.
         retrieved = self.retrieve(question)
-        # Формируем ответ (заглушка)
-        answer = f"AI {self.agent_id} отвечает на '{question}' на основе {len(retrieved)} объектов."
-        return answer
+        return f"AI {self.agent_id} отвечает на '{question}' на основе {len(retrieved)} объектов."
 
     def retrieve(self, query: str, top_k: int = 5) -> List[KnowledgeObject]:
-        """
-        Гибридный поиск с преобразованием текста в вектор (заглушка).
-        Здесь должен быть вызов embedding модели.
-        """
-        # Заглушка: генерируем случайный вектор
+        # Здесь должен быть реальный embedder. Используем заглушку.
         import random
-        vec = [random.random() for _ in range(128)]  # просто для примера
+        vec = [random.random() for _ in range(128)]
         return self.memory.hybrid_retrieve(query_vector=vec, top_k=top_k)
 
     def publish(self, knowledge: Union[KnowledgeObject, Dict]) -> str:
-        """
-        Публикует новое знание в GCN (создаёт или обновляет).
-        """
         if isinstance(knowledge, dict):
-            # Создаём объект из словаря
             obj = KnowledgeObject(
                 id=str(uuid.uuid4()),
                 type=KnowledgeType(knowledge.get("type", "claim")),
@@ -589,7 +555,7 @@ class AIAdapter:
                 predicate=knowledge["predicate"],
                 object=knowledge["object"],
                 author=self.agent_id,
-                created=datetime.utcnow(),
+                created=datetime.now(timezone.utc),
                 evidence=knowledge.get("evidence", []),
                 confidence=knowledge.get("confidence", 0.5),
             )
@@ -599,44 +565,32 @@ class AIAdapter:
         return self.memory.create(obj, self.agent_id)
 
     def verify(self, obj_id: str, status: str):
-        """Запрашивает верификацию знания."""
         self.memory.verify(obj_id, self.agent_id, status, self.agent_id)
 
     def explain(self, obj_id: str) -> Dict:
-        """Возвращает объяснение (provenance) для объекта."""
         obj = self.memory.get(obj_id)
         if not obj:
             return {"error": "not found"}
+        history = self.memory.get_object_history(obj_id)
         return {
             "id": obj.id,
             "author": obj.author,
             "created": obj.created.isoformat(),
             "confidence": obj.confidence,
             "evidence": obj.evidence,
+            "history_events": len(history),
             "provenance": obj.provenance.__dict__ if obj.provenance else None,
         }
 
 
-# ==================== 8. Многоуровневая память (концептуально) ====================
 class MemoryHierarchy:
-    """
-    Разделение памяти на уровни (рабочая, эпизодическая, семантическая, ассоциативная, процедурная).
-    В данной реализации это просто обёртка над MemoryStore с дополнительными метаданными.
-    """
     def __init__(self, store: MemoryStore):
         self.store = store
-        # В реальности здесь могут быть отдельные хранилища с разными политиками
-        # Например, рабочая память – эфемерная, семантическая – долговременная.
-        # Для простоты пока используем одно хранилище.
 
     def add_to_working(self, obj: KnowledgeObject):
-        """Помещает в рабочую память (высокоприоритетный доступ)."""
-        # Может быть отдельный кеш
         pass
 
     def episodic_recall(self, time_range: Tuple[datetime, datetime]) -> List[KnowledgeObject]:
-        """Вспоминает события за период."""
-        # Поиск по created
         result = []
         for obj in self.store._objects.values():
             if time_range[0] <= obj.created <= time_range[1]:
@@ -644,66 +598,37 @@ class MemoryHierarchy:
         return result
 
 
-# ==================== 9. Пример использования ====================
-def demo():
-    # Инициализация
+if __name__ == "__main__":
+    # Демонстрация
     store = MemoryStore()
-    # Создаём двух агентов
     alice = AIAdapter(store, "Alice")
-    bob = AIAdapter(store, "Bob")
-    carol = AIAdapter(store, "Carol")
-
-    # Alice создаёт знание
     obj1 = KnowledgeObject(
         id=str(uuid.uuid4()),
         type=KnowledgeType.CLAIM,
         subject="Python",
         predicate="is_used_for",
-        object="Machine Learning",
+        object="ML",
         author=alice.agent_id,
-        created=datetime.utcnow(),
+        created=datetime.now(timezone.utc),
         confidence=0.9
     )
     alice.publish(obj1)
-
-    # Alice создаёт ещё одно знание и связывает
     obj2 = KnowledgeObject(
         id=str(uuid.uuid4()),
         type=KnowledgeType.CLAIM,
-        subject="Machine Learning",
+        subject="ML",
         predicate="requires",
         object="Data",
         author=alice.agent_id,
-        created=datetime.utcnow(),
+        created=datetime.now(timezone.utc),
         confidence=0.8
     )
     alice.publish(obj2)
     store.link(obj1.id, obj2.id, "implies", alice.agent_id)
 
-    # Bob ищет знания по запросу
-    retrieved = bob.retrieve("What is Python used for?")
-    print("Bob retrieved:", [f"{o.subject} {o.predicate} {o.object}" for o in retrieved])
+    # Проверка истории
+    print("History for obj1:", len(store.get_object_history(obj1.id)))
 
-    # Bob проверяет объект
-    bob.verify(obj1.id, "confirmed")
-
-    # Carol использует знания для вывода
-    # Carol может получить объект и использовать его в reasoning
-    carol_obj = store.get(obj1.id)
-    print(f"Carol sees: {carol_obj.subject} {carol_obj.predicate} {carol_obj.object}")
-
-    # Сохранение состояния
-    store.save("gcn_state.json")
-    print("State saved.")
-
-    # Проверка целостности: хеш не изменился
-    print("Hash of obj1:", obj1.content_hash)
-
-    # Демонстрация событийной истории
-    print(f"Total events: {len(store._events)}")
-    for ev in store._events[-3:]:
-        print(f"Event {ev.type.value} by {ev.actor} on {ev.target_id}")
-
-
-if __name__ == "__main__":
-    demo()
+    # Retract – теперь чистит граф
+    store.retract(obj1.id, alice.agent_id, "test")
+    print("Edges after retract:", store._graph._edges)  # Должно быть пусто

@@ -451,7 +451,7 @@ class CognitiveMemory:
 
                 # Сохраняем GCN состояние
                 gcn_state_path = self.base_dir / GCN_STATE_FILENAME
-                self.gcn_store.save(str(gcn_state_path))
+                await self.gcn_store.async_save(str(gcn_state_path))
 
                 self._dirty = False
             except Exception as e:
@@ -658,6 +658,12 @@ class CognitiveMemory:
                     self.index.add(np.array([emb]).astype('float32'))
                 self._emb_added_since_train += 1
                 self._train_index_if_needed()
+                # ---- Синхронизация эмбеддинга с GCN ----
+                if self.use_embeddings and emb is not None and fact.gcn_id:
+                    try:
+                        self.gcn_store.set_embedding(fact.gcn_id, emb.tolist())
+                    except Exception as e:
+                        logger.debug(f"GCN embedding sync failed: {e}")
             except Exception:
                 emb = None
 
@@ -1113,8 +1119,43 @@ class CognitiveMemory:
                 "confidence": round(confidence, 3),
                 "importance": fact.importance,
                 "activation": fact.activation,
-                "gcn_id": fact.gcn_id,  # добавляем для связи с GCN
+                "gcn_id": fact.gcn_id,
             })
+
+        # ---- ДОБАВЛЕНО: Дополнение результатов из GCN ----
+        if self.use_embeddings and hasattr(self, 'gcn_store'):
+            try:
+                q_emb = self._get_embedding(query).tolist() if self.use_embeddings else None
+                gcn_results = self.gcn_store.hybrid_retrieve(
+                    query_vector=q_emb,
+                    top_k=top_k
+                )
+                existing_ids = {r["id"] for r in result}
+                for gobj in gcn_results:
+                    if gobj.id.startswith("fact_gcn_"):
+                        try:
+                            fid = int(gobj.id.split("_")[-1])
+                            if fid not in existing_ids and fid in self.facts_by_id:
+                                f = self.facts_by_id[fid]
+                                result.append({
+                                    "id": f.id,
+                                    "text": f.text,
+                                    "type": f.type,
+                                    "timestamp": f.timestamp,
+                                    "score": gobj.confidence * 0.8,
+                                    "confidence": gobj.confidence,
+                                    "importance": f.importance,
+                                    "activation": f.activation,
+                                    "gcn_id": f.gcn_id,
+                                    "source": "gcn"
+                                })
+                        except:
+                            pass
+                result.sort(key=lambda x: x["score"], reverse=True)
+                result = result[:top_k]
+            except Exception as e:
+                logger.debug(f"GCN hybrid search fallback: {e}")
+        # ---- КОНЕЦ ДОБАВЛЕННОГО БЛОКА ----
 
         self._cache[cache_key] = (result, time.time())
         if len(self._cache) > self._cache_maxsize:
