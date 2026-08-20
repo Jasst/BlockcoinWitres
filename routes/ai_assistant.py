@@ -1190,32 +1190,74 @@ class CognitiveController:
                 # 1. Команда "запомни" – сохраняет факт и генерирует ответ через LLM
                 # ------------------------------------------------------------
                 if action == "store":
-                    fid = self.memory._add_fact(rest, 'command', confidence=1.0, importance=1.5)
-                    # --- НОВОЕ: добавить в рабочую память ---
-                    fact = self.memory.facts_by_id.get(fid)
-                    if fact and fact.gcn_id:
-                        self.memory.hierarchy.add_to_working(fact.gcn_id)
-                    await self.memory._schedule_save()
+                    # Проверяем, не просит ли пользователь сохранить глобально
+                    is_global = any(word in rest.lower() for word in ("глобально", "global"))
 
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию. "
-                                "Подтверди, что ты запомнил, кратко и естественно, возможно, с уточнением или перефразировкой, "
-                                "чтобы показать понимание."
+                    if is_global:
+                        # Убираем слова-маркеры из фразы
+                        clean_rest = rest
+                        for word in ("глобально", "global"):
+                            clean_rest = clean_rest.replace(word, "").strip()
+                        clean_rest = " ".join(clean_rest.split())  # схлопываем пробелы
+
+                        # 1. Пробуем извлечь факт через LLM
+                        try:
+                            prompt = (
+                                "Извлеки из следующего запроса пользователя факт, который нужно запомнить. "
+                                "Сформулируй его как краткое, чёткое утверждение, без лишних пояснений. "
+                                "Ответь только фактом.\n\n"
+                                f"Запрос: {clean_rest}"
                             )
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Запомни: {rest}"
-                        }
-                    ]
-                    response = await self._call_llm(messages, temp=0.5, max_tokens=150)
-                    if response:
-                        return response, {"memory": "stored", "id": fid}
+                            fact_text = await self._call_llm([{"role": "user", "content": prompt}], temp=0.3,
+                                                             max_tokens=150)
+                            fact_text = fact_text.strip()
+                            # Проверяем, что LLM вернула осмысленный текст (длина > 5 символов)
+                            if len(fact_text) < 5:
+                                fact_text = clean_rest
+                        except Exception:
+                            # При любой ошибке используем очищенный текст
+                            fact_text = clean_rest
+
+                        # 2. Сохраняем в глобальную память через роутер
+                        gcn_id = self.router.add_knowledge(
+                            subject=fact_text,
+                            predicate="is_fact",
+                            obj="true",
+                            scope=MemoryScope.GLOBAL,
+                            confidence=1.0,
+                            source_type="user_command"
+                        )
+                        await self.router.global_memory._schedule_save()
+                        response = f"Запомнил глобально: {fact_text}"
+                        return response, {"memory": "stored_global", "id": gcn_id}
+
                     else:
-                        return f"Запомнил: {rest}", {"memory": "stored", "id": fid}
+                        # Прежняя логика для личной памяти (без изменений)
+                        fid = self.memory._add_fact(rest, 'command', confidence=1.0, importance=1.5)
+                        fact = self.memory.facts_by_id.get(fid)
+                        if fact and fact.gcn_id:
+                            self.memory.hierarchy.add_to_working(fact.gcn_id)
+                        await self.memory._schedule_save()
+
+                        messages = [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию. "
+                                    "Подтверди, что ты запомнил, кратко и естественно, возможно, с уточнением или перефразировкой, "
+                                    "чтобы показать понимание."
+                                )
+                            },
+                            {
+                                "role": "user",
+                                "content": f"Запомни: {rest}"
+                            }
+                        ]
+                        response = await self._call_llm(messages, temp=0.5, max_tokens=150)
+                        if response:
+                            return response, {"memory": "stored", "id": fid}
+                        else:
+                            return f"Запомнил: {rest}", {"memory": "stored", "id": fid}
 
                 # ------------------------------------------------------------
                 # 2. Команда "забудь" – удаляет факты и генерирует ответ через LLM

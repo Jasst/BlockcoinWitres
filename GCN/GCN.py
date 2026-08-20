@@ -110,6 +110,14 @@ class KnowledgeObject:
         }
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
+    def update(self, **kwargs):
+        for key, value in kwargs.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+        self.version += 1
+        self.content_hash = self.compute_hash()
+        return self
+
 class KnowledgeIngestion:
     """
     Обрабатывает поступление новых знаний в GCN:
@@ -973,7 +981,7 @@ class MemoryStore:
                 "embedding_dim": self.embedding_dim,
             }
         with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, default=str, indent=2)
+            json.dump(data, f, default=str, indent=2, ensure_ascii=False)
 
     def load(self, path: str):
         """Синхронная загрузка."""
