@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Any, Set, Tuple, Union, Callable
 from enum import Enum
 from collections import defaultdict
 import numpy as np
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ try:
         HYBRID_WEIGHT_EVIDENCE, HYBRID_WEIGHT_CONFIDENCE,
         FAISS_NLIST, FAISS_NPROBE, FAISS_MIN_TRAIN_VECTORS,
         EMBEDDING_DIM,
-        WORKING_MEMORY_SIZE          # <-- добавить
+        WORKING_MEMORY_SIZE
     )
 except ImportError:
     HYBRID_WEIGHT_SEMANTIC = 0.40
@@ -65,13 +66,20 @@ class KnowledgeType(Enum):
     MEMORY_EVENT = "memory_event"
 
 
+# GCN.py — после импортов, до KnowledgeType
+
+class MemoryScope(Enum):
+    PRIVATE = "private"   # личное, видно только владельцу
+    SHARED = "shared"     # доступно группе/друзьям (можно расширить)
+    GLOBAL = "global"     # общедоступное, коллективное знание
+
 @dataclass
 class KnowledgeObject:
     id: str
     type: KnowledgeType
     subject: str
     predicate: str
-    object: Any          # может содержать метаданные (словарь)
+    object: Any
     author: str
     created: datetime
     evidence: List[str] = field(default_factory=list)
@@ -80,6 +88,8 @@ class KnowledgeObject:
     content_hash: Optional[str] = None
     signature: Optional[str] = None
     provenance: Optional[Provenance] = None
+    scope: MemoryScope = MemoryScope.GLOBAL      # новое поле
+    source_type: Optional[str] = None            # "agent_observation", "user_input", "web_search" и т.д.
 
     def __post_init__(self):
         if self.content_hash is None:
@@ -95,18 +105,122 @@ class KnowledgeObject:
             "evidence": sorted(self.evidence),
             "confidence": self.confidence,
             "version": self.version,
+            "scope": self.scope.value,           # добавить в хэш
+            "source_type": self.source_type,
         }
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
-    def update(self, **kwargs) -> KnowledgeObject:
-        new_obj = copy.deepcopy(self)
-        for k, v in kwargs.items():
-            if hasattr(new_obj, k):
-                setattr(new_obj, k, v)
-        new_obj.version += 1
-        new_obj.created = datetime.now(timezone.utc)
-        new_obj.content_hash = new_obj.compute_hash()
-        return new_obj
+class KnowledgeIngestion:
+    """
+    Обрабатывает поступление новых знаний в GCN:
+    - дедупликация
+    - обнаружение противоречий
+    - агрегация свидетельств
+    - обновление confidence
+    - слияние канонических утверждений
+    """
+    def __init__(self, store: MemoryStore, similarity_threshold: float = 0.85):
+        self.store = store
+        self.similarity_threshold = similarity_threshold
+
+    def submit_candidate(self, candidate: KnowledgeObject, actor: str) -> str:
+        """
+        Предложить знание глобальной памяти.
+        Возвращает ID объекта (нового или существующего).
+        """
+        with self.store._lock:
+            # 1. Поиск семантически похожих утверждений (по эмбеддингу, если есть)
+            similar = self._find_similar(candidate)
+
+            # 2. Если найдены похожие, решаем, что делать
+            if similar:
+                return self._merge_or_support(candidate, similar, actor)
+            else:
+                # 3. Новое знание — просто сохраняем
+                return self.store.create(candidate, actor)
+
+    def _find_similar(self, candidate: KnowledgeObject) -> List[KnowledgeObject]:
+        """Ищет похожие объекты в глобальной памяти (только GLOBAL scope)."""
+        # Получаем эмбеддинг кандидата (если есть)
+        emb = self.store.get_embedding(candidate.id)
+        if emb:
+            results = self.store.semantic_search(emb, top_k=10)
+            similar_ids = [oid for oid, _ in results]
+        else:
+            # fallback по ключевым словам (если нет эмбеддинга)
+            similar_ids = self._keyword_search(candidate.subject)
+        # Фильтруем только глобальные объекты
+        return [self.store.get(oid) for oid in similar_ids
+                if oid and self.store.get(oid) and self.store.get(oid).scope == MemoryScope.GLOBAL]
+
+    def _keyword_search(self, text: str) -> List[str]:
+        # простая эвристика: ищем по вхождению слов (заглушка)
+        results = []
+        for obj in self.store._objects.values():
+            if obj.scope == MemoryScope.GLOBAL and any(w in obj.subject.lower() for w in text.lower().split()):
+                results.append(obj.id)
+        return results[:10]
+
+    def _merge_or_support(self, candidate: KnowledgeObject, similar: List[KnowledgeObject], actor: str) -> str:
+        """
+        Решает: объединить с существующим, добавить свидетельство или создать противоречие.
+        """
+        # Выбираем наиболее похожий объект (по confidence или similarity)
+        best = similar[0]
+        similarity = self._compute_similarity(candidate.subject, best.subject)
+
+        if similarity > 0.95:
+            # Почти идентичны — усиливаем существующий
+            return self._reinforce(best, candidate, actor)
+        elif similarity > 0.7:
+            # Похожи, но есть различия — проверяем противоречие
+            if self._is_contradictory(candidate, best):
+                # Регистрируем противоречие
+                self.store.register_contradiction(candidate.id, best.id, actor)
+                # Понижаем уверенность обоих (уже есть в register_contradiction)
+                # Возвращаем ID нового кандидата
+                return candidate.id
+            else:
+                # Поддерживаем существующий
+                return self._reinforce(best, candidate, actor)
+        else:
+            # Недостаточно похожи — создаём новый
+            return self.store.create(candidate, actor)
+
+    def _reinforce(self, existing: KnowledgeObject, candidate: KnowledgeObject, actor: str) -> str:
+        """
+        Усиливает существующее знание свидетельством от нового кандидата.
+        Обновляет confidence, evidence и создаёт событие REINFORCE.
+        """
+        # Добавляем evidence кандидата (или id кандидата) к существующему
+        new_evidence = existing.evidence + candidate.evidence
+        # Пересчитываем confidence: увеличиваем, но с насыщением
+        new_conf = min(1.0, existing.confidence + 0.05 * (1 - existing.confidence))
+        # Обновляем объект
+        self.store.update(existing.id, {"evidence": new_evidence, "confidence": new_conf}, actor)
+        # Создаём событие REINFORCE отдельно (можно добавить в update)
+        event = KnowledgeEvent(
+            id=str(uuid.uuid4()),
+            type=EventType.REINFORCE,
+            timestamp=datetime.now(timezone.utc),
+            actor=actor,
+            target_id=existing.id,
+            payload={"candidate_id": candidate.id, "new_confidence": new_conf}
+        )
+        self.store._events.append(event)
+        return existing.id
+
+    def _is_contradictory(self, a: KnowledgeObject, b: KnowledgeObject) -> bool:
+        # Простая эвристика: если одно содержит отрицание, а другое нет, и они о схожем предмете
+        neg_words = {'не', 'нет', 'без', 'против', 'отрицает'}
+        has_neg_a = any(w in a.subject.lower() for w in neg_words)
+        has_neg_b = any(w in b.subject.lower() for w in neg_words)
+        return has_neg_a != has_neg_b
+
+    def _compute_similarity(self, text1: str, text2: str) -> float:
+        # Используем существующий метод из CognitiveMemory
+        from GCN.memory_graph import CognitiveMemory
+        return CognitiveMemory._compute_similarity(text1, text2)
 
 
 class EventType(Enum):

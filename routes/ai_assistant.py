@@ -22,9 +22,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-# Импорты из пакета GCN (новая структура)
-from GCN.memory_graph import CognitiveMemory, Fact, Episode, Goal
-from GCN.GCN import AIAdapter, KnowledgeObject, KnowledgeType
+from GCN.GCN import AIAdapter, KnowledgeObject, KnowledgeType, MemoryScope
+from GCN.memory_graph import CognitiveMemory, Fact, Episode, Goal, GCNMemoryRouter
 
 try:
     from GCN.config_ai import *
@@ -416,13 +415,15 @@ class CognitiveController:
         self.user_dir = MEMORY_BASE_DIR / user_id
         self.user_dir.mkdir(parents=True, exist_ok=True)
 
-        # ---- GCN-память (единое хранилище) ----
-        self.memory = CognitiveMemory(user_id, MEMORY_BASE_DIR)
-        # AIAdapter для публикации знаний в GCN.
-        # embedder_func передан явно: раньше AIAdapter создавался без него,
-        # и его .retrieve()/.query() (сейчас не используются в этом файле, но
-        # готовы к использованию, например, из agent_core.py) вместо этого
-        # использовали случайный вектор — см. фикс в GCN.py.
+        # ---- GCN-память: роутер (личная + глобальная + общая) ----
+        self.router = GCNMemoryRouter(user_id, MEMORY_BASE_DIR)
+        self.router.set_llm_caller(self._call_llm)  # передаём метод для извлечения фактов
+
+        # Для обратной совместимости: старый код использует self.memory
+        # Теперь self.memory указывает на личную память
+        self.memory = self.router.private_memory
+
+        # AIAdapter использует store из личной памяти (для публикации)
         embedder_func = (
             (lambda text: self.memory.embedder.encode(text, convert_to_numpy=True).tolist())
             if self.memory.use_embeddings and self.memory.embedder is not None
@@ -953,7 +954,7 @@ class CognitiveController:
                 except Exception as e:
                     logger.warning(f"Fact extraction error: {e}")
 
-        relevant = await self.memory.retrieve_hybrid(message, top_k=7, use_graph=True)
+        relevant = await self.router.retrieve(message, top_k=7, include_private=True)
         memory_context = ""
         if relevant:
             lines = []

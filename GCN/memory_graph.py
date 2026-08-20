@@ -23,12 +23,14 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 import faiss
+import uuid
 
 # Импорт GCN-компонентов (папка GCN, файл GCN.py)
 from GCN.GCN import (
     KnowledgeObject, KnowledgeType, KnowledgeEvent, EventType,
     MemoryStore, KnowledgeGraph as GCNKnowledgeGraph,
-    AIAdapter, Provenance, MemoryHierarchy
+    AIAdapter, Provenance, MemoryHierarchy,
+    MemoryScope, KnowledgeIngestion   # добавить эти два
 )
 
 logger = logging.getLogger(__name__)
@@ -1091,3 +1093,170 @@ class CognitiveMemory:
         if self._save_task:
             self._save_task.cancel()
         await self._save_async()
+
+class GCNMemoryRouter:
+    """
+    Управляет тремя слоями памяти: личный (PRIVATE), общий (SHARED), глобальный (GLOBAL).
+    Обеспечивает:
+    - унифицированный поиск с учётом scope и весов
+    - маршрутизацию добавления знаний (в зависимости от scope)
+    - извлечение с ранжированием
+    - инжекшн в глобальную память (дедупликация, агрегация, противоречия)
+    - извлечение фактов из диалогов через LLM
+    """
+    _global_instance: Optional[CognitiveMemory] = None
+    _shared_instance: Optional[CognitiveMemory] = None
+
+    def __init__(self, user_id: str, base_dir: Path):
+        self.user_id = user_id
+        self.base_dir = base_dir
+
+        # Личная память – всегда своя
+        self.private_memory = CognitiveMemory(user_id, base_dir)
+
+        # Глобальная память – единый экземпляр для всех (синглтон)
+        self.global_memory = self._get_global_memory(base_dir)
+
+        # Общая память – единый экземпляр для всех (можно расширить до групповой)
+        self.shared_memory = self._get_shared_memory(base_dir)
+
+        # Инжектор для глобальной памяти (отвечает за дедупликацию, агрегацию, противоречия)
+        self.global_ingestion = KnowledgeIngestion(self.global_memory.store)
+
+        # Функция вызова LLM (будет установлена из контроллера)
+        self._llm_caller = None
+
+    @classmethod
+    def _get_global_memory(cls, base_dir: Path) -> CognitiveMemory:
+        """Возвращает глобальную память как синглтон."""
+        if cls._global_instance is None:
+            cls._global_instance = CognitiveMemory("global", base_dir)
+        return cls._global_instance
+
+    @classmethod
+    def _get_shared_memory(cls, base_dir: Path) -> CognitiveMemory:
+        """Возвращает общую (shared) память как синглтон."""
+        if cls._shared_instance is None:
+            cls._shared_instance = CognitiveMemory("shared", base_dir)
+        return cls._shared_instance
+
+    def set_llm_caller(self, llm_caller):
+        """Передаёт функцию вызова LLM для извлечения фактов."""
+        self._llm_caller = llm_caller
+
+    async def retrieve(self, query: str, top_k: int = 7, include_private: bool = True) -> List[Dict]:
+        """
+        Объединённый поиск по всем доступным слоям с ранжированием.
+        """
+        private_results = []
+        shared_results = []
+        global_results = []
+
+        if include_private:
+            private_results = await self.private_memory.retrieve_hybrid(query, top_k=top_k)
+        shared_results = await self.shared_memory.retrieve_hybrid(query, top_k=top_k)
+        global_results = await self.global_memory.retrieve_hybrid(query, top_k=top_k)
+
+        # Применяем веса к скорам в зависимости от scope
+        # Приватные выше, глобальные чуть ниже, общие посередине
+        for item in private_results:
+            item["_score"] = item.get("score", 0.5) * 1.2  # +20%
+        for item in shared_results:
+            item["_score"] = item.get("score", 0.5) * 1.0  # базовый
+        for item in global_results:
+            item["_score"] = item.get("score", 0.5) * 0.9  # -10%
+
+        combined = private_results + shared_results + global_results
+
+        # Убираем дубликаты по тексту (можно по id, но для надёжности по тексту)
+        seen_texts = set()
+        unique = []
+        for item in combined:
+            text = item.get("text", "")
+            if text and text not in seen_texts:
+                seen_texts.add(text)
+                unique.append(item)
+
+        # Сортируем по _score
+        unique.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
+        return unique[:top_k]
+
+    def add_knowledge(self, subject: str, predicate: str, obj: Any,
+                      scope: MemoryScope = MemoryScope.PRIVATE,
+                      confidence: float = 0.5, author: Optional[str] = None,
+                      source_type: str = "user_input") -> str:
+        """
+        Добавляет знание в соответствующий слой с учётом scope.
+        Для GLOBAL использует инжекшн (дедупликация, агрегация).
+        """
+        if author is None:
+            author = self.user_id
+
+        # Создаём объект
+        ko = KnowledgeObject(
+            id=f"fact_{uuid.uuid4()}",
+            type=KnowledgeType.CLAIM,
+            subject=subject,
+            predicate=predicate,
+            object={"value": obj},
+            author=author,
+            created=datetime.now(timezone.utc),
+            confidence=confidence,
+            scope=scope,
+            source_type=source_type
+        )
+
+        if scope == MemoryScope.GLOBAL:
+            return self.global_ingestion.submit_candidate(ko, author)
+        elif scope == MemoryScope.PRIVATE:
+            return self.private_memory.store.create(ko, author)
+        elif scope == MemoryScope.SHARED:
+            return self.shared_memory.store.create(ko, author)
+        else:
+            raise ValueError(f"Unknown scope: {scope}")
+
+    async def add_episode(self, user_msg: str, assistant_msg: str, salience: float = 0.0,
+                          scope: MemoryScope = MemoryScope.PRIVATE,
+                          extract_facts: bool = False):
+        """
+        Сохраняет эпизод в личную память, а также, если extract_facts=True,
+        извлекает факты с помощью LLM и отправляет в глобальную память.
+        """
+        # Всегда сохраняем эпизод в личную память
+        await self.private_memory.add_episode(user_msg, assistant_msg, salience)
+
+        # Если включено извлечение фактов для глобальной памяти
+        if extract_facts and self._llm_caller is not None:
+            extracted = await self._extract_facts_with_llm(user_msg, assistant_msg)
+            for fact in extracted:
+                self.add_knowledge(
+                    subject=fact,
+                    predicate="is_fact",
+                    obj="true",
+                    scope=MemoryScope.GLOBAL,
+                    confidence=0.6,
+                    source_type="dialogue_extraction"
+                )
+
+    async def _extract_facts_with_llm(self, user_msg: str, assistant_msg: str) -> List[str]:
+        """Извлекает факты из диалога с помощью LLM."""
+        if not self._llm_caller:
+            return []
+        combined = f"User: {user_msg}\nAssistant: {assistant_msg}"
+        prompt = (
+            "Извлеки из диалога ниже все фактические утверждения (не мнения, не общие фразы). "
+            "Верни только факты, каждый с новой строки, без нумерации и пояснений.\n\n"
+            f"Диалог:\n{combined}"
+        )
+        try:
+            raw = await self._llm_caller([{"role": "user", "content": prompt}], temp=0.2, max_tokens=300)
+            if not raw:
+                return []
+            # Разбиваем по строкам и фильтруем
+            lines = [line.strip().strip('-•*').strip() for line in raw.split('\n') if line.strip()]
+            # Оставляем только предложения длиной > 20 символов
+            facts = [line for line in lines if len(line) > 20]
+            return facts[:5]
+        except Exception as e:
+            logger.warning(f"Fact extraction failed: {e}")
+            return []
