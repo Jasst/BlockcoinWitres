@@ -532,8 +532,9 @@ class CognitiveController:
         принято (см. needs_search_heuristic/явный флаг), поэтому не вносит
         дополнительный LLM round-trip в обычные (без поиска) реплики.
         """
+        # Исправлено: используем правильную структуру истории
         history_tail = "\n".join(
-            f"User: {item['user'][:200]}\nAI: {item['assistant'][:200]}"
+            f"{item['role'].capitalize()}: {item['content'][:200]}"
             for item in self.history[-4:]
         ) if self.history else "(диалог только начался)"
 
