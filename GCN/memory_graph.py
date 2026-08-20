@@ -179,17 +179,13 @@ class CognitiveMemory:
         self.base_dir = base_dir / user_id / "cognitive_memory"
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
-        # ---- GCN-слой (основное хранилище) ----
-        self.gcn_store = MemoryStore()
-        gcn_state_path = self.base_dir / GCN_STATE_FILENAME
-        if gcn_state_path.exists():
-            try:
-                self.gcn_store.load(str(gcn_state_path))
-                logger.info("GCN state loaded")
-            except Exception as e:
-                logger.warning(f"Failed to load GCN state: {e}")
-
         # ---- Эмбеддинги (для генерации векторов) ----
+        # ВАЖНО: инициализируем эмбеддер ДО MemoryStore, чтобы передать туда
+        # реальную размерность вектора. Раньше MemoryStore() создавался с
+        # захардкоженным EMBEDDING_DIM=128 из конфига, а
+        # all-mpnet-base-v2 отдаёт 768 — из-за этого FAISS-индекс в GCN
+        # никогда не строился на реальных векторах (см. комментарий в
+        # MemoryStore.__init__ в GCN.py).
         self.use_embeddings = MEMORY_USE_EMBEDDINGS
         if self.use_embeddings:
             try:
@@ -203,6 +199,18 @@ class CognitiveMemory:
         else:
             self.embedder = None
             self.embedding_dim = 0
+
+        # ---- GCN-слой (основное хранилище) ----
+        self.gcn_store = MemoryStore(embedding_dim=self.embedding_dim or None)
+        self.hierarchy = MemoryHierarchy(self.gcn_store, size=WORKING_MEMORY_SIZE)
+
+        gcn_state_path = self.base_dir / GCN_STATE_FILENAME
+        if gcn_state_path.exists():
+            try:
+                self.gcn_store.load(str(gcn_state_path))
+                logger.info("GCN state loaded")
+            except Exception as e:
+                logger.warning(f"Failed to load GCN state: {e}")
 
         # ---- Кэши (синхронизируются с GCN) ----
         self.semantic_facts: List[Fact] = []
@@ -284,6 +292,15 @@ class CognitiveMemory:
             self.facts_by_id[fid] = fact
             for kw in fact.keywords:
                 self.keyword_index[kw].append(fid)
+        # --- НОВОЕ: заполняем противоречия из графа ---
+        for f in self.semantic_facts:
+            if f.gcn_id:
+                neighbors = self.gcn_store._graph.get_neighbors(f.gcn_id, "CONTRADICTS")
+                for _, target_id in neighbors:
+                    target_fact = self._find_fact_by_gcn_id(target_id)
+                    if target_fact:
+                        f.contradicts.add(target_fact.id)
+
         self._next_fact_id = max_id + 1
 
         self.episodic_memory = []
@@ -389,12 +406,10 @@ class CognitiveMemory:
         fid = self._next_fact_id
         self._next_fact_id += 1
 
-        # Генерируем embedding
         emb = None
         if self.use_embeddings:
             emb = self._get_embedding(text).tolist()
 
-        # Создаём в GCN (передаём local_id)
         gcn_id = self.gcn_store.add_fact(
             text=text,
             fact_type=ftype,
@@ -402,10 +417,15 @@ class CognitiveMemory:
             confidence=confidence,
             importance=importance,
             embedding=emb,
-            local_id=fid  # <--- ОБЯЗАТЕЛЬНО добавить эту строку
+            local_id=fid
         )
 
-        # Создаём локальный Fact
+        # --- НОВОЕ: запись доступа и пересчёт confidence ---
+        self.gcn_store.record_access(gcn_id, self.user_id)
+        updated_conf = self.gcn_store.compute_confidence(gcn_id)
+        if updated_conf != confidence:
+            self.gcn_store.update(gcn_id, {"confidence": updated_conf}, self.user_id)
+
         fact = Fact(
             id=fid,
             text=text,
@@ -413,7 +433,7 @@ class CognitiveMemory:
             timestamp=time.time(),
             keywords=list(self._extract_keywords(text)),
             importance=importance,
-            confidence=confidence,
+            confidence=updated_conf,  # используем обновлённое значение
             novelty=novelty,
             salience=salience,
             stability=0.5,
@@ -445,6 +465,25 @@ class CognitiveMemory:
         self._detect_contradictions(fid, candidate_ids=similar_ids)
         self._dirty = True
         return fid
+
+    def get_working_memory(self) -> List[Dict]:
+        """Возвращает объекты рабочей памяти в формате словарей (для ai_assistant)."""
+        objects = self.hierarchy.get_working()
+        result = []
+        for obj in objects:
+            if obj.type == KnowledgeType.CLAIM:
+                meta = obj.object if isinstance(obj.object, dict) else {}
+                fact = self._find_fact_by_gcn_id(obj.id)
+                result.append({
+                    "id": fact.id if fact else None,
+                    "text": obj.subject,
+                    "type": meta.get("fact_type", "unknown"),
+                    "timestamp": obj.created.timestamp(),
+                    "confidence": obj.confidence,
+                    "importance": meta.get("importance", 1.0),
+                    "gcn_id": obj.id,
+                })
+        return result
 
     def _find_similar_by_embedding(self, emb: np.ndarray, k: int = 20,
                                    exclude_id: Optional[int] = None) -> List[Tuple[int, float]]:
@@ -479,11 +518,11 @@ class CognitiveMemory:
         return candidates[:top_k]
 
     def _create_synapse(self, src: int, tgt: int, weight: float = SYNAPSE_INITIAL_WEIGHT):
-        """Создаёт или обновляет синапс (локально и в GCN)."""
         key = (src, tgt)
         if key in self.synapses:
             syn = self.synapses[key]
-            syn.weight = min(SYNAPSE_MAX_WEIGHT, syn.weight + HEBBIAN_LEARNING_RATE * (weight - syn.weight))
+            syn.weight = min(SYNAPSE_MAX_WEIGHT,
+                             max(SYNAPSE_MIN_WEIGHT, syn.weight + HEBBIAN_LEARNING_RATE * (weight - syn.weight)))
         else:
             self.synapses[key] = Synapse(
                 source_id=src,
@@ -494,20 +533,18 @@ class CognitiveMemory:
                 confidence=0.5
             )
         self.graph[src].add(tgt)
-        # Синхронизируем с GCN
+        # Синхронизация через GCN link
         fact_src = self.facts_by_id.get(src)
         fact_tgt = self.facts_by_id.get(tgt)
         if fact_src and fact_tgt and fact_src.gcn_id and fact_tgt.gcn_id:
             try:
-                self.gcn_store.set_relation_weight(
-                    fact_src.gcn_id, fact_tgt.gcn_id, "synapse", self.synapses[key].weight, self.user_id
-                )
+                self.gcn_store.link(fact_src.gcn_id, fact_tgt.gcn_id, "synapse", self.user_id,
+                                    weight=self.synapses[key].weight)
             except Exception as e:
-                logger.debug(f"GCN synapse sync failed: {e}")
+                logger.debug(f"GCN link failed: {e}")
         self._dirty = True
 
     def _detect_contradictions(self, fact_id: int, candidate_ids: Optional[List[int]] = None):
-        """Обнаружение противоречий (локально)."""
         fact = self.facts_by_id.get(fact_id)
         if not fact:
             return
@@ -522,13 +559,32 @@ class CognitiveMemory:
                 continue
             common = fact_kw & set(other.keywords)
             if len(common) > 0 and len(common) / max(1, len(fact_kw)) > 0.5:
-                if other_id not in fact.contradicts:
-                    fact.contradicts.add(other_id)
-                    other.contradicts.add(fact_id)
-                    fact.confidence *= 0.97
-                    other.confidence *= 0.97
-                    # В GCN можно зафиксировать событие CONTRADICT
-                    self._dirty = True
+                # Регистрируем противоречие через GCN
+                try:
+                    self.gcn_store.register_contradiction(fact.gcn_id, other.gcn_id, self.user_id)
+                    # Обновляем локальные confidence
+                    fact.confidence = self.gcn_store.compute_confidence(fact.gcn_id)
+                    other.confidence = self.gcn_store.compute_confidence(other.gcn_id)
+                except Exception as e:
+                    logger.debug(f"Contradiction registration failed: {e}")
+
+    # ==================== ВЕРИФИКАЦИЯ ПРОТИВОРЕЧИЙ ====================
+    def get_unverified_contradictions(self, limit: int = 5) -> List[Tuple['Fact', 'Fact']]:
+        """Возвращает пары фактов с необработанным (LLM-непроверенным) противоречием."""
+        pairs = []
+        seen = set()
+        for f in self.semantic_facts:
+            for other_id in f.contradicts:
+                key = tuple(sorted((f.id, other_id)))
+                if key in seen:
+                    continue
+                other = self.facts_by_id.get(other_id)
+                if other:
+                    seen.add(key)
+                    pairs.append((f, other))
+                if len(pairs) >= limit:
+                    return pairs
+        return pairs
 
     # ==================== УДАЛЕНИЕ ФАКТОВ ====================
     def _remove_facts(self, ids: Set[int]) -> int:
@@ -991,12 +1047,11 @@ class CognitiveMemory:
     # ==================== СОХРАНЕНИЕ ====================
     async def _save_async(self):
         async with self._lock:
-            # Сохраняем GCN состояние
+            # --- НОВОЕ: перестраиваем FAISS индекс перед сохранением ---
+            self.gcn_store.build_faiss_index(force=True)
             gcn_state_path = self.base_dir / GCN_STATE_FILENAME
             await self.gcn_store.async_save(str(gcn_state_path))
-            # Сохраняем локальные счётчики и кэши (для быстрого восстановления)
-            # Но мы можем восстановить их из GCN, поэтому не обязательно сохранять отдельно.
-            # Однако для надёжности сохраним отдельный файл с метаданными
+            # Сохраняем локальные счётчики (опционально)
             meta_path = self.base_dir / "meta.json"
             meta = {
                 "next_fact_id": self._next_fact_id,

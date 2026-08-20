@@ -307,6 +307,102 @@ async def rewrite_query(llm_caller, original: str) -> str:
 
 
 # =====================================================================
+# 5b. Промпты для программно-парсимых LLM-вызовов (строгий JSON)
+# =====================================================================
+# Все три промпта ниже используются там, где ответ LLM парсится кодом, а не
+# показывается пользователю напрямую. Поэтому: temp=0.0-0.2, явная JSON-схема,
+# запрет на пояснения/markdown, и safe-парсинг с фолбэком на эвристику при сбое.
+
+ROUTER_PROMPT = """Ты — модуль планирования когнитивного ассистента. Проанализируй запрос пользователя и контекст.
+Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```:
+
+{{
+  "needs_web_search": true/false,
+  "search_query": "переписанный поисковый запрос (3-10 слов) или null",
+  "is_factual_time_sensitive": true/false,
+  "answer_strategy": "direct" | "search_then_answer" | "recall_then_answer" | "clarify"
+}}
+
+Правила:
+- needs_web_search=true, если для точного ответа нужны свежие/актуальные/числовые данные
+  (курсы, цены, новости, даты, "сейчас", "сегодня"), которых нет в истории диалога.
+- search_query — короткий запрос для поисковика, а не сам вопрос пользователя дословно.
+- is_factual_time_sensitive=true для вопросов с числами, единицами измерения, курсами, датами.
+- answer_strategy="clarify" только если вопрос пользователя действительно неоднозначен
+  настолько, что угадать намерение нельзя.
+
+Последние реплики диалога:
+{history_tail}
+
+Активные цели пользователя: {goals}
+
+Запрос пользователя: {message}
+"""
+
+REFLECTION_PROMPT = """Ты — модуль саморефлексии когнитивного ассистента. Ниже темы, где предсказания модели чаще всего ошибались (ошибка > {threshold}).
+Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```:
+
+{{
+  "weight_adjustments": {{"semantic": 0.0, "graph": 0.0, "freshness": 0.0, "evidence": 0.0, "confidence": 0.0}},
+  "topics_to_research": ["тема1", "тема2"]
+}}
+
+Каждое значение в weight_adjustments — дельта в диапазоне [-0.05, 0.05] (0, если менять не нужно).
+topics_to_research — темы, по которым стоит провести дополнительный автономный поиск (максимум 3).
+
+Темы с ошибками:
+{topics}
+"""
+
+CONTRADICTION_VERIFY_PROMPT = """Ты — верификатор фактов в системе памяти AI-ассистента. Даны два утверждения, помеченные как противоречащие друг другу.
+Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```:
+
+{{
+  "relation": "true_contradiction" | "false_positive" | "both_partially_true",
+  "keep": "A" | "B" | "both" | "neither",
+  "reason": "краткое обоснование в одном предложении"
+}}
+
+"false_positive" — утверждения на самом деле не противоречат друг другу (например, относятся
+к разным моментам времени, разным объектам, или совпадение ключевых слов случайно).
+"both_partially_true" — оба верны в своём контексте, keep="both".
+
+Утверждение A: {text_a}
+Утверждение B: {text_b}
+"""
+
+
+def parse_llm_json(raw: str) -> Optional[Dict]:
+    """
+    Безопасный парсинг JSON из ответа LLM. Локальные модели (особенно через
+    LM Studio) часто оборачивают JSON в ```json ... ``` или добавляют текст
+    до/после — эта функция вытаскивает первый валидный JSON-объект.
+    Возвращает None при неудаче — вызывающий код обязан иметь фолбэк.
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Последняя попытка: вырезать самый внешний {...} блок
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+# =====================================================================
 # 6. КОГНИТИВНЫЙ КОНТРОЛЛЕР
 # =====================================================================
 class CognitiveController:
@@ -322,8 +418,17 @@ class CognitiveController:
 
         # ---- GCN-память (единое хранилище) ----
         self.memory = CognitiveMemory(user_id, MEMORY_BASE_DIR)
-        # AIAdapter для публикации знаний в GCN
-        self.ai_adapter = AIAdapter(self.memory.store, user_id)
+        # AIAdapter для публикации знаний в GCN.
+        # embedder_func передан явно: раньше AIAdapter создавался без него,
+        # и его .retrieve()/.query() (сейчас не используются в этом файле, но
+        # готовы к использованию, например, из agent_core.py) вместо этого
+        # использовали случайный вектор — см. фикс в GCN.py.
+        embedder_func = (
+            (lambda text: self.memory.embedder.encode(text, convert_to_numpy=True).tolist())
+            if self.memory.use_embeddings and self.memory.embedder is not None
+            else None
+        )
+        self.ai_adapter = AIAdapter(self.memory.store, user_id, embedder_func=embedder_func)
 
         self.history: List[Dict] = []
         self.max_history = 20
@@ -416,6 +521,43 @@ class CognitiveController:
                 await self._auto_research()
             except Exception as e:
                 logger.error(f"Auto research error: {e}")
+
+    async def _route(self, message: str) -> Dict:
+        """
+        Заменяет собой связку rewrite_query() + is_factual_query()-эвристику
+        одним LLM-вызовом с temp=0.0 и строгим JSON-выводом. Учитывает не
+        только текущее сообщение, но и хвост диалога и активные цели —
+        rewrite_query() видел только исходную строку.
+        Вызывается из _prepare_messages ТОЛЬКО когда решение "искать" уже
+        принято (см. needs_search_heuristic/явный флаг), поэтому не вносит
+        дополнительный LLM round-trip в обычные (без поиска) реплики.
+        """
+        history_tail = "\n".join(
+            f"User: {item['user'][:200]}\nAI: {item['assistant'][:200]}"
+            for item in self.history[-4:]
+        ) if self.history else "(диалог только начался)"
+
+        active_goals = [obj for obj in self.memory.store._objects.values()
+                        if obj.type == KnowledgeType.HYPOTHESIS and obj.object.get("status") == "active"]
+        goals_str = "; ".join(g.subject for g in active_goals[:3]) or "нет"
+
+        prompt = ROUTER_PROMPT.format(history_tail=history_tail, goals=goals_str, message=message)
+        try:
+            raw = await self._call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=200)
+            result = parse_llm_json(raw)
+            if result and "search_query" in result:
+                return result
+            logger.warning(f"Router: bad/incomplete JSON, falling back to heuristics: {raw[:200]!r}")
+        except Exception as e:
+            logger.warning(f"Router LLM call failed, falling back to heuristics: {e}")
+
+        # Фолбэк на regex-эвристику при сбое LLM/парсинга — offline safety net.
+        return {
+            "needs_web_search": True,
+            "search_query": None,
+            "is_factual_time_sensitive": is_factual_query(message),
+            "answer_strategy": "search_then_answer",
+        }
 
     async def _plan_goals(self):
         if len(self.history) < 5:
@@ -579,16 +721,11 @@ class CognitiveController:
             return
 
         worst_topics = sorted(errors_by_keyword.items(), key=lambda kv: sum(kv[1]) / len(kv[1]), reverse=True)[:3]
+        topics_str = "\n".join(f"- {topic} (средняя ошибка: {sum(err)/len(err):.2f})" for topic, err in worst_topics)
+        prompt = REFLECTION_PROMPT.format(threshold=REFLECTION_ERROR_THRESHOLD, topics=topics_str)
 
-        prompt = (
-            "Ты — когнитивный ассистент. Проанализируй следующие темы, в которых мои предсказания часто ошибочны (ошибка > 0.6):\n\n"
-            + "\n".join([f"- {topic} (средняя ошибка: {sum(err) / len(err):.2f})" for topic, err in worst_topics])
-            + "\n\nПредложи кратко (2-3 предложения), что можно улучшить: "
-              "какие факты добавить, какие связи усилить, какие веса поиска изменить. "
-              "Ответь только текстом, без нумерации."
-        )
         try:
-            analysis = await self._call_llm(
+            raw = await self._call_llm(
                 [{"role": "user", "content": prompt}],
                 temp=REFLECTION_LLM_TEMP,
                 max_tokens=REFLECTION_LLM_MAX_TOKENS
@@ -597,38 +734,34 @@ class CognitiveController:
             logger.warning(f"Reflection LLM call failed: {e}")
             return
 
-        analysis_lower = analysis.lower()
-        if "усилить свежесть" in analysis_lower or "свежие данные" in analysis_lower:
-            new_weight = min(0.35, self.memory._dynamic_weights.get("freshness", 0.15) + 0.03)
-            self.memory._dynamic_weights["freshness"] = new_weight
-            logger.info(f"[Reflection] Increased freshness weight to {new_weight:.3f}")
+        result = parse_llm_json(raw)
+        if not result:
+            logger.warning(f"Reflection: bad JSON from LLM, skipping this cycle: {raw[:200]!r}")
+            return
 
-        if "усилить граф" in analysis_lower or "ассоциативные связи" in analysis_lower:
-            new_weight = min(0.35, self.memory._dynamic_weights.get("graph", 0.20) + 0.03)
-            self.memory._dynamic_weights["graph"] = new_weight
-            logger.info(f"[Reflection] Increased graph weight to {new_weight:.3f}")
+        # Верхние границы на веса — не даём рефлексии "разогнать" один вес
+        # в стену за счёт остальных. Значения подобраны так, чтобы ни один
+        # компонент не мог перекрыть больше половины итогового скора.
+        bounds = {"semantic": 0.6, "graph": 0.35, "freshness": 0.35, "evidence": 0.25, "confidence": 0.20}
+        adjustments = result.get("weight_adjustments", {})
+        if isinstance(adjustments, dict):
+            for key, delta in adjustments.items():
+                if key not in self.memory._dynamic_weights or not isinstance(delta, (int, float)):
+                    continue
+                delta = max(-0.05, min(0.05, float(delta)))
+                if abs(delta) < 1e-6:
+                    continue
+                old_val = self.memory._dynamic_weights[key]
+                new_val = max(0.01, min(bounds.get(key, 0.5), old_val + delta))
+                self.memory._dynamic_weights[key] = new_val
+                logger.info(f"[Reflection] {key}: {old_val:.3f} -> {new_val:.3f} (Δ{delta:+.3f})")
 
-        # Новые блоки для semantic, confidence, evidence
-        if "усилить семантику" in analysis_lower or "эмбеддинги" in analysis_lower:
-            new_weight = min(0.6, self.memory._dynamic_weights.get("semantic", 0.40) + 0.03)
-            self.memory._dynamic_weights["semantic"] = new_weight
-            logger.info(f"[Reflection] Increased semantic weight to {new_weight:.3f}")
-
-        if "усилить доверие" in analysis_lower or "уверенность" in analysis_lower:
-            new_weight = min(0.20, self.memory._dynamic_weights.get("confidence", 0.05) + 0.02)
-            self.memory._dynamic_weights["confidence"] = new_weight
-            logger.info(f"[Reflection] Increased confidence weight to {new_weight:.3f}")
-
-        if "усилить доказательства" in analysis_lower or "факты" in analysis_lower:
-            new_weight = min(0.25, self.memory._dynamic_weights.get("evidence", 0.10) + 0.02)
-            self.memory._dynamic_weights["evidence"] = new_weight
-            logger.info(f"[Reflection] Increased evidence weight to {new_weight:.3f}")
-
-        # Блок авто-исследования остаётся без изменений
-        if "добавить факты" in analysis_lower or "поискать" in analysis_lower:
-            for topic, _ in worst_topics:
-                logger.info(f"[Reflection] Auto-research for topic: {topic}")
-                asyncio.create_task(self.research(topic))
+        topics_to_research = result.get("topics_to_research", [])
+        if isinstance(topics_to_research, list):
+            for topic in topics_to_research[:3]:
+                if isinstance(topic, str) and topic.strip():
+                    logger.info(f"[Reflection] Auto-research for topic: {topic}")
+                    asyncio.create_task(self.research(topic.strip()))
 
         self.prediction_history.clear()
         self._last_reflection_time = time.time()
@@ -784,8 +917,15 @@ class CognitiveController:
         sources = []
 
         if web_search and self.searcher:
-            search_query = await rewrite_query(self._call_llm, message)
-            max_res = 7 if is_factual_query(message) else MAX_PAGES_TO_FETCH
+            # Единый вызов вместо раздельных rewrite_query() + is_factual_query():
+            # роутер одновременно переписывает поисковый запрос и определяет,
+            # время-чувствительный ли вопрос (влияет на глубину поиска), с учётом
+            # контекста диалога и активных целей — не только последнего сообщения.
+            # Вызывается ТОЛЬКО когда поиск уже решено делать (auto-heuristic или
+            # явный флаг), поэтому не добавляет LLM round-trip к обычным репликам.
+            route = await self._route(message)
+            search_query = route.get("search_query") or message
+            max_res = 7 if route.get("is_factual_time_sensitive") else MAX_PAGES_TO_FETCH
             search_data = await self.deep_search(search_query, max_results=max_res)
             if search_data["search_performed"]:
                 search_meta["web_search_used"] = True
@@ -892,6 +1032,13 @@ class CognitiveController:
             salience = 1.0 - uncertainty
             await self.memory.add_episode(message, response, salience=salience)
 
+            # --- НОВОЕ: обновляем рабочую память ---
+            relevant = self._last_prepare_meta.get("relevant", [])
+            for fact_dict in relevant[:3]:
+                gcn_id = fact_dict.get("gcn_id")
+                if gcn_id:
+                    self.memory.hierarchy.add_to_working(gcn_id)
+
         # ---- Рефлексия: запоминаем предсказание и ошибку ----
         predictions = self._last_prepare_meta.get("predictions", [])
         if predictions and response:
@@ -932,8 +1079,93 @@ class CognitiveController:
             return self._extract_facts_from_text(text)
 
     async def _verify_pending_contradictions(self, max_checks: int = 5):
-        # В GCN противоречия можно обнаруживать через граф, но для совместимости оставляем заглушку
-        pass
+        """
+        Реальная верификация противоречий через LLM + GCN-провенанс.
+        Раньше это была заглушка (pass) — вызывалась в каждом цикле
+        консолидации, но ничего не делала. _detect_contradictions() в
+        memory_graph.py помечает пары фактов грубой эвристикой (наличие
+        отрицания + пересечение ключевых слов), давая много ложных
+        срабатываний. Здесь эти пары прогоняются через LLM-судью с temp=0.0
+        и строгим JSON-выводом, а решение фиксируется в GCN через уже
+        существующий, но ранее не задействованный MemoryStore.verify().
+        """
+        pairs = self.memory.get_unverified_contradictions(limit=max_checks)
+        if not pairs:
+            return
+
+        actor = f"reflection:{self.user_id}"
+        resolved = 0
+        for fact_a, fact_b in pairs:
+            prompt = CONTRADICTION_VERIFY_PROMPT.format(text_a=fact_a.text, text_b=fact_b.text)
+            try:
+                raw = await self._call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=150)
+            except Exception as e:
+                logger.warning(f"Contradiction verify LLM call failed ({fact_a.id},{fact_b.id}): {e}")
+                continue
+
+            verdict = parse_llm_json(raw)
+            if not verdict or "relation" not in verdict:
+                logger.warning(f"Contradiction verify: bad JSON from LLM: {raw[:200]!r}")
+                continue
+
+            relation = verdict.get("relation")
+            reason = verdict.get("reason", "")
+
+            if relation == "false_positive":
+                # Удаляем противоречие из графа GCN
+                try:
+                    self.memory.store._graph.remove_relation(fact_a.gcn_id, "CONTRADICTS", fact_b.gcn_id)
+                    self.memory.store._graph.remove_relation(fact_b.gcn_id, "CONTRADICTS", fact_a.gcn_id)
+                    # Обновляем confidence
+                    fact_a.confidence = min(1.0, fact_a.confidence + 0.05)
+                    fact_b.confidence = min(1.0, fact_b.confidence + 0.05)
+                    self.memory.store.update(fact_a.gcn_id, {"confidence": fact_a.confidence}, self.user_id)
+                    self.memory.store.update(fact_b.gcn_id, {"confidence": fact_b.confidence}, self.user_id)
+                except Exception as e:
+                    logger.debug(f"Failed to remove contradiction edges: {e}")
+                # Также удаляем из локальных множеств
+                fact_a.contradicts.discard(fact_b.id)
+                fact_b.contradicts.discard(fact_a.id)
+            else:
+                keep = verdict.get("keep")
+                if keep == "A":
+                    self._demote_or_retract(fact_b, actor, reason)
+                elif keep == "B":
+                    self._demote_or_retract(fact_a, actor, reason)
+                elif keep == "neither":
+                    self._demote_or_retract(fact_a, actor, reason)
+                    self._demote_or_retract(fact_b, actor, reason)
+                # keep == "both" (both_partially_true) — оставляем оба как есть,
+                # но всё равно фиксируем VERIFY-событие в GCN ниже.
+                # Раз мы вынесли явный вердикт — снимаем пару из "необработанных",
+                # чтобы не гонять её через LLM повторно каждый цикл.
+                fact_a.contradicts.discard(fact_b.id)
+                fact_b.contradicts.discard(fact_a.id)
+
+            for fact in (fact_a, fact_b):
+                if fact.gcn_id:
+                    try:
+                        self.memory.store.verify(fact.gcn_id, verifier="llm_reflection",
+                                                  status=relation, actor=actor)
+                    except Exception as e:
+                        logger.debug(f"GCN verify() failed for {fact.gcn_id}: {e}")
+
+            resolved += 1
+            self.memory._dirty = True
+
+        if resolved:
+            logger.info(f"[ContradictionVerify] Resolved {resolved}/{len(pairs)} pending pairs")
+            await self.memory._schedule_save()
+
+    def _demote_or_retract(self, fact: 'Fact', actor: str, reason: str):
+        """Понижает доверие к факту; при падении ниже порога — ретрактит в GCN."""
+        fact.confidence *= 0.5
+        if fact.confidence < 0.15 and fact.gcn_id:
+            try:
+                self.memory.store.retract(fact.gcn_id, actor, reason=f"contradiction: {reason}"[:200])
+                logger.info(f"[ContradictionVerify] Retracted fact {fact.id}: {reason}")
+            except Exception as e:
+                logger.debug(f"Retract failed for {fact.gcn_id}: {e}")
 
     def _extract_facts_from_text(self, text: str) -> List[str]:
         sentences = re.split(r'[.!?]', text)
@@ -957,6 +1189,10 @@ class CognitiveController:
                 # ------------------------------------------------------------
                 if action == "store":
                     fid = self.memory._add_fact(rest, 'command', confidence=1.0, importance=1.5)
+                    # --- НОВОЕ: добавить в рабочую память ---
+                    fact = self.memory.facts_by_id.get(fid)
+                    if fact and fact.gcn_id:
+                        self.memory.hierarchy.add_to_working(fact.gcn_id)
                     await self.memory._schedule_save()
 
                     messages = [
@@ -1188,16 +1424,23 @@ class CognitiveController:
                 if goal_obj.subject.lower() in full_response.lower():
                     goal_obj.confidence = min(1.0, goal_obj.confidence + 0.1)
                     if goal_obj.confidence >= 0.9:
-                        # Обновляем статус цели на completed
                         new_obj = goal_obj.object.copy() if isinstance(goal_obj.object, dict) else {}
                         new_obj["status"] = "completed"
-                        self.memory.store.update(goal_obj.id, {"object": new_obj, "confidence": goal_obj.confidence}, self.user_id)
+                        self.memory.store.update(goal_obj.id, {"object": new_obj, "confidence": goal_obj.confidence},
+                                                 self.user_id)
                     else:
                         self.memory.store.update(goal_obj.id, {"confidence": goal_obj.confidence}, self.user_id)
-                    self.memory._sync_goal_from_gcn(goal_obj.id)  # <--- добавить
+                    self.memory._sync_goal_from_gcn(goal_obj.id)
             await self.memory._schedule_save()
 
-        # ---- Рефлексия: запоминаем предсказание и ошибку ----
+            # --- НОВОЕ: обновляем рабочую память (аналогично process_input) ---
+            relevant = self._last_prepare_meta.get("relevant", [])
+            for fact_dict in relevant[:3]:
+                gcn_id = fact_dict.get("gcn_id")
+                if gcn_id:
+                    self.memory.hierarchy.add_to_working(gcn_id)
+
+        # Рефлексия: запоминаем предсказание и ошибку
         predictions = self._last_prepare_meta.get("predictions", [])
         if predictions and full_response:
             error = self._compute_prediction_error(predictions, full_response)
@@ -1252,6 +1495,7 @@ class CognitiveController:
             "max_history": self.max_history,
             "current_working_memory": len(self.current_working_memory),
             "last_prediction_error": self.last_prediction_error,
+            "working_memory": len(self.memory.hierarchy.working_memory),
             **memory_stats
         }
 

@@ -204,3 +204,11 @@ HYBRID_WEIGHT_BM25 = 0.25
 HYBRID_WEIGHT_COSINE = 0.40
 FACTUAL_WEIGHTS = (0.35, 0.30, 0.15, 0.20)   # (bm25, cosine, freshness, graph) для запросов с числами/единицами
 GENERAL_WEIGHTS = (HYBRID_WEIGHT_BM25, HYBRID_WEIGHT_COSINE, HYBRID_WEIGHT_FRESHNESS, HYBRID_WEIGHT_GRAPH)
+
+# -------------------------------
+# FAISS адаптивные пороги
+# -------------------------------
+FAISS_SMALL_THRESHOLD = 50      # при числе векторов < 50 – точный поиск
+FAISS_MEDIUM_THRESHOLD = 500    # при числе < 500 – HNSW, иначе IVF
+FAISS_HNSW_EF_CONSTRUCTION = 80
+FAISS_HNSW_M = 32
