@@ -6,7 +6,7 @@ from pathlib import Path
 # -------------------------------
 # Общие пути
 # -------------------------------
-MEMORY_BASE_DIR = Path("ai_memory_v3")
+MEMORY_BASE_DIR = Path(__file__).resolve().parent.parent / "ai_memory_v3"
 MEMORY_BASE_DIR.mkdir(exist_ok=True)
 
 # -------------------------------
@@ -45,7 +45,8 @@ DYNAMIC_WEIGHTS_ENABLED = True
 # -------------------------------
 EMBEDDING_DIM = 128                # размерность векторов (для демо)
 USE_EMBEDDINGS = True
-
+# В config_ai.py добавьте:
+GLOBAL_FACT_CONFIDENCE_THRESHOLD = 0.75
 # -------------------------------
 # GCN-специфичные параметры
 # -------------------------------

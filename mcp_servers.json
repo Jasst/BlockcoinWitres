@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "blockcoin-memory": {
+      "command": "python",
+      "args": ["mcp_server_blockcoin.py"],
+      "env": {"PYTHONPATH": "."}
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  }
+}

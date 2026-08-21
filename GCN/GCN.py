@@ -229,6 +229,15 @@ class KnowledgeIngestion:
             payload={"candidate_id": candidate.id, "new_confidence": new_conf}
         )
         self.store._events.append(event)
+
+        # ---------------------- FIX ----------------------
+        # Копируем эмбеддинг из кандидата в существующий, если у существующего его нет
+        if self.store.get_embedding(existing.id) is None:
+            cand_emb = self.store.get_embedding(candidate.id)
+            if cand_emb is not None:
+                self.store.set_embedding(existing.id, cand_emb)
+        # -------------------------------------------------
+
         return existing.id
 
     def _is_contradictory(self, a: KnowledgeObject, b: KnowledgeObject) -> bool:

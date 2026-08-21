@@ -1250,21 +1250,7 @@ class GCNMemoryRouter:
             source_type=source_type
         )
 
-        # --- КРИТИЧНО: эмбеддинг объекта ---
-        # Раньше объекты, добавленные через add_knowledge() (весь путь
-        # GLOBAL/SHARED и часть PRIVATE), создавались БЕЗ вызова
-        # store.set_embedding(). MemoryStore.hybrid_retrieve() ищет
-        # кандидатов только через semantic_search(), который смотрит
-        # исключительно в _embedding_index — а туда объект без
-        # set_embedding() никогда не попадал. На практике это значило,
-        # что любой факт, сохранённый как "глобально" или "общее",
-        # физически лежал в сторе, но был НЕВИДИМ для router.retrieve():
-        # ни разу не мог быть найден обратно. Плюс KnowledgeIngestion
-        # (дедуп для GLOBAL) искал похожие кандидаты тем же способом —
-        # get_embedding(candidate.id) всегда возвращал None, и дедуп
-        # реально работал только через грубый keyword-fallback.
-        # Теперь эмбеддинг считается той же моделью, что и слой-назначение,
-        # и проставляется ДО create()/submit_candidate().
+        # ---- Проставляем эмбеддинг (было добавлено ранее) ----
         dest_memory = {
             MemoryScope.GLOBAL: self.global_memory,
             MemoryScope.SHARED: self.shared_memory,
@@ -1275,12 +1261,27 @@ class GCNMemoryRouter:
             if emb is not None:
                 dest_memory.store.set_embedding(ko.id, emb)
 
+        # ---- Логика сохранения с учётом scope ----
         if scope == MemoryScope.GLOBAL:
-            return self.global_ingestion.submit_candidate(ko, author)
+            # Отправляем в глобальный инжектор (дедупликация/усиление)
+            result = self.global_ingestion.submit_candidate(ko, author)
+
+            # ---------------------- FIX ----------------------
+            # Помечаем FAISS-индекс глобальной памяти как "грязный",
+            # чтобы при следующем поиске он перестроился.
+            self.global_memory.store._faiss_dirty = True
+            # Если объектов мало, можно перестроить синхронно:
+            # self.global_memory.store.build_faiss_index(force=True)
+            # -------------------------------------------------
+
+            return result
+
         elif scope == MemoryScope.PRIVATE:
             return self.private_memory.store.create(ko, author)
+
         elif scope == MemoryScope.SHARED:
             return self.shared_memory.store.create(ko, author)
+
         else:
             raise ValueError(f"Unknown scope: {scope}")
 
@@ -1303,18 +1304,22 @@ class GCNMemoryRouter:
                     predicate="is_fact",
                     obj="true",
                     scope=MemoryScope.GLOBAL,
-                    confidence=0.6,
+                    confidence=0.75,
                     source_type="dialogue_extraction"
                 )
 
     async def _extract_facts_with_llm(self, user_msg: str, assistant_msg: str) -> List[str]:
-        """Извлекает факты из диалога с помощью LLM."""
+        """Извлекает факты из диалога с помощью LLM с улучшенной фильтрацией."""
         if not self._llm_caller:
             return []
         combined = f"User: {user_msg}\nAssistant: {assistant_msg}"
         prompt = (
-            "Извлеки из диалога ниже все фактические утверждения (не мнения, не общие фразы). "
-            "Верни только факты, каждый с новой строки, без нумерации и пояснений.\n\n"
+            "Извлеки из диалога только объективные, проверяемые факты. "
+            "Факт должен быть кратким утверждением, содержащим конкретную информацию "
+            "(числа, даты, имена, определения). "
+            "НЕ включай: мнения, прогнозы, инструкции, общие фразы. "
+            "Каждый факт — отдельное предложение. "
+            "Верни только факты, каждый с новой строки, без нумерации.\n\n"
             f"Диалог:\n{combined}"
         )
         try:
@@ -1323,9 +1328,19 @@ class GCNMemoryRouter:
                 return []
             # Разбиваем по строкам и фильтруем
             lines = [line.strip().strip('-•*').strip() for line in raw.split('\n') if line.strip()]
-            # Оставляем только предложения длиной > 20 символов
-            facts = [line for line in lines if len(line) > 20]
-            return facts[:5]
+            facts = []
+            for line in lines:
+                # Длина и базовые фильтры
+                if not (20 < len(line) < 400):
+                    continue
+                # Исключаем субъективные начала
+                if line[0].lower() in ('я', 'ты', 'мы', 'давайте', 'попробуйте'):
+                    continue
+                # Должен содержать ключевой глагол или цифры
+                if not re.search(r'(является|составляет|равен|находится|имеет|был|стал|\d)', line):
+                    continue
+                facts.append(line[:300])
+            return facts[:5]  # максимум 5 фактов
         except Exception as e:
             logger.warning(f"Fact extraction failed: {e}")
             return []

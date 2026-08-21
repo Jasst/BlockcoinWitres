@@ -21,6 +21,7 @@ from bs4 import BeautifulSoup
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from GCN.mcp_client_manager import MCPToolManager
 
 from GCN.GCN import AIAdapter, KnowledgeObject, KnowledgeType, MemoryScope
 from GCN.memory_graph import CognitiveMemory, Fact, Episode, Goal, GCNMemoryRouter
@@ -52,6 +53,7 @@ except ImportError:
     DDG_MIN_INTERVAL = 1.2
     DDG_MAX_RETRIES = 3
     SEARCH_CACHE_TTL = 300
+    GLOBAL_FACT_CONFIDENCE_THRESHOLD
     SEARCH_CACHE_MAX_SIZE = 200
     PAGE_CONTENT_MAX_CHARS = 6000
     MAX_PAGES_TO_FETCH = 7
@@ -454,7 +456,25 @@ class CognitiveController:
         self.reflection_interval = REFLECTION_INTERVAL
         self._last_reflection_time = time.time()
 
+        self.mcp_manager = MCPToolManager()
+        # Запускаем подключение к MCP-серверам в фоне (не блокируем старт)
+        self._mcp_task = asyncio.create_task(self.mcp_manager.initialize())
+
         logger.info(f"CognitiveController (GCN) initialized for {user_id[:16]}")
+
+    async def _handle_mcp_call(self, decision: Dict) -> str:
+        """Выполняет вызов внешнего MCP-инструмента."""
+        server = decision.get("server")
+        tool = decision.get("tool")
+        args = decision.get("arguments", {})
+        if not server or not tool:
+            return "Ошибка: не указан сервер или инструмент"
+        try:
+            result = await self.mcp_manager.call_tool(server, tool, args)
+            return result
+        except Exception as e:
+            logger.error(f"MCP call error: {e}", exc_info=True)
+            return f"Ошибка вызова MCP: {str(e)}"
 
     @property
     def searcher(self):
@@ -938,27 +958,17 @@ class CognitiveController:
                         facts = await self._extract_facts_llm(search_data["context"])
                     else:
                         facts = self._extract_facts_from_text(search_data["context"])
-                    # Факты из веб-поиска — объективные, не привязанные к
-                    # конкретному пользователю утверждения, ровно то, для
-                    # чего существует GLOBAL-слой с дедупликацией/агрегацией
-                    # свидетельств (KnowledgeIngestion). Раньше они шли через
-                    # self.ai_adapter.publish(), а ai_adapter создан поверх
-                    # self.memory.store — т.е. ЛИЧНОГО стора пользователя:
-                    # факт помечался scope=GLOBAL, но физически оседал в
-                    # private и был невидим остальным пользователям и
-                    # недостижим через router.retrieve() (см. также фикс
-                    # эмбеддингов в GCNMemoryRouter.add_knowledge — раньше
-                    # объекты без него всё равно были ненаходимы). Теперь
-                    # пишем через router.add_knowledge(scope=GLOBAL) — так
-                    # факт реально проходит дедуп и становится доступен
-                    # всем через router.retrieve().
+
+                    # Порог уверенности для глобальных фактов (можно вынести в конфиг)
+                    GLOBAL_FACT_CONFIDENCE = 0.75
+
                     for f in facts:
                         self.router.add_knowledge(
                             subject=f,
                             predicate="is_fact",
                             obj="true",
                             scope=MemoryScope.GLOBAL,
-                            confidence=0.6,
+                            confidence=GLOBAL_FACT_CONFIDENCE,
                             author=self.user_id,
                             source_type="web_search",
                         )
@@ -1037,6 +1047,41 @@ class CognitiveController:
 
         response = await self._call_llm(messages)
 
+        # ===== НАЧАЛО БЛОКА ОБРАБОТКИ MCP =====
+        try:
+            raw_text = response.strip()
+            start = raw_text.find("{")
+            end = raw_text.rfind("}") + 1
+            if start != -1 and end > start:
+                decision = json.loads(raw_text[start:end])
+                if decision.get("action") == "mcp_call":
+                    tool_result = await self._handle_mcp_call(decision)
+                    # Добавляем результат в историю как ассистентское сообщение
+                    self.history.append({"role": "assistant", "content": f"Результат вызова: {tool_result}"})
+                    # Формируем новый запрос к LLM с этим результатом
+                    messages = self._build_messages(
+                        message=message,
+                        web_search=web_search,
+                        search_context=search_meta.get("context", ""),
+                        memory_context=self._last_prepare_meta.get("memory_context", ""),
+                        image_base64=image_base64,
+                        image_mime=image_mime,
+                        reasoning=reasoning,
+                        uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
+                        predictions=self._last_prepare_meta.get("predictions", []),
+                        goal_hint=self._last_prepare_meta.get("goal_hint", "")
+                    )
+                    # Добавляем результат как часть пользовательского запроса
+                    messages.append({"role": "user",
+                                     "content": f"Результат вызова инструмента: {tool_result}\nТеперь дай финальный ответ пользователю."})
+                    final_response = await self._call_llm(messages)
+                    response = final_response
+                elif decision.get("action") == "reply":
+                    response = decision.get("message", response)
+        except json.JSONDecodeError:
+            pass  # не JSON, оставляем как есть
+        # ===== КОНЕЦ БЛОКА =====
+
         self.history.append({"role": "user", "content": message})
         if response:
             self.history.append({"role": "assistant", "content": response})
@@ -1047,14 +1092,14 @@ class CognitiveController:
             salience = 1.0 - uncertainty
             await self.memory.add_episode(message, response, salience=salience)
 
-            # --- НОВОЕ: обновляем рабочую память ---
+            # Обновляем рабочую память
             relevant = self._last_prepare_meta.get("relevant", [])
             for fact_dict in relevant[:3]:
                 gcn_id = fact_dict.get("gcn_id")
                 if gcn_id:
                     self.memory.hierarchy.add_to_working(gcn_id)
 
-        # ---- Рефлексия: запоминаем предсказание и ошибку ----
+        # Рефлексия: запоминаем предсказание и ошибку
         predictions = self._last_prepare_meta.get("predictions", [])
         if predictions and response:
             error = self._compute_prediction_error(predictions, response)
@@ -1073,25 +1118,42 @@ class CognitiveController:
         return response, search_meta
 
     async def _extract_facts_llm(self, text: str) -> List[str]:
+        """
+        Извлекает объективные факты из текста с улучшенной фильтрацией.
+        """
         prompt = (
-            "Извлеки из текста все утверждения, которые являются объективными, проверяемыми фактами (не мнения, не прогнозы, не общие фразы). "
-            "Каждый факт должен быть самодостаточным (понятен без контекста) и содержать конкретную информацию (числа, даты, имена, определения). "
-            "Верни каждый факт с новой строки, без нумерации и пояснений. Если фактов нет — верни пустую строку.\n\n"
+            "Извлеки из текста только объективные, проверяемые факты. "
+            "Факт должен быть кратким утверждением, содержащим конкретную информацию "
+            "(числа, даты, имена, определения). "
+            "НЕ включай: мнения, прогнозы, инструкции, общие фразы. "
+            "Каждый факт — отдельное предложение. "
+            "Верни только факты, каждый с новой строки, без нумерации.\n\n"
             f"ТЕКСТ:\n{text[:4000]}"
         )
         try:
-            raw = await self._call_llm([{"role": "user", "content": prompt}], temp=0.2, max_tokens=500)
-            if not raw or not raw.strip():
-                return []
-            facts = []
-            for line in raw.split('\n'):
-                line = line.strip().strip('-•*').strip()
-                if 15 < len(line) < 400:
-                    facts.append(line[:300])
-            return facts[:20]
+            raw = await self._call_llm(
+                [{"role": "user", "content": prompt}],  # FIX: передаём правильные аргументы
+                temp=0.2,
+                max_tokens=300
+            )
         except Exception as e:
-            logger.warning(f"LLM fact extraction failed, falling back to regex: {e}")
-            return self._extract_facts_from_text(text)
+            logger.warning(f"LLM fact extraction call failed: {e}")
+            return []
+
+        if not raw:
+            return []
+
+        facts = []
+        for line in raw.split('\n'):
+            line = line.strip().strip('-•*').strip()
+            if not (20 < len(line) < 400):
+                continue
+            if line[0].lower() in ('я', 'ты', 'мы', 'давайте', 'попробуйте'):
+                continue
+            if not re.search(r'(является|составляет|равен|находится|имеет|был|стал|\d)', line):
+                continue
+            facts.append(line[:300])
+        return facts[:10]
 
     async def _verify_pending_contradictions(self, max_checks: int = 5):
         """
@@ -1378,6 +1440,23 @@ class CognitiveController:
             system_parts.append(
                 "Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
 
+        # ===== ДОБАВЛЯЕМ ОПИСАНИЕ MCP-ИНСТРУМЕНТОВ =====
+        if hasattr(self, 'mcp_manager') and self.mcp_manager._initialized:
+            external_tools = self.mcp_manager.get_all_tools()
+            if external_tools:
+                system_parts.append("=== ВНЕШНИЕ ИНСТРУМЕНТЫ (MCP) ===")
+                system_parts.append("Ты можешь вызывать их, используя JSON-действие:")
+                system_parts.append(
+                    '{"action": "mcp_call", "server": "имя_сервера", "tool": "имя_инструмента", "arguments": {...}}')
+                system_parts.append("Доступные инструменты:")
+                for t in external_tools:
+                    server = t.get("server", "unknown")
+                    name = t["name"]
+                    desc = t.get("description", "")
+                    system_parts.append(f"- {server}/{name}: {desc}")
+                system_parts.append("")
+        # ================================================
+
         system_content = "\n".join(system_parts)
         messages = [{"role": "system", "content": system_content}]
 
@@ -1413,6 +1492,8 @@ class CognitiveController:
             messages.append({"role": "user", "content": user_text})
 
         return messages
+
+
 
     async def research(self, goal: str) -> Dict[str, Any]:
         prompt = (
@@ -1471,27 +1552,76 @@ class CognitiveController:
         full_response = ""
         try:
             if LM_STUDIO_USE_STREAM:
+                # Собираем ответ, не стримя его сразу
                 async for token in self._call_llm_stream(messages):
                     full_response += token
-                    yield f"data: {json.dumps({'token': token})}\n\n"
-                    await asyncio.sleep(0)
+                    # НЕ yield здесь, чтобы избежать дублирования
+
+                # ===== ОБРАБОТКА MCP (JSON-команды) =====
+                try:
+                    raw_text = full_response.strip()
+                    start = raw_text.find("{")
+                    end = raw_text.rfind("}") + 1
+                    if start != -1 and end > start:
+                        decision = json.loads(raw_text[start:end])
+                        if decision.get("action") == "mcp_call":
+                            tool_result = await self._handle_mcp_call(decision)
+                            # Добавляем в историю промежуточный результат (но не будем показывать)
+                            # self.history.append({"role": "assistant", "content": f"Результат вызова: {tool_result}"})
+                            # Формируем новый запрос к LLM с результатом
+                            messages = self._build_messages(
+                                message=message,
+                                web_search=web_search,
+                                search_context=search_meta.get("context", ""),
+                                memory_context=self._last_prepare_meta.get("memory_context", ""),
+                                image_base64=image_base64,
+                                image_mime=image_mime,
+                                reasoning=reasoning,
+                                uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
+                                predictions=self._last_prepare_meta.get("predictions", []),
+                                goal_hint=self._last_prepare_meta.get("goal_hint", "")
+                            )
+                            # Добавляем результат вызова как сообщение пользователя (чтобы LLM его учла)
+                            messages.append({"role": "user",
+                                             "content": f"Результат вызова инструмента: {tool_result}\nТеперь дай финальный ответ пользователю."})
+                            # Получаем финальный ответ (не потоковый)
+                            final_response = await self._call_llm(messages)
+                            full_response = final_response
+                        elif decision.get("action") == "reply":
+                            full_response = decision.get("message", full_response)
+                except json.JSONDecodeError:
+                    pass  # Не JSON, оставляем как есть
+                # ===== КОНЕЦ ОБРАБОТКИ =====
+
+                # Теперь стримим финальный ответ
+                if char_by_char is None:
+                    char_by_char = STREAM_CHAR_BY_CHAR
+                if char_by_char:
+                    for ch in full_response:
+                        yield f"data: {json.dumps({'token': ch})}\n\n"
+                        await asyncio.sleep(STREAM_CHAR_DELAY)
+                else:
+                    for word in full_response.split():
+                        yield f"data: {json.dumps({'token': word + ' '})}\n\n"
             else:
-                response = await self._call_llm(messages)
+                # Не-потоковый режим внутри потока - используем process_input
+                response, _ = await self.process_input(message, web_search, image_base64, image_mime, reasoning)
                 full_response = response
                 if char_by_char is None:
                     char_by_char = STREAM_CHAR_BY_CHAR
                 if char_by_char:
-                    for ch in response:
+                    for ch in full_response:
                         yield f"data: {json.dumps({'token': ch})}\n\n"
                         await asyncio.sleep(STREAM_CHAR_DELAY)
                 else:
-                    for word in response.split():
+                    for word in full_response.split():
                         yield f"data: {json.dumps({'token': word + ' '})}\n\n"
         except Exception as e:
             logger.error(f"Stream error: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
 
+        # Сохраняем историю и эпизод после того, как ответ получен
         self.history.append({"role": "user", "content": message})
         if full_response:
             self.history.append({"role": "assistant", "content": full_response})
@@ -1515,14 +1645,14 @@ class CognitiveController:
                     self.memory._sync_goal_from_gcn(goal_obj.id)
             await self.memory._schedule_save()
 
-            # --- НОВОЕ: обновляем рабочую память (аналогично process_input) ---
+            # Обновляем рабочую память
             relevant = self._last_prepare_meta.get("relevant", [])
             for fact_dict in relevant[:3]:
                 gcn_id = fact_dict.get("gcn_id")
                 if gcn_id:
                     self.memory.hierarchy.add_to_working(gcn_id)
 
-        # Рефлексия: запоминаем предсказание и ошибку
+        # Рефлексия
         predictions = self._last_prepare_meta.get("predictions", [])
         if predictions and full_response:
             error = self._compute_prediction_error(predictions, full_response)
@@ -1539,6 +1669,8 @@ class CognitiveController:
                 asyncio.create_task(self._quick_correction(message, predictions, full_response))
 
         yield "data: [DONE]\n\n"
+
+
 
     async def enhance_prompt(self, prompt: str) -> str:
         enhancement = await self._call_llm([
