@@ -14,8 +14,8 @@ MEMORY_BASE_DIR.mkdir(exist_ok=True)
 # -------------------------------
 LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
 LM_STUDIO_API_KEY = "lm-studio"
-LM_STUDIO_TIMEOUT = 160
-LM_STUDIO_STREAM_TIMEOUT = 500
+LM_STUDIO_TIMEOUT = 300
+LM_STUDIO_STREAM_TIMEOUT = 600
 LM_STUDIO_USE_STREAM = True
 LM_STUDIO_VISION_SUPPORTED = True
 
@@ -204,3 +204,11 @@ HYBRID_WEIGHT_BM25 = 0.25
 HYBRID_WEIGHT_COSINE = 0.40
 FACTUAL_WEIGHTS = (0.35, 0.30, 0.15, 0.20)   # (bm25, cosine, freshness, graph) для запросов с числами/единицами
 GENERAL_WEIGHTS = (HYBRID_WEIGHT_BM25, HYBRID_WEIGHT_COSINE, HYBRID_WEIGHT_FRESHNESS, HYBRID_WEIGHT_GRAPH)
+
+# -------------------------------
+# FAISS адаптивные пороги
+# -------------------------------
+FAISS_SMALL_THRESHOLD = 50      # при числе векторов < 50 – точный поиск
+FAISS_MEDIUM_THRESHOLD = 500    # при числе < 500 – HNSW, иначе IVF
+FAISS_HNSW_EF_CONSTRUCTION = 80
+FAISS_HNSW_M = 32

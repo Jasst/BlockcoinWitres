@@ -23,12 +23,14 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 import faiss
+import uuid
 
 # Импорт GCN-компонентов (папка GCN, файл GCN.py)
 from GCN.GCN import (
     KnowledgeObject, KnowledgeType, KnowledgeEvent, EventType,
     MemoryStore, KnowledgeGraph as GCNKnowledgeGraph,
-    AIAdapter, Provenance, MemoryHierarchy
+    AIAdapter, Provenance, MemoryHierarchy,
+    MemoryScope, KnowledgeIngestion   # добавить эти два
 )
 
 logger = logging.getLogger(__name__)
@@ -174,26 +176,45 @@ class CognitiveMemory:
     с GCN для быстрого доступа и совместимости с ai_assistant.py.
     """
 
+    # ---- Общий на процесс кэш моделей эмбеддингов ----
+    # Раньше каждый CognitiveMemory (а это один инстанс на КАЖДОГО
+    # пользователя + ещё global + shared синглтоны) грузил свой собственный
+    # SentenceTransformer("all-mpnet-base-v2") — это ~420МБ весов и
+    # инициализация модели на КАЖДОГО активного юзера одновременно, хотя
+    # сама модель не имеет пользовательского состояния и полностью
+    # потокобезопасна для .encode(). Теперь модель грузится один раз на
+    # имя (EMBEDDING_MODEL) и переиспользуется всеми инстансами.
+    _embedder_cache: Dict[str, "SentenceTransformer"] = {}
+    _embedder_cache_lock = None  # инициализируется лениво (threading.Lock)
+
+    @classmethod
+    def _get_shared_embedder(cls, model_name: str) -> "SentenceTransformer":
+        if cls._embedder_cache_lock is None:
+            import threading
+            cls._embedder_cache_lock = threading.Lock()
+        with cls._embedder_cache_lock:
+            embedder = cls._embedder_cache.get(model_name)
+            if embedder is None:
+                embedder = SentenceTransformer(model_name)
+                cls._embedder_cache[model_name] = embedder
+            return embedder
+
     def __init__(self, user_id: str, base_dir: Path):
         self.user_id = user_id
         self.base_dir = base_dir / user_id / "cognitive_memory"
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
-        # ---- GCN-слой (основное хранилище) ----
-        self.gcn_store = MemoryStore()
-        gcn_state_path = self.base_dir / GCN_STATE_FILENAME
-        if gcn_state_path.exists():
-            try:
-                self.gcn_store.load(str(gcn_state_path))
-                logger.info("GCN state loaded")
-            except Exception as e:
-                logger.warning(f"Failed to load GCN state: {e}")
-
         # ---- Эмбеддинги (для генерации векторов) ----
+        # ВАЖНО: инициализируем эмбеддер ДО MemoryStore, чтобы передать туда
+        # реальную размерность вектора. Раньше MemoryStore() создавался с
+        # захардкоженным EMBEDDING_DIM=128 из конфига, а
+        # all-mpnet-base-v2 отдаёт 768 — из-за этого FAISS-индекс в GCN
+        # никогда не строился на реальных векторах (см. комментарий в
+        # MemoryStore.__init__ в GCN.py).
         self.use_embeddings = MEMORY_USE_EMBEDDINGS
         if self.use_embeddings:
             try:
-                self.embedder = SentenceTransformer(EMBEDDING_MODEL)
+                self.embedder = self._get_shared_embedder(EMBEDDING_MODEL)
                 self.embedding_dim = self.embedder.get_sentence_embedding_dimension()
             except Exception as e:
                 logger.error(f"Embeddings init failed: {e}. Disabling.")
@@ -203,6 +224,18 @@ class CognitiveMemory:
         else:
             self.embedder = None
             self.embedding_dim = 0
+
+        # ---- GCN-слой (основное хранилище) ----
+        self.gcn_store = MemoryStore(embedding_dim=self.embedding_dim or None)
+        self.hierarchy = MemoryHierarchy(self.gcn_store, size=WORKING_MEMORY_SIZE)
+
+        gcn_state_path = self.base_dir / GCN_STATE_FILENAME
+        if gcn_state_path.exists():
+            try:
+                self.gcn_store.load(str(gcn_state_path))
+                logger.info("GCN state loaded")
+            except Exception as e:
+                logger.warning(f"Failed to load GCN state: {e}")
 
         # ---- Кэши (синхронизируются с GCN) ----
         self.semantic_facts: List[Fact] = []
@@ -284,6 +317,15 @@ class CognitiveMemory:
             self.facts_by_id[fid] = fact
             for kw in fact.keywords:
                 self.keyword_index[kw].append(fid)
+        # --- НОВОЕ: заполняем противоречия из графа ---
+        for f in self.semantic_facts:
+            if f.gcn_id:
+                neighbors = self.gcn_store._graph.get_neighbors(f.gcn_id, "CONTRADICTS")
+                for _, target_id in neighbors:
+                    target_fact = self._find_fact_by_gcn_id(target_id)
+                    if target_fact:
+                        f.contradicts.add(target_fact.id)
+
         self._next_fact_id = max_id + 1
 
         self.episodic_memory = []
@@ -381,6 +423,17 @@ class CognitiveMemory:
             return np.zeros(self.embedding_dim if self.embedding_dim else 128)
         return self.embedder.encode(text, convert_to_numpy=True)
 
+    def embed_text(self, text: str) -> Optional[List[float]]:
+        """
+        Публичная обёртка над _get_embedding() для внешних вызывающих
+        (GCNMemoryRouter). Возвращает None, если эмбеддинги отключены —
+        вызывающий код должен уметь работать без вектора (fallback на
+        keyword-поиск), а не падать.
+        """
+        if not self.use_embeddings or self.embedder is None:
+            return None
+        return self._get_embedding(text).tolist()
+
     # ==================== ДОБАВЛЕНИЕ ФАКТОВ ====================
     def _add_fact(self, text: str, ftype: str, importance: float = 1.0,
                   confidence: float = 0.5, novelty: float = 0.0,
@@ -389,12 +442,10 @@ class CognitiveMemory:
         fid = self._next_fact_id
         self._next_fact_id += 1
 
-        # Генерируем embedding
         emb = None
         if self.use_embeddings:
             emb = self._get_embedding(text).tolist()
 
-        # Создаём в GCN (передаём local_id)
         gcn_id = self.gcn_store.add_fact(
             text=text,
             fact_type=ftype,
@@ -402,10 +453,15 @@ class CognitiveMemory:
             confidence=confidence,
             importance=importance,
             embedding=emb,
-            local_id=fid  # <--- ОБЯЗАТЕЛЬНО добавить эту строку
+            local_id=fid
         )
 
-        # Создаём локальный Fact
+        # --- НОВОЕ: запись доступа и пересчёт confidence ---
+        self.gcn_store.record_access(gcn_id, self.user_id)
+        updated_conf = self.gcn_store.compute_confidence(gcn_id)
+        if updated_conf != confidence:
+            self.gcn_store.update(gcn_id, {"confidence": updated_conf}, self.user_id)
+
         fact = Fact(
             id=fid,
             text=text,
@@ -413,7 +469,7 @@ class CognitiveMemory:
             timestamp=time.time(),
             keywords=list(self._extract_keywords(text)),
             importance=importance,
-            confidence=confidence,
+            confidence=updated_conf,  # используем обновлённое значение
             novelty=novelty,
             salience=salience,
             stability=0.5,
@@ -445,6 +501,25 @@ class CognitiveMemory:
         self._detect_contradictions(fid, candidate_ids=similar_ids)
         self._dirty = True
         return fid
+
+    def get_working_memory(self) -> List[Dict]:
+        """Возвращает объекты рабочей памяти в формате словарей (для ai_assistant)."""
+        objects = self.hierarchy.get_working()
+        result = []
+        for obj in objects:
+            if obj.type == KnowledgeType.CLAIM:
+                meta = obj.object if isinstance(obj.object, dict) else {}
+                fact = self._find_fact_by_gcn_id(obj.id)
+                result.append({
+                    "id": fact.id if fact else None,
+                    "text": obj.subject,
+                    "type": meta.get("fact_type", "unknown"),
+                    "timestamp": obj.created.timestamp(),
+                    "confidence": obj.confidence,
+                    "importance": meta.get("importance", 1.0),
+                    "gcn_id": obj.id,
+                })
+        return result
 
     def _find_similar_by_embedding(self, emb: np.ndarray, k: int = 20,
                                    exclude_id: Optional[int] = None) -> List[Tuple[int, float]]:
@@ -479,11 +554,11 @@ class CognitiveMemory:
         return candidates[:top_k]
 
     def _create_synapse(self, src: int, tgt: int, weight: float = SYNAPSE_INITIAL_WEIGHT):
-        """Создаёт или обновляет синапс (локально и в GCN)."""
         key = (src, tgt)
         if key in self.synapses:
             syn = self.synapses[key]
-            syn.weight = min(SYNAPSE_MAX_WEIGHT, syn.weight + HEBBIAN_LEARNING_RATE * (weight - syn.weight))
+            syn.weight = min(SYNAPSE_MAX_WEIGHT,
+                             max(SYNAPSE_MIN_WEIGHT, syn.weight + HEBBIAN_LEARNING_RATE * (weight - syn.weight)))
         else:
             self.synapses[key] = Synapse(
                 source_id=src,
@@ -494,20 +569,18 @@ class CognitiveMemory:
                 confidence=0.5
             )
         self.graph[src].add(tgt)
-        # Синхронизируем с GCN
+        # Синхронизация через GCN link
         fact_src = self.facts_by_id.get(src)
         fact_tgt = self.facts_by_id.get(tgt)
         if fact_src and fact_tgt and fact_src.gcn_id and fact_tgt.gcn_id:
             try:
-                self.gcn_store.set_relation_weight(
-                    fact_src.gcn_id, fact_tgt.gcn_id, "synapse", self.synapses[key].weight, self.user_id
-                )
+                self.gcn_store.link(fact_src.gcn_id, fact_tgt.gcn_id, "synapse", self.user_id,
+                                    weight=self.synapses[key].weight)
             except Exception as e:
-                logger.debug(f"GCN synapse sync failed: {e}")
+                logger.debug(f"GCN link failed: {e}")
         self._dirty = True
 
     def _detect_contradictions(self, fact_id: int, candidate_ids: Optional[List[int]] = None):
-        """Обнаружение противоречий (локально)."""
         fact = self.facts_by_id.get(fact_id)
         if not fact:
             return
@@ -522,13 +595,32 @@ class CognitiveMemory:
                 continue
             common = fact_kw & set(other.keywords)
             if len(common) > 0 and len(common) / max(1, len(fact_kw)) > 0.5:
-                if other_id not in fact.contradicts:
-                    fact.contradicts.add(other_id)
-                    other.contradicts.add(fact_id)
-                    fact.confidence *= 0.97
-                    other.confidence *= 0.97
-                    # В GCN можно зафиксировать событие CONTRADICT
-                    self._dirty = True
+                # Регистрируем противоречие через GCN
+                try:
+                    self.gcn_store.register_contradiction(fact.gcn_id, other.gcn_id, self.user_id)
+                    # Обновляем локальные confidence
+                    fact.confidence = self.gcn_store.compute_confidence(fact.gcn_id)
+                    other.confidence = self.gcn_store.compute_confidence(other.gcn_id)
+                except Exception as e:
+                    logger.debug(f"Contradiction registration failed: {e}")
+
+    # ==================== ВЕРИФИКАЦИЯ ПРОТИВОРЕЧИЙ ====================
+    def get_unverified_contradictions(self, limit: int = 5) -> List[Tuple['Fact', 'Fact']]:
+        """Возвращает пары фактов с необработанным (LLM-непроверенным) противоречием."""
+        pairs = []
+        seen = set()
+        for f in self.semantic_facts:
+            for other_id in f.contradicts:
+                key = tuple(sorted((f.id, other_id)))
+                if key in seen:
+                    continue
+                other = self.facts_by_id.get(other_id)
+                if other:
+                    seen.add(key)
+                    pairs.append((f, other))
+                if len(pairs) >= limit:
+                    return pairs
+        return pairs
 
     # ==================== УДАЛЕНИЕ ФАКТОВ ====================
     def _remove_facts(self, ids: Set[int]) -> int:
@@ -760,10 +852,20 @@ class CognitiveMemory:
         if self.use_embeddings:
             query_vector = self._get_embedding(query).tolist()
 
+        # start_node для графового компонента гибридного поиска.
+        # Раньше сюда всегда передавался None — весь граф Hebbian/STDP
+        # синапсов, который старательно строится в _create_synapse()/
+        # _hebbian_update(), никогда не участвовал в retrieve_hybrid():
+        # вес HYBRID_WEIGHT_GRAPH существовал только на бумаге. Берём
+        # последний активный элемент рабочей памяти как точку старта
+        # обхода графа — так соседи по синапсам реально попадают в
+        # кандидаты поиска.
+        start_node = self.hierarchy.working_memory[-1] if use_graph and self.hierarchy.working_memory else None
+
         # Выполняем поиск в GCN
         gcn_results = self.gcn_store.hybrid_retrieve(
             query_vector=query_vector,
-            start_node=None,  # можно передать стартовый узел, если есть
+            start_node=start_node,
             top_k=top_k * 2,
             weights = self._dynamic_weights
         )
@@ -991,12 +1093,11 @@ class CognitiveMemory:
     # ==================== СОХРАНЕНИЕ ====================
     async def _save_async(self):
         async with self._lock:
-            # Сохраняем GCN состояние
+            # --- НОВОЕ: перестраиваем FAISS индекс перед сохранением ---
+            self.gcn_store.build_faiss_index(force=True)
             gcn_state_path = self.base_dir / GCN_STATE_FILENAME
             await self.gcn_store.async_save(str(gcn_state_path))
-            # Сохраняем локальные счётчики и кэши (для быстрого восстановления)
-            # Но мы можем восстановить их из GCN, поэтому не обязательно сохранять отдельно.
-            # Однако для надёжности сохраним отдельный файл с метаданными
+            # Сохраняем локальные счётчики (опционально)
             meta_path = self.base_dir / "meta.json"
             meta = {
                 "next_fact_id": self._next_fact_id,
@@ -1036,3 +1137,195 @@ class CognitiveMemory:
         if self._save_task:
             self._save_task.cancel()
         await self._save_async()
+
+class GCNMemoryRouter:
+    """
+    Управляет тремя слоями памяти: личный (PRIVATE), общий (SHARED), глобальный (GLOBAL).
+    Обеспечивает:
+    - унифицированный поиск с учётом scope и весов
+    - маршрутизацию добавления знаний (в зависимости от scope)
+    - извлечение с ранжированием
+    - инжекшн в глобальную память (дедупликация, агрегация, противоречия)
+    - извлечение фактов из диалогов через LLM
+    """
+    _global_instance: Optional[CognitiveMemory] = None
+    _shared_instance: Optional[CognitiveMemory] = None
+
+    def __init__(self, user_id: str, base_dir: Path):
+        self.user_id = user_id
+        self.base_dir = base_dir
+
+        # Личная память – всегда своя
+        self.private_memory = CognitiveMemory(user_id, base_dir)
+
+        # Глобальная память – единый экземпляр для всех (синглтон)
+        self.global_memory = self._get_global_memory(base_dir)
+
+        # Общая память – единый экземпляр для всех (можно расширить до групповой)
+        self.shared_memory = self._get_shared_memory(base_dir)
+
+        # Инжектор для глобальной памяти (отвечает за дедупликацию, агрегацию, противоречия)
+        self.global_ingestion = KnowledgeIngestion(self.global_memory.store)
+
+        # Функция вызова LLM (будет установлена из контроллера)
+        self._llm_caller = None
+
+    @classmethod
+    def _get_global_memory(cls, base_dir: Path) -> CognitiveMemory:
+        """Возвращает глобальную память как синглтон."""
+        if cls._global_instance is None:
+            cls._global_instance = CognitiveMemory("global", base_dir)
+        return cls._global_instance
+
+    @classmethod
+    def _get_shared_memory(cls, base_dir: Path) -> CognitiveMemory:
+        """Возвращает общую (shared) память как синглтон."""
+        if cls._shared_instance is None:
+            cls._shared_instance = CognitiveMemory("shared", base_dir)
+        return cls._shared_instance
+
+    def set_llm_caller(self, llm_caller):
+        """Передаёт функцию вызова LLM для извлечения фактов."""
+        self._llm_caller = llm_caller
+
+    async def retrieve(self, query: str, top_k: int = 7, include_private: bool = True) -> List[Dict]:
+        """
+        Объединённый поиск по всем доступным слоям с ранжированием.
+        """
+        private_results = []
+        shared_results = []
+        global_results = []
+
+        if include_private:
+            private_results = await self.private_memory.retrieve_hybrid(query, top_k=top_k)
+        shared_results = await self.shared_memory.retrieve_hybrid(query, top_k=top_k)
+        global_results = await self.global_memory.retrieve_hybrid(query, top_k=top_k)
+
+        # Применяем веса к скорам в зависимости от scope
+        # Приватные выше, глобальные чуть ниже, общие посередине
+        for item in private_results:
+            item["_score"] = item.get("score", 0.5) * 1.2  # +20%
+        for item in shared_results:
+            item["_score"] = item.get("score", 0.5) * 1.0  # базовый
+        for item in global_results:
+            item["_score"] = item.get("score", 0.5) * 0.9  # -10%
+
+        combined = private_results + shared_results + global_results
+
+        # Убираем дубликаты по тексту (можно по id, но для надёжности по тексту)
+        seen_texts = set()
+        unique = []
+        for item in combined:
+            text = item.get("text", "")
+            if text and text not in seen_texts:
+                seen_texts.add(text)
+                unique.append(item)
+
+        # Сортируем по _score
+        unique.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
+        return unique[:top_k]
+
+    def add_knowledge(self, subject: str, predicate: str, obj: Any,
+                      scope: MemoryScope = MemoryScope.PRIVATE,
+                      confidence: float = 0.5, author: Optional[str] = None,
+                      source_type: str = "user_input") -> str:
+        """
+        Добавляет знание в соответствующий слой с учётом scope.
+        Для GLOBAL использует инжекшн (дедупликация, агрегация).
+        """
+        if author is None:
+            author = self.user_id
+
+        # Создаём объект
+        ko = KnowledgeObject(
+            id=f"fact_{uuid.uuid4()}",
+            type=KnowledgeType.CLAIM,
+            subject=subject,
+            predicate=predicate,
+            object={"value": obj},
+            author=author,
+            created=datetime.now(timezone.utc),
+            confidence=confidence,
+            scope=scope,
+            source_type=source_type
+        )
+
+        # --- КРИТИЧНО: эмбеддинг объекта ---
+        # Раньше объекты, добавленные через add_knowledge() (весь путь
+        # GLOBAL/SHARED и часть PRIVATE), создавались БЕЗ вызова
+        # store.set_embedding(). MemoryStore.hybrid_retrieve() ищет
+        # кандидатов только через semantic_search(), который смотрит
+        # исключительно в _embedding_index — а туда объект без
+        # set_embedding() никогда не попадал. На практике это значило,
+        # что любой факт, сохранённый как "глобально" или "общее",
+        # физически лежал в сторе, но был НЕВИДИМ для router.retrieve():
+        # ни разу не мог быть найден обратно. Плюс KnowledgeIngestion
+        # (дедуп для GLOBAL) искал похожие кандидаты тем же способом —
+        # get_embedding(candidate.id) всегда возвращал None, и дедуп
+        # реально работал только через грубый keyword-fallback.
+        # Теперь эмбеддинг считается той же моделью, что и слой-назначение,
+        # и проставляется ДО create()/submit_candidate().
+        dest_memory = {
+            MemoryScope.GLOBAL: self.global_memory,
+            MemoryScope.SHARED: self.shared_memory,
+            MemoryScope.PRIVATE: self.private_memory,
+        }.get(scope)
+        if dest_memory is not None:
+            emb = dest_memory.embed_text(subject)
+            if emb is not None:
+                dest_memory.store.set_embedding(ko.id, emb)
+
+        if scope == MemoryScope.GLOBAL:
+            return self.global_ingestion.submit_candidate(ko, author)
+        elif scope == MemoryScope.PRIVATE:
+            return self.private_memory.store.create(ko, author)
+        elif scope == MemoryScope.SHARED:
+            return self.shared_memory.store.create(ko, author)
+        else:
+            raise ValueError(f"Unknown scope: {scope}")
+
+    async def add_episode(self, user_msg: str, assistant_msg: str, salience: float = 0.0,
+                          scope: MemoryScope = MemoryScope.PRIVATE,
+                          extract_facts: bool = False):
+        """
+        Сохраняет эпизод в личную память, а также, если extract_facts=True,
+        извлекает факты с помощью LLM и отправляет в глобальную память.
+        """
+        # Всегда сохраняем эпизод в личную память
+        await self.private_memory.add_episode(user_msg, assistant_msg, salience)
+
+        # Если включено извлечение фактов для глобальной памяти
+        if extract_facts and self._llm_caller is not None:
+            extracted = await self._extract_facts_with_llm(user_msg, assistant_msg)
+            for fact in extracted:
+                self.add_knowledge(
+                    subject=fact,
+                    predicate="is_fact",
+                    obj="true",
+                    scope=MemoryScope.GLOBAL,
+                    confidence=0.6,
+                    source_type="dialogue_extraction"
+                )
+
+    async def _extract_facts_with_llm(self, user_msg: str, assistant_msg: str) -> List[str]:
+        """Извлекает факты из диалога с помощью LLM."""
+        if not self._llm_caller:
+            return []
+        combined = f"User: {user_msg}\nAssistant: {assistant_msg}"
+        prompt = (
+            "Извлеки из диалога ниже все фактические утверждения (не мнения, не общие фразы). "
+            "Верни только факты, каждый с новой строки, без нумерации и пояснений.\n\n"
+            f"Диалог:\n{combined}"
+        )
+        try:
+            raw = await self._llm_caller([{"role": "user", "content": prompt}], temp=0.2, max_tokens=300)
+            if not raw:
+                return []
+            # Разбиваем по строкам и фильтруем
+            lines = [line.strip().strip('-•*').strip() for line in raw.split('\n') if line.strip()]
+            # Оставляем только предложения длиной > 20 символов
+            facts = [line for line in lines if len(line) > 20]
+            return facts[:5]
+        except Exception as e:
+            logger.warning(f"Fact extraction failed: {e}")
+            return []
