@@ -138,8 +138,8 @@ if errorlevel 1 (
 echo.
 
 echo %BOLD%%BLUE%[2/4]%RESET% %WHITE%> Activating environment...%RESET%
-if exist "%PROJECT_DIR%\venv\Scripts\activate.bat" (
-    call "%PROJECT_DIR%\venv\Scripts\activate.bat"
+if exist "%PROJECT_DIR%\.venv\Scripts\activate.bat" (
+    call "%PROJECT_DIR%\.venv\Scripts\activate.bat"
     echo %GREEN%  ✓ Virtual environment activated%RESET%
 ) else (
     echo %DIM%  ℹ No virtual environment found%RESET%
@@ -222,8 +222,8 @@ echo.
 :MONITOR_LOOP
 cd /d "%PROJECT_DIR%"
 %DOCKER_COMPOSE% up -d >nul 2>&1
-if exist "%PROJECT_DIR%\venv\Scripts\activate.bat" (
-    call "%PROJECT_DIR%\venv\Scripts\activate.bat" >nul 2>&1
+if exist "%PROJECT_DIR%\.venv\Scripts\activate.bat" (
+    call "%PROJECT_DIR%\.venv\Scripts\activate.bat" >nul 2>&1
 )
 set WAITRESS_MODE=stable
 python run.py
