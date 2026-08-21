@@ -6,7 +6,7 @@ from pathlib import Path
 # -------------------------------
 # Общие пути
 # -------------------------------
-MEMORY_BASE_DIR = Path("ai_memory_v3")
+MEMORY_BASE_DIR = Path(__file__).resolve().parent.parent / "ai_memory_v3"
 MEMORY_BASE_DIR.mkdir(exist_ok=True)
 
 # -------------------------------

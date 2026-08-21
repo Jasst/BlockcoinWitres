@@ -570,11 +570,12 @@ async def remember(
             source_type="mcp_tool"
         )
         if scope_enum == MemoryScope.GLOBAL:
-            await router.global_memory._schedule_save()
+            await router.global_memory._save_async()
         elif scope_enum == MemoryScope.PRIVATE:
-            await router.private_memory._schedule_save()
+            await router.private_memory._save_async()
+
         elif scope_enum == MemoryScope.SHARED:
-            await router.shared_memory._schedule_save()
+            await router.shared_memory._save_async()
         return f"✅ Сохранён (ID: {obj_id}, скоуп: {scope})"
     except Exception as e:
         logger.error(f"Remember error: {e}", exc_info=True)
