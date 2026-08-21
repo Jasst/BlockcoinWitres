@@ -14,8 +14,8 @@ MEMORY_BASE_DIR.mkdir(exist_ok=True)
 # -------------------------------
 LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
 LM_STUDIO_API_KEY = "lm-studio"
-LM_STUDIO_TIMEOUT = 160
-LM_STUDIO_STREAM_TIMEOUT = 500
+LM_STUDIO_TIMEOUT = 300
+LM_STUDIO_STREAM_TIMEOUT = 600
 LM_STUDIO_USE_STREAM = True
 LM_STUDIO_VISION_SUPPORTED = True
 

@@ -176,6 +176,29 @@ class CognitiveMemory:
     с GCN для быстрого доступа и совместимости с ai_assistant.py.
     """
 
+    # ---- Общий на процесс кэш моделей эмбеддингов ----
+    # Раньше каждый CognitiveMemory (а это один инстанс на КАЖДОГО
+    # пользователя + ещё global + shared синглтоны) грузил свой собственный
+    # SentenceTransformer("all-mpnet-base-v2") — это ~420МБ весов и
+    # инициализация модели на КАЖДОГО активного юзера одновременно, хотя
+    # сама модель не имеет пользовательского состояния и полностью
+    # потокобезопасна для .encode(). Теперь модель грузится один раз на
+    # имя (EMBEDDING_MODEL) и переиспользуется всеми инстансами.
+    _embedder_cache: Dict[str, "SentenceTransformer"] = {}
+    _embedder_cache_lock = None  # инициализируется лениво (threading.Lock)
+
+    @classmethod
+    def _get_shared_embedder(cls, model_name: str) -> "SentenceTransformer":
+        if cls._embedder_cache_lock is None:
+            import threading
+            cls._embedder_cache_lock = threading.Lock()
+        with cls._embedder_cache_lock:
+            embedder = cls._embedder_cache.get(model_name)
+            if embedder is None:
+                embedder = SentenceTransformer(model_name)
+                cls._embedder_cache[model_name] = embedder
+            return embedder
+
     def __init__(self, user_id: str, base_dir: Path):
         self.user_id = user_id
         self.base_dir = base_dir / user_id / "cognitive_memory"
@@ -191,7 +214,7 @@ class CognitiveMemory:
         self.use_embeddings = MEMORY_USE_EMBEDDINGS
         if self.use_embeddings:
             try:
-                self.embedder = SentenceTransformer(EMBEDDING_MODEL)
+                self.embedder = self._get_shared_embedder(EMBEDDING_MODEL)
                 self.embedding_dim = self.embedder.get_sentence_embedding_dimension()
             except Exception as e:
                 logger.error(f"Embeddings init failed: {e}. Disabling.")
@@ -399,6 +422,17 @@ class CognitiveMemory:
         if not self.use_embeddings or self.embedder is None:
             return np.zeros(self.embedding_dim if self.embedding_dim else 128)
         return self.embedder.encode(text, convert_to_numpy=True)
+
+    def embed_text(self, text: str) -> Optional[List[float]]:
+        """
+        Публичная обёртка над _get_embedding() для внешних вызывающих
+        (GCNMemoryRouter). Возвращает None, если эмбеддинги отключены —
+        вызывающий код должен уметь работать без вектора (fallback на
+        keyword-поиск), а не падать.
+        """
+        if not self.use_embeddings or self.embedder is None:
+            return None
+        return self._get_embedding(text).tolist()
 
     # ==================== ДОБАВЛЕНИЕ ФАКТОВ ====================
     def _add_fact(self, text: str, ftype: str, importance: float = 1.0,
@@ -818,10 +852,20 @@ class CognitiveMemory:
         if self.use_embeddings:
             query_vector = self._get_embedding(query).tolist()
 
+        # start_node для графового компонента гибридного поиска.
+        # Раньше сюда всегда передавался None — весь граф Hebbian/STDP
+        # синапсов, который старательно строится в _create_synapse()/
+        # _hebbian_update(), никогда не участвовал в retrieve_hybrid():
+        # вес HYBRID_WEIGHT_GRAPH существовал только на бумаге. Берём
+        # последний активный элемент рабочей памяти как точку старта
+        # обхода графа — так соседи по синапсам реально попадают в
+        # кандидаты поиска.
+        start_node = self.hierarchy.working_memory[-1] if use_graph and self.hierarchy.working_memory else None
+
         # Выполняем поиск в GCN
         gcn_results = self.gcn_store.hybrid_retrieve(
             query_vector=query_vector,
-            start_node=None,  # можно передать стартовый узел, если есть
+            start_node=start_node,
             top_k=top_k * 2,
             weights = self._dynamic_weights
         )
@@ -1205,6 +1249,31 @@ class GCNMemoryRouter:
             scope=scope,
             source_type=source_type
         )
+
+        # --- КРИТИЧНО: эмбеддинг объекта ---
+        # Раньше объекты, добавленные через add_knowledge() (весь путь
+        # GLOBAL/SHARED и часть PRIVATE), создавались БЕЗ вызова
+        # store.set_embedding(). MemoryStore.hybrid_retrieve() ищет
+        # кандидатов только через semantic_search(), который смотрит
+        # исключительно в _embedding_index — а туда объект без
+        # set_embedding() никогда не попадал. На практике это значило,
+        # что любой факт, сохранённый как "глобально" или "общее",
+        # физически лежал в сторе, но был НЕВИДИМ для router.retrieve():
+        # ни разу не мог быть найден обратно. Плюс KnowledgeIngestion
+        # (дедуп для GLOBAL) искал похожие кандидаты тем же способом —
+        # get_embedding(candidate.id) всегда возвращал None, и дедуп
+        # реально работал только через грубый keyword-fallback.
+        # Теперь эмбеддинг считается той же моделью, что и слой-назначение,
+        # и проставляется ДО create()/submit_candidate().
+        dest_memory = {
+            MemoryScope.GLOBAL: self.global_memory,
+            MemoryScope.SHARED: self.shared_memory,
+            MemoryScope.PRIVATE: self.private_memory,
+        }.get(scope)
+        if dest_memory is not None:
+            emb = dest_memory.embed_text(subject)
+            if emb is not None:
+                dest_memory.store.set_embedding(ko.id, emb)
 
         if scope == MemoryScope.GLOBAL:
             return self.global_ingestion.submit_candidate(ko, author)

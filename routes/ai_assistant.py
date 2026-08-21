@@ -313,22 +313,18 @@ async def rewrite_query(llm_caller, original: str) -> str:
 # запрет на пояснения/markdown, и safe-парсинг с фолбэком на эвристику при сбое.
 
 ROUTER_PROMPT = """Ты — модуль планирования когнитивного ассистента. Проанализируй запрос пользователя и контекст.
-Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```:
+Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```.
 
-{{
-  "needs_web_search": true/false,
-  "search_query": "переписанный поисковый запрос (3-10 слов) или null",
-  "is_factual_time_sensitive": true/false,
-  "answer_strategy": "direct" | "search_then_answer" | "recall_then_answer" | "clarify"
-}}
+Примеры правильных ответов:
+- Запрос: "Курс доллара сегодня" -> {{"needs_web_search": true, "search_query": "курс доллара сегодня", "is_factual_time_sensitive": true, "answer_strategy": "search_then_answer"}}
+- Запрос: "Что такое теория относительности?" -> {{"needs_web_search": false, "search_query": null, "is_factual_time_sensitive": false, "answer_strategy": "recall_then_answer"}}
+- Запрос: "Как приготовить борщ?" -> {{"needs_web_search": false, "search_query": null, "is_factual_time_sensitive": false, "answer_strategy": "direct"}}
 
 Правила:
-- needs_web_search=true, если для точного ответа нужны свежие/актуальные/числовые данные
-  (курсы, цены, новости, даты, "сейчас", "сегодня"), которых нет в истории диалога.
-- search_query — короткий запрос для поисковика, а не сам вопрос пользователя дословно.
-- is_factual_time_sensitive=true для вопросов с числами, единицами измерения, курсами, датами.
-- answer_strategy="clarify" только если вопрос пользователя действительно неоднозначен
-  настолько, что угадать намерение нельзя.
+- needs_web_search=true, если для точного ответа нужны свежие/актуальные/числовые данные (курсы, цены, новости, даты, "сейчас", "сегодня"), которых нет в истории диалога.
+- search_query — короткий запрос для поисковика (3-10 слов), а не сам вопрос пользователя дословно.
+- is_factual_time_sensitive=true для вопросов с числами, единицами измерения, курсами, датами, текущими событиями.
+- answer_strategy="clarify" только если вопрос пользователя действительно неоднозначен настолько, что угадать намерение нельзя.
 
 Последние реплики диалога:
 {history_tail}
@@ -339,32 +335,33 @@ ROUTER_PROMPT = """Ты — модуль планирования когнити
 """
 
 REFLECTION_PROMPT = """Ты — модуль саморефлексии когнитивного ассистента. Ниже темы, где предсказания модели чаще всего ошибались (ошибка > {threshold}).
-Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```:
+Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```.
 
+Пример корректного ответа:
 {{
-  "weight_adjustments": {{"semantic": 0.0, "graph": 0.0, "freshness": 0.0, "evidence": 0.0, "confidence": 0.0}},
-  "topics_to_research": ["тема1", "тема2"]
+  "weight_adjustments": {{"semantic": 0.02, "graph": 0.0, "freshness": -0.01, "evidence": 0.0, "confidence": 0.0}},
+  "topics_to_research": ["квантовая физика", "нейросети"]
 }}
 
 Каждое значение в weight_adjustments — дельта в диапазоне [-0.05, 0.05] (0, если менять не нужно).
-topics_to_research — темы, по которым стоит провести дополнительный автономный поиск (максимум 3).
+Если ошибки вызваны нехваткой знаний, укажи соответствующие темы в topics_to_research (максимум 3).
 
 Темы с ошибками:
 {topics}
 """
 
 CONTRADICTION_VERIFY_PROMPT = """Ты — верификатор фактов в системе памяти AI-ассистента. Даны два утверждения, помеченные как противоречащие друг другу.
-Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```:
+Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```.
 
-{{
-  "relation": "true_contradiction" | "false_positive" | "both_partially_true",
-  "keep": "A" | "B" | "both" | "neither",
-  "reason": "краткое обоснование в одном предложении"
-}}
+Примеры:
+- A: "Вода кипит при 100°C", B: "Вода кипит при 80°C" -> {{"relation": "true_contradiction", "keep": "B", "reason": "Температура кипения зависит от давления, но при нормальных условиях 100°C, поэтому B неверно."}}
+- A: "Эйнштейн родился в 1879", B: "Эйнштейн родился в 1879 году" -> {{"relation": "false_positive", "keep": "both", "reason": "Оба утверждения идентичны."}}
+- A: "Кофе полезен", B: "Кофе вреден" -> {{"relation": "both_partially_true", "keep": "both", "reason": "Влияние кофе зависит от дозировки и индивидуальных особенностей."}}
 
-"false_positive" — утверждения на самом деле не противоречат друг другу (например, относятся
-к разным моментам времени, разным объектам, или совпадение ключевых слов случайно).
-"both_partially_true" — оба верны в своём контексте, keep="both".
+Варианты relation:
+- "true_contradiction" — утверждения действительно противоречат друг другу.
+- "false_positive" — на самом деле не противоречат (разные объекты, время, или случайное совпадение ключевых слов).
+- "both_partially_true" — оба верны в своём контексте, keep="both".
 
 Утверждение A: {text_a}
 Утверждение B: {text_b}
@@ -566,14 +563,15 @@ class CognitiveController:
             return
         history_summary = "\n".join([f"User: {item['user']}\nAI: {item['assistant']}" for item in self.history[-10:]])
         prompt = (
-            f"На основе диалогов с пользователем сформулируй 1-3 долгосрочные цели. "
-            f"Ответь в виде списка целей (каждая с новой строки).\n\n{history_summary}"
+            f"На основе диалогов с пользователем сформулируй 1-3 долгосрочные цели, которые могут быть полезны для ассистента. "
+            "Цели должны быть конкретными, измеримыми и достижимыми. Например: 'Изучить тему X', 'Научиться делать Y', 'Собрать информацию о Z'. "
+            "Ответь в виде списка целей (каждая с новой строки), без дополнительных пояснений.\n\n"
+            f"Диалоги:\n{history_summary}"
         )
         try:
             goals_text = await self._call_llm([{"role": "user", "content": prompt}], temp=0.7, max_tokens=200)
             goals = [g.strip("-• ").strip() for g in goals_text.split('\n') if g.strip()]
             for g in goals:
-                # Только add_goal – без ручного создания
                 await self.memory.add_goal(g, priority=0.5)
             await self.memory._schedule_save()
             logger.info(f"[Planner] Generated goals: {goals}")
@@ -940,17 +938,32 @@ class CognitiveController:
                         facts = await self._extract_facts_llm(search_data["context"])
                     else:
                         facts = self._extract_facts_from_text(search_data["context"])
+                    # Факты из веб-поиска — объективные, не привязанные к
+                    # конкретному пользователю утверждения, ровно то, для
+                    # чего существует GLOBAL-слой с дедупликацией/агрегацией
+                    # свидетельств (KnowledgeIngestion). Раньше они шли через
+                    # self.ai_adapter.publish(), а ai_adapter создан поверх
+                    # self.memory.store — т.е. ЛИЧНОГО стора пользователя:
+                    # факт помечался scope=GLOBAL, но физически оседал в
+                    # private и был невидим остальным пользователям и
+                    # недостижим через router.retrieve() (см. также фикс
+                    # эмбеддингов в GCNMemoryRouter.add_knowledge — раньше
+                    # объекты без него всё равно были ненаходимы). Теперь
+                    # пишем через router.add_knowledge(scope=GLOBAL) — так
+                    # факт реально проходит дедуп и становится доступен
+                    # всем через router.retrieve().
                     for f in facts:
-                        # Публикуем через AIAdapter в GCN (добавляет в GCN и синхронизирует кэши)
-                        self.ai_adapter.publish({
-                            "subject": f,
-                            "predicate": "is_fact",
-                            "object": "true",
-                            "type": "claim",
-                            "confidence": 0.6
-                        })
-                    await self.memory._schedule_save()
-                    logger.info(f"Extracted {len(facts)} facts from web search")
+                        self.router.add_knowledge(
+                            subject=f,
+                            predicate="is_fact",
+                            obj="true",
+                            scope=MemoryScope.GLOBAL,
+                            confidence=0.6,
+                            author=self.user_id,
+                            source_type="web_search",
+                        )
+                    await self.router.global_memory._schedule_save()
+                    logger.info(f"Extracted {len(facts)} facts from web search -> global memory")
                 except Exception as e:
                     logger.warning(f"Fact extraction error: {e}")
 
@@ -1061,9 +1074,9 @@ class CognitiveController:
 
     async def _extract_facts_llm(self, text: str) -> List[str]:
         prompt = (
-            "Извлеки из текста ниже список коротких, самодостаточных фактических утверждений "
-            "(проверяемые факты, а не мнения или вода). Каждый факт — отдельным пунктом, "
-            "без нумерации, без пояснений. Если фактов нет — верни пустую строку.\n\n"
+            "Извлеки из текста все утверждения, которые являются объективными, проверяемыми фактами (не мнения, не прогнозы, не общие фразы). "
+            "Каждый факт должен быть самодостаточным (понятен без контекста) и содержать конкретную информацию (числа, даты, имена, определения). "
+            "Верни каждый факт с новой строки, без нумерации и пояснений. Если фактов нет — верни пустую строку.\n\n"
             f"ТЕКСТ:\n{text[:4000]}"
         )
         try:
@@ -1200,22 +1213,21 @@ class CognitiveController:
                             clean_rest = clean_rest.replace(word, "").strip()
                         clean_rest = " ".join(clean_rest.split())  # схлопываем пробелы
 
-                        # 1. Пробуем извлечь факт через LLM
+                        # 1. Пробуем извлечь факт через LLM с улучшенным промптом
                         try:
                             prompt = (
-                                "Извлеки из следующего запроса пользователя факт, который нужно запомнить. "
-                                "Сформулируй его как краткое, чёткое утверждение, без лишних пояснений. "
-                                "Ответь только фактом.\n\n"
+                                "Извлеки из запроса пользователя объективный факт (утверждение, которое может быть проверено или использовано как знание). "
+                                "Игнорируй мнения, временные события, эмоции, инструкции и пожелания. "
+                                "Сформулируй факт как краткое предложение в настоящем времени (или прошедшем, если это не теряет актуальности). "
+                                "Ответь только фактом, без пояснений.\n\n"
                                 f"Запрос: {clean_rest}"
                             )
                             fact_text = await self._call_llm([{"role": "user", "content": prompt}], temp=0.3,
                                                              max_tokens=150)
                             fact_text = fact_text.strip()
-                            # Проверяем, что LLM вернула осмысленный текст (длина > 5 символов)
                             if len(fact_text) < 5:
                                 fact_text = clean_rest
                         except Exception:
-                            # При любой ошибке используем очищенный текст
                             fact_text = clean_rest
 
                         # 2. Сохраняем в глобальную память через роутер
@@ -1334,28 +1346,47 @@ class CognitiveController:
                         memory_context: str, image_base64: Optional[str],
                         image_mime: Optional[str], reasoning: bool,
                         uncertainty: float, predictions: List[str], goal_hint: str) -> List[Dict]:
+        # Формируем детализированный системный промпт
         system_parts = [
-            "Ты — AI-ассистент с когнитивной памятью и доступом к интернету.",
-            "Используй предоставленный контекст из памяти и результаты поиска."
+            "Ты — когнитивный AI-ассистент с доступом к трём источникам знаний:",
+            "1. ЛИЧНАЯ ПАМЯТЬ (факты, которые пользователь просил запомнить или извлечены из диалога) — самый надёжный источник.",
+            "2. РЕЗУЛЬТАТЫ ПОИСКА В ИНТЕРНЕТЕ (актуальные данные) — используй, если они есть и релевантны.",
+            "3. ГЛОБАЛЬНАЯ ПАМЯТЬ (общие факты, накопленные из разных диалогов) — менее приоритетны.",
+            "",
+            "ПРАВИЛА ОТВЕТА:",
+            "- Всегда отдавай приоритет личной памяти над поиском, если информация совпадает.",
+            "- Если информация из разных источников противоречит, укажи это и предложи пользователю уточнить.",
+            "- Для фактов из поиска указывай источник (URL или название), если он известен.",
+            "- Если ты не уверен в ответе (уверенность < 0.7), честно скажи об этом.",
+            "- Ответ должен быть структурирован: краткое вступление, основная часть, вывод (если нужно).",
+            "- Если в контексте есть несколько фактов по теме, объедини их в связное объяснение, не перечисляй просто список.",
+            "- Не выдумывай фактов, которых нет в предоставленном контексте. Если информации недостаточно, скажи об этом прямо.",
         ]
+
+        # Добавляем подсказки в зависимости от состояния
         if uncertainty > 0.6:
-            system_parts.append(f"Твоя уверенность в ответе низкая ({uncertainty:.2f}). Если не знаешь – скажи об этом.")
+            system_parts.append(
+                f"Твоя уверенность в ответе низкая ({uncertainty:.2f}). Если не знаешь – скажи об этом.")
         if predictions:
             system_parts.append(f"Возможное продолжение темы: {', '.join(predictions[:3])}.")
         if goal_hint:
             system_parts.append(f"Учитывай активные цели: {goal_hint}.")
         if reasoning:
-            system_parts.append("Перед ответом покажи рассуждения: начни с 💭 РАССУЖДЕНИЕ: и заканчивая ---, затем финальный ответ.")
+            system_parts.append(
+                "Перед ответом покажи рассуждения: начни с 💭 РАССУЖДЕНИЕ: и заканчивая ---, затем финальный ответ.")
         if web_search:
-            system_parts.append("Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
+            system_parts.append(
+                "Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
 
-        system_content = "\n\n".join(system_parts)
+        system_content = "\n".join(system_parts)
         messages = [{"role": "system", "content": system_content}]
 
+        # Добавляем историю
         for item in self.history[-self.max_history:]:
             if item.get("role") != "system":
                 messages.append(item)
 
+        # Формируем пользовательский контекст
         user_blocks = []
         if memory_context:
             user_blocks.append(memory_context)
@@ -1367,6 +1398,7 @@ class CognitiveController:
         user_blocks.append(f"Вопрос пользователя: {message}")
         user_text = "\n\n".join(user_blocks)
 
+        # Поддержка изображений
         if image_base64 and LM_STUDIO_VISION_SUPPORTED:
             if not image_base64.startswith("data:image"):
                 if image_mime:
@@ -1383,7 +1415,11 @@ class CognitiveController:
         return messages
 
     async def research(self, goal: str) -> Dict[str, Any]:
-        prompt = f"Сформулируй 3 гипотезы по вопросу: {goal}"
+        prompt = (
+            f"Сформулируй 3 чёткие, проверяемые гипотезы по вопросу: {goal}. "
+            "Каждая гипотеза должна быть кратким утверждением (не вопросом), содержащим конкретное предположение. "
+            "Ответь в виде маркированного списка, без пояснений."
+        )
         hypotheses_text = await self._call_llm([{"role": "user", "content": prompt}], temp=0.8)
         hypotheses = [h.strip("-• ").strip() for h in hypotheses_text.split('\n') if h.strip()][:3]
         if not hypotheses:
@@ -1400,11 +1436,13 @@ class CognitiveController:
                 logger.debug(f"Research search error for '{q}': {e}")
 
         evidence_text = "\n".join([f"- {e['title']}: {e['source']} (запрос: {e['query']})" for e in all_evidence[:6]])
-        context = f"Вопрос: {goal}\nГипотезы: {', '.join(hypotheses)}\nИсточники:\n{evidence_text}"
 
         answer_prompt = (
-            f"На основе гипотез и источников дай развёрнутый ответ. "
-            f"Укажи уверенность (0-1) и аргументы.\n\n{context}"
+            f"На основе следующих гипотез и собранных доказательств дай развёрнутый ответ на вопрос: {goal}.\n"
+            "Укажи уверенность (0-1) для каждого утверждения и приведи аргументы.\n"
+            "Структурируй ответ: вступление, основная часть с аргументацией, заключение.\n\n"
+            f"Гипотезы: {', '.join(hypotheses)}\n\n"
+            f"Источники:\n{evidence_text}"
         )
         answer = await self._call_llm([{"role": "user", "content": answer_prompt}], temp=0.6)
         return {"answer": answer, "confidence": 0.7, "hypotheses": hypotheses, "evidence": all_evidence}
@@ -1678,18 +1716,108 @@ async def global_stats(address: str = Depends(require_auth)):
     return assistant.get_stats()
 
 
+@router.get("/gcn_global_stats")
+async def gcn_global_stats(address: str = Depends(require_auth)):
+    """Статистика по глобальному/общему слоям GCN (не по личной памяти юзера)."""
+    global_mem = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
+    shared_mem = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
+    return {"global": global_mem.get_stats(), "shared": shared_mem.get_stats()}
+
+
 @router.post("/force_merge")
 async def force_merge(address: str = Depends(require_auth)):
-    return {"status": "no-op", "message": "Global merge disabled"}
+    """
+    Ручной запуск консолидации (light_consolidation: дедуп по эмбеддингам
+    + затухание салиентности) для глобального и общего слоёв памяти.
+    Раньше это был no-op — реальной операции слияния/консолидации для
+    global/shared не существовало вообще: light_consolidation/
+    deep_consolidation вызывались по таймеру только для self.memory
+    (личной памяти) каждого CognitiveController, а global/shared
+    синглтоны не трогались никогда (см. start_global_merge_task ниже).
+    """
+    global_mem = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
+    shared_mem = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
+    try:
+        await global_mem.light_consolidation()
+        await shared_mem.light_consolidation()
+        return {"status": "ok", "message": "Global/shared consolidation complete"}
+    except Exception as e:
+        logger.error(f"force_merge failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/apply_global")
 async def apply_global(address: str = Depends(require_auth)):
-    return {"status": "no-op", "message": "Global apply disabled"}
+    """
+    Полная (deep) консолидация глобального и общего слоёв: пересчёт
+    importance/confidence, replay по эпизодам, обрезка до
+    SEMANTIC_MAX_FACTS. Дороже force_merge — предназначена для редкого
+    ручного вызова, не для частого поллинга.
+    """
+    global_mem = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
+    shared_mem = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
+    try:
+        await global_mem.deep_consolidation()
+        await shared_mem.deep_consolidation()
+        return {"status": "ok", "message": "Global/shared deep consolidation complete"}
+    except Exception as e:
+        logger.error(f"apply_global failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+_global_merge_task: Optional[asyncio.Task] = None
 
 
 def start_global_merge_task():
-    logger.info("Global merge task disabled")
+    """
+    Запускает ОДНУ фоновую задачу на весь процесс, которая периодически
+    консолидирует global/shared память (по тем же интервалам, что и
+    личная память каждого пользователя: CONSOLIDATION_INTERVAL /
+    DEEP_CONSOLIDATION_INTERVAL). Идемпотентна: повторный вызов, пока
+    задача жива, — no-op. Раньше эта функция ничего не делала и нигде
+    не вызывалась — эквивалент отсутствия периодической консолидации
+    для общей памяти вообще (она только росла и никогда не чистилась
+    от дублей/затухшей салиентности).
+
+    Вызывать один раз при старте приложения, например:
+        @router.on_event("startup")
+        async def _on_startup():
+            start_global_merge_task()
+    (уже зарегистрировано ниже автоматически.)
+    """
+    global _global_merge_task
+    if _global_merge_task is not None and not _global_merge_task.done():
+        logger.info("Global merge task already running")
+        return
+    loop = asyncio.get_event_loop()
+    if not loop.is_running():
+        logger.warning("start_global_merge_task called without a running loop; skipped")
+        return
+    _global_merge_task = asyncio.create_task(_global_merge_loop())
+    logger.info("Global merge task started")
+
+
+async def _global_merge_loop():
+    global_mem = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
+    shared_mem = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
+    while True:
+        await asyncio.sleep(CONSOLIDATION_INTERVAL)
+        try:
+            await global_mem.light_consolidation()
+            await shared_mem.light_consolidation()
+        except Exception as e:
+            logger.error(f"Global light consolidation error: {e}")
+        await asyncio.sleep(DEEP_CONSOLIDATION_INTERVAL - CONSOLIDATION_INTERVAL)
+        try:
+            await global_mem.deep_consolidation()
+            await shared_mem.deep_consolidation()
+        except Exception as e:
+            logger.error(f"Global deep consolidation error: {e}")
+
+
+@router.on_event("startup")
+async def _on_router_startup():
+    start_global_merge_task()
 
 
 async def shutdown_all():

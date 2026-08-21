@@ -162,11 +162,24 @@ class KnowledgeIngestion:
                 if oid and self.store.get(oid) and self.store.get(oid).scope == MemoryScope.GLOBAL]
 
     def _keyword_search(self, text: str) -> List[str]:
-        # простая эвристика: ищем по вхождению слов (заглушка)
+        # Fallback-эвристика на случай, если у кандидата не оказалось
+        # эмбеддинга (embed_text() вернул None — эмбеддинги отключены).
+        # Раньше это был единственный реально работающий путь дедупа,
+        # т.к. эмбеддинги для GLOBAL-кандидатов вообще не проставлялись
+        # (см. GCNMemoryRouter.add_knowledge) — теперь это чистый fallback,
+        # но ограничиваем скан, чтобы не пройтись по всем ~20k объектам
+        # глобального стора на каждую вставку факта.
         results = []
+        scanned = 0
+        SCAN_LIMIT = 3000
         for obj in self.store._objects.values():
+            scanned += 1
+            if scanned > SCAN_LIMIT:
+                break
             if obj.scope == MemoryScope.GLOBAL and any(w in obj.subject.lower() for w in text.lower().split()):
                 results.append(obj.id)
+                if len(results) >= 10:
+                    break
         return results[:10]
 
     def _merge_or_support(self, candidate: KnowledgeObject, similar: List[KnowledgeObject], actor: str) -> str:
@@ -299,7 +312,12 @@ class KnowledgeGraph:
 
     def get_relation_weight(self, source_id: str, relation: str, target_id: str) -> Optional[float]:
         meta = self._edge_meta.get((source_id, relation, target_id))
-        return meta["weight"] if meta else None
+        if meta:
+            try:
+                return float(meta["weight"])
+            except (ValueError, TypeError):
+                return None
+        return None
 
     def get_neighbors(self, node_id: str, relation: Optional[str] = None) -> List[Tuple[str, str]]:
         if relation is None:
@@ -923,7 +941,6 @@ class MemoryStore:
             sem_results = self.semantic_search(query_vector, top_k=top_k * 3)
             for obj_id, sim in sem_results:
                 candidates.add(obj_id)
-                # клиппинг сима в [0,1]
                 scores[obj_id] = scores.get(obj_id, 0.0) + max(0.0, min(1.0, sim)) * weights['semantic']
 
         # 2. Графовый
@@ -933,7 +950,6 @@ class MemoryStore:
                 if obj_id == start_node:
                     continue
                 candidates.add(obj_id)
-                # вес ребра (если есть)
                 edge_weight = self._graph.get_relation_weight(start_node, "synapse", obj_id) or 1.0
                 scores[obj_id] = scores.get(obj_id, 0.0) + min(1.0, edge_weight) * weights['graph']
 
@@ -1014,13 +1030,11 @@ class MemoryStore:
             for ed in data.get("events", []):
                 ed = dict(ed)
                 ed["type"] = EventType(ed["type"])
-                ed["timestamp"] = datetime.fromisoformat(ed["timestamp"]) if isinstance(ed["timestamp"], str) else ed["timestamp"]
+                ed["timestamp"] = datetime.fromisoformat(ed["timestamp"]) if isinstance(ed["timestamp"], str) else ed[
+                    "timestamp"]
                 self._events.append(KnowledgeEvent(**ed))
 
             self._embedding_index = dict(data.get("embeddings", {}))
-            # embedding_dim из файла имеет приоритет, только если он не был явно
-            # передан конструктору при создании этого MemoryStore (тогда caller
-            # уже сообщил нам актуальную размерность реального эмбеддера).
             saved_dim = data.get("embedding_dim")
             if saved_dim and self.embedding_dim == EMBEDDING_DIM:
                 self.embedding_dim = saved_dim
@@ -1076,6 +1090,16 @@ class AIAdapter:
             return []
 
     def publish(self, knowledge: Union[KnowledgeObject, Dict]) -> str:
+        # ВАЖНО: AIAdapter пишет напрямую в self.memory — тот MemoryStore,
+        # с которым он был создан (в ai_assistant.py это store ПРИВАТНОЙ
+        # памяти пользователя). KnowledgeObject.scope по умолчанию =
+        # MemoryScope.GLOBAL (см. dataclass выше), и раньше это поле здесь
+        # не переопределялось: объект физически лежал в приватном сторе,
+        # но был помечен как GLOBAL — GCNMemoryRouter/KnowledgeIngestion
+        # никогда его не увидят, а любой код, ориентирующийся на obj.scope,
+        # ошибочно считал бы его глобальным. Проставляем scope, реально
+        # соответствующий тому, куда объект попадает физически (this
+        # store), если вызывающий явно не указал иное.
         if isinstance(knowledge, dict):
             # ожидаем поля: subject, predicate, object, type (опционально), confidence
             obj = KnowledgeObject(
@@ -1088,10 +1112,18 @@ class AIAdapter:
                 created=datetime.now(timezone.utc),
                 evidence=knowledge.get("evidence", []),
                 confidence=knowledge.get("confidence", 0.5),
+                scope=knowledge.get("scope", MemoryScope.PRIVATE),
             )
         else:
             obj = knowledge
             obj.author = self.agent_id
+            if "scope" not in obj.__dict__ or obj.scope is None:
+                obj.scope = MemoryScope.PRIVATE
+        # Эмбеддинг для publish() не проставляется автоматически — вызывающий
+        # код, которому нужна семантическая находимость этого объекта,
+        # должен сам вызвать self.memory.set_embedding(obj_id, vector)
+        # (см. GCNMemoryRouter.add_knowledge для образца) либо использовать
+        # router.add_knowledge() вместо публикации через AIAdapter.
         return self.memory.create(obj, self.agent_id)
 
     def verify(self, obj_id: str, status: str):
