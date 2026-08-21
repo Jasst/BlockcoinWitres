@@ -53,6 +53,7 @@ except ImportError:
     DDG_MIN_INTERVAL = 1.2
     DDG_MAX_RETRIES = 3
     SEARCH_CACHE_TTL = 300
+    GLOBAL_FACT_CONFIDENCE_THRESHOLD
     SEARCH_CACHE_MAX_SIZE = 200
     PAGE_CONTENT_MAX_CHARS = 6000
     MAX_PAGES_TO_FETCH = 7
@@ -957,27 +958,17 @@ class CognitiveController:
                         facts = await self._extract_facts_llm(search_data["context"])
                     else:
                         facts = self._extract_facts_from_text(search_data["context"])
-                    # Факты из веб-поиска — объективные, не привязанные к
-                    # конкретному пользователю утверждения, ровно то, для
-                    # чего существует GLOBAL-слой с дедупликацией/агрегацией
-                    # свидетельств (KnowledgeIngestion). Раньше они шли через
-                    # self.ai_adapter.publish(), а ai_adapter создан поверх
-                    # self.memory.store — т.е. ЛИЧНОГО стора пользователя:
-                    # факт помечался scope=GLOBAL, но физически оседал в
-                    # private и был невидим остальным пользователям и
-                    # недостижим через router.retrieve() (см. также фикс
-                    # эмбеддингов в GCNMemoryRouter.add_knowledge — раньше
-                    # объекты без него всё равно были ненаходимы). Теперь
-                    # пишем через router.add_knowledge(scope=GLOBAL) — так
-                    # факт реально проходит дедуп и становится доступен
-                    # всем через router.retrieve().
+
+                    # Порог уверенности для глобальных фактов (можно вынести в конфиг)
+                    GLOBAL_FACT_CONFIDENCE = 0.75
+
                     for f in facts:
                         self.router.add_knowledge(
                             subject=f,
                             predicate="is_fact",
                             obj="true",
                             scope=MemoryScope.GLOBAL,
-                            confidence=0.6,
+                            confidence=GLOBAL_FACT_CONFIDENCE,
                             author=self.user_id,
                             source_type="web_search",
                         )
@@ -1126,27 +1117,43 @@ class CognitiveController:
 
         return response, search_meta
 
-
     async def _extract_facts_llm(self, text: str) -> List[str]:
+        """
+        Извлекает объективные факты из текста с улучшенной фильтрацией.
+        """
         prompt = (
-            "Извлеки из текста все утверждения, которые являются объективными, проверяемыми фактами (не мнения, не прогнозы, не общие фразы). "
-            "Каждый факт должен быть самодостаточным (понятен без контекста) и содержать конкретную информацию (числа, даты, имена, определения). "
-            "Верни каждый факт с новой строки, без нумерации и пояснений. Если фактов нет — верни пустую строку.\n\n"
+            "Извлеки из текста только объективные, проверяемые факты. "
+            "Факт должен быть кратким утверждением, содержащим конкретную информацию "
+            "(числа, даты, имена, определения). "
+            "НЕ включай: мнения, прогнозы, инструкции, общие фразы. "
+            "Каждый факт — отдельное предложение. "
+            "Верни только факты, каждый с новой строки, без нумерации.\n\n"
             f"ТЕКСТ:\n{text[:4000]}"
         )
         try:
-            raw = await self._call_llm([{"role": "user", "content": prompt}], temp=0.2, max_tokens=500)
-            if not raw or not raw.strip():
-                return []
-            facts = []
-            for line in raw.split('\n'):
-                line = line.strip().strip('-•*').strip()
-                if 15 < len(line) < 400:
-                    facts.append(line[:300])
-            return facts[:20]
+            raw = await self._call_llm(
+                [{"role": "user", "content": prompt}],  # FIX: передаём правильные аргументы
+                temp=0.2,
+                max_tokens=300
+            )
         except Exception as e:
-            logger.warning(f"LLM fact extraction failed, falling back to regex: {e}")
-            return self._extract_facts_from_text(text)
+            logger.warning(f"LLM fact extraction call failed: {e}")
+            return []
+
+        if not raw:
+            return []
+
+        facts = []
+        for line in raw.split('\n'):
+            line = line.strip().strip('-•*').strip()
+            if not (20 < len(line) < 400):
+                continue
+            if line[0].lower() in ('я', 'ты', 'мы', 'давайте', 'попробуйте'):
+                continue
+            if not re.search(r'(является|составляет|равен|находится|имеет|был|стал|\d)', line):
+                continue
+            facts.append(line[:300])
+        return facts[:10]
 
     async def _verify_pending_contradictions(self, max_checks: int = 5):
         """

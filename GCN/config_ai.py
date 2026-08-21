@@ -45,7 +45,8 @@ DYNAMIC_WEIGHTS_ENABLED = True
 # -------------------------------
 EMBEDDING_DIM = 128                # размерность векторов (для демо)
 USE_EMBEDDINGS = True
-
+# В config_ai.py добавьте:
+GLOBAL_FACT_CONFIDENCE_THRESHOLD = 0.75
 # -------------------------------
 # GCN-специфичные параметры
 # -------------------------------
