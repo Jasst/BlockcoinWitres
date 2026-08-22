@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import threading
 import uuid
 import copy
@@ -367,6 +368,30 @@ class KnowledgeGraph:
             self._edge_meta.pop((source, relation, node_id), None)
 
 
+def _coerce_scope(raw: Any) -> MemoryScope:
+    """Приводит значение scope, пришедшее из JSON, к enum MemoryScope.
+    Раньше save() сериализовал enum через json.dump(..., default=str), что
+    для plain Enum даёт 'MemoryScope.PRIVATE', а load() эту строку обратно
+    в enum не конвертировал вовсе — obj.scope оставался строкой, и любой
+    код вида obj.scope.value падал после перезапуска процесса. Здесь же
+    на всякий случай поддерживаем и старый (битый) формат, и новый
+    (obj.scope.value), чтобы не терять уже сохранённые файлы."""
+    if isinstance(raw, MemoryScope):
+        return raw
+    if isinstance(raw, str):
+        if raw.startswith("MemoryScope."):
+            name = raw.split(".", 1)[1]
+            try:
+                return MemoryScope[name]
+            except KeyError:
+                pass
+        try:
+            return MemoryScope(raw)
+        except ValueError:
+            pass
+    return MemoryScope.GLOBAL
+
+
 class MemoryStore:
     def __init__(self, embedding_dim: Optional[int] = None):
         self._objects: Dict[str, KnowledgeObject] = {}
@@ -394,6 +419,14 @@ class MemoryStore:
         # MemoryStore (см. CognitiveMemory.__init__ в memory_graph.py).
         self.embedding_dim = embedding_dim if embedding_dim is not None else EMBEDDING_DIM
         self._faiss_dirty = False                       # флаг для перестройки
+
+        # mtime файла состояния на момент последней загрузки/сохранения этим
+        # процессом. Используется, чтобы отличить "файл не менялся" от
+        # "другой процесс (например, MCP-сервер в отдельном процессе) уже
+        # что-то туда записал" — раньше save() всегда писал поверх файла
+        # своим снапшотом целиком, и более поздние записи другого процесса
+        # молча терялись (последний записавший побеждает).
+        self._loaded_mtime: Optional[float] = None
 
     # ---------- Основные операции (синхронные, с блокировкой) ----------
     def create(self, obj: KnowledgeObject, actor: str) -> str:
@@ -981,15 +1014,91 @@ class MemoryStore:
         return [self._objects[oid] for oid in sorted_ids[:top_k]]
 
     # ---------- Персистентность ----------
+    def _merge_disk_state(self, path: str):
+        """
+        Если файл состояния изменился с момента нашей последней загрузки
+        (значит, его записал другой процесс — например, MCP-сервер, идущий
+        отдельным процессом от основного FastAPI-приложения), подтягиваем
+        то, что там появилось, вместо того чтобы просто затереть его своим
+        снапшотом.
+
+        Стратегия слияния:
+          - объекты: побеждает более высокая version (KnowledgeObject.version
+            инкрементится на каждый update()), при равенстве — уже
+            присутствующий в памяти (наш) вариант;
+          - события: объединение по KnowledgeEvent.id (событие — неизменяемый
+            факт, дублей по смыслу быть не может);
+          - рёбра графа: объединение множеств, вес ребра — максимум из двух.
+
+        Не идеальная CRDT-семантика, но устраняет главный риск: полную потерю
+        записей одного процесса при сохранении другого.
+        """
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                disk_data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.warning(f"Не удалось прочитать {path} для слияния: {e}")
+            return
+
+        # --- объекты: побеждает больший version ---
+        for k, v in disk_data.get("objects", {}).items():
+            local_obj = self._objects.get(k)
+            disk_version = v.get("version", 1)
+            if local_obj is None or disk_version > local_obj.version:
+                vv = dict(v)
+                vv["type"] = KnowledgeType(vv["type"])
+                vv["created"] = datetime.fromisoformat(vv["created"]) if isinstance(vv["created"], str) else vv["created"]
+                vv["provenance"] = None
+                vv["scope"] = _coerce_scope(vv.get("scope", MemoryScope.GLOBAL))
+                obj = KnowledgeObject(**vv)
+                self._objects[k] = obj
+                self._by_type[obj.type].add(k)
+                self._by_author[obj.author].add(k)
+
+        # --- события: объединение по id ---
+        known_event_ids = {e.id for e in self._events}
+        for ed in disk_data.get("events", []):
+            if ed.get("id") in known_event_ids:
+                continue
+            ed = dict(ed)
+            ed["type"] = EventType(ed["type"])
+            ed["timestamp"] = datetime.fromisoformat(ed["timestamp"]) if isinstance(ed["timestamp"], str) else ed["timestamp"]
+            self._events.append(KnowledgeEvent(**ed))
+
+        # --- граф: объединение рёбер, вес = максимум ---
+        for src, edges in disk_data.get("graph_edges", {}).items():
+            for relation, target in edges:
+                existing_weight = self._graph.get_relation_weight(src, relation, target)
+                meta_key = "|".join([src, relation, target])
+                disk_weight = disk_data.get("graph_edge_meta", {}).get(meta_key, {}).get("weight", 1.0)
+                weight = max(existing_weight or 0.0, disk_weight)
+                self._graph.add_relation(src, relation, target, weight=weight)
+
+        # --- эмбеддинги: подтягиваем те, которых у нас ещё нет ---
+        for k, v in disk_data.get("embeddings", {}).items():
+            self._embedding_index.setdefault(k, v)
+
+        logger.info(f"Слияние с диском: {path} — учтены изменения другого процесса")
+
     def save(self, path: str):
-        """Синхронное сохранение."""
+        """Синхронное сохранение. Перед записью подтягивает изменения,
+        сделанные другим процессом с момента нашей последней загрузки —
+        см. _merge_disk_state()."""
         with self._lock:
+            if os.path.exists(path):
+                try:
+                    disk_mtime = os.path.getmtime(path)
+                    if self._loaded_mtime is None or disk_mtime > self._loaded_mtime:
+                        self._merge_disk_state(path)
+                except OSError:
+                    pass
             objects_data = {}
             for k, v in self._objects.items():
                 od = dict(v.__dict__)
                 od["type"] = v.type.value
                 od["created"] = v.created.isoformat()
                 od["provenance"] = None
+                od["scope"] = v.scope.value if isinstance(v.scope, MemoryScope) else v.scope
                 objects_data[k] = od
             data = {
                 "objects": objects_data,
@@ -1007,6 +1116,10 @@ class MemoryStore:
             }
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, default=str, indent=2, ensure_ascii=False)
+        try:
+            self._loaded_mtime = os.path.getmtime(path)
+        except OSError:
+            self._loaded_mtime = time.time()
 
     def load(self, path: str):
         """Синхронная загрузка."""
@@ -1022,6 +1135,7 @@ class MemoryStore:
                 v["type"] = KnowledgeType(v["type"])
                 v["created"] = datetime.fromisoformat(v["created"]) if isinstance(v["created"], str) else v["created"]
                 v["provenance"] = None
+                v["scope"] = _coerce_scope(v.get("scope", MemoryScope.GLOBAL))
                 obj = KnowledgeObject(**v)
                 self._objects[k] = obj
                 self._by_type[obj.type].add(k)
@@ -1048,6 +1162,10 @@ class MemoryStore:
             if saved_dim and self.embedding_dim == EMBEDDING_DIM:
                 self.embedding_dim = saved_dim
             self._faiss_dirty = data.get("faiss_dirty", True)
+        try:
+            self._loaded_mtime = os.path.getmtime(path)
+        except OSError:
+            self._loaded_mtime = time.time()
 
     # ---------- Асинхронные обёртки ----------
     async def async_save(self, path: str):

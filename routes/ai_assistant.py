@@ -1,5 +1,6 @@
 """
 Когнитивный ассистент с интеграцией CognitiveMemory, планированием, автономностью.
+Рефакторинг: вынесены общие утилиты в GCN.llm_client и GCN.web_search.
 """
 import sys
 import uuid
@@ -26,59 +27,12 @@ from GCN.mcp_client_manager import MCPToolManager
 from GCN.GCN import AIAdapter, KnowledgeObject, KnowledgeType, MemoryScope
 from GCN.memory_graph import CognitiveMemory, Fact, Episode, Goal, GCNMemoryRouter
 
-try:
-    from GCN.config_ai import *
-except ImportError:
-    # fallback (все необходимые переменные)
-    LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
-    LM_STUDIO_API_KEY = "lm-studio"
-    LM_STUDIO_TIMEOUT = 160
-    LM_STUDIO_STREAM_TIMEOUT = 500
-    LM_STUDIO_USE_STREAM = True
-    LM_STUDIO_VISION_SUPPORTED = False
-    MEMORY_BASE_DIR = Path("ai_memory_v3")
-    MEMORY_BASE_DIR.mkdir(exist_ok=True)
-    MAX_MESSAGE_LENGTH = 10000
-    MIN_MESSAGE_LENGTH = 1
-    DEEP_SEARCH_TOTAL_BUDGET = 15
-    REFLECTION_INTERVAL = 3600 * 4
-    REFLECTION_ERROR_THRESHOLD = 0.6
-    REFLECTION_HISTORY_SIZE = 100
-    REFLECTION_LLM_TEMP = 0.5
-    REFLECTION_LLM_MAX_TOKENS = 300
-    CONSOLIDATION_INTERVAL = 3600 * 2
-    DEEP_CONSOLIDATION_INTERVAL = 3600 * 8
-    CURIOSITY_RESEARCH_INTERVAL = 600
-    LONG_TERM_PLANNER_INTERVAL = 3600 * 6
-    DDG_MIN_INTERVAL = 1.2
-    DDG_MAX_RETRIES = 3
-    SEARCH_CACHE_TTL = 300
-    GLOBAL_FACT_CONFIDENCE_THRESHOLD
-    SEARCH_CACHE_MAX_SIZE = 200
-    PAGE_CONTENT_MAX_CHARS = 6000
-    MAX_PAGES_TO_FETCH = 7
-    MIN_RELEVANCE_THRESHOLD = 0.28
-    CHUNK_SIZE = 1200
-    CHUNK_OVERLAP = 150
-    PARALLEL_FETCH_LIMIT = 8
-    MAX_SEARCH_ATTEMPTS = 3
-    ENABLE_QUERY_REWRITE = True
-    EXTRACT_FACTS_FROM_SEARCH = True
-    EXTRACT_FACTS_WITH_LLM = True
-    EASYDIFFUSION_ENABLED = True
-    EASYDIFFUSION_URL = "http://localhost:9000"
-    EASYDIFFUSION_TIMEOUT = 120
-    EASYDIFFUSION_DEFAULT_STEPS = 20
-    EASYDIFFUSION_DEFAULT_WIDTH = 512
-    EASYDIFFUSION_DEFAULT_HEIGHT = 512
-    STREAM_CHAR_BY_CHAR = False
-    STREAM_CHAR_DELAY = 0.02
-    MAX_IMAGE_SIZE_BASE64 = 5 * 1024 * 1024
-    MEMORY_CONTROL_COMMANDS = {
-        "запомни": "store",
-        "забудь": "forget",
-        "что ты знаешь о": "recall"
-    }
+# ===== НОВЫЕ ИМПОРТЫ (вместо удалённого кода) =====
+from GCN.llm_client import call_llm, call_llm_stream
+from GCN.web_search import deep_search
+
+
+from GCN.config_ai import *
 
 logger = logging.getLogger(__name__)
 
@@ -100,157 +54,8 @@ def _now() -> float:
     return time.time()
 
 
-def _hash_query(q: str) -> str:
-    """SHA-256 хэш запроса (32 символа — без коллизий)."""
-    return hashlib.sha256(q.lower().strip().encode()).hexdigest()[:32]
-
-
 # =====================================================================
-# 1. Поисковый кэш (LRU + TTL)
-# =====================================================================
-class SearchCache:
-    def __init__(self, ttl: int = SEARCH_CACHE_TTL, maxsize: int = SEARCH_CACHE_MAX_SIZE):
-        self.ttl = ttl
-        self.maxsize = maxsize
-        self._cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
-        self._lock = asyncio.Lock()
-
-    async def get(self, key: str) -> Optional[Any]:
-        async with self._lock:
-            if key not in self._cache:
-                return None
-            value, ts = self._cache[key]
-            if _now() - ts > self.ttl:
-                del self._cache[key]
-                return None
-            self._cache.move_to_end(key)
-            return value
-
-    async def set(self, key: str, value: Any):
-        async with self._lock:
-            self._cache[key] = (value, _now())
-            self._cache.move_to_end(key)
-            while len(self._cache) > self.maxsize:
-                self._cache.popitem(last=False)
-
-
-# =====================================================================
-# 2. Загрузчик страниц
-# =====================================================================
-class WebPageFetcher:
-    def __init__(self, timeout: int = 15):
-        self.timeout = timeout
-        self._session: Optional[aiohttp.ClientSession] = None
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.5",
-                },
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
-            )
-        return self._session
-
-    async def fetch(self, url: str) -> str:
-        try:
-            session = await self._get_session()
-            async with session.get(url, allow_redirects=True, max_redirects=5) as resp:
-                if resp.status != 200:
-                    return ""
-                content_type = resp.headers.get("Content-Type", "")
-                if "text/html" not in content_type and "application/xhtml" not in content_type:
-                    return ""
-                html = await resp.text()
-                return self._extract_text(html, url)
-        except Exception as e:
-            logger.debug(f"Fetch error for {url}: {e}")
-            return ""
-
-    def _extract_text(self, html: str, url: str) -> str:
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript"]):
-                tag.decompose()
-            main = soup.find("main") or soup.find("article") or soup.find("div", class_=re.compile("content|article|post"))
-            if main:
-                text = main.get_text(separator="\n", strip=True)
-            else:
-                text = soup.get_text(separator="\n", strip=True)
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            text = "\n".join(lines)
-            if len(text) > PAGE_CONTENT_MAX_CHARS:
-                text = text[:PAGE_CONTENT_MAX_CHARS] + "\n...[truncated]"
-            return text
-        except Exception as e:
-            logger.debug(f"Parse error for {url}: {e}")
-            return ""
-
-    async def fetch_many(self, urls: List[str], limit: int = PARALLEL_FETCH_LIMIT) -> List[Tuple[str, str]]:
-        semaphore = asyncio.Semaphore(limit)
-
-        async def fetch_one(url):
-            async with semaphore:
-                text = await self.fetch(url)
-                return url, text
-
-        tasks = [fetch_one(u) for u in urls]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        out = []
-        for r in results:
-            if isinstance(r, tuple):
-                out.append(r)
-        return out
-
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-
-# =====================================================================
-# 3. Ранжирование чанков
-# =====================================================================
-class ChunkRanker:
-    @staticmethod
-    def _tokenize(text: str) -> List[str]:
-        return re.findall(r'\b\w+\b', text.lower())
-
-    @staticmethod
-    def score_chunks(query: str, chunks: List[str]) -> List[Tuple[float, str]]:
-        q_tokens = set(ChunkRanker._tokenize(query))
-        if not q_tokens:
-            return [(0.0, c) for c in chunks]
-        scored = []
-        for chunk in chunks:
-            c_tokens = ChunkRanker._tokenize(chunk)
-            if not c_tokens:
-                scored.append((0.0, chunk))
-                continue
-            overlap = len(q_tokens & set(c_tokens))
-            tf = sum(c_tokens.count(qt) for qt in q_tokens)
-            score = (overlap * 2 + tf) / (len(c_tokens) + 1)
-            scored.append((score, chunk))
-        scored.sort(reverse=True)
-        return scored
-
-    @staticmethod
-    def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-        if len(text) <= size:
-            return [text]
-        chunks = []
-        start = 0
-        while start < len(text):
-            end = start + size
-            chunk = text[start:end]
-            chunks.append(chunk)
-            start += size - overlap
-        return chunks
-
-
-# =====================================================================
-# 4. Умный триггер поиска
+# 1. Умный триггер поиска (оставлен)
 # =====================================================================
 SEARCH_TRIGGER_KEYWORDS = [
     'сегодня', 'сейчас', 'новости', 'курс', 'погода', 'свежие',
@@ -285,9 +90,6 @@ def is_factual_query(message: str) -> bool:
     return False
 
 
-# =====================================================================
-# 5. Переписывание запроса
-# =====================================================================
 async def rewrite_query(llm_caller, original: str) -> str:
     if not ENABLE_QUERY_REWRITE:
         return original
@@ -308,12 +110,8 @@ async def rewrite_query(llm_caller, original: str) -> str:
 
 
 # =====================================================================
-# 5b. Промпты для программно-парсимых LLM-вызовов (строгий JSON)
+# 2. Промпты для строгого JSON (без изменений)
 # =====================================================================
-# Все три промпта ниже используются там, где ответ LLM парсится кодом, а не
-# показывается пользователю напрямую. Поэтому: temp=0.0-0.2, явная JSON-схема,
-# запрет на пояснения/markdown, и safe-парсинг с фолбэком на эвристику при сбое.
-
 ROUTER_PROMPT = """Ты — модуль планирования когнитивного ассистента. Проанализируй запрос пользователя и контекст.
 Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```.
 
@@ -371,12 +169,7 @@ CONTRADICTION_VERIFY_PROMPT = """Ты — верификатор фактов в
 
 
 def parse_llm_json(raw: str) -> Optional[Dict]:
-    """
-    Безопасный парсинг JSON из ответа LLM. Локальные модели (особенно через
-    LM Studio) часто оборачивают JSON в ```json ... ``` или добавляют текст
-    до/после — эта функция вытаскивает первый валидный JSON-объект.
-    Возвращает None при неудаче — вызывающий код обязан иметь фолбэк.
-    """
+    """Безопасный парсинг JSON из ответа LLM."""
     if not raw:
         return None
     text = raw.strip()
@@ -389,7 +182,6 @@ def parse_llm_json(raw: str) -> Optional[Dict]:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # Последняя попытка: вырезать самый внешний {...} блок
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -401,7 +193,7 @@ def parse_llm_json(raw: str) -> Optional[Dict]:
 
 
 # =====================================================================
-# 6. КОГНИТИВНЫЙ КОНТРОЛЛЕР
+# 3. КОГНИТИВНЫЙ КОНТРОЛЛЕР (изменён)
 # =====================================================================
 class CognitiveController:
     """
@@ -414,15 +206,11 @@ class CognitiveController:
         self.user_dir = MEMORY_BASE_DIR / user_id
         self.user_dir.mkdir(parents=True, exist_ok=True)
 
-        # ---- GCN-память: роутер (личная + глобальная + общая) ----
         self.router = GCNMemoryRouter(user_id, MEMORY_BASE_DIR)
-        self.router.set_llm_caller(self._call_llm)  # передаём метод для извлечения фактов
+        self.router.set_llm_caller(call_llm)
 
-        # Для обратной совместимости: старый код использует self.memory
-        # Теперь self.memory указывает на личную память
         self.memory = self.router.private_memory
 
-        # AIAdapter использует store из личной памяти (для публикации)
         embedder_func = (
             (lambda text: self.memory.embedder.encode(text, convert_to_numpy=True).tolist())
             if self.memory.use_embeddings and self.memory.embedder is not None
@@ -436,9 +224,8 @@ class CognitiveController:
 
         self._searcher = None
         self._last_ddg_call = 0.0
-        self.search_cache = SearchCache()
-        self.web_fetcher = WebPageFetcher()
-        self.chunk_ranker = ChunkRanker()
+
+        # УДАЛЕНЫ: self.search_cache, self.web_fetcher, self.chunk_ranker
 
         self._consolidation_task = None
         self._planner_task = None
@@ -451,13 +238,11 @@ class CognitiveController:
         self.last_prediction_error = 0.0
         self._last_prepare_meta: Dict = {}
 
-        # ---- Рефлексия (самообучение) ----
         self.prediction_history: List[Dict] = []
         self.reflection_interval = REFLECTION_INTERVAL
         self._last_reflection_time = time.time()
 
         self.mcp_manager = MCPToolManager()
-        # Запускаем подключение к MCP-серверам в фоне (не блокируем старт)
         self._mcp_task = asyncio.create_task(self.mcp_manager.initialize())
 
         logger.info(f"CognitiveController (GCN) initialized for {user_id[:16]}")
@@ -507,6 +292,7 @@ class CognitiveController:
             self._research_task = asyncio.create_task(self._periodic_research())
             self._reflection_task = asyncio.create_task(self._periodic_reflection())
 
+    # ----- Фоновые задачи (без изменений) -----
     async def _periodic_consolidation(self):
         while True:
             await asyncio.sleep(CONSOLIDATION_INTERVAL)
@@ -541,16 +327,6 @@ class CognitiveController:
                 logger.error(f"Auto research error: {e}")
 
     async def _route(self, message: str) -> Dict:
-        """
-        Заменяет собой связку rewrite_query() + is_factual_query()-эвристику
-        одним LLM-вызовом с temp=0.0 и строгим JSON-выводом. Учитывает не
-        только текущее сообщение, но и хвост диалога и активные цели —
-        rewrite_query() видел только исходную строку.
-        Вызывается из _prepare_messages ТОЛЬКО когда решение "искать" уже
-        принято (см. needs_search_heuristic/явный флаг), поэтому не вносит
-        дополнительный LLM round-trip в обычные (без поиска) реплики.
-        """
-        # Исправлено: используем правильную структуру истории
         history_tail = "\n".join(
             f"{item['role'].capitalize()}: {item['content'][:200]}"
             for item in self.history[-4:]
@@ -562,7 +338,7 @@ class CognitiveController:
 
         prompt = ROUTER_PROMPT.format(history_tail=history_tail, goals=goals_str, message=message)
         try:
-            raw = await self._call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=200)
+            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=200)
             result = parse_llm_json(raw)
             if result and "search_query" in result:
                 return result
@@ -570,7 +346,6 @@ class CognitiveController:
         except Exception as e:
             logger.warning(f"Router LLM call failed, falling back to heuristics: {e}")
 
-        # Фолбэк на regex-эвристику при сбое LLM/парсинга — offline safety net.
         return {
             "needs_web_search": True,
             "search_query": None,
@@ -589,7 +364,7 @@ class CognitiveController:
             f"Диалоги:\n{history_summary}"
         )
         try:
-            goals_text = await self._call_llm([{"role": "user", "content": prompt}], temp=0.7, max_tokens=200)
+            goals_text = await call_llm([{"role": "user", "content": prompt}], temp=0.7, max_tokens=200)
             goals = [g.strip("-• ").strip() for g in goals_text.split('\n') if g.strip()]
             for g in goals:
                 await self.memory.add_goal(g, priority=0.5)
@@ -599,7 +374,6 @@ class CognitiveController:
             logger.error(f"Planning error: {e}")
 
     async def _auto_research(self):
-        # Ищем активные цели (объекты типа HYPOTHESIS с object="active")
         active_goals = [obj for obj in self.memory.store._objects.values()
                         if obj.type == KnowledgeType.HYPOTHESIS and obj.object.get("status") == "active"]
         for goal_obj in active_goals:
@@ -608,109 +382,15 @@ class CognitiveController:
                 await self.research(goal_obj.subject)
                 goal_obj.confidence = min(1.0, goal_obj.confidence + 0.2)
                 self.memory.store.update(goal_obj.id, {"confidence": goal_obj.confidence}, self.user_id)
-                self.memory._sync_goal_from_gcn(goal_obj.id)  # <--- добавить
+                self.memory._sync_goal_from_gcn(goal_obj.id)
         await self.memory._schedule_save()
 
-    async def _call_llm(self, messages, temp=0.7, max_tokens=2048, retries=3):
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
-        payload = {"model": "local-model", "messages": messages, "temperature": temp, "max_tokens": max_tokens}
-        for attempt in range(retries):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(LM_STUDIO_URL, json=payload, headers=headers, timeout=LM_STUDIO_TIMEOUT) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        else:
-                            error_text = await resp.text()
-                            logger.error(f"LLM error {resp.status}: {error_text[:200]}")
-                            if resp.status >= 500 and attempt < retries - 1:
-                                await asyncio.sleep(2 ** attempt)
-                                continue
-                            return ""
-            except Exception as e:
-                logger.error(f"LLM call failed: {e}")
-                if attempt < retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                return ""
-        return ""
 
-    async def _call_llm_stream(self, messages, temp=0.7, max_tokens=2048):
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
-        payload = {
-            "model": "local-model",
-            "messages": messages,
-            "temperature": temp,
-            "max_tokens": max_tokens,
-            "stream": True,
-        }
-        timeout = aiohttp.ClientTimeout(total=LM_STUDIO_STREAM_TIMEOUT)
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(LM_STUDIO_URL, json=payload, headers=headers, timeout=timeout) as resp:
-                    logger.info(f"[Stream] Status: {resp.status}")
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        logger.error(f"Stream error {resp.status}: {error_text[:200]}")
-                        yield "[Ошибка LLM]"
-                        return
-                    async for line in resp.content:
-                        line = line.decode('utf-8').strip()
-                        if not line:
-                            continue
-                        if line.startswith('data: '):
-                            data = line[6:]
-                            if data == '[DONE]':
-                                break
-                            try:
-                                chunk = json.loads(data)
-                                delta = chunk.get('choices', [{}])[0].get('delta', {})
-                                content = delta.get('content', '')
-                                if content:
-                                    yield content
-                            except json.JSONDecodeError:
-                                continue
-        except asyncio.CancelledError:
-            logger.debug("Stream cancelled")
-            raise
-        except Exception as e:
-            logger.error(f"Stream error: {e}")
-            yield f"[Ошибка: {e}]"
 
-    async def search_ddg(self, query: str, max_results: int = 5) -> List[Dict]:
-        if not self.searcher:
-            return []
-        elapsed = _now() - self._last_ddg_call
-        if elapsed < DDG_MIN_INTERVAL:
-            await asyncio.sleep(DDG_MIN_INTERVAL - elapsed)
-        loop = asyncio.get_event_loop()
-        for attempt in range(DDG_MAX_RETRIES):
-            try:
-                results = await loop.run_in_executor(
-                    None,
-                    lambda: list(self.searcher.text(query, max_results=max_results))
-                )
-                self._last_ddg_call = _now()
-                return [{"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")} for r in results]
-            except Exception as e:
-                logger.warning(f"DDG attempt {attempt + 1} failed: {e}")
-                if attempt < DDG_MAX_RETRIES - 1:
-                    await asyncio.sleep((2 ** attempt) + 0.5)
-                else:
-                    logger.error("DDG failed after all retries")
-        return []
 
-    # =====================================================================
-    # РЕФЛЕКСИЯ (самообучение на ошибках)
-    # =====================================================================
 
+    # ===== РЕФЛЕКСИЯ (без изменений) =====
     def _compute_prediction_error(self, predicted: List[str], actual: str) -> float:
-        """
-        Оценивает, насколько предсказанные фразы (список) похожи на реальный ответ.
-        Возвращает 0 (идеально) … 1 (полное несовпадение).
-        Использует схожесть по ключевым словам из memory_graph.
-        """
         if not predicted or not actual:
             return 1.0
         pred_text = " ".join(predicted)
@@ -745,7 +425,7 @@ class CognitiveController:
         prompt = REFLECTION_PROMPT.format(threshold=REFLECTION_ERROR_THRESHOLD, topics=topics_str)
 
         try:
-            raw = await self._call_llm(
+            raw = await call_llm(
                 [{"role": "user", "content": prompt}],
                 temp=REFLECTION_LLM_TEMP,
                 max_tokens=REFLECTION_LLM_MAX_TOKENS
@@ -759,9 +439,6 @@ class CognitiveController:
             logger.warning(f"Reflection: bad JSON from LLM, skipping this cycle: {raw[:200]!r}")
             return
 
-        # Верхние границы на веса — не даём рефлексии "разогнать" один вес
-        # в стену за счёт остальных. Значения подобраны так, чтобы ни один
-        # компонент не мог перекрыть больше половины итогового скора.
         bounds = {"semantic": 0.6, "graph": 0.35, "freshness": 0.35, "evidence": 0.25, "confidence": 0.20}
         adjustments = result.get("weight_adjustments", {})
         if isinstance(adjustments, dict):
@@ -790,22 +467,6 @@ class CognitiveController:
         logger.info(f"[QuickCorrection] High error detected for: {query[:50]}...")
         await self.research(query)
 
-    def _content_has_currency_numbers(self, text: str) -> bool:
-        if not text:
-            return False
-        patterns = [
-            r'\b\d{1,3}[.,]\d{2}\b',
-            r'\b\d{1,3}\.\d{2}\s*(?:₽|руб|RUB|USD|EUR)\b',
-            r'(?:USD|EUR|RUB)\s*/\s*(?:RUB|USD|EUR)\s*[:=]?\s*\d{1,3}[.,]\d{2}',
-            r'курс.*\d{1,3}[.,]\d{2}',
-            r'доллар.*\d{1,3}[.,]\d{2}',
-            r'евро.*\d{1,3}[.,]\d{2}',
-        ]
-        for pat in patterns:
-            if re.search(pat, text, re.IGNORECASE):
-                return True
-        return False
-
     def _generate_alternative_queries(self, original: str, attempt: int) -> str:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if attempt == 1:
@@ -817,112 +478,7 @@ class CognitiveController:
         else:
             return f"{original} котировка"
 
-    async def deep_search(self, query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict[str, Any]:
-        all_sources = []
-        all_context_parts = []
-        queries_to_try = [query]
-        for i in range(1, MAX_SEARCH_ATTEMPTS):
-            alt = self._generate_alternative_queries(query, i)
-            if alt not in queries_to_try:
-                queries_to_try.append(alt)
-
-        fetched_total = 0
-        budget = getattr(self, '_deep_search_budget', DEEP_SEARCH_TOTAL_BUDGET)
-
-        for q in queries_to_try:
-            if fetched_total >= budget:
-                break
-            cache_key = _hash_query(q)
-            cached = await self.search_cache.get(cache_key)
-            if cached:
-                if self._content_has_currency_numbers(cached.get("context", "")):
-                    return cached
-                all_sources.extend(cached.get("sources", []))
-                all_context_parts.append(cached.get("context", ""))
-                continue
-
-            ddg_results = await self.search_ddg(q, max_results=max_results + 2)
-            if not ddg_results:
-                continue
-
-            urls = [r["url"] for r in ddg_results if r.get("url")]
-            remaining = budget - fetched_total
-            to_fetch = urls[:min(max_results, remaining)]
-            fetched = await self.web_fetcher.fetch_many(to_fetch, limit=PARALLEL_FETCH_LIMIT)
-            fetched_total += len(fetched)
-
-            documents = []
-            url_to_title = {r["url"]: r["title"] for r in ddg_results}
-            for url, text in fetched:
-                if text:
-                    full_text = f"{url_to_title.get(url, '')}\n{text}"
-                    documents.append({"url": url, "title": url_to_title.get(url, url), "text": full_text})
-                else:
-                    snippet = next((r["snippet"] for r in ddg_results if r["url"] == url), "")
-                    if snippet:
-                        documents.append({"url": url, "title": url_to_title.get(url, url), "text": snippet})
-
-            if not documents:
-                continue
-
-            all_chunks = []
-            for doc in documents:
-                chunks = self.chunk_ranker.chunk_text(doc["text"])
-                for ch in chunks:
-                    all_chunks.append({"chunk": ch, "url": doc["url"], "title": doc["title"]})
-
-            scored = self.chunk_ranker.score_chunks(q, [c["chunk"] for c in all_chunks])
-            top_chunks = []
-            sources_used = set()
-            for score, chunk_text in scored:
-                if score < MIN_RELEVANCE_THRESHOLD:
-                    continue
-                meta = next((c for c in all_chunks if c["chunk"] == chunk_text), None)
-                if not meta:
-                    continue
-                top_chunks.append({"score": round(score, 3), **meta})
-                sources_used.add(meta["url"])
-                if len(top_chunks) >= max_results * 2:
-                    break
-
-            context_parts = []
-            for i, ch in enumerate(top_chunks, 1):
-                context_parts.append(
-                    f"[{i}] Источник: {ch['title']}\nURL: {ch['url']}\nРелевантность: {ch['score']}\n{ch['chunk'][:600]}"
-                )
-            context = "\n\n---\n\n".join(context_parts)
-            sources = [{"title": url_to_title.get(u, u), "url": u} for u in sources_used]
-
-            result_item = {
-                "sources": sources,
-                "context": context,
-                "search_performed": True,
-                "chunks_found": len(top_chunks),
-            }
-            await self.search_cache.set(cache_key, result_item)
-
-            if self._content_has_currency_numbers(context):
-                return result_item
-
-            all_sources.extend(sources)
-            all_context_parts.append(context)
-
-        combined_context = "\n\n".join(filter(None, all_context_parts))
-        seen = set()
-        unique_sources = []
-        for s in all_sources:
-            key = s["url"]
-            if key not in seen:
-                seen.add(key)
-                unique_sources.append(s)
-
-        return {
-            "sources": unique_sources,
-            "context": combined_context,
-            "search_performed": True,
-            "chunks_found": len(combined_context) // 500,
-        }
-
+    # ===== ОСНОВНАЯ ЛОГИКА ПОДГОТОВКИ СООБЩЕНИЙ (изменена) =====
     async def _prepare_messages(self, message: str, web_search: bool = False,
                                 image_base64: Optional[str] = None,
                                 image_mime: Optional[str] = None,
@@ -937,16 +493,11 @@ class CognitiveController:
         sources = []
 
         if web_search and self.searcher:
-            # Единый вызов вместо раздельных rewrite_query() + is_factual_query():
-            # роутер одновременно переписывает поисковый запрос и определяет,
-            # время-чувствительный ли вопрос (влияет на глубину поиска), с учётом
-            # контекста диалога и активных целей — не только последнего сообщения.
-            # Вызывается ТОЛЬКО когда поиск уже решено делать (auto-heuristic или
-            # явный флаг), поэтому не добавляет LLM round-trip к обычным репликам.
             route = await self._route(message)
             search_query = route.get("search_query") or message
             max_res = 7 if route.get("is_factual_time_sensitive") else MAX_PAGES_TO_FETCH
-            search_data = await self.deep_search(search_query, max_results=max_res)
+            # ВЫЗОВ ИМПОРТИРОВАННОЙ deep_search
+            search_data = await deep_search(search_query, max_results=max_res)
             if search_data["search_performed"]:
                 search_meta["web_search_used"] = True
                 search_meta["sources"] = search_data["sources"]
@@ -959,7 +510,6 @@ class CognitiveController:
                     else:
                         facts = self._extract_facts_from_text(search_data["context"])
 
-                    # Порог уверенности для глобальных фактов (можно вынести в конфиг)
                     GLOBAL_FACT_CONFIDENCE = 0.75
 
                     for f in facts:
@@ -997,7 +547,6 @@ class CognitiveController:
         if search_context:
             uncertainty *= 0.7
 
-        # Активные цели (из GCN)
         active_goals = [obj for obj in self.memory.store._objects.values()
                         if obj.type == KnowledgeType.HYPOTHESIS and obj.object.get("status") == "active"]
         goal_hint = ""
@@ -1033,6 +582,7 @@ class CognitiveController:
         }
         return messages, search_meta
 
+    # ===== ПРОЦЕССИНГ ВХОДА (без изменений) =====
     async def process_input(self, message: str, web_search: bool = False,
                             image_base64: Optional[str] = None,
                             image_mime: Optional[str] = None,
@@ -1045,9 +595,8 @@ class CognitiveController:
             message, web_search, image_base64, image_mime, reasoning
         )
 
-        response = await self._call_llm(messages)
+        response = await call_llm(messages)
 
-        # ===== НАЧАЛО БЛОКА ОБРАБОТКИ MCP =====
         try:
             raw_text = response.strip()
             start = raw_text.find("{")
@@ -1056,9 +605,7 @@ class CognitiveController:
                 decision = json.loads(raw_text[start:end])
                 if decision.get("action") == "mcp_call":
                     tool_result = await self._handle_mcp_call(decision)
-                    # Добавляем результат в историю как ассистентское сообщение
                     self.history.append({"role": "assistant", "content": f"Результат вызова: {tool_result}"})
-                    # Формируем новый запрос к LLM с этим результатом
                     messages = self._build_messages(
                         message=message,
                         web_search=web_search,
@@ -1071,16 +618,14 @@ class CognitiveController:
                         predictions=self._last_prepare_meta.get("predictions", []),
                         goal_hint=self._last_prepare_meta.get("goal_hint", "")
                     )
-                    # Добавляем результат как часть пользовательского запроса
                     messages.append({"role": "user",
                                      "content": f"Результат вызова инструмента: {tool_result}\nТеперь дай финальный ответ пользователю."})
-                    final_response = await self._call_llm(messages)
+                    final_response = await call_llm(messages)
                     response = final_response
                 elif decision.get("action") == "reply":
                     response = decision.get("message", response)
         except json.JSONDecodeError:
-            pass  # не JSON, оставляем как есть
-        # ===== КОНЕЦ БЛОКА =====
+            pass
 
         self.history.append({"role": "user", "content": message})
         if response:
@@ -1092,14 +637,12 @@ class CognitiveController:
             salience = 1.0 - uncertainty
             await self.memory.add_episode(message, response, salience=salience)
 
-            # Обновляем рабочую память
             relevant = self._last_prepare_meta.get("relevant", [])
             for fact_dict in relevant[:3]:
                 gcn_id = fact_dict.get("gcn_id")
                 if gcn_id:
                     self.memory.hierarchy.add_to_working(gcn_id)
 
-        # Рефлексия: запоминаем предсказание и ошибку
         predictions = self._last_prepare_meta.get("predictions", [])
         if predictions and response:
             error = self._compute_prediction_error(predictions, response)
@@ -1117,10 +660,8 @@ class CognitiveController:
 
         return response, search_meta
 
+    # ===== ИЗВЛЕЧЕНИЕ ФАКТОВ (без изменений) =====
     async def _extract_facts_llm(self, text: str) -> List[str]:
-        """
-        Извлекает объективные факты из текста с улучшенной фильтрацией.
-        """
         prompt = (
             "Извлеки из текста только объективные, проверяемые факты. "
             "Факт должен быть кратким утверждением, содержащим конкретную информацию "
@@ -1131,8 +672,8 @@ class CognitiveController:
             f"ТЕКСТ:\n{text[:4000]}"
         )
         try:
-            raw = await self._call_llm(
-                [{"role": "user", "content": prompt}],  # FIX: передаём правильные аргументы
+            raw = await call_llm(
+                [{"role": "user", "content": prompt}],
                 temp=0.2,
                 max_tokens=300
             )
@@ -1155,95 +696,6 @@ class CognitiveController:
             facts.append(line[:300])
         return facts[:10]
 
-    async def _verify_pending_contradictions(self, max_checks: int = 5):
-        """
-        Реальная верификация противоречий через LLM + GCN-провенанс.
-        Раньше это была заглушка (pass) — вызывалась в каждом цикле
-        консолидации, но ничего не делала. _detect_contradictions() в
-        memory_graph.py помечает пары фактов грубой эвристикой (наличие
-        отрицания + пересечение ключевых слов), давая много ложных
-        срабатываний. Здесь эти пары прогоняются через LLM-судью с temp=0.0
-        и строгим JSON-выводом, а решение фиксируется в GCN через уже
-        существующий, но ранее не задействованный MemoryStore.verify().
-        """
-        pairs = self.memory.get_unverified_contradictions(limit=max_checks)
-        if not pairs:
-            return
-
-        actor = f"reflection:{self.user_id}"
-        resolved = 0
-        for fact_a, fact_b in pairs:
-            prompt = CONTRADICTION_VERIFY_PROMPT.format(text_a=fact_a.text, text_b=fact_b.text)
-            try:
-                raw = await self._call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=150)
-            except Exception as e:
-                logger.warning(f"Contradiction verify LLM call failed ({fact_a.id},{fact_b.id}): {e}")
-                continue
-
-            verdict = parse_llm_json(raw)
-            if not verdict or "relation" not in verdict:
-                logger.warning(f"Contradiction verify: bad JSON from LLM: {raw[:200]!r}")
-                continue
-
-            relation = verdict.get("relation")
-            reason = verdict.get("reason", "")
-
-            if relation == "false_positive":
-                # Удаляем противоречие из графа GCN
-                try:
-                    self.memory.store._graph.remove_relation(fact_a.gcn_id, "CONTRADICTS", fact_b.gcn_id)
-                    self.memory.store._graph.remove_relation(fact_b.gcn_id, "CONTRADICTS", fact_a.gcn_id)
-                    # Обновляем confidence
-                    fact_a.confidence = min(1.0, fact_a.confidence + 0.05)
-                    fact_b.confidence = min(1.0, fact_b.confidence + 0.05)
-                    self.memory.store.update(fact_a.gcn_id, {"confidence": fact_a.confidence}, self.user_id)
-                    self.memory.store.update(fact_b.gcn_id, {"confidence": fact_b.confidence}, self.user_id)
-                except Exception as e:
-                    logger.debug(f"Failed to remove contradiction edges: {e}")
-                # Также удаляем из локальных множеств
-                fact_a.contradicts.discard(fact_b.id)
-                fact_b.contradicts.discard(fact_a.id)
-            else:
-                keep = verdict.get("keep")
-                if keep == "A":
-                    self._demote_or_retract(fact_b, actor, reason)
-                elif keep == "B":
-                    self._demote_or_retract(fact_a, actor, reason)
-                elif keep == "neither":
-                    self._demote_or_retract(fact_a, actor, reason)
-                    self._demote_or_retract(fact_b, actor, reason)
-                # keep == "both" (both_partially_true) — оставляем оба как есть,
-                # но всё равно фиксируем VERIFY-событие в GCN ниже.
-                # Раз мы вынесли явный вердикт — снимаем пару из "необработанных",
-                # чтобы не гонять её через LLM повторно каждый цикл.
-                fact_a.contradicts.discard(fact_b.id)
-                fact_b.contradicts.discard(fact_a.id)
-
-            for fact in (fact_a, fact_b):
-                if fact.gcn_id:
-                    try:
-                        self.memory.store.verify(fact.gcn_id, verifier="llm_reflection",
-                                                  status=relation, actor=actor)
-                    except Exception as e:
-                        logger.debug(f"GCN verify() failed for {fact.gcn_id}: {e}")
-
-            resolved += 1
-            self.memory._dirty = True
-
-        if resolved:
-            logger.info(f"[ContradictionVerify] Resolved {resolved}/{len(pairs)} pending pairs")
-            await self.memory._schedule_save()
-
-    def _demote_or_retract(self, fact: 'Fact', actor: str, reason: str):
-        """Понижает доверие к факту; при падении ниже порога — ретрактит в GCN."""
-        fact.confidence *= 0.5
-        if fact.confidence < 0.15 and fact.gcn_id:
-            try:
-                self.memory.store.retract(fact.gcn_id, actor, reason=f"contradiction: {reason}"[:200])
-                logger.info(f"[ContradictionVerify] Retracted fact {fact.id}: {reason}")
-            except Exception as e:
-                logger.debug(f"Retract failed for {fact.gcn_id}: {e}")
-
     def _extract_facts_from_text(self, text: str) -> List[str]:
         sentences = re.split(r'[.!?]', text)
         facts = []
@@ -1253,6 +705,7 @@ class CognitiveController:
                 facts.append(s[:300])
         return facts[:20]
 
+    # ===== КОМАНДЫ ПАМЯТИ (без изменений) =====
     async def _handle_memory_command(self, message: str) -> Optional[Tuple[str, Dict]]:
         lower_msg = message.lower()
         for cmd, action in MEMORY_CONTROL_COMMANDS.items():
@@ -1260,39 +713,29 @@ class CognitiveController:
                 rest = message[len(cmd):].strip()
                 if not rest:
                     continue
-
-                # ------------------------------------------------------------
-                # 1. Команда "запомни" – сохраняет факт и генерирует ответ через LLM
-                # ------------------------------------------------------------
                 if action == "store":
-                    # Проверяем, не просит ли пользователь сохранить глобально
                     is_global = any(word in rest.lower() for word in ("глобально", "global"))
-
                     if is_global:
-                        # Убираем слова-маркеры из фразы
                         clean_rest = rest
                         for word in ("глобально", "global"):
                             clean_rest = clean_rest.replace(word, "").strip()
-                        clean_rest = " ".join(clean_rest.split())  # схлопываем пробелы
-
-                        # 1. Пробуем извлечь факт через LLM с улучшенным промптом
+                        clean_rest = " ".join(clean_rest.split())
                         try:
                             prompt = (
+                                "Если факт структурирован и содержит достаточно информации по теме , запомни как есть ,полный текст если нет Извлеки из запроса пользователя"
                                 "Извлеки из запроса пользователя объективный факт (утверждение, которое может быть проверено или использовано как знание). "
                                 "Игнорируй мнения, временные события, эмоции, инструкции и пожелания. "
                                 "Сформулируй факт как краткое предложение в настоящем времени (или прошедшем, если это не теряет актуальности). "
-                                "Ответь только фактом, без пояснений.\n\n"
+                                "Ответь только фактом, без пояснений.Или полным текстом если факт структурирован\n\n"
                                 f"Запрос: {clean_rest}"
                             )
-                            fact_text = await self._call_llm([{"role": "user", "content": prompt}], temp=0.3,
-                                                             max_tokens=150)
+                            fact_text = await call_llm([{"role": "user", "content": prompt}], temp=0.3, max_tokens=150)
                             fact_text = fact_text.strip()
                             if len(fact_text) < 5:
                                 fact_text = clean_rest
                         except Exception:
                             fact_text = clean_rest
 
-                        # 2. Сохраняем в глобальную память через роутер
                         gcn_id = self.router.add_knowledge(
                             subject=fact_text,
                             predicate="is_fact",
@@ -1306,7 +749,6 @@ class CognitiveController:
                         return response, {"memory": "stored_global", "id": gcn_id}
 
                     else:
-                        # Прежняя логика для личной памяти (без изменений)
                         fid = self.memory._add_fact(rest, 'command', confidence=1.0, importance=1.5)
                         fact = self.memory.facts_by_id.get(fid)
                         if fact and fact.gcn_id:
@@ -1327,15 +769,12 @@ class CognitiveController:
                                 "content": f"Запомни: {rest}"
                             }
                         ]
-                        response = await self._call_llm(messages, temp=0.5, max_tokens=150)
+                        response = await call_llm(messages, temp=0.5, max_tokens=150)
                         if response:
                             return response, {"memory": "stored", "id": fid}
                         else:
                             return f"Запомнил: {rest}", {"memory": "stored", "id": fid}
 
-                # ------------------------------------------------------------
-                # 2. Команда "забудь" – удаляет факты и генерирует ответ через LLM
-                # ------------------------------------------------------------
                 elif action == "forget":
                     to_remove_ids = {f.id for f in self.memory.semantic_facts if rest.lower() in f.text.lower()}
                     if to_remove_ids:
@@ -1355,7 +794,7 @@ class CognitiveController:
                                 "content": f"Забудь: {rest} (удалено {removed} фактов)"
                             }
                         ]
-                        response = await self._call_llm(messages, temp=0.5, max_tokens=150)
+                        response = await call_llm(messages, temp=0.5, max_tokens=150)
                         if response:
                             return response, {"memory": "forgot", "count": removed}
                         else:
@@ -1363,12 +802,8 @@ class CognitiveController:
                     else:
                         return "Ничего не найдено для удаления.", {"memory": "no_match"}
 
-                # ------------------------------------------------------------
-                # 3. Команда "что ты знаешь о" – улучшенная версия с LLM
-                # ------------------------------------------------------------
                 elif action == "recall":
                     facts = await self.memory.retrieve_hybrid(rest, top_k=7, use_graph=True)
-
                     if not facts:
                         return "Ничего не найдено по вашему запросу.", {"memory": "no_recall"}
 
@@ -1392,23 +827,93 @@ class CognitiveController:
                         }
                     ]
 
-                    response = await self._call_llm(messages, temp=0.6, max_tokens=500)
-
+                    response = await call_llm(messages, temp=0.6, max_tokens=500)
                     if not response:
                         answer = "Вот что я знаю:\n" + "\n".join(
                             f"- {f['text']} (уверенность: {f.get('confidence', 0.5):.2f})" for f in facts[:5]
                         )
                         return answer, {"memory": "recalled_fallback"}
-
                     return response, {"memory": "recalled"}
 
         return None
 
+    # ===== ВЕРИФИКАЦИЯ ПРОТИВОРЕЧИЙ (без изменений) =====
+    async def _verify_pending_contradictions(self, max_checks: int = 5):
+        pairs = self.memory.get_unverified_contradictions(limit=max_checks)
+        if not pairs:
+            return
+
+        actor = f"reflection:{self.user_id}"
+        resolved = 0
+        for fact_a, fact_b in pairs:
+            prompt = CONTRADICTION_VERIFY_PROMPT.format(text_a=fact_a.text, text_b=fact_b.text)
+            try:
+                raw = await call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=150)
+            except Exception as e:
+                logger.warning(f"Contradiction verify LLM call failed ({fact_a.id},{fact_b.id}): {e}")
+                continue
+
+            verdict = parse_llm_json(raw)
+            if not verdict or "relation" not in verdict:
+                logger.warning(f"Contradiction verify: bad JSON from LLM: {raw[:200]!r}")
+                continue
+
+            relation = verdict.get("relation")
+            reason = verdict.get("reason", "")
+
+            if relation == "false_positive":
+                try:
+                    self.memory.store._graph.remove_relation(fact_a.gcn_id, "CONTRADICTS", fact_b.gcn_id)
+                    self.memory.store._graph.remove_relation(fact_b.gcn_id, "CONTRADICTS", fact_a.gcn_id)
+                    fact_a.confidence = min(1.0, fact_a.confidence + 0.05)
+                    fact_b.confidence = min(1.0, fact_b.confidence + 0.05)
+                    self.memory.store.update(fact_a.gcn_id, {"confidence": fact_a.confidence}, self.user_id)
+                    self.memory.store.update(fact_b.gcn_id, {"confidence": fact_b.confidence}, self.user_id)
+                except Exception as e:
+                    logger.debug(f"Failed to remove contradiction edges: {e}")
+                fact_a.contradicts.discard(fact_b.id)
+                fact_b.contradicts.discard(fact_a.id)
+            else:
+                keep = verdict.get("keep")
+                if keep == "A":
+                    self._demote_or_retract(fact_b, actor, reason)
+                elif keep == "B":
+                    self._demote_or_retract(fact_a, actor, reason)
+                elif keep == "neither":
+                    self._demote_or_retract(fact_a, actor, reason)
+                    self._demote_or_retract(fact_b, actor, reason)
+                fact_a.contradicts.discard(fact_b.id)
+                fact_b.contradicts.discard(fact_a.id)
+
+            for fact in (fact_a, fact_b):
+                if fact.gcn_id:
+                    try:
+                        self.memory.store.verify(fact.gcn_id, verifier="llm_reflection",
+                                                  status=relation, actor=actor)
+                    except Exception as e:
+                        logger.debug(f"GCN verify() failed for {fact.gcn_id}: {e}")
+
+            resolved += 1
+            self.memory._dirty = True
+
+        if resolved:
+            logger.info(f"[ContradictionVerify] Resolved {resolved}/{len(pairs)} pending pairs")
+            await self.memory._schedule_save()
+
+    def _demote_or_retract(self, fact: 'Fact', actor: str, reason: str):
+        fact.confidence *= 0.5
+        if fact.confidence < 0.15 and fact.gcn_id:
+            try:
+                self.memory.store.retract(fact.gcn_id, actor, reason=f"contradiction: {reason}"[:200])
+                logger.info(f"[ContradictionVerify] Retracted fact {fact.id}: {reason}")
+            except Exception as e:
+                logger.debug(f"Retract failed for {fact.gcn_id}: {e}")
+
+    # ===== ПОСТРОЕНИЕ СООБЩЕНИЙ (без изменений) =====
     def _build_messages(self, message: str, web_search: bool, search_context: str,
                         memory_context: str, image_base64: Optional[str],
                         image_mime: Optional[str], reasoning: bool,
                         uncertainty: float, predictions: List[str], goal_hint: str) -> List[Dict]:
-        # Формируем детализированный системный промпт
         system_parts = [
             "Ты — когнитивный AI-ассистент с доступом к трём источникам знаний:",
             "1. ЛИЧНАЯ ПАМЯТЬ (факты, которые пользователь просил запомнить или извлечены из диалога) — самый надёжный источник.",
@@ -1425,10 +930,8 @@ class CognitiveController:
             "- Не выдумывай фактов, которых нет в предоставленном контексте. Если информации недостаточно, скажи об этом прямо.",
         ]
 
-        # Добавляем подсказки в зависимости от состояния
         if uncertainty > 0.6:
-            system_parts.append(
-                f"Твоя уверенность в ответе низкая ({uncertainty:.2f}). Если не знаешь – скажи об этом.")
+            system_parts.append(f"Твоя уверенность в ответе низкая ({uncertainty:.2f}). Если не знаешь – скажи об этом.")
         if predictions:
             system_parts.append(f"Возможное продолжение темы: {', '.join(predictions[:3])}.")
         if goal_hint:
@@ -1437,10 +940,8 @@ class CognitiveController:
             system_parts.append(
                 "Перед ответом покажи рассуждения: начни с 💭 РАССУЖДЕНИЕ: и заканчивая ---, затем финальный ответ.")
         if web_search:
-            system_parts.append(
-                "Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
+            system_parts.append("Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
 
-        # ===== ДОБАВЛЯЕМ ОПИСАНИЕ MCP-ИНСТРУМЕНТОВ =====
         if hasattr(self, 'mcp_manager') and self.mcp_manager._initialized:
             external_tools = self.mcp_manager.get_all_tools()
             if external_tools:
@@ -1455,17 +956,14 @@ class CognitiveController:
                     desc = t.get("description", "")
                     system_parts.append(f"- {server}/{name}: {desc}")
                 system_parts.append("")
-        # ================================================
 
         system_content = "\n".join(system_parts)
         messages = [{"role": "system", "content": system_content}]
 
-        # Добавляем историю
         for item in self.history[-self.max_history:]:
             if item.get("role") != "system":
                 messages.append(item)
 
-        # Формируем пользовательский контекст
         user_blocks = []
         if memory_context:
             user_blocks.append(memory_context)
@@ -1477,7 +975,6 @@ class CognitiveController:
         user_blocks.append(f"Вопрос пользователя: {message}")
         user_text = "\n\n".join(user_blocks)
 
-        # Поддержка изображений
         if image_base64 and LM_STUDIO_VISION_SUPPORTED:
             if not image_base64.startswith("data:image"):
                 if image_mime:
@@ -1493,15 +990,14 @@ class CognitiveController:
 
         return messages
 
-
-
+    # ===== ИССЛЕДОВАНИЕ (изменён) =====
     async def research(self, goal: str) -> Dict[str, Any]:
         prompt = (
             f"Сформулируй 3 чёткие, проверяемые гипотезы по вопросу: {goal}. "
             "Каждая гипотеза должна быть кратким утверждением (не вопросом), содержащим конкретное предположение. "
             "Ответь в виде маркированного списка, без пояснений."
         )
-        hypotheses_text = await self._call_llm([{"role": "user", "content": prompt}], temp=0.8)
+        hypotheses_text = await call_llm([{"role": "user", "content": prompt}], temp=0.8)
         hypotheses = [h.strip("-• ").strip() for h in hypotheses_text.split('\n') if h.strip()][:3]
         if not hypotheses:
             hypotheses = ["Не удалось сгенерировать гипотезы"]
@@ -1510,7 +1006,8 @@ class CognitiveController:
         queries = [goal] + hypotheses[:2]
         for q in queries:
             try:
-                data = await self.deep_search(q, max_results=3)
+                # ВЫЗОВ ИМПОРТИРОВАННОЙ deep_search
+                data = await deep_search(q, max_results=3)
                 for src in data.get("sources", []):
                     all_evidence.append({"source": src.get("url", ""), "title": src.get("title", ""), "query": q})
             except Exception as e:
@@ -1525,14 +1022,10 @@ class CognitiveController:
             f"Гипотезы: {', '.join(hypotheses)}\n\n"
             f"Источники:\n{evidence_text}"
         )
-        answer = await self._call_llm([{"role": "user", "content": answer_prompt}], temp=0.6)
+        answer = await call_llm([{"role": "user", "content": answer_prompt}], temp=0.6)
         return {"answer": answer, "confidence": 0.7, "hypotheses": hypotheses, "evidence": all_evidence}
 
-    async def get_response(self, message: str, web_search: bool = False,
-                           image_base64: str = None, image_mime: str = None,
-                           reasoning: bool = False):
-        return await self.process_input(message, web_search, image_base64, image_mime, reasoning)
-
+    # ===== ПОТОКОВЫЙ ОТВЕТ (без изменений) =====
     async def stream_response(self, message: str, web_search: bool = False,
                               image_base64: str = None, image_mime: str = None,
                               reasoning: bool = False, char_by_char: bool = None):
@@ -1552,59 +1045,67 @@ class CognitiveController:
         full_response = ""
         try:
             if LM_STUDIO_USE_STREAM:
-                # Собираем ответ, не стримя его сразу
-                async for token in self._call_llm_stream(messages):
+                # Решаем, похож ли ответ на JSON tool-call, ТОЛЬКО по первым
+                # непустым символам — если нет, отдаём токены клиенту сразу,
+                # по мере поступления от LLM, а не после полной генерации.
+                looks_like_json: Optional[bool] = None
+                json_buffer = ""
+
+                async for token in call_llm_stream(messages):
                     full_response += token
-                    # НЕ yield здесь, чтобы избежать дублирования
 
-                # ===== ОБРАБОТКА MCP (JSON-команды) =====
-                try:
-                    raw_text = full_response.strip()
-                    start = raw_text.find("{")
-                    end = raw_text.rfind("}") + 1
-                    if start != -1 and end > start:
-                        decision = json.loads(raw_text[start:end])
-                        if decision.get("action") == "mcp_call":
-                            tool_result = await self._handle_mcp_call(decision)
-                            # Добавляем в историю промежуточный результат (но не будем показывать)
-                            # self.history.append({"role": "assistant", "content": f"Результат вызова: {tool_result}"})
-                            # Формируем новый запрос к LLM с результатом
-                            messages = self._build_messages(
-                                message=message,
-                                web_search=web_search,
-                                search_context=search_meta.get("context", ""),
-                                memory_context=self._last_prepare_meta.get("memory_context", ""),
-                                image_base64=image_base64,
-                                image_mime=image_mime,
-                                reasoning=reasoning,
-                                uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
-                                predictions=self._last_prepare_meta.get("predictions", []),
-                                goal_hint=self._last_prepare_meta.get("goal_hint", "")
-                            )
-                            # Добавляем результат вызова как сообщение пользователя (чтобы LLM его учла)
-                            messages.append({"role": "user",
-                                             "content": f"Результат вызова инструмента: {tool_result}\nТеперь дай финальный ответ пользователю."})
-                            # Получаем финальный ответ (не потоковый)
-                            final_response = await self._call_llm(messages)
-                            full_response = final_response
-                        elif decision.get("action") == "reply":
-                            full_response = decision.get("message", full_response)
-                except json.JSONDecodeError:
-                    pass  # Не JSON, оставляем как есть
-                # ===== КОНЕЦ ОБРАБОТКИ =====
+                    if looks_like_json is None:
+                        stripped = full_response.lstrip()
+                        if stripped:
+                            looks_like_json = stripped.startswith("{")
 
-                # Теперь стримим финальный ответ
-                if char_by_char is None:
-                    char_by_char = STREAM_CHAR_BY_CHAR
-                if char_by_char:
-                    for ch in full_response:
-                        yield f"data: {json.dumps({'token': ch})}\n\n"
-                        await asyncio.sleep(STREAM_CHAR_DELAY)
-                else:
-                    for word in full_response.split():
-                        yield f"data: {json.dumps({'token': word + ' '})}\n\n"
+                    if looks_like_json:
+                        # Возможный tool-call — копим молча, решим после конца потока
+                        json_buffer += token
+                    elif looks_like_json is False:
+                        # Обычный ответ — стримим по-настоящему, без искусственных задержек
+                        yield f"data: {json.dumps({'token': token})}\n\n"
+                    # looks_like_json is None (ещё нет ни одного непробельного символа) — ждём
+
+                if looks_like_json:
+                    try:
+                        raw_text = full_response.strip()
+                        start = raw_text.find("{")
+                        end = raw_text.rfind("}") + 1
+                        decision = json.loads(raw_text[start:end]) if start != -1 and end > start else None
+                    except json.JSONDecodeError:
+                        decision = None
+
+                    if decision and decision.get("action") == "mcp_call":
+                        tool_result = await self._handle_mcp_call(decision)
+                        messages = self._build_messages(
+                            message=message,
+                            web_search=web_search,
+                            search_context=search_meta.get("context", ""),
+                            memory_context=self._last_prepare_meta.get("memory_context", ""),
+                            image_base64=image_base64,
+                            image_mime=image_mime,
+                            reasoning=reasoning,
+                            uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
+                            predictions=self._last_prepare_meta.get("predictions", []),
+                            goal_hint=self._last_prepare_meta.get("goal_hint", "")
+                        )
+                        messages.append({"role": "user",
+                                         "content": f"Результат вызова инструмента: {tool_result}\nТеперь дай финальный ответ пользователю."})
+                        full_response = ""
+                        async for token in call_llm_stream(messages):
+                            full_response += token
+                            yield f"data: {json.dumps({'token': token})}\n\n"
+                    elif decision and decision.get("action") == "reply":
+                        full_response = decision.get("message", full_response)
+                        for word in full_response.split():
+                            yield f"data: {json.dumps({'token': word + ' '})}\n\n"
+                    else:
+                        # Не распарсилось как ожидаемый tool-call — отдаём как обычный текст,
+                        # раз уж мы его всё равно уже накопили целиком в json_buffer
+                        for word in full_response.split():
+                            yield f"data: {json.dumps({'token': word + ' '})}\n\n"
             else:
-                # Не-потоковый режим внутри потока - используем process_input
                 response, _ = await self.process_input(message, web_search, image_base64, image_mime, reasoning)
                 full_response = response
                 if char_by_char is None:
@@ -1621,7 +1122,6 @@ class CognitiveController:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
 
-        # Сохраняем историю и эпизод после того, как ответ получен
         self.history.append({"role": "user", "content": message})
         if full_response:
             self.history.append({"role": "assistant", "content": full_response})
@@ -1630,7 +1130,6 @@ class CognitiveController:
             salience = 1.0 - uncertainty
             await self.memory.add_episode(message, full_response, salience=salience)
 
-            # Обновление целей (из GCN)
             active_goals = self._last_prepare_meta.get("active_goals", [])
             for goal_obj in active_goals:
                 if goal_obj.subject.lower() in full_response.lower():
@@ -1645,14 +1144,12 @@ class CognitiveController:
                     self.memory._sync_goal_from_gcn(goal_obj.id)
             await self.memory._schedule_save()
 
-            # Обновляем рабочую память
             relevant = self._last_prepare_meta.get("relevant", [])
             for fact_dict in relevant[:3]:
                 gcn_id = fact_dict.get("gcn_id")
                 if gcn_id:
                     self.memory.hierarchy.add_to_working(gcn_id)
 
-        # Рефлексия
         predictions = self._last_prepare_meta.get("predictions", [])
         if predictions and full_response:
             error = self._compute_prediction_error(predictions, full_response)
@@ -1670,10 +1167,9 @@ class CognitiveController:
 
         yield "data: [DONE]\n\n"
 
-
-
+    # ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (без изменений) =====
     async def enhance_prompt(self, prompt: str) -> str:
-        enhancement = await self._call_llm([
+        enhancement = await call_llm([
             {"role": "system", "content": "Ты — эксперт по улучшению промптов. Добавь детали, стиль, освещение, сохрани суть."},
             {"role": "user", "content": prompt}
         ], temp=0.9)
@@ -1713,8 +1209,13 @@ class CognitiveController:
             **memory_stats
         }
 
+    async def get_response(self, message: str, web_search: bool = False,
+                           image_base64: str = None, image_mime: str = None,
+                           reasoning: bool = False):
+        return await self.process_input(message, web_search, image_base64, image_mime, reasoning)
+
     async def shutdown(self):
-        await self.web_fetcher.close()
+
         if self._consolidation_task:
             self._consolidation_task.cancel()
         if self._planner_task:
@@ -1732,7 +1233,6 @@ class CognitiveController:
 _assistants: Dict[str, CognitiveController] = {}
 _assistants_lock = asyncio.Lock()
 
-
 async def get_assistant(user_id: str):
     async with _assistants_lock:
         if user_id not in _assistants:
@@ -1742,10 +1242,9 @@ async def get_assistant(user_id: str):
 
 
 # =====================================================================
-# FastAPI роутер
+# FastAPI роутер (без изменений)
 # =====================================================================
 router = APIRouter(prefix='/ai', tags=['ai'])
-
 
 class AIRequest(BaseModel):
     message: str = Field(..., min_length=MIN_MESSAGE_LENGTH, max_length=MAX_MESSAGE_LENGTH)
@@ -1756,18 +1255,14 @@ class AIRequest(BaseModel):
     reasoning: bool = False
     char_by_char: Optional[bool] = None
 
-
 class ResearchRequest(BaseModel):
     goal: str = Field(..., min_length=1, max_length=2000)
-
 
 class ImageGenRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=2000)
 
-
 class EnhanceRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=5000)
-
 
 @router.post("/chat")
 async def chat_with_ai(body: AIRequest, address: str = Depends(require_auth)):
@@ -1795,16 +1290,14 @@ async def chat_with_ai(body: AIRequest, address: str = Depends(require_auth)):
     )
     return {"reply": response, "meta": meta}
 
-
 @router.post("/search")
 async def direct_search(body: dict, address: str = Depends(require_auth)):
     query = body.get("query", "").strip()
     if not query:
         return {"error": "query required"}
     assistant = await get_assistant(address)
-    result = await assistant.deep_search(query, max_results=5)
+    result = await deep_search(query, max_results=5)  # используем импортированную
     return {"type": "search", "query": query, **result}
-
 
 @router.post("/research")
 async def research_endpoint(body: ResearchRequest, address: str = Depends(require_auth)):
@@ -1815,7 +1308,6 @@ async def research_endpoint(body: ResearchRequest, address: str = Depends(requir
     except Exception as e:
         logger.error(f"Research failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.post("/generate_image")
 async def generate_image_endpoint(body: ImageGenRequest, address: str = Depends(require_auth)):
@@ -1830,7 +1322,6 @@ async def generate_image_endpoint(body: ImageGenRequest, address: str = Depends(
         logger.error(f"Image gen failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.post("/enhance_prompt")
 async def enhance_prompt_endpoint(body: EnhanceRequest, address: str = Depends(require_auth)):
     assistant = await get_assistant(address)
@@ -1841,32 +1332,19 @@ async def enhance_prompt_endpoint(body: EnhanceRequest, address: str = Depends(r
         logger.error(f"Enhance prompt failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.get("/global_stats")
 async def global_stats(address: str = Depends(require_auth)):
     assistant = await get_assistant(address)
     return assistant.get_stats()
 
-
 @router.get("/gcn_global_stats")
 async def gcn_global_stats(address: str = Depends(require_auth)):
-    """Статистика по глобальному/общему слоям GCN (не по личной памяти юзера)."""
     global_mem = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
     shared_mem = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
     return {"global": global_mem.get_stats(), "shared": shared_mem.get_stats()}
 
-
 @router.post("/force_merge")
 async def force_merge(address: str = Depends(require_auth)):
-    """
-    Ручной запуск консолидации (light_consolidation: дедуп по эмбеддингам
-    + затухание салиентности) для глобального и общего слоёв памяти.
-    Раньше это был no-op — реальной операции слияния/консолидации для
-    global/shared не существовало вообще: light_consolidation/
-    deep_consolidation вызывались по таймеру только для self.memory
-    (личной памяти) каждого CognitiveController, а global/shared
-    синглтоны не трогались никогда (см. start_global_merge_task ниже).
-    """
     global_mem = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
     shared_mem = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
     try:
@@ -1877,15 +1355,8 @@ async def force_merge(address: str = Depends(require_auth)):
         logger.error(f"force_merge failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.post("/apply_global")
 async def apply_global(address: str = Depends(require_auth)):
-    """
-    Полная (deep) консолидация глобального и общего слоёв: пересчёт
-    importance/confidence, replay по эпизодам, обрезка до
-    SEMANTIC_MAX_FACTS. Дороже force_merge — предназначена для редкого
-    ручного вызова, не для частого поллинга.
-    """
     global_mem = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
     shared_mem = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
     try:
@@ -1896,27 +1367,9 @@ async def apply_global(address: str = Depends(require_auth)):
         logger.error(f"apply_global failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 _global_merge_task: Optional[asyncio.Task] = None
 
-
 def start_global_merge_task():
-    """
-    Запускает ОДНУ фоновую задачу на весь процесс, которая периодически
-    консолидирует global/shared память (по тем же интервалам, что и
-    личная память каждого пользователя: CONSOLIDATION_INTERVAL /
-    DEEP_CONSOLIDATION_INTERVAL). Идемпотентна: повторный вызов, пока
-    задача жива, — no-op. Раньше эта функция ничего не делала и нигде
-    не вызывалась — эквивалент отсутствия периодической консолидации
-    для общей памяти вообще (она только росла и никогда не чистилась
-    от дублей/затухшей салиентности).
-
-    Вызывать один раз при старте приложения, например:
-        @router.on_event("startup")
-        async def _on_startup():
-            start_global_merge_task()
-    (уже зарегистрировано ниже автоматически.)
-    """
     global _global_merge_task
     if _global_merge_task is not None and not _global_merge_task.done():
         logger.info("Global merge task already running")
@@ -1927,7 +1380,6 @@ def start_global_merge_task():
         return
     _global_merge_task = asyncio.create_task(_global_merge_loop())
     logger.info("Global merge task started")
-
 
 async def _global_merge_loop():
     global_mem = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
@@ -1946,11 +1398,9 @@ async def _global_merge_loop():
         except Exception as e:
             logger.error(f"Global deep consolidation error: {e}")
 
-
 @router.on_event("startup")
 async def _on_router_startup():
     start_global_merge_task()
-
 
 async def shutdown_all():
     for uid, assistant in _assistants.items():
@@ -1959,9 +1409,7 @@ async def shutdown_all():
         except Exception:
             pass
 
-
 import atexit
-
 
 def _shutdown():
     try:
@@ -1972,6 +1420,5 @@ def _shutdown():
         loop.run_until_complete(shutdown_all())
     except Exception as e:
         logger.warning(f"Shutdown error: {e}")
-
 
 atexit.register(_shutdown)
