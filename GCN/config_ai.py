@@ -19,6 +19,7 @@ LM_STUDIO_STREAM_TIMEOUT = 600
 LM_STUDIO_USE_STREAM = True
 LM_STUDIO_VISION_SUPPORTED = True
 
+
 # -------------------------------
 # Параметры памяти (GCN)
 # -------------------------------
