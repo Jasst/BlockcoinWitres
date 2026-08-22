@@ -284,6 +284,37 @@ class CognitiveMemory:
     def store(self) -> MemoryStore:
         return self.gcn_store
 
+    # ==================== ОБНОВЛЕНИЕ ИЗ ДРУГОГО ПРОЦЕССА ====================
+    def reload_if_stale(self) -> bool:
+        """
+        Перечитывает состояние с диска, если его успел изменить другой
+        процесс (например, MCP-сервер запущен отдельным процессом от
+        основного FastAPI-приложения — см. mcp_server_blockcoin.py — и у
+        каждого процесса своя копия в памяти).
+
+        Полезно вызывать перед операциями чтения (recall и т.п.), чтобы не
+        отдавать заведомо устаревшие данные. Возвращает True, если
+        состояние было перечитано.
+        """
+        gcn_state_path = self.base_dir / GCN_STATE_FILENAME
+        if not gcn_state_path.exists():
+            return False
+        try:
+            disk_mtime = gcn_state_path.stat().st_mtime
+        except OSError:
+            return False
+        if self.gcn_store._loaded_mtime is not None and disk_mtime <= self.gcn_store._loaded_mtime:
+            return False
+        try:
+            self.gcn_store.load(str(gcn_state_path))
+            self._rebuild_caches_from_gcn()
+            self._rebuild_predictive_from_episodes()
+            logger.info(f"[{self.user_id[:16]}] Память перечитана с диска (изменена другим процессом)")
+            return True
+        except Exception as e:
+            logger.warning(f"reload_if_stale failed: {e}")
+            return False
+
     # ==================== ПОСТРОЕНИЕ КЭШЕЙ ИЗ GCN ====================
     def _rebuild_caches_from_gcn(self):
         self.semantic_facts = []
@@ -1188,10 +1219,21 @@ class GCNMemoryRouter:
         """Передаёт функцию вызова LLM для извлечения фактов."""
         self._llm_caller = llm_caller
 
+    def refresh(self, include_private: bool = True):
+        """Подтягивает изменения, сделанные другим процессом (чат-процесс
+        и MCP-процесс держат независимые копии памяти в RAM). Вызывать
+        перед чтением, если процесс живёт долго и в фоне мог писать другой
+        процесс — например, в начале каждого MCP tool call."""
+        if include_private:
+            self.private_memory.reload_if_stale()
+        self.shared_memory.reload_if_stale()
+        self.global_memory.reload_if_stale()
+
     async def retrieve(self, query: str, top_k: int = 7, include_private: bool = True) -> List[Dict]:
         """
         Объединённый поиск по всем доступным слоям с ранжированием.
         """
+        self.refresh(include_private=include_private)
         private_results = []
         shared_results = []
         global_results = []

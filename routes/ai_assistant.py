@@ -484,27 +484,13 @@ class CognitiveController:
             yield f"[Ошибка: {e}]"
 
     async def search_ddg(self, query: str, max_results: int = 5) -> List[Dict]:
+        # Раньше это был дублирующий throttled-путь, который никогда не вызывался
+        # реальным пайплайном (_prepare_messages шёл через deep_search напрямую).
+        # Теперь throttling/retry живут в GCN.web_search.search_ddg — используем его.
         if not self.searcher:
             return []
-        elapsed = _now() - self._last_ddg_call
-        if elapsed < DDG_MIN_INTERVAL:
-            await asyncio.sleep(DDG_MIN_INTERVAL - elapsed)
-        loop = asyncio.get_event_loop()
-        for attempt in range(DDG_MAX_RETRIES):
-            try:
-                results = await loop.run_in_executor(
-                    None,
-                    lambda: list(self.searcher.text(query, max_results=max_results))
-                )
-                self._last_ddg_call = _now()
-                return [{"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")} for r in results]
-            except Exception as e:
-                logger.warning(f"DDG attempt {attempt + 1} failed: {e}")
-                if attempt < DDG_MAX_RETRIES - 1:
-                    await asyncio.sleep((2 ** attempt) + 0.5)
-                else:
-                    logger.error("DDG failed after all retries")
-        return []
+        from GCN.web_search import search_ddg as _search_ddg
+        return await _search_ddg(query, max_results=max_results)
 
     # ===== РЕФЛЕКСИЯ (без изменений) =====
     def _compute_prediction_error(self, predicted: List[str], actual: str) -> float:
@@ -1161,47 +1147,66 @@ class CognitiveController:
         full_response = ""
         try:
             if LM_STUDIO_USE_STREAM:
+                # Решаем, похож ли ответ на JSON tool-call, ТОЛЬКО по первым
+                # непустым символам — если нет, отдаём токены клиенту сразу,
+                # по мере поступления от LLM, а не после полной генерации.
+                looks_like_json: Optional[bool] = None
+                json_buffer = ""
+
                 async for token in self._call_llm_stream(messages):
                     full_response += token
 
-                try:
-                    raw_text = full_response.strip()
-                    start = raw_text.find("{")
-                    end = raw_text.rfind("}") + 1
-                    if start != -1 and end > start:
-                        decision = json.loads(raw_text[start:end])
-                        if decision.get("action") == "mcp_call":
-                            tool_result = await self._handle_mcp_call(decision)
-                            messages = self._build_messages(
-                                message=message,
-                                web_search=web_search,
-                                search_context=search_meta.get("context", ""),
-                                memory_context=self._last_prepare_meta.get("memory_context", ""),
-                                image_base64=image_base64,
-                                image_mime=image_mime,
-                                reasoning=reasoning,
-                                uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
-                                predictions=self._last_prepare_meta.get("predictions", []),
-                                goal_hint=self._last_prepare_meta.get("goal_hint", "")
-                            )
-                            messages.append({"role": "user",
-                                             "content": f"Результат вызова инструмента: {tool_result}\nТеперь дай финальный ответ пользователю."})
-                            final_response = await self._call_llm(messages)
-                            full_response = final_response
-                        elif decision.get("action") == "reply":
-                            full_response = decision.get("message", full_response)
-                except json.JSONDecodeError:
-                    pass
+                    if looks_like_json is None:
+                        stripped = full_response.lstrip()
+                        if stripped:
+                            looks_like_json = stripped.startswith("{")
 
-                if char_by_char is None:
-                    char_by_char = STREAM_CHAR_BY_CHAR
-                if char_by_char:
-                    for ch in full_response:
-                        yield f"data: {json.dumps({'token': ch})}\n\n"
-                        await asyncio.sleep(STREAM_CHAR_DELAY)
-                else:
-                    for word in full_response.split():
-                        yield f"data: {json.dumps({'token': word + ' '})}\n\n"
+                    if looks_like_json:
+                        # Возможный tool-call — копим молча, решим после конца потока
+                        json_buffer += token
+                    elif looks_like_json is False:
+                        # Обычный ответ — стримим по-настоящему, без искусственных задержек
+                        yield f"data: {json.dumps({'token': token})}\n\n"
+                    # looks_like_json is None (ещё нет ни одного непробельного символа) — ждём
+
+                if looks_like_json:
+                    try:
+                        raw_text = full_response.strip()
+                        start = raw_text.find("{")
+                        end = raw_text.rfind("}") + 1
+                        decision = json.loads(raw_text[start:end]) if start != -1 and end > start else None
+                    except json.JSONDecodeError:
+                        decision = None
+
+                    if decision and decision.get("action") == "mcp_call":
+                        tool_result = await self._handle_mcp_call(decision)
+                        messages = self._build_messages(
+                            message=message,
+                            web_search=web_search,
+                            search_context=search_meta.get("context", ""),
+                            memory_context=self._last_prepare_meta.get("memory_context", ""),
+                            image_base64=image_base64,
+                            image_mime=image_mime,
+                            reasoning=reasoning,
+                            uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
+                            predictions=self._last_prepare_meta.get("predictions", []),
+                            goal_hint=self._last_prepare_meta.get("goal_hint", "")
+                        )
+                        messages.append({"role": "user",
+                                         "content": f"Результат вызова инструмента: {tool_result}\nТеперь дай финальный ответ пользователю."})
+                        full_response = ""
+                        async for token in self._call_llm_stream(messages):
+                            full_response += token
+                            yield f"data: {json.dumps({'token': token})}\n\n"
+                    elif decision and decision.get("action") == "reply":
+                        full_response = decision.get("message", full_response)
+                        for word in full_response.split():
+                            yield f"data: {json.dumps({'token': word + ' '})}\n\n"
+                    else:
+                        # Не распарсилось как ожидаемый tool-call — отдаём как обычный текст,
+                        # раз уж мы его всё равно уже накопили целиком в json_buffer
+                        for word in full_response.split():
+                            yield f"data: {json.dumps({'token': word + ' '})}\n\n"
             else:
                 response, _ = await self.process_input(message, web_search, image_base64, image_mime, reasoning)
                 full_response = response

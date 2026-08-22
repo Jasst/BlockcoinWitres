@@ -2,13 +2,43 @@
 """
 MCP Сервер для BlockcoinWitres (GCN Cognitive Memory) – Рефакторинг
 Использует общие утилиты и методы контроллера.
+
+ВАЖНО (исправлено): раньше память для MCP инициализировалась ОДИН РАЗ на
+модульном уровне под захардкоженным DEFAULT_USER = "default_user":
+
+    router = GCNMemoryRouter(DEFAULT_USER, Path(MEMORY_BASE_DIR))
+
+Тогда как обычный чат (routes/ai_assistant.py) создаёт контроллер по
+реальному user_id — адресу кошелька:
+
+    assistant = await get_assistant(address)
+
+Из-за этого приватная память MCP (recall/remember/forget/...) физически
+лежала в другом каталоге (MEMORY_BASE_DIR/default_user/...) и никогда не
+пересекалась с приватной памятью настоящего пользователя чата — это не
+"устаревание", а два независимых набора данных.
+
+Теперь каждый инструмент принимает user_id (адрес кошелька — тот же, что
+использует чат). Если он не передан, используется DEFAULT_USER как явный,
+залогированный fallback для обратной совместимости со старыми клиентами,
+а не тихая подмена данных.
+
+Второе исправление: global/shared-память — это process-level синглтоны
+(GCNMemoryRouter._global_instance / _shared_instance), а MCP-сервер живёт
+в ОТДЕЛЬНОМ процессе (см. mcp_servers.json: command "python", args
+["mcp_server_blockcoin.py"], поднимается через stdio). Поэтому перед
+каждым обращением к памяти теперь вызывается router.refresh() /
+memory.reload_if_stale(), которые дешёво (через mtime файла) проверяют,
+не записал ли что-то другой процесс, и подтягивают изменения — см.
+GCNMemoryRouter.refresh() и CognitiveMemory.reload_if_stale() в
+memory_graph.py, и MemoryStore._merge_disk_state() в GCN.py (та же логика
+защищает и от потери данных при одновременной записи с двух процессов).
 """
 import asyncio
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
-from datetime import datetime
+from typing import Optional, Dict
 
 # Добавляем корень проекта
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -35,21 +65,42 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("blockcoin-mcp")
 
-# Инициализация памяти для одного пользователя
+# Fallback для клиентов, которые ещё не передают user_id явно.
 DEFAULT_USER = "default_user"
-router = GCNMemoryRouter(DEFAULT_USER, Path(MEMORY_BASE_DIR))
-logger.info(f"Память загружена для {DEFAULT_USER}")
+
+# Кеш роутеров по user_id (аналог _assistants в routes/ai_assistant.py) —
+# держим по одному GCNMemoryRouter на пользователя вместо одного глобального.
+_routers: Dict[str, GCNMemoryRouter] = {}
+
+
+def get_router(user_id: Optional[str]) -> GCNMemoryRouter:
+    uid = user_id or DEFAULT_USER
+    if uid == DEFAULT_USER:
+        logger.warning(
+            "MCP-вызов без user_id — используется DEFAULT_USER='default_user', "
+            "это НЕ приватная память реального пользователя чата. "
+            "Передавайте user_id (адрес кошелька) явно."
+        )
+    if uid not in _routers:
+        _routers[uid] = GCNMemoryRouter(uid, Path(MEMORY_BASE_DIR))
+        logger.info(f"Память MCP инициализирована для {uid[:16]}")
+    return _routers[uid]
+
 
 mcp = FastMCP("BlockcoinWitres Memory", description="Когнитивная память с веб-поиском и генерацией")
+
+_USER_ID_DESC = "Идентификатор пользователя (тот же адрес кошелька, что использует чат). Если не передан — используется общий default_user, а не личная память конкретного человека."
 
 # ------------------------------------------------------------
 # ИНСТРУМЕНТЫ (используют общие утилиты)
 # ------------------------------------------------------------
 
 @mcp.tool()
-async def recall(query: str, top_k: int = 5, scope: Optional[str] = None) -> str:
+async def recall(query: str, top_k: int = 5, scope: Optional[str] = None,
+                  user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
     """Поиск в памяти с фильтром по скоупу."""
-    results = await router.retrieve(query, top_k=top_k*2, include_private=True)
+    router = get_router(user_id)
+    results = await router.retrieve(query, top_k=top_k*2, include_private=True)  # retrieve() сам вызывает refresh()
     if scope:
         scope_lower = scope.lower()
         filtered = []
@@ -75,8 +126,11 @@ async def recall(query: str, top_k: int = 5, scope: Optional[str] = None) -> str
     return "\n".join(out)
 
 @mcp.tool()
-async def remember(fact: str, scope: str = "private") -> str:
+async def remember(fact: str, scope: str = "private",
+                    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
     """Сохранить факт в указанный скоуп."""
+    router = get_router(user_id)
+    router.refresh()
     scope_map = {"private": MemoryScope.PRIVATE, "shared": MemoryScope.SHARED, "global": MemoryScope.GLOBAL}
     scope_enum = scope_map.get(scope.lower(), MemoryScope.PRIVATE)
     obj_id = router.add_knowledge(
@@ -85,6 +139,7 @@ async def remember(fact: str, scope: str = "private") -> str:
         obj="true",
         scope=scope_enum,
         confidence=0.7,
+        author=router.user_id,
         source_type="mcp_tool"
     )
     if scope_enum == MemoryScope.GLOBAL:
@@ -96,9 +151,12 @@ async def remember(fact: str, scope: str = "private") -> str:
     return f"✅ Сохранён (ID: {obj_id}, скоуп: {scope})"
 
 @mcp.tool()
-async def forget(query: str) -> str:
+async def forget(query: str,
+                  user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
     """Удалить факты из личной памяти по ключевым словам."""
+    router = get_router(user_id)
     memory = router.private_memory
+    memory.reload_if_stale()
     to_remove = [f.id for f in memory.semantic_facts if query.lower() in f.text.lower()]
     if not to_remove:
         return "Ничего не найдено."
@@ -147,12 +205,13 @@ async def generate_image(
         return f"❌ Ошибка: {str(e)}"
 
 @mcp.tool()
-async def research_topic(topic: str, depth: int = 2) -> str:
+async def research_topic(topic: str, depth: int = 2,
+                          user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
     """
     Глубокое исследование темы с использованием общего контроллера.
-    Получаем ассистента для DEFAULT_USER и вызываем его метод research.
+    Получаем ассистента для user_id (тот же, что использует чат) и вызываем его метод research.
     """
-    assistant = await get_assistant(DEFAULT_USER)
+    assistant = await get_assistant(user_id or DEFAULT_USER)
     result = await assistant.research(topic)  # возвращает Dict с answer, hypotheses, evidence
     out = [f"🔬 Исследование по теме: {topic}\n"]
     out.append("Гипотезы:\n- " + "\n- ".join(result.get("hypotheses", [])))
@@ -163,8 +222,10 @@ async def research_topic(topic: str, depth: int = 2) -> str:
     return "\n".join(out)
 
 @mcp.tool()
-async def get_episodes(limit: int = 5) -> str:
-    memory = router.private_memory
+async def get_episodes(limit: int = 5,
+                        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
+    memory = get_router(user_id).private_memory
+    memory.reload_if_stale()
     episodes = memory.episodic_memory[-limit:] if memory.episodic_memory else []
     if not episodes:
         return "Нет эпизодов."
@@ -175,8 +236,10 @@ async def get_episodes(limit: int = 5) -> str:
     return "\n".join(out)
 
 @mcp.tool()
-async def get_contradictions(limit: int = 5) -> str:
-    memory = router.private_memory
+async def get_contradictions(limit: int = 5,
+                              user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
+    memory = get_router(user_id).private_memory
+    memory.reload_if_stale()
     pairs = memory.get_unverified_contradictions(limit=limit)
     if not pairs:
         return "Нет неразрешённых противоречий."
@@ -187,9 +250,11 @@ async def get_contradictions(limit: int = 5) -> str:
     return "\n".join(out)
 
 @mcp.tool()
-async def resolve_contradiction(fact_id_a: str, fact_id_b: str, verdict: str, reason: str = "") -> str:
+async def resolve_contradiction(fact_id_a: str, fact_id_b: str, verdict: str, reason: str = "",
+                                 user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
     """Ручное разрешение противоречия."""
-    memory = router.private_memory
+    memory = get_router(user_id).private_memory
+    memory.reload_if_stale()
     def find_fact(fid):
         if fid in memory.facts_by_id:
             return memory.facts_by_id[fid]
@@ -233,8 +298,10 @@ async def resolve_contradiction(fact_id_a: str, fact_id_b: str, verdict: str, re
         return f"Неизвестный вердикт: {verdict}"
 
 @mcp.tool()
-async def get_goals() -> str:
-    goals = await router.private_memory.get_active_goals()
+async def get_goals(user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
+    memory = get_router(user_id).private_memory
+    memory.reload_if_stale()
+    goals = await memory.get_active_goals()
     if not goals:
         return "Нет активных целей."
     out = ["🎯 Активные цели:"]
@@ -243,13 +310,18 @@ async def get_goals() -> str:
     return "\n".join(out)
 
 @mcp.tool()
-async def add_goal(description: str, priority: float = 0.5) -> str:
-    gid = await router.private_memory.add_goal(description, priority)
+async def add_goal(description: str, priority: float = 0.5,
+                    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
+    memory = get_router(user_id).private_memory
+    memory.reload_if_stale()
+    gid = await memory.add_goal(description, priority)
     return f"✅ Цель добавлена (ID: {gid})"
 
 @mcp.tool()
-async def semantic_search(query: str, top_k: int = 5) -> str:
-    memory = router.private_memory
+async def semantic_search(query: str, top_k: int = 5,
+                           user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
+    memory = get_router(user_id).private_memory
+    memory.reload_if_stale()
     emb = memory.embed_text(query)
     if emb is None:
         return "Эмбеддинги недоступны."
@@ -262,8 +334,10 @@ async def semantic_search(query: str, top_k: int = 5) -> str:
     return "\n".join(out) if out else "Ничего не найдено."
 
 @mcp.tool()
-async def graph_explore(seed_text: str, depth: int = 2) -> str:
-    memory = router.private_memory
+async def graph_explore(seed_text: str, depth: int = 2,
+                         user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
+    memory = get_router(user_id).private_memory
+    memory.reload_if_stale()
     seed_ids = [f.id for f in memory.semantic_facts if seed_text.lower() in f.text.lower()]
     if not seed_ids:
         return f"Факты с '{seed_text}' не найдены."
@@ -285,8 +359,10 @@ async def graph_explore(seed_text: str, depth: int = 2) -> str:
     return "\n".join(out)
 
 @mcp.tool()
-async def get_memory_stats() -> str:
-    stats = router.private_memory.get_stats()
+async def get_memory_stats(user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
+    memory = get_router(user_id).private_memory
+    memory.reload_if_stale()
+    stats = memory.get_stats()
     return (
         f"📊 Статистика:\n"
         f"  Фактов: {stats.get('semantic_facts', 0)}\n"
@@ -296,11 +372,16 @@ async def get_memory_stats() -> str:
     )
 
 # ------------------------------------------------------------
-# РЕСУРСЫ (остаются без изменений)
+# РЕСУРСЫ
+# Раньше были "memory://facts" и "memory://fact/{fact_id}" — всегда на
+# DEFAULT_USER. Теперь user_id — часть URI, иначе ресурс в принципе не
+# может указать, чья это память.
 # ------------------------------------------------------------
-@mcp.resource("memory://facts")
-async def list_facts() -> str:
-    facts = router.private_memory.semantic_facts
+@mcp.resource("memory://{user_id}/facts")
+async def list_facts(user_id: str) -> str:
+    memory = get_router(user_id).private_memory
+    memory.reload_if_stale()
+    facts = memory.semantic_facts
     if not facts:
         return "Нет фактов."
     out = [f"📚 Всего фактов: {len(facts)}"]
@@ -310,13 +391,15 @@ async def list_facts() -> str:
         out.append(f"  ... и ещё {len(facts)-20}")
     return "\n".join(out)
 
-@mcp.resource("memory://fact/{fact_id}")
-async def get_fact(fact_id: str) -> str:
-    obj = router.private_memory.store.get(fact_id)
+@mcp.resource("memory://{user_id}/fact/{fact_id}")
+async def get_fact(user_id: str, fact_id: str) -> str:
+    memory = get_router(user_id).private_memory
+    memory.reload_if_stale()
+    obj = memory.store.get(fact_id)
     if not obj:
-        for f in router.private_memory.semantic_facts:
+        for f in memory.semantic_facts:
             if str(f.id) == fact_id:
-                obj = router.private_memory.store.get(f.gcn_id)
+                obj = memory.store.get(f.gcn_id)
                 break
     if not obj:
         return f"Факт {fact_id} не найден."

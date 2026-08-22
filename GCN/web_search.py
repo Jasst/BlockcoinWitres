@@ -190,38 +190,64 @@ def content_has_currency_numbers(text: str) -> bool:
     return False
 
 
+# ---------- Модульные синглтоны (были локальными — кеш и коннекшн-пул
+# создавались заново на каждый вызов deep_search и не работали вообще) ----------
+_search_cache = SearchCache()
+_fetcher = WebPageFetcher()
+_ddg_lock = asyncio.Lock()
+_last_ddg_call = 0.0
+
+
 async def search_ddg(query: str, max_results: int = 5) -> List[Dict]:
+    """DDG-поиск с троттлингом и ретраями (раньше это было только в неиспользуемом
+    CognitiveController.search_ddg — реальный путь вызова шёл в обход)."""
     if not DDGS_AVAILABLE:
         return []
+    global _last_ddg_call
     loop = asyncio.get_event_loop()
-    ddgs = DDGS()
-    try:
-        results = await loop.run_in_executor(
-            None,
-            lambda: list(ddgs.text(query, max_results=max_results))
-        )
-        return [{"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")} for r in results]
-    except Exception as e:
-        logger.warning(f"DDG search error: {e}")
+
+    async with _ddg_lock:
+        elapsed = time.time() - _last_ddg_call
+        if elapsed < DDG_MIN_INTERVAL:
+            await asyncio.sleep(DDG_MIN_INTERVAL - elapsed)
+
+        for attempt in range(DDG_MAX_RETRIES):
+            try:
+                ddgs = DDGS()
+                results = await loop.run_in_executor(
+                    None,
+                    lambda: list(ddgs.text(query, max_results=max_results))
+                )
+                _last_ddg_call = time.time()
+                return [{"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")}
+                        for r in results]
+            except Exception as e:
+                logger.warning(f"DDG attempt {attempt + 1}/{DDG_MAX_RETRIES} failed: {e}")
+                if attempt < DDG_MAX_RETRIES - 1:
+                    await asyncio.sleep((2 ** attempt) + 0.5)
+        _last_ddg_call = time.time()
         return []
 
 
 async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict[str, Any]:
-    cache = SearchCache()
-    fetcher = WebPageFetcher()
     cache_key = hash_query(query)
-    cached = await cache.get(cache_key)
-    if cached:
-        if content_has_currency_numbers(cached.get("context", "")):
+
+    # Курсы/цены устаревают быстро — для таких запросов кеш сознательно
+    # обходим, чтобы не отдавать протухшие цифры (раньше это никогда не
+    # срабатывало, т.к. кеш был всегда пуст).
+    skip_cache = content_has_currency_numbers(query)
+
+    if not skip_cache:
+        cached = await _search_cache.get(cache_key)
+        if cached:
             return cached
-        return cached
 
     ddg_results = await search_ddg(query, max_results=max_results + 2)
     if not ddg_results:
         return {"sources": [], "context": "Поиск не дал результатов.", "search_performed": False}
 
     urls = [r["url"] for r in ddg_results if r.get("url")]
-    fetched = await fetcher.fetch_many(urls[:max_results], limit=PARALLEL_FETCH_LIMIT)
+    fetched = await _fetcher.fetch_many(urls[:max_results], limit=PARALLEL_FETCH_LIMIT)
 
     url_to_title = {r["url"]: r["title"] for r in ddg_results}
     sources = []
@@ -243,9 +269,14 @@ async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict
         "search_performed": True,
         "chunks_found": len(context_parts)
     }
-    await cache.set(cache_key, result)
-    await fetcher.close()
+    if not skip_cache:
+        await _search_cache.set(cache_key, result)
     return result
+
+
+async def close_search_resources():
+    """Вызывать при остановке приложения — закрывает переиспользуемую aiohttp-сессию."""
+    await _fetcher.close()
 
 
 __all__ = [
@@ -255,5 +286,6 @@ __all__ = [
     'hash_query',
     'content_has_currency_numbers',
     'search_ddg',
-    'deep_search'
+    'deep_search',
+    'close_search_resources'
 ]
