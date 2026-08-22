@@ -125,14 +125,42 @@ async def recall(query: str, top_k: int = 5, scope: Optional[str] = None,
         out.append(f"{i}. {text} (уверенность: {conf:.2f}, важность: {imp:.2f})")
     return "\n".join(out)
 
+
 @mcp.tool()
-async def remember(fact: str, scope: str = "private",
-                    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
-    """Сохранить факт в указанный скоуп."""
+async def remember(fact: str, scope: Optional[str] = None,
+                   user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)) -> str:
+    """
+    Сохранить факт в указанный скоуп.
+    Параметр scope может быть: "private", "shared", "global".
+    Если пользователь просит запомнить глобально, обязательно передайте scope="global".
+    """
     router = get_router(user_id)
     router.refresh()
-    scope_map = {"private": MemoryScope.PRIVATE, "shared": MemoryScope.SHARED, "global": MemoryScope.GLOBAL}
-    scope_enum = scope_map.get(scope.lower(), MemoryScope.PRIVATE)
+
+    # ---- Автоопределение скоупа, если scope не передан явно или равен "private" ----
+    if scope is None or scope.lower() == "private":
+        # Если в тексте факта есть слова "глобально" или "global" – сохраняем глобально
+        if "глобально" in fact.lower() or "global" in fact.lower():
+            scope_enum = MemoryScope.GLOBAL
+        else:
+            scope_enum = MemoryScope.PRIVATE
+    else:
+        scope_map = {"private": MemoryScope.PRIVATE, "shared": MemoryScope.SHARED, "global": MemoryScope.GLOBAL}
+        scope_enum = scope_map.get(scope.lower(), MemoryScope.PRIVATE)
+
+    # ---- Логирование пути ----
+    if scope_enum == MemoryScope.GLOBAL:
+        target_dir = router.global_memory.base_dir
+        logger.info(f"🌍 ГЛОБАЛЬНОЕ сохранение в {target_dir}")
+    elif scope_enum == MemoryScope.PRIVATE:
+        target_dir = router.private_memory.base_dir
+        logger.info(f"🔒 ПРИВАТНОЕ сохранение в {target_dir}")
+    else:
+        target_dir = router.shared_memory.base_dir
+        logger.info(f"👥 SHARED сохранение в {target_dir}")
+
+    logger.info(f"📝 Факт: {fact[:100]}... (скоуп выбран: {scope_enum.value})")
+
     obj_id = router.add_knowledge(
         subject=fact,
         predicate="is_fact",
@@ -142,13 +170,23 @@ async def remember(fact: str, scope: str = "private",
         author=router.user_id,
         source_type="mcp_tool"
     )
+
+    # Сохраняем на диск
     if scope_enum == MemoryScope.GLOBAL:
         await router.global_memory._save_async()
+        # Проверим, что файл появился
+        gcn_path = router.global_memory.base_dir / "gcn_state.json"
+        if gcn_path.exists():
+            logger.info(f"✅ Глобальный файл обновлён: {gcn_path} (размер {gcn_path.stat().st_size} байт)")
+        else:
+            logger.warning(f"❌ Глобальный файл НЕ СОЗДАН! Проверьте права: {gcn_path}")
     elif scope_enum == MemoryScope.PRIVATE:
         await router.private_memory._save_async()
     elif scope_enum == MemoryScope.SHARED:
         await router.shared_memory._save_async()
-    return f"✅ Сохранён (ID: {obj_id}, скоуп: {scope})"
+
+    return f"✅ Сохранён (ID: {obj_id}, скоуп: {scope_enum.value})"
+
 
 @mcp.tool()
 async def forget(query: str,
