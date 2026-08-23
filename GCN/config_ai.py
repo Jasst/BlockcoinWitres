@@ -120,7 +120,7 @@ EASYDIFFUSION_TIMEOUT = 120
 EASYDIFFUSION_DEFAULT_STEPS = 20
 EASYDIFFUSION_DEFAULT_WIDTH = 512
 EASYDIFFUSION_DEFAULT_HEIGHT = 512
-EASYDIFFUSION_MODEL = "realismByStableYogi_ponyV65"   # <-- добавьте эту строку
+EASYDIFFUSION_MODEL = "realisticVisionV60B1_v51HyperVAE"   # <-- добавьте эту строку
 GENERATED_IMAGES_DIR = Path("E:/BlockcoinWitres/generated_images")
 GENERATED_IMAGES_DIR.mkdir(exist_ok=True)
 
