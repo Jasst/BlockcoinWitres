@@ -1,6 +1,7 @@
 """
 Когнитивный ассистент с интеграцией CognitiveMemory, планированием, автономностью.
 Рефакторинг: вынесены общие утилиты в GCN.llm_client и GCN.web_search.
+Добавлены: классификация намерений, автоматическое извлечение фактов, улучшенные команды.
 """
 import sys
 import uuid
@@ -27,10 +28,8 @@ from GCN.mcp_client_manager import MCPToolManager
 from GCN.GCN import AIAdapter, KnowledgeObject, KnowledgeType, MemoryScope
 from GCN.memory_graph import CognitiveMemory, Fact, Episode, Goal, GCNMemoryRouter
 
-# ===== НОВЫЕ ИМПОРТЫ (вместо удалённого кода) =====
 from GCN.llm_client import call_llm, call_llm_stream
 from GCN.web_search import deep_search
-
 
 from GCN.config_ai import *
 
@@ -66,7 +65,6 @@ SEARCH_TRIGGER_KEYWORDS = [
     'сравнение', 'обзор', 'анализ', 'докажи', 'проверь', 'правда ли',
 ]
 
-
 def needs_search_heuristic(message: str) -> bool:
     msg_lower = message.lower()
     if re.search(r'https?://\S+', msg_lower):
@@ -76,7 +74,6 @@ def needs_search_heuristic(message: str) -> bool:
     if re.search(r'\b(сейчас|сегодня|вчера|завтра|этот год|этот месяц)\b', msg_lower):
         return True
     return False
-
 
 def is_factual_query(message: str) -> bool:
     patterns = [
@@ -88,7 +85,6 @@ def is_factual_query(message: str) -> bool:
         if re.search(pat, message, re.IGNORECASE):
             return True
     return False
-
 
 async def rewrite_query(llm_caller, original: str) -> str:
     if not ENABLE_QUERY_REWRITE:
@@ -107,7 +103,6 @@ async def rewrite_query(llm_caller, original: str) -> str:
     except Exception as e:
         logger.debug(f"Query rewrite failed: {e}")
     return original
-
 
 # =====================================================================
 # 2. Промпты для строгого JSON (без изменений)
@@ -140,11 +135,15 @@ REFLECTION_PROMPT = """Ты — модуль саморефлексии когн
 Пример корректного ответа:
 {{
   "weight_adjustments": {{"semantic": 0.02, "graph": 0.0, "freshness": -0.01, "evidence": 0.0, "confidence": 0.0}},
-  "topics_to_research": ["квантовая физика", "нейросети"]
+  "topics_to_research": ["квантовая физика", "нейросети"],
+  "propose_concepts": ["Разница между обучением с учителем и без учителя часто путается из-за смешения терминов"]
 }}
 
 Каждое значение в weight_adjustments — дельта в диапазоне [-0.05, 0.05] (0, если менять не нужно).
 Если ошибки вызваны нехваткой знаний, укажи соответствующие темы в topics_to_research (максимум 3).
+Если ошибки вызваны не нехваткой фактов, а тем, что связанные факты не складываются в понятное обобщение
+(модель "видит" факты, но не понимает общей идеи) — сформулируй в propose_concepts (максимум 2) короткое
+обобщающее утверждение, которое стоило бы явно сохранить в памяти как концепт.
 
 Темы с ошибками:
 {topics}
@@ -191,6 +190,44 @@ def parse_llm_json(raw: str) -> Optional[Dict]:
             return None
     return None
 
+# ========== НОВЫЙ МОДУЛЬ: классификация намерений ==========
+INTENT_CLASSIFICATION_PROMPT = """Проанализируй сообщение пользователя и определи, относится ли оно к управлению памятью.
+Если да, укажи команду и извлеки сущности.
+
+Возможные команды:
+- "store" — запомнить факт (пользователь хочет, чтобы ты запомнил информацию).
+- "forget" — забыть факт (удалить информацию).
+- "recall" — вспомнить информацию по теме.
+- "none" — обычный вопрос, не связанный с управлением памятью.
+
+Также извлеки "content" — текст, который нужно запомнить/забыть/или тему для поиска.
+
+Ответь ТОЛЬКО валидным JSON:
+{{"intent": "store|forget|recall|none", "content": "извлечённый текст или пустая строка", "confidence": 0.0-1.0}}
+
+Примеры:
+- "Запомни, что мой любимый цвет синий" -> {{"intent": "store", "content": "мой любимый цвет синий", "confidence": 0.95}}
+- "Забудь всё о погоде" -> {{"intent": "forget", "content": "погода", "confidence": 0.9}}
+- "Что ты знаешь о Питоне?" -> {{"intent": "recall", "content": "Питон", "confidence": 0.95}}
+- "Как дела?" -> {{"intent": "none", "content": "", "confidence": 1.0}}
+
+Сообщение: {message}
+"""
+
+async def classify_intent(message: str) -> Dict:
+    """Определяет намерение пользователя с помощью LLM."""
+    if not ENABLE_INTENT_CLASSIFICATION:
+        # fallback на старую логику
+        return {"intent": "none", "content": "", "confidence": 1.0}
+    try:
+        prompt = INTENT_CLASSIFICATION_PROMPT.format(message=message)
+        raw = await call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=150)
+        result = parse_llm_json(raw)
+        if result and "intent" in result:
+            return result
+    except Exception as e:
+        logger.debug(f"Intent classification failed: {e}")
+    return {"intent": "none", "content": "", "confidence": 0.0}
 
 # =====================================================================
 # 3. КОГНИТИВНЫЙ КОНТРОЛЛЕР (изменён)
@@ -225,12 +262,11 @@ class CognitiveController:
         self._searcher = None
         self._last_ddg_call = 0.0
 
-        # УДАЛЕНЫ: self.search_cache, self.web_fetcher, self.chunk_ranker
-
         self._consolidation_task = None
         self._planner_task = None
         self._research_task = None
         self._reflection_task = None
+        self._idle_task = None
         self._start_background_tasks()
 
         self.current_working_memory: List[str] = []
@@ -244,6 +280,10 @@ class CognitiveController:
 
         self.mcp_manager = MCPToolManager()
         self._mcp_task = asyncio.create_task(self.mcp_manager.initialize())
+
+        # Для отслеживания бездействия
+        self._last_activity_time = time.time()
+        self._idle_consolidation_done = False
 
         logger.info(f"CognitiveController (GCN) initialized for {user_id[:16]}")
 
@@ -291,8 +331,9 @@ class CognitiveController:
             self._planner_task = asyncio.create_task(self._periodic_planning())
             self._research_task = asyncio.create_task(self._periodic_research())
             self._reflection_task = asyncio.create_task(self._periodic_reflection())
+            self._idle_task = asyncio.create_task(self._idle_consolidation())
 
-    # ----- Фоновые задачи (без изменений) -----
+    # ----- Фоновые задачи (добавлена консолидация по бездействию) -----
     async def _periodic_consolidation(self):
         while True:
             await asyncio.sleep(CONSOLIDATION_INTERVAL)
@@ -309,6 +350,21 @@ class CognitiveController:
                 await self.memory.deep_consolidation()
             except Exception as e:
                 logger.error(f"Deep consolidation error: {e}")
+
+    async def _idle_consolidation(self):
+        """Запускает лёгкую консолидацию при бездействии."""
+        while True:
+            await asyncio.sleep(60)  # проверяем каждую минуту
+            if time.time() - self._last_activity_time > IDLE_CONSOLIDATION_DELAY:
+                if not self._idle_consolidation_done:
+                    logger.info("Idle consolidation triggered")
+                    try:
+                        await self.memory.light_consolidation()
+                        self._idle_consolidation_done = True
+                    except Exception as e:
+                        logger.error(f"Idle consolidation error: {e}")
+            else:
+                self._idle_consolidation_done = False
 
     async def _periodic_planning(self):
         while True:
@@ -385,11 +441,7 @@ class CognitiveController:
                 self.memory._sync_goal_from_gcn(goal_obj.id)
         await self.memory._schedule_save()
 
-
-
-
-
-    # ===== РЕФЛЕКСИЯ (без изменений) =====
+    # ===== РЕФЛЕКСИЯ =====
     def _compute_prediction_error(self, predicted: List[str], actual: str) -> float:
         if not predicted or not actual:
             return 1.0
@@ -460,6 +512,37 @@ class CognitiveController:
                     logger.info(f"[Reflection] Auto-research for topic: {topic}")
                     asyncio.create_task(self.research(topic.strip()))
 
+        # НОВОЕ: сохраняем предложенные рефлексией концепты как низкоуверенные
+        # CONCEPT-узлы личной памяти пользователя (не глобальной — это гипотеза
+        # саморефлексии по конкретным ошибкам этого пользователя, её ещё
+        # предстоит подтвердить обычной консолидацией/form_concepts).
+        proposed_concepts = result.get("propose_concepts", [])
+        if isinstance(proposed_concepts, list):
+            for concept_text in proposed_concepts[:2]:
+                if not (isinstance(concept_text, str) and 10 < len(concept_text.strip()) < 400):
+                    continue
+                try:
+                    concept_id = f"concept_{uuid.uuid4()}"
+                    concept_obj = KnowledgeObject(
+                        id=concept_id,
+                        type=KnowledgeType.CONCEPT,
+                        subject=concept_text.strip(),
+                        predicate="abstracts",
+                        object={"source": "reflection"},
+                        author=f"reflection:{self.user_id}",
+                        created=datetime.now(timezone.utc),
+                        confidence=0.4,  # низкая — это гипотеза саморефлексии, а не подтверждённое обобщение
+                        scope=MemoryScope.PRIVATE,
+                        source_type="reflection_hypothesis",
+                    )
+                    self.memory.store.create(concept_obj, actor=f"reflection:{self.user_id}")
+                    emb = self.memory.embed_text(concept_text.strip())
+                    if emb is not None:
+                        self.memory.store.set_embedding(concept_id, emb)
+                    logger.info(f"[Reflection] Proposed concept saved: {concept_text[:80]}")
+                except Exception as e:
+                    logger.debug(f"Failed to save proposed concept: {e}")
+
         self.prediction_history.clear()
         self._last_reflection_time = time.time()
 
@@ -478,7 +561,43 @@ class CognitiveController:
         else:
             return f"{original} котировка"
 
-    # ===== ОСНОВНАЯ ЛОГИКА ПОДГОТОВКИ СООБЩЕНИЙ (изменена) =====
+    # ===== НОВЫЙ МЕТОД: автоматическое извлечение фактов из сообщения =====
+    async def _auto_extract_facts(self, message: str) -> List[str]:
+        """Извлекает факты из сообщения пользователя для автоматического запоминания."""
+        if not AUTO_EXTRACT_FACTS:
+            return []
+        # Пропускаем, если сообщение является командой (чтобы не дублировать)
+        if any(message.lower().startswith(cmd) for cmd in MEMORY_CONTROL_COMMANDS.keys()):
+            return []
+        # Используем тот же метод, что и для извлечения из поиска
+        prompt = (
+            "Извлеки из сообщения пользователя объективные факты, которые могут быть полезны для запоминания. "
+            "Факты должны быть краткими утверждениями, содержащими конкретную информацию. "
+            "Игнорируй мнения, команды, вопросы, приветствия. "
+            "Если фактов нет, верни пустой ответ. "
+            "Каждый факт с новой строки, без нумерации.\n\n"
+            f"Сообщение: {message}"
+        )
+        try:
+            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.2, max_tokens=200)
+        except Exception as e:
+            logger.debug(f"Auto-extract LLM call failed: {e}")
+            return []
+        if not raw:
+            return []
+        lines = [line.strip().strip('-•*').strip() for line in raw.split('\n') if line.strip()]
+        facts = []
+        for line in lines:
+            if not (20 < len(line) < 400):
+                continue
+            if line[0].lower() in ('я', 'ты', 'мы', 'давайте', 'попробуйте'):
+                continue
+            if not re.search(r'(является|составляет|равен|находится|имеет|был|стал|\d)', line):
+                continue
+            facts.append(line[:300])
+        return facts[:3]
+
+    # ===== ОСНОВНАЯ ЛОГИКА ПОДГОТОВКИ СООБЩЕНИЙ =====
     async def _prepare_messages(self, message: str, web_search: bool = False,
                                 image_base64: Optional[str] = None,
                                 image_mime: Optional[str] = None,
@@ -496,7 +615,6 @@ class CognitiveController:
             route = await self._route(message)
             search_query = route.get("search_query") or message
             max_res = 7 if route.get("is_factual_time_sensitive") else MAX_PAGES_TO_FETCH
-            # ВЫЗОВ ИМПОРТИРОВАННОЙ deep_search
             search_data = await deep_search(search_query, max_results=max_res)
             if search_data["search_performed"]:
                 search_meta["web_search_used"] = True
@@ -530,12 +648,57 @@ class CognitiveController:
         relevant = await self.router.retrieve(message, top_k=7, include_private=True)
         memory_context = ""
         if relevant:
+            type_labels = {
+                "claim": "факт", "concept": "концепт (обобщение)",
+                "episode": "прошлый диалог", "goal": "цель",
+            }
+            scope_labels = {
+                "private": "личный",
+                "shared": "общий",
+                "global": "глобальный"
+            }
             lines = []
             for fact in relevant:
                 text = fact["text"][:300]
                 conf = fact.get("confidence", 0.5)
-                lines.append(f"- {text} (уверенность: {conf:.2f}, важность: {fact.get('importance', 1.0):.2f})")
+                label = type_labels.get(fact.get("type"), "факт")
+                scope = fact.get("scope", "private")  # если поле отсутствует, считаем private
+                scope_label = scope_labels.get(scope, scope)
+                lines.append(
+                    f"- [{scope_label} {label}] {text} (уверенность: {conf:.2f}, важность: {fact.get('importance', 1.0):.2f})"
+                )
+
+            # УДАЛЁН ВТОРОЙ ЦИКЛ (который перезаписывал lines без scope)
+
+            # НОВОЕ: явно перечисляем непогашенные противоречия
+            contradiction_lines = []
+            seen_pairs = set()
+            for fact in relevant:
+                gcn_id = fact.get("gcn_id")
+                if not gcn_id:
+                    continue
+                for store in (self.router.private_memory.store, self.router.shared_memory.store,
+                              self.router.global_memory.store):
+                    obj = store.get(gcn_id)
+                    if not obj:
+                        continue
+                    for relation, other_id in store._graph.get_neighbors(gcn_id, "CONTRADICTS"):
+                        pair_key = tuple(sorted((gcn_id, other_id)))
+                        if pair_key in seen_pairs:
+                            continue
+                        other_obj = (self.router.private_memory.store.get(other_id) or
+                                     self.router.shared_memory.store.get(other_id) or
+                                     self.router.global_memory.store.get(other_id))
+                        if other_obj:
+                            seen_pairs.add(pair_key)
+                            contradiction_lines.append(
+                                f"- «{obj.subject[:150]}» ПРОТИВОРЕЧИТ «{other_obj.subject[:150]}»")
+                    break
+
             memory_context = "=== КОНТЕКСТ ИЗ ДОЛГОСРОЧНОЙ ПАМЯТИ ===\n" + "\n".join(lines) + "\n\n"
+            if contradiction_lines:
+                memory_context += ("=== НЕРАЗРЕШЁННЫЕ ПРОТИВОРЕЧИЯ В ПАМЯТИ ===\n"
+                                   + "\n".join(contradiction_lines) + "\n\n")
             self.current_working_memory = [f["text"] for f in relevant[:3]]
 
         predictions = await self.memory.predict_next(self.current_working_memory) if self.current_working_memory else []
@@ -582,15 +745,99 @@ class CognitiveController:
         }
         return messages, search_meta
 
-    # ===== ПРОЦЕССИНГ ВХОДА (без изменений) =====
+
+    # ===== ПРОЦЕССИНГ ВХОДА (изменён: добавлена классификация и автоизвлечение) =====
     async def process_input(self, message: str, web_search: bool = False,
                             image_base64: Optional[str] = None,
                             image_mime: Optional[str] = None,
                             reasoning: bool = False) -> Tuple[str, Dict]:
+        # Обновляем время активности
+        self._last_activity_time = time.time()
+
+        # 1. Сначала проверяем команды памяти (старый способ для совместимости)
         cmd_response = await self._handle_memory_command(message)
         if cmd_response:
             return cmd_response[0], cmd_response[1]
 
+        # 2. Новая классификация намерений
+        if ENABLE_INTENT_CLASSIFICATION:
+            intent_data = await classify_intent(message)
+            intent = intent_data.get("intent", "none")
+            content = intent_data.get("content", "")
+            confidence = intent_data.get("confidence", 0.0)
+
+            if intent == "store" and content and confidence > 0.6:
+                # Сохраняем факт в private память
+                fid = self.memory._add_fact(content, 'auto', confidence=0.7, importance=1.2)
+                fact = self.memory.facts_by_id.get(fid)
+                if fact and fact.gcn_id:
+                    self.memory.hierarchy.add_to_working(fact.gcn_id)
+                await self.memory._schedule_save()
+                return f"✅ Запомнил: {content}", {"memory": "auto_stored", "id": fid}
+
+            elif intent == "forget" and content and confidence > 0.6:
+                to_remove = {f.id for f in self.memory.semantic_facts if content.lower() in f.text.lower()}
+                if to_remove:
+                    removed = self.memory._remove_facts(to_remove)
+                    await self.memory._schedule_save()
+                    return f"✅ Удалено {removed} фактов по запросу '{content}'", {"memory": "auto_forgot"}
+                else:
+                    return f"Ничего не найдено для удаления по '{content}'", {"memory": "no_match"}
+
+
+            # ===== НОВЫЙ КОД (С SCOPE) =====
+
+            elif intent == "recall" and content and confidence > 0.6:
+
+                facts = await self.memory.retrieve_hybrid(content, top_k=5, use_graph=True)
+
+                if not facts:
+                    return "Ничего не найдено.", {"memory": "no_recall"}
+
+                scope_labels = {"private": "личный", "shared": "общий", "global": "глобальный"}
+
+                context_lines = []
+
+                for f in facts[:5]:
+                    scope = f.get("scope", "private")
+
+                    scope_label = scope_labels.get(scope, scope)
+
+                    context_lines.append(f"- [{scope_label}] {f['text']}")
+
+                context = "\n".join(context_lines)
+
+                # Используем LLM для связного ответа
+
+                messages = [
+
+                    {"role": "system", "content": "Ты — ассистент. На основе фактов дай связный ответ."},
+
+                    {"role": "user", "content": f"Вопрос: {content}\n\nФакты:\n{context}"}
+
+                ]
+
+                response = await call_llm(messages, temp=0.6, max_tokens=500)
+
+                if not response:
+                    response = "Вот что я знаю:\n" + context
+
+                return response, {"memory": "recalled"}
+            # Если intent == "none" или низкая уверенность, идём дальше
+
+        # 3. Автоматическое извлечение фактов (даже без команды)
+        if AUTO_EXTRACT_FACTS and not any(cmd in message.lower() for cmd in MEMORY_CONTROL_COMMANDS.keys()):
+            extracted = await self._auto_extract_facts(message)
+            if extracted:
+                for fact in extracted:
+                    fid = self.memory._add_fact(fact, 'auto_extracted', confidence=AUTO_EXTRACT_CONFIDENCE, importance=0.8)
+                    fact_obj = self.memory.facts_by_id.get(fid)
+                    if fact_obj and fact_obj.gcn_id:
+                        self.memory.hierarchy.add_to_working(fact_obj.gcn_id)
+                await self.memory._schedule_save()
+                logger.info(f"Auto-extracted {len(extracted)} facts from message")
+
+        # 4. Обычная обработка (поиск, генерация ответа)
         messages, search_meta = await self._prepare_messages(
             message, web_search, image_base64, image_mime, reasoning
         )
@@ -705,7 +952,7 @@ class CognitiveController:
                 facts.append(s[:300])
         return facts[:20]
 
-    # ===== КОМАНДЫ ПАМЯТИ (без изменений) =====
+    # ===== КОМАНДЫ ПАМЯТИ (расширенный список команд) =====
     async def _handle_memory_command(self, message: str) -> Optional[Tuple[str, Dict]]:
         lower_msg = message.lower()
         for cmd, action in MEMORY_CONTROL_COMMANDS.items():
@@ -714,6 +961,7 @@ class CognitiveController:
                 if not rest:
                     continue
                 if action == "store":
+                    # Проверяем на глобальность
                     is_global = any(word in rest.lower() for word in ("глобально", "global"))
                     if is_global:
                         clean_rest = rest
@@ -722,11 +970,10 @@ class CognitiveController:
                         clean_rest = " ".join(clean_rest.split())
                         try:
                             prompt = (
-                                "Если факт структурирован и содержит достаточно информации по теме , запомни как есть ,полный текст если нет Извлеки из запроса пользователя"
-                                "Извлеки из запроса пользователя объективный факт (утверждение, которое может быть проверено или использовано как знание). "
+                                "Если факт структурирован и содержит достаточно информации по теме, запомни как есть, полный текст. Иначе извлеки из запроса пользователя объективный факт (утверждение, которое может быть проверено или использовано как знание). "
                                 "Игнорируй мнения, временные события, эмоции, инструкции и пожелания. "
                                 "Сформулируй факт как краткое предложение в настоящем времени (или прошедшем, если это не теряет актуальности). "
-                                "Ответь только фактом, без пояснений.Или полным текстом если факт структурирован\n\n"
+                                "Ответь только фактом, без пояснений. Или полным текстом, если факт структурирован.\n\n"
                                 f"Запрос: {clean_rest}"
                             )
                             fact_text = await call_llm([{"role": "user", "content": prompt}], temp=0.3, max_tokens=150)
@@ -807,9 +1054,12 @@ class CognitiveController:
                     if not facts:
                         return "Ничего не найдено по вашему запросу.", {"memory": "no_recall"}
 
+                    scope_labels = {"private": "личный", "shared": "общий", "global": "глобальный"}
                     context_lines = []
                     for f in facts[:5]:
-                        context_lines.append(f"- {f['text']}")
+                        scope = f.get("scope", "private")
+                        scope_label = scope_labels.get(scope, scope)
+                        context_lines.append(f"- [{scope_label}] {f['text']}")
                     context = "\n".join(context_lines)
 
                     messages = [
@@ -909,7 +1159,7 @@ class CognitiveController:
             except Exception as e:
                 logger.debug(f"Retract failed for {fact.gcn_id}: {e}")
 
-    # ===== ПОСТРОЕНИЕ СООБЩЕНИЙ (без изменений) =====
+    # ===== ПОСТРОЕНИЕ СООБЩЕНИЙ =====
     def _build_messages(self, message: str, web_search: bool, search_context: str,
                         memory_context: str, image_base64: Optional[str],
                         image_mime: Optional[str], reasoning: bool,
@@ -928,6 +1178,10 @@ class CognitiveController:
             "- Ответ должен быть структурирован: краткое вступление, основная часть, вывод (если нужно).",
             "- Если в контексте есть несколько фактов по теме, объедини их в связное объяснение, не перечисляй просто список.",
             "- Не выдумывай фактов, которых нет в предоставленном контексте. Если информации недостаточно, скажи об этом прямо.",
+            "- В контексте факты помечены типом: [концепт (обобщение)] — это уже консолидированное коллективное знание, "
+            "более общее и надёжное, чем разовый [факт]; [прошлый диалог] — эпизод, а не факт, используй его как контекст беседы.",
+            "- Если в блоке 'НЕРАЗРЕШЁННЫЕ ПРОТИВОРЕЧИЯ В ПАМЯТИ' есть пары — это не ошибка поиска, а зафиксированное "
+            "системой расхождение источников; обязательно назови обе стороны и не выбирай одну молча.",
         ]
 
         if uncertainty > 0.6:
@@ -990,7 +1244,7 @@ class CognitiveController:
 
         return messages
 
-    # ===== ИССЛЕДОВАНИЕ (изменён) =====
+    # ===== ИССЛЕДОВАНИЕ =====
     async def research(self, goal: str) -> Dict[str, Any]:
         prompt = (
             f"Сформулируй 3 чёткие, проверяемые гипотезы по вопросу: {goal}. "
@@ -1006,7 +1260,6 @@ class CognitiveController:
         queries = [goal] + hypotheses[:2]
         for q in queries:
             try:
-                # ВЫЗОВ ИМПОРТИРОВАННОЙ deep_search
                 data = await deep_search(q, max_results=3)
                 for src in data.get("sources", []):
                     all_evidence.append({"source": src.get("url", ""), "title": src.get("title", ""), "query": q})
@@ -1025,10 +1278,12 @@ class CognitiveController:
         answer = await call_llm([{"role": "user", "content": answer_prompt}], temp=0.6)
         return {"answer": answer, "confidence": 0.7, "hypotheses": hypotheses, "evidence": all_evidence}
 
-    # ===== ПОТОКОВЫЙ ОТВЕТ (без изменений) =====
+    # ===== ПОТОКОВЫЙ ОТВЕТ =====
     async def stream_response(self, message: str, web_search: bool = False,
                               image_base64: str = None, image_mime: str = None,
                               reasoning: bool = False, char_by_char: bool = None):
+        self._last_activity_time = time.time()
+
         cmd_response = await self._handle_memory_command(message)
         if cmd_response:
             yield f"data: {json.dumps({'token': cmd_response[0]})}\n\n"
@@ -1045,9 +1300,6 @@ class CognitiveController:
         full_response = ""
         try:
             if LM_STUDIO_USE_STREAM:
-                # Решаем, похож ли ответ на JSON tool-call, ТОЛЬКО по первым
-                # непустым символам — если нет, отдаём токены клиенту сразу,
-                # по мере поступления от LLM, а не после полной генерации.
                 looks_like_json: Optional[bool] = None
                 json_buffer = ""
 
@@ -1060,12 +1312,9 @@ class CognitiveController:
                             looks_like_json = stripped.startswith("{")
 
                     if looks_like_json:
-                        # Возможный tool-call — копим молча, решим после конца потока
                         json_buffer += token
                     elif looks_like_json is False:
-                        # Обычный ответ — стримим по-настоящему, без искусственных задержек
                         yield f"data: {json.dumps({'token': token})}\n\n"
-                    # looks_like_json is None (ещё нет ни одного непробельного символа) — ждём
 
                 if looks_like_json:
                     try:
@@ -1101,8 +1350,6 @@ class CognitiveController:
                         for word in full_response.split():
                             yield f"data: {json.dumps({'token': word + ' '})}\n\n"
                     else:
-                        # Не распарсилось как ожидаемый tool-call — отдаём как обычный текст,
-                        # раз уж мы его всё равно уже накопили целиком в json_buffer
                         for word in full_response.split():
                             yield f"data: {json.dumps({'token': word + ' '})}\n\n"
             else:
@@ -1167,7 +1414,7 @@ class CognitiveController:
 
         yield "data: [DONE]\n\n"
 
-    # ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (без изменений) =====
+    # ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====
     async def enhance_prompt(self, prompt: str) -> str:
         enhancement = await call_llm([
             {"role": "system", "content": "Ты — эксперт по улучшению промптов. Добавь детали, стиль, освещение, сохрани суть."},
@@ -1215,7 +1462,6 @@ class CognitiveController:
         return await self.process_input(message, web_search, image_base64, image_mime, reasoning)
 
     async def shutdown(self):
-
         if self._consolidation_task:
             self._consolidation_task.cancel()
         if self._planner_task:
@@ -1224,8 +1470,9 @@ class CognitiveController:
             self._research_task.cancel()
         if self._reflection_task:
             self._reflection_task.cancel()
+        if self._idle_task:
+            self._idle_task.cancel()
         await self.memory.shutdown()
-
 
 # =====================================================================
 # Фабрика ассистентов
@@ -1239,7 +1486,6 @@ async def get_assistant(user_id: str):
             _assistants[user_id] = CognitiveController(user_id)
             logger.info(f"Создан когнитивный ассистент для {user_id[:16]}")
         return _assistants[user_id]
-
 
 # =====================================================================
 # FastAPI роутер (без изменений)
@@ -1296,7 +1542,7 @@ async def direct_search(body: dict, address: str = Depends(require_auth)):
     if not query:
         return {"error": "query required"}
     assistant = await get_assistant(address)
-    result = await deep_search(query, max_results=5)  # используем импортированную
+    result = await deep_search(query, max_results=5)
     return {"type": "search", "query": query, **result}
 
 @router.post("/research")
@@ -1384,6 +1630,13 @@ def start_global_merge_task():
 async def _global_merge_loop():
     global_mem = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
     shared_mem = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
+    # НОВОЕ: лёгкий системный роутер только для того, чтобы дотянуться до
+    # form_concepts() — сам он не хранит приватных данных пользователя
+    # (user_id="system:consolidation" не привязан ни к одному реальному
+    # аккаунту), а global/shared внутри него — те же синглтоны, что и
+    # global_mem/shared_mem выше (см. GCNMemoryRouter._get_global_memory).
+    concept_router = GCNMemoryRouter("system:consolidation", MEMORY_BASE_DIR)
+    concept_router.set_llm_caller(call_llm)
     while True:
         await asyncio.sleep(CONSOLIDATION_INTERVAL)
         try:
@@ -1397,6 +1650,15 @@ async def _global_merge_loop():
             await shared_mem.deep_consolidation()
         except Exception as e:
             logger.error(f"Global deep consolidation error: {e}")
+        # НОВОЕ: формирование концептов — шаг абстрагирования поверх
+        # консолидированных фактов (см. GCNMemoryRouter.form_concepts).
+        # Именно здесь у системы появляется шанс на эмерджентные обобщения,
+        # а не только на дедуп/decay сырых фактов.
+        try:
+            await concept_router.form_concepts(MemoryScope.GLOBAL)
+            await concept_router.form_concepts(MemoryScope.SHARED)
+        except Exception as e:
+            logger.error(f"Concept formation error: {e}")
 
 @router.on_event("startup")
 async def _on_router_startup():

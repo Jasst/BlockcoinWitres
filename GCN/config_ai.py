@@ -19,7 +19,6 @@ LM_STUDIO_STREAM_TIMEOUT = 600
 LM_STUDIO_USE_STREAM = True
 LM_STUDIO_VISION_SUPPORTED = True
 
-
 # -------------------------------
 # Параметры памяти (GCN)
 # -------------------------------
@@ -46,14 +45,14 @@ DYNAMIC_WEIGHTS_ENABLED = True
 # -------------------------------
 EMBEDDING_DIM = 128                # размерность векторов (для демо)
 USE_EMBEDDINGS = True
-# В config_ai.py добавьте:
 GLOBAL_FACT_CONFIDENCE_THRESHOLD = 0.75
+
 # -------------------------------
 # GCN-специфичные параметры
 # -------------------------------
-GCN_STATE_FILENAME = "gcn_state.json"  # имя файла для сохранения состояния
-GCN_AUTO_VERIFY = True                 # автоматически проверять противоречия при связывании
-GCN_EVIDENCE_THRESHOLD = 0.6           # минимальное доверие для использования как evidence
+GCN_STATE_FILENAME = "gcn_state.json"
+GCN_AUTO_VERIFY = True
+GCN_EVIDENCE_THRESHOLD = 0.6
 
 # -------------------------------
 # Консолидация и сон
@@ -100,12 +99,15 @@ LONG_TERM_PLANNER_INTERVAL = 3600 * 6
 GOAL_MAX_ACTIVE = 5
 
 # -------------------------------
-# Команды управления памятью
+# Команды управления памятью (дополнительные триггеры для гибкости)
 # -------------------------------
 MEMORY_CONTROL_COMMANDS = {
     "запомни": "store",
     "забудь": "forget",
-    "что ты знаешь о": "recall"
+    "что ты знаешь о": "recall",
+    "напомни о": "recall",           # новый синоним
+    "сохрани": "store",              # новый синоним
+    "удали": "forget",               # новый синоним
 }
 
 # -------------------------------
@@ -141,9 +143,9 @@ DUPLICATE_SIMILARITY_THRESHOLD = 0.92
 # -------------------------------
 # Рефлексия (самообучение)
 # -------------------------------
-REFLECTION_INTERVAL = 3600 * 4          # запуск рефлексии каждые 4 часа
-REFLECTION_ERROR_THRESHOLD = 0.6        # ошибка выше этого значения считается значимой
-REFLECTION_HISTORY_SIZE = 100           # сколько последних предсказаний хранить
+REFLECTION_INTERVAL = 3600 * 4
+REFLECTION_ERROR_THRESHOLD = 0.6
+REFLECTION_HISTORY_SIZE = 100
 REFLECTION_LLM_TEMP = 0.5
 REFLECTION_LLM_MAX_TOKENS = 300
 
@@ -198,19 +200,44 @@ FAISS_MIN_TRAIN_VECTORS = 500
 
 # -------------------------------
 # Гибридный поиск (memory_graph.retrieve_hybrid)
-# Отдельная схема весов от HYBRID_WEIGHT_SEMANTIC/GRAPH/... выше (те теперь
-# реально используются в GCN.hybrid_retrieve) — эта используется
-# для BM25/cosine/freshness/graph ранжирования по фактам в CognitiveMemory.
 # -------------------------------
 HYBRID_WEIGHT_BM25 = 0.25
 HYBRID_WEIGHT_COSINE = 0.40
-FACTUAL_WEIGHTS = (0.35, 0.30, 0.15, 0.20)   # (bm25, cosine, freshness, graph) для запросов с числами/единицами
+FACTUAL_WEIGHTS = (0.35, 0.30, 0.15, 0.20)
 GENERAL_WEIGHTS = (HYBRID_WEIGHT_BM25, HYBRID_WEIGHT_COSINE, HYBRID_WEIGHT_FRESHNESS, HYBRID_WEIGHT_GRAPH)
 
 # -------------------------------
 # FAISS адаптивные пороги
 # -------------------------------
-FAISS_SMALL_THRESHOLD = 50      # при числе векторов < 50 – точный поиск
-FAISS_MEDIUM_THRESHOLD = 500    # при числе < 500 – HNSW, иначе IVF
+FAISS_SMALL_THRESHOLD = 50
+FAISS_MEDIUM_THRESHOLD = 500
 FAISS_HNSW_EF_CONSTRUCTION = 80
 FAISS_HNSW_M = 32
+
+# ===== НОВЫЕ ПАРАМЕТРЫ ДЛЯ УЛУЧШЕНИЙ =====
+
+# Классификация намерений (если False, используем старую логику)
+ENABLE_INTENT_CLASSIFICATION = True
+
+# Автоматическое извлечение фактов из сообщений (без команды)
+AUTO_EXTRACT_FACTS = True
+AUTO_EXTRACT_CONFIDENCE = 0.5
+
+# Порог уверенности для автоматического запоминания
+AUTO_EXTRACT_THRESHOLD = 0.6
+
+# Время бездействия для запуска консолидации (секунды)
+IDLE_CONSOLIDATION_DELAY = 900  # 15 минут
+
+# -------------------------------
+# Формирование концептов (абстрагирование, шаг эмерджентности)
+# -------------------------------
+CONCEPT_MIN_CLUSTER_SIZE = 3        # минимум фактов в кластере, чтобы сформировать концепт
+CONCEPT_SIMILARITY_THRESHOLD = 0.6  # порог косинусной близости для объединения в кластер
+CONCEPT_MAX_SCAN = 2000             # лимит сканируемых фактов за один запуск (O(n^2) по эмбеддингам)
+CONCEPT_MAX_PER_RUN = 5             # не больше стольких новых концептов за один цикл консолидации
+
+# -------------------------------
+# Кросс-слойное заземление (PRIVATE/SHARED -> GLOBAL через GROUNDS_IN)
+# -------------------------------
+CROSS_LAYER_GROUNDING_THRESHOLD = 0.75

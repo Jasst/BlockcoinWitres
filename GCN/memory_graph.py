@@ -95,6 +95,11 @@ except ImportError:
     HYBRID_WEIGHT_SEMANTIC = 0.40
     HYBRID_WEIGHT_CONFIDENCE = 0.05
     HYBRID_WEIGHT_EVIDENCE = 0.10
+    CONCEPT_MIN_CLUSTER_SIZE = 3
+    CONCEPT_SIMILARITY_THRESHOLD = 0.6
+    CONCEPT_MAX_SCAN = 2000
+    CONCEPT_MAX_PER_RUN = 5
+    CROSS_LAYER_GROUNDING_THRESHOLD = 0.75
 
 
 # =====================================================================
@@ -549,6 +554,7 @@ class CognitiveMemory:
                     "confidence": obj.confidence,
                     "importance": meta.get("importance", 1.0),
                     "gcn_id": obj.id,
+                    "scope": obj.scope.value,
                 })
         return result
 
@@ -893,46 +899,96 @@ class CognitiveMemory:
         # кандидаты поиска.
         start_node = self.hierarchy.working_memory[-1] if use_graph and self.hierarchy.working_memory else None
 
-        # Выполняем поиск в GCN
+        # Выполняем поиск в GCN (top_k*3 — с запасом: дальше не фильтруем по
+        # типу и подмешиваем activation-буст, поэтому порядок может измениться)
         gcn_results = self.gcn_store.hybrid_retrieve(
             query_vector=query_vector,
             start_node=start_node,
-            top_k=top_k * 2,
+            top_k=top_k * 3,
             weights = self._dynamic_weights
         )
 
-        # Преобразуем в формат, ожидаемый ai_assistant.py
+        # УЛУЧШЕНИЕ (spreading activation → скоринг): раньше spread_activation()
+        # — полноценная многошаговая Hebbian/STDP-активация по графу синапсов —
+        # вообще не вызывалась из retrieve_hybrid. Единственным "графовым"
+        # вкладом был одношаговый обход GCN-графа от start_node; вес
+        # HYBRID_WEIGHT_GRAPH существовал только на бумаге, а вся дорогая
+        # ассоциативная сеть, которую строит _hebbian_update()/_create_synapse(),
+        # была мёртвым кодом с точки зрения того, что реально видит модель.
+        # Теперь прогоняем активацию от текущей рабочей памяти (working_memory
+        # как seed) и используем результат как буст к итоговому скору —
+        # ассоциативно связанные факты реально всплывают выше при поиске.
+        activation_map: Dict[int, float] = {}
+        if use_graph and self.hierarchy.working_memory:
+            seed_local_ids = []
+            for gcn_id in self.hierarchy.working_memory:
+                fact = self._find_fact_by_gcn_id(gcn_id)
+                if fact:
+                    seed_local_ids.append(fact.id)
+            if seed_local_ids:
+                try:
+                    activation_map = await self.spread_activation(seed_local_ids)
+                except Exception as e:
+                    logger.debug(f"spread_activation failed in retrieve_hybrid: {e}")
+
+        # Преобразуем в формат, ожидаемый ai_assistant.py.
+        # УЛУЧШЕНИЕ (все типы знаний, не только CLAIM): раньше сюда попадали
+        # ТОЛЬКО KnowledgeType.CLAIM — эпизоды, процедуры, концепты,
+        # гипотезы/цели и связи физически лежали в MemoryStore и участвовали
+        # в графе, но были полностью невидимы для retrieval. Модель не могла
+        # "вспомнить" эпизод по факту или концепт по ключевому слову. Теперь
+        # конвертируем любой тип, с разметкой meta по типу.
         result = []
         for obj in gcn_results:
-            # Определяем, является ли объект фактом (CLAIM)
+            meta = obj.object if isinstance(obj.object, dict) else {}
+            fid = None
+            activation_boost = 0.0
+
             if obj.type == KnowledgeType.CLAIM:
-                fid = None
-                # Пытаемся извлечь id из obj.id
-                try:
-                    fid = int(obj.id.split("_")[-1])
-                except:
-                    pass
-                # Находим локальный Fact по gcn_id
                 fact = self._find_fact_by_gcn_id(obj.id)
                 if fact:
                     fid = fact.id
-                if fid is None:
-                    continue
-                # Формируем словарь
-                meta = obj.object if isinstance(obj.object, dict) else {}
-                result.append({
-                    "id": fid,
-                    "text": obj.subject,
-                    "type": meta.get("fact_type", "unknown"),
-                    "timestamp": obj.created.timestamp(),
-                    "score": obj.confidence,  # GCN возвращает confidence как score
-                    "confidence": obj.confidence,
-                    "importance": meta.get("importance", 1.0),
-                    "activation": 0.0,  # не вычисляем
-                    "gcn_id": obj.id,
-                })
-            # Можно также включить эпизоды, если нужно
-        # Сортируем по score и ограничиваем top_k
+                    activation_boost = activation_map.get(fact.id, 0.0)
+                text = obj.subject
+                item_type = meta.get("fact_type", "claim")
+                importance = meta.get("importance", 1.0)
+            elif obj.type == KnowledgeType.MEMORY_EVENT:
+                text = f"{obj.subject} → {obj.predicate}" if obj.predicate else obj.subject
+                item_type = "episode"
+                importance = meta.get("importance", 1.0)
+            elif obj.type == KnowledgeType.HYPOTHESIS:
+                text = obj.subject
+                item_type = "goal"
+                importance = meta.get("priority", 0.5)
+            elif obj.type == KnowledgeType.CONCEPT:
+                text = obj.subject
+                item_type = "concept"
+                # обобщения по умолчанию чуть весомее сырых фактов — это сжатый,
+                # уже провалидированный консолидацией слой знаний
+                importance = meta.get("importance", 1.2)
+            else:
+                text = obj.subject
+                item_type = obj.type.value
+                importance = meta.get("importance", 1.0)
+
+            base_score = obj.confidence
+            final_score = (min(1.0, base_score + HYBRID_WEIGHT_GRAPH * activation_boost)
+                           if activation_boost else base_score)
+
+            result.append({
+                "id": fid,
+                "text": text,
+                "type": item_type,
+                "timestamp": obj.created.timestamp(),
+                "score": final_score,      # confidence + activation-буст
+                "confidence": obj.confidence,
+                "importance": importance,
+                "activation": activation_boost,
+                "gcn_id": obj.id,
+                "scope": obj.scope.value,
+            })
+
+        # Сортируем по score (уже учитывает activation) и ограничиваем top_k
         result.sort(key=lambda x: x["score"], reverse=True)
         result = result[:top_k]
 
@@ -1195,8 +1251,17 @@ class GCNMemoryRouter:
         # Общая память – единый экземпляр для всех (можно расширить до групповой)
         self.shared_memory = self._get_shared_memory(base_dir)
 
-        # Инжектор для глобальной памяти (отвечает за дедупликацию, агрегацию, противоречия)
-        self.global_ingestion = KnowledgeIngestion(self.global_memory.store)
+        # Инжекторы дедупликации/агрегации/противоречий.
+        # УЛУЧШЕНИЕ: раньше инжектор был только у глобальной памяти — PRIVATE
+        # и SHARED никогда не дедуплицировались и не усиливались по смыслу
+        # (только точное совпадение текста в GCNMemoryRouter.retrieve и
+        # decay-дубликаты по эмбеддингам в light_consolidation). Теперь у
+        # каждого слоя свой инжектор (KnowledgeIngestion теперь параметризован
+        # по scope — см. GCN.py), и вся логика merge/reinforce/contradiction
+        # доступна везде, не только в глобальной памяти.
+        self.global_ingestion = KnowledgeIngestion(self.global_memory.store, scope=MemoryScope.GLOBAL)
+        self.shared_ingestion = KnowledgeIngestion(self.shared_memory.store, scope=MemoryScope.SHARED)
+        self.private_ingestion = KnowledgeIngestion(self.private_memory.store, scope=MemoryScope.PRIVATE)
 
         # Функция вызова LLM (будет установлена из контроллера)
         self._llm_caller = None
@@ -1252,7 +1317,20 @@ class GCNMemoryRouter:
         for item in global_results:
             item["_score"] = item.get("score", 0.5) * 0.9  # -10%
 
-        combined = private_results + shared_results + global_results
+        # УЛУЧШЕНИЕ (кросс-слойная связность / "глобальный мозг"): раньше три
+        # слоя памяти были полностью изолированы друг от друга — три
+        # независимых retrieve_hybrid, объединённых только конкатенацией и
+        # статичным весом по scope. Личный факт пользователя A никак не мог
+        # "дотянуться" через граф до факта пользователя B, даже если оба
+        # физически обосновывают один и тот же глобальный концепт. Теперь,
+        # если личный/общий факт был явно заземлён на глобальный концепт
+        # через ребро GROUNDS_IN (см. add_knowledge ниже), подтягиваем этот
+        # концепт в выдачу — так запрос в приватной памяти может всплыть
+        # коллективной абстракцией, а не только изолированным личным фактом.
+        grounded_extra = (self._pull_grounded_concepts(private_results, self.private_memory.store)
+                          + self._pull_grounded_concepts(shared_results, self.shared_memory.store))
+
+        combined = private_results + shared_results + global_results + grounded_extra
 
         # Убираем дубликаты по тексту (можно по id, но для надёжности по тексту)
         seen_texts = set()
@@ -1266,6 +1344,41 @@ class GCNMemoryRouter:
         # Сортируем по _score
         unique.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
         return unique[:top_k]
+
+    def _pull_grounded_concepts(self, results: List[Dict], source_store: "MemoryStore") -> List[Dict]:
+        """Для топовых результатов данного слоя подтягивает связанные GLOBAL-концепты
+        через ребро GROUNDS_IN (см. add_knowledge). Часть кросс-слойного заземления
+        памяти — полноценный spreading activation через границы store пока не
+        реализован (это отдельный шаг), но точечное "притягивание" уже связанных
+        концептов работает и является дешёвой первой версией этой идеи."""
+        extra = []
+        seen = set()
+        for item in results[:5]:
+            gid = item.get("gcn_id")
+            if not gid:
+                continue
+            for relation, target_id in source_store._graph.get_neighbors(gid, "GROUNDS_IN"):
+                if target_id in seen:
+                    continue
+                seen.add(target_id)
+                gobj = self.global_memory.store.get(target_id)
+                if gobj is None:
+                    continue
+                score = gobj.confidence * 0.85  # чуть ниже "родного" глобального результата
+                extra.append({
+                    "id": None,
+                    "text": gobj.subject,
+                    "type": "concept",
+                    "timestamp": gobj.created.timestamp(),
+                    "score": score,
+                    "confidence": gobj.confidence,
+                    "importance": 1.2,
+                    "activation": 0.0,
+                    "gcn_id": gobj.id,
+                    "_score": score,
+                    "scope": gobj.scope.value,
+                })
+        return extra
 
     def add_knowledge(self, subject: str, predicate: str, obj: Any,
                       scope: MemoryScope = MemoryScope.PRIVATE,
@@ -1304,28 +1417,47 @@ class GCNMemoryRouter:
                 dest_memory.store.set_embedding(ko.id, emb)
 
         # ---- Логика сохранения с учётом scope ----
-        if scope == MemoryScope.GLOBAL:
-            # Отправляем в глобальный инжектор (дедупликация/усиление)
-            result = self.global_ingestion.submit_candidate(ko, author)
-
-            # ---------------------- FIX ----------------------
-            # Помечаем FAISS-индекс глобальной памяти как "грязный",
-            # чтобы при следующем поиске он перестроился.
-            self.global_memory.store._faiss_dirty = True
-            # Если объектов мало, можно перестроить синхронно:
-            # self.global_memory.store.build_faiss_index(force=True)
-            # -------------------------------------------------
-
-            return result
-
-        elif scope == MemoryScope.PRIVATE:
-            return self.private_memory.store.create(ko, author)
-
-        elif scope == MemoryScope.SHARED:
-            return self.shared_memory.store.create(ko, author)
-
-        else:
+        # УЛУЧШЕНИЕ: раньше через инжектор (дедуп/усиление/противоречия) шла
+        # только GLOBAL-ветка, PRIVATE и SHARED просто делали store.create()
+        # без всякой консолидации по смыслу. Теперь у каждого scope свой
+        # инжектор (см. __init__), так что личная и общая память тоже
+        # дедуплицируются и усиливаются повторными подтверждениями, а не
+        # только глобальная.
+        ingestion_map = {
+            MemoryScope.GLOBAL: (self.global_ingestion, self.global_memory),
+            MemoryScope.SHARED: (self.shared_ingestion, self.shared_memory),
+            MemoryScope.PRIVATE: (self.private_ingestion, self.private_memory),
+        }
+        entry = ingestion_map.get(scope)
+        if entry is None:
             raise ValueError(f"Unknown scope: {scope}")
+        ingestion, dest = entry
+
+        result = ingestion.submit_candidate(ko, author)
+        # Помечаем FAISS-индекс как "грязный", чтобы при следующем поиске перестроился
+        dest.store._faiss_dirty = True
+
+        # УЛУЧШЕНИЕ (кросс-слойное заземление / "глобальный мозг"): личные и
+        # общие факты раньше физически существовали только в своём store и
+        # никогда не соединялись с глобальным графом — три отдельных "мозга"
+        # вместо одной ткани. Теперь при добавлении PRIVATE/SHARED-знания
+        # ищем семантически близкие GLOBAL-концепты/факты и проводим ребро
+        # GROUNDS_IN от нового объекта к ним. Это даёт retrieve() точку
+        # входа для подтягивания коллективной абстракции (см.
+        # _pull_grounded_concepts) и в перспективе — путь для spreading
+        # activation через границы слоёв.
+        if scope in (MemoryScope.PRIVATE, MemoryScope.SHARED):
+            emb = dest.store.get_embedding(result)
+            if emb is not None:
+                try:
+                    global_matches = self.global_memory.store.semantic_search(emb, top_k=3)
+                    for gid, sim in global_matches:
+                        if sim >= CROSS_LAYER_GROUNDING_THRESHOLD:
+                            dest.store._graph.add_relation(result, "GROUNDS_IN", gid, weight=sim)
+                except Exception as e:
+                    logger.debug(f"Cross-layer grounding failed for {result}: {e}")
+
+        return result
 
     async def add_episode(self, user_msg: str, assistant_msg: str, salience: float = 0.0,
                           scope: MemoryScope = MemoryScope.PRIVATE,
@@ -1386,3 +1518,132 @@ class GCNMemoryRouter:
         except Exception as e:
             logger.warning(f"Fact extraction failed: {e}")
             return []
+
+    # ==================== ФОРМИРОВАНИЕ КОНЦЕПТОВ ====================
+    # НОВОЕ: KnowledgeType.CONCEPT существовал в схеме, но нигде не создавался —
+    # у системы не было шага абстрагирования/обобщения. Консолидация (light/deep)
+    # только дедуплицировала и пересчитывала confidence/importance сырых CLAIM.
+    # Именно на этом шаге в такой архитектуре рождается эмерджентность:
+    # периодическая кластеризация связанных фактов в узлы более высокого уровня
+    # (CONCEPT), с обратными рёбрами ABSTRACTS_FROM к источникам. Это даёт:
+    # (1) компактный, осмысленный контекст в промпт вместо кучи мелких фактов,
+    # (2) узлы графа, через которые spreading activation начинает "перепрыгивать"
+    # между темами, а не только между дословно связанными синапсами.
+    async def form_concepts(self, scope: MemoryScope = MemoryScope.GLOBAL,
+                            min_cluster_size: int = CONCEPT_MIN_CLUSTER_SIZE,
+                            similarity_threshold: float = CONCEPT_SIMILARITY_THRESHOLD,
+                            max_scan: int = CONCEPT_MAX_SCAN,
+                            max_concepts_per_run: int = CONCEPT_MAX_PER_RUN) -> List[str]:
+        """Кластеризует семантически близкие CLAIM-объекты указанного слоя и
+        формулирует для каждого достаточно большого кластера обобщающий CONCEPT
+        через LLM. Вызывать из периодической глубокой консолидации (не на
+        каждый запрос — операция O(n^2) по эмбеддингам в пределах max_scan)."""
+        target = {
+            MemoryScope.GLOBAL: self.global_memory,
+            MemoryScope.SHARED: self.shared_memory,
+            MemoryScope.PRIVATE: self.private_memory,
+        }.get(scope)
+        if target is None or self._llm_caller is None:
+            return []
+
+        store = target.store
+        candidates = [obj for obj in store._objects.values()
+                     if obj.type == KnowledgeType.CLAIM and obj.scope == scope][:max_scan]
+        vectors, objs = [], []
+        for obj in candidates:
+            vec = store.get_embedding(obj.id)
+            if vec:
+                vectors.append(vec)
+                objs.append(obj)
+        if len(objs) < min_cluster_size:
+            return []
+
+        vectors_np = np.array(vectors, dtype='float32')
+        norms = np.linalg.norm(vectors_np, axis=1, keepdims=True)
+        vectors_norm = vectors_np / (norms + 1e-8)
+        sim_matrix = vectors_norm @ vectors_norm.T
+
+        # Простая union-find кластеризация по порогу косинусной близости —
+        # без внешних зависимостей (sklearn/hdbscan не гарантированы в окружении)
+        parent = list(range(len(objs)))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        n = len(objs)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if sim_matrix[i, j] >= similarity_threshold:
+                    union(i, j)
+
+        clusters: Dict[int, List[int]] = defaultdict(list)
+        for i in range(n):
+            clusters[find(i)].append(i)
+
+        # Уже абстрагированные факты (есть ABSTRACTS_FROM входящее ребро) не переобобщаем
+        already_abstracted = set()
+        for obj in objs:
+            if store._graph.get_incoming(obj.id, "ABSTRACTS_FROM"):
+                already_abstracted.add(obj.id)
+
+        formed: List[str] = []
+        for idxs in clusters.values():
+            if len(formed) >= max_concepts_per_run:
+                break
+            if len(idxs) < min_cluster_size:
+                continue
+            members = [objs[i] for i in idxs if objs[i].id not in already_abstracted]
+            if len(members) < min_cluster_size:
+                continue
+
+            facts_text = "\n".join(f"- {m.subject}" for m in members[:12])
+            prompt = (
+                "Ниже — набор связанных фактов из памяти AI-ассистента. "
+                "Сформулируй ОДНО краткое обобщающее утверждение (концепт), которое "
+                "связывает их общий смысл. Не перечисляй факты, а обобщи их суть в "
+                "одном предложении на русском языке. Ответь только этим предложением, "
+                "без пояснений и без кавычек.\n\n" + facts_text
+            )
+            try:
+                concept_text = await self._llm_caller([{"role": "user", "content": prompt}],
+                                                       temp=0.3, max_tokens=120)
+                concept_text = (concept_text or "").strip().strip('"').strip()
+            except Exception as e:
+                logger.warning(f"Concept formation LLM call failed: {e}")
+                continue
+            if not (10 < len(concept_text) < 400):
+                continue
+
+            centroid = np.mean([vectors_norm[i] for i in idxs if objs[i].id not in already_abstracted], axis=0)
+            concept_id = f"concept_{uuid.uuid4()}"
+            concept_obj = KnowledgeObject(
+                id=concept_id,
+                type=KnowledgeType.CONCEPT,
+                subject=concept_text,
+                predicate="abstracts",
+                object={"member_count": len(members)},
+                author=f"consolidation:{scope.value}",
+                created=datetime.now(timezone.utc),
+                confidence=0.6,
+                scope=scope,
+                source_type="concept_formation",
+            )
+            store.create(concept_obj, actor="system:consolidation")
+            store.set_embedding(concept_id, centroid.tolist())
+            for m in members:
+                store._graph.add_relation(concept_id, "ABSTRACTS_FROM", m.id, weight=1.0)
+            formed.append(concept_id)
+
+        if formed:
+            store._faiss_dirty = True
+            await target._schedule_save()
+            logger.info(f"[ConceptFormation] scope={scope.value}: сформировано {len(formed)} концептов")
+        return formed
