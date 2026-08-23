@@ -128,13 +128,24 @@ class KnowledgeIngestion:
     - обновление confidence
     - слияние канонических утверждений
     """
-    def __init__(self, store: MemoryStore, similarity_threshold: float = 0.85):
+    def __init__(self, store: MemoryStore, similarity_threshold: float = 0.85,
+                 scope: Optional["MemoryScope"] = None):
         self.store = store
         self.similarity_threshold = similarity_threshold
+        # УЛУЧШЕНИЕ: раньше _find_similar/_keyword_search были жёстко зашиты на
+        # MemoryScope.GLOBAL, поэтому дедуп/усиление/обнаружение противоречий
+        # работали ТОЛЬКО для глобальной памяти — PRIVATE и SHARED росли без
+        # консолидации знаний вообще (только decay/дубликаты по эмбеддингам в
+        # light_consolidation). Теперь одна и та же реализация обслуживает
+        # любой scope: если scope не передан явно, берём scope самого
+        # кандидата (так один и тот же класс переиспользуется для
+        # global_ingestion/shared_ingestion/private_ingestion в
+        # GCNMemoryRouter — см. memory_graph.py).
+        self.scope = scope
 
     def submit_candidate(self, candidate: KnowledgeObject, actor: str) -> str:
         """
-        Предложить знание глобальной памяти.
+        Предложить знание памяти соответствующего scope (глобальной/общей/личной).
         Возвращает ID объекта (нового или существующего).
         """
         with self.store._lock:
@@ -149,7 +160,8 @@ class KnowledgeIngestion:
                 return self.store.create(candidate, actor)
 
     def _find_similar(self, candidate: KnowledgeObject) -> List[KnowledgeObject]:
-        """Ищет похожие объекты в глобальной памяти (только GLOBAL scope)."""
+        """Ищет похожие объекты того же scope, что и кандидат (см. __init__)."""
+        target_scope = self.scope or candidate.scope
         # Получаем эмбеддинг кандидата (если есть)
         emb = self.store.get_embedding(candidate.id)
         if emb:
@@ -157,19 +169,15 @@ class KnowledgeIngestion:
             similar_ids = [oid for oid, _ in results]
         else:
             # fallback по ключевым словам (если нет эмбеддинга)
-            similar_ids = self._keyword_search(candidate.subject)
-        # Фильтруем только глобальные объекты
+            similar_ids = self._keyword_search(candidate.subject, target_scope)
         return [self.store.get(oid) for oid in similar_ids
-                if oid and self.store.get(oid) and self.store.get(oid).scope == MemoryScope.GLOBAL]
+                if oid and self.store.get(oid) and self.store.get(oid).scope == target_scope]
 
-    def _keyword_search(self, text: str) -> List[str]:
+    def _keyword_search(self, text: str, target_scope: "MemoryScope") -> List[str]:
         # Fallback-эвристика на случай, если у кандидата не оказалось
         # эмбеддинга (embed_text() вернул None — эмбеддинги отключены).
-        # Раньше это был единственный реально работающий путь дедупа,
-        # т.к. эмбеддинги для GLOBAL-кандидатов вообще не проставлялись
-        # (см. GCNMemoryRouter.add_knowledge) — теперь это чистый fallback,
-        # но ограничиваем скан, чтобы не пройтись по всем ~20k объектам
-        # глобального стора на каждую вставку факта.
+        # Ограничиваем скан, чтобы не пройтись по всем ~20k объектам
+        # стора на каждую вставку факта.
         results = []
         scanned = 0
         SCAN_LIMIT = 3000
@@ -177,7 +185,7 @@ class KnowledgeIngestion:
             scanned += 1
             if scanned > SCAN_LIMIT:
                 break
-            if obj.scope == MemoryScope.GLOBAL and any(w in obj.subject.lower() for w in text.lower().split()):
+            if obj.scope == target_scope and any(w in obj.subject.lower() for w in text.lower().split()):
                 results.append(obj.id)
                 if len(results) >= 10:
                     break
@@ -214,10 +222,29 @@ class KnowledgeIngestion:
         Усиливает существующее знание свидетельством от нового кандидата.
         Обновляет confidence, evidence и создаёт событие REINFORCE.
         """
-        # Добавляем evidence кандидата (или id кандидата) к существующему
-        new_evidence = existing.evidence + candidate.evidence
-        # Пересчитываем confidence: увеличиваем, но с насыщением
-        new_conf = min(1.0, existing.confidence + 0.05 * (1 - existing.confidence))
+        # Добавляем evidence кандидата к существующему
+        new_evidence = list(existing.evidence)
+        for e in candidate.evidence:
+            if e not in new_evidence:
+                new_evidence.append(e)
+
+        # УЛУЧШЕНИЕ (диверсификация confidence): раньше каждый submit поднимал
+        # confidence на фиксированные +5% с насыщением, НЕЗАВИСИМО от того, кто
+        # его прислал. Один активный автор мог за несколько сообщений продавить
+        # confidence любого своего же утверждения почти до 1.0 — то есть
+        # "коллективная" уверенность на деле измеряла активность одного
+        # человека, а не согласие независимых источников. Теперь трекаем
+        # авторов-подтвердивших как отдельные evidence-записи вида
+        # "author:<id>" и даём полный прирост (+5%) только за НОВОГО автора;
+        # повторный сабмит уже подтвердившего автора почти не двигает
+        # уверенность (+1%) — так confidence реально отражает разнообразие
+        # источников, а не число попыток одного человека.
+        author_tag = f"author:{candidate.author}"
+        is_new_author = author_tag not in new_evidence
+        if is_new_author:
+            new_evidence.append(author_tag)
+        increment = 0.05 if is_new_author else 0.01
+        new_conf = min(1.0, existing.confidence + increment * (1 - existing.confidence))
         # Обновляем объект
         self.store.update(existing.id, {"evidence": new_evidence, "confidence": new_conf}, actor)
         # Создаём событие REINFORCE отдельно (можно добавить в update)
