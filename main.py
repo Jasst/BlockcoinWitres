@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
-
+from GCN.config_ai import GENERATED_IMAGES_DIR
 from config import CONFIG, SECRET_KEY, STATIC_FOLDER, UPLOAD_FOLDER
 from database import init_db, close_db, Blockchain
 from setup import setup_logging, get_rate_limit_stats
@@ -71,10 +71,11 @@ if os.path.isdir(STATIC_FOLDER):
     app.mount('/static', StaticFiles(directory=STATIC_FOLDER), name='static')
 if os.path.isdir(UPLOAD_FOLDER):
     app.mount('/uploads', StaticFiles(directory=UPLOAD_FOLDER), name='uploads')
+
+
+
 # Добавляем раздачу папки generated_images
-generated_images_dir = Path("./generated_images")
-generated_images_dir.mkdir(exist_ok=True)
-app.mount('/generated_images', StaticFiles(directory=str(generated_images_dir)), name='generated_images')
+app.mount('/generated_images', StaticFiles(directory=str(GENERATED_IMAGES_DIR)), name='generated_images')
 
 # ========== sw.js и manifest.json ==========
 @app.get('/sw.js', include_in_schema=False)

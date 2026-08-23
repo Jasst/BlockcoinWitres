@@ -10,6 +10,7 @@ from GCN.config_ai import (
     EASYDIFFUSION_DEFAULT_STEPS,
     EASYDIFFUSION_DEFAULT_WIDTH,
     EASYDIFFUSION_DEFAULT_HEIGHT,
+    EASYDIFFUSION_MODEL,
 )
 from GCN.llm_client import call_llm
 
@@ -64,7 +65,7 @@ async def generate_image(
         "steps": steps if steps is not None else EASYDIFFUSION_DEFAULT_STEPS,
         "width": width if width is not None else EASYDIFFUSION_DEFAULT_WIDTH,
         "height": height if height is not None else EASYDIFFUSION_DEFAULT_HEIGHT,
-        "model": "realisticVisionV60B1_v51HyperVAE",  # или другая модель
+        "model": EASYDIFFUSION_MODEL,  # <-- используем конфиг
     }
     url = f"{EASYDIFFUSION_URL}{EASYDIFFUSION_ENDPOINT}"
     try:

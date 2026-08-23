@@ -27,6 +27,7 @@ from GCN.config_ai import MEMORY_BASE_DIR
 from GCN.web_search import deep_search
 from routes.ai_assistant import get_assistant
 from GCN.image_utils import enhance_prompt, generate_image as gen_image
+from GCN.config_ai import GENERATED_IMAGES_DIR
 
 
 try:
@@ -269,7 +270,7 @@ async def generate_image(
         return {"status": "error", "message": "Не удалось сгенерировать изображение"}
 
     # 3. Сохранение на диск и формирование ссылки
-    output_dir = Path("./generated_images")
+    output_dir = GENERATED_IMAGES_DIR
     output_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = output_dir / f"image_{timestamp}.png"
