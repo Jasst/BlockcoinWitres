@@ -64,6 +64,7 @@ async def generate_image(
         "steps": steps if steps is not None else EASYDIFFUSION_DEFAULT_STEPS,
         "width": width if width is not None else EASYDIFFUSION_DEFAULT_WIDTH,
         "height": height if height is not None else EASYDIFFUSION_DEFAULT_HEIGHT,
+        "model": "realisticVisionV60B1_v51HyperVAE",  # или другая модель
     }
     url = f"{EASYDIFFUSION_URL}{EASYDIFFUSION_ENDPOINT}"
     try:
