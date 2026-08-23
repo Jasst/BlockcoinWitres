@@ -1149,6 +1149,7 @@ function _clearAiHistory() {
         _closeAiChatBtn = document.getElementById('closeAiChatBtn');
         _aiStopBtn = document.getElementById('aiStopBtn');
         _aiNewChatBtn = document.getElementById('aiNewChatBtn');
+        _aiImageGenBtn = document.getElementById('aiImageGenBtn');
         if (!_aiMessagesContainer) return;
         _loadAiHistory(_currentAiSessionId);
         _setupAiUI();
