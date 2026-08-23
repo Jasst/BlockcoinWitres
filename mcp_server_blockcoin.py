@@ -14,7 +14,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Optional, Dict, Any
-
+import random
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mcp.server.fastmcp import FastMCP
@@ -28,11 +28,18 @@ from routes.ai_assistant import get_assistant
 
 try:
     from GCN.config_ai import (
-        EASYDIFFUSION_ENABLED, EASYDIFFUSION_URL, EASYDIFFUSION_TIMEOUT,
+        EASYDIFFUSION_ENABLED, EASYDIFFUSION_URL, EASYDIFFUSION_ENDPOINT,
+        EASYDIFFUSION_TIMEOUT,
         EASYDIFFUSION_DEFAULT_STEPS, EASYDIFFUSION_DEFAULT_WIDTH, EASYDIFFUSION_DEFAULT_HEIGHT
     )
 except ImportError:
     EASYDIFFUSION_ENABLED = False
+    EASYDIFFUSION_URL = "http://localhost:7860"
+    EASYDIFFUSION_ENDPOINT = "/v1/sdapi/v1/txt2img"
+    EASYDIFFUSION_TIMEOUT = 120
+    EASYDIFFUSION_DEFAULT_STEPS = 20
+    EASYDIFFUSION_DEFAULT_WIDTH = 512
+    EASYDIFFUSION_DEFAULT_HEIGHT = 512
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("blockcoin-mcp")
@@ -233,32 +240,42 @@ async def web_search(
 @mcp.tool()
 async def generate_image(
     prompt: str = Field(..., description="Описание изображения"),
-    steps: int = Field(EASYDIFFUSION_DEFAULT_STEPS, description="Количество шагов генерации"),
-    width: int = Field(EASYDIFFUSION_DEFAULT_WIDTH, description="Ширина"),
-    height: int = Field(EASYDIFFUSION_DEFAULT_HEIGHT, description="Высота")
+    steps: int = Field(20, description="Количество шагов"),
+    width: int = Field(512, description="Ширина"),
+    height: int = Field(512, description="Высота"),
+    cfg_scale: float = Field(7.0, description="Масштаб CFG"),
+    sampler: str = Field("dpmpp_2m", description="Сэмплер"),
+    seed: int = Field(-1, description="Зерно (-1 для случайного)")
 ) -> Dict[str, Any]:
-    """
-    Генерирует изображение через EasyDiffusion и возвращает base64-строку.
-    """
     if not EASYDIFFUSION_ENABLED:
-        return {"status": "error", "message": "Генерация отключена в конфиге."}
-    import aiohttp
+        return {"status": "error", "message": "Генерация отключена."}
+    import aiohttp, random
+    payload = {
+        "prompt": prompt,
+        "negative_prompt": "",
+        "sampler_name": sampler,
+        "scheduler_name": "automatic",
+        "num_inference_steps": steps,
+        "seed": seed if seed != -1 else random.randint(0, 2**32-1),
+        "guidance_scale": cfg_scale,
+        "width": width,
+        "height": height
+    }
+    url = f"{EASYDIFFUSION_URL}{EASYDIFFUSION_ENDPOINT}"
     try:
-        payload = {"prompt": prompt, "steps": steps, "width": width, "height": height}
         async with aiohttp.ClientSession() as session:
-            async with session.post(f"{EASYDIFFUSION_URL}/generate", json=payload,
-                                    timeout=aiohttp.ClientTimeout(total=EASYDIFFUSION_TIMEOUT)) as resp:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    image_b64 = data.get("image_base64")
-                    if image_b64:
-                        return {"status": "ok", "image_base64": image_b64}
-                    else:
-                        return {"status": "error", "message": "Пустой ответ от EasyDiffusion"}
+                    images = data.get("images")
+                    if images and len(images) > 0:
+                        return {"status": "ok", "image_base64": images[0]}
+                    return {"status": "error", "message": "Изображение не получено"}
                 else:
                     return {"status": "error", "message": f"HTTP {resp.status}: {await resp.text()}"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
 
 @mcp.tool()
 async def research_topic(
