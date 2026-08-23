@@ -14,25 +14,36 @@ import logging
 import sys
 from pathlib import Path
 from typing import Optional, Dict, Any
-
+import random
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-
+import os
+import base64
+from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
-
+from GCN.llm_client import call_llm
 from GCN.memory_graph import GCNMemoryRouter, MemoryScope
 from GCN.config_ai import MEMORY_BASE_DIR
 from GCN.web_search import deep_search
-from GCN.llm_client import call_llm
 from routes.ai_assistant import get_assistant
+from GCN.image_utils import enhance_prompt, generate_image as gen_image
+from GCN.config_ai import GENERATED_IMAGES_DIR
+
 
 try:
     from GCN.config_ai import (
-        EASYDIFFUSION_ENABLED, EASYDIFFUSION_URL, EASYDIFFUSION_TIMEOUT,
+        EASYDIFFUSION_ENABLED, EASYDIFFUSION_URL, EASYDIFFUSION_ENDPOINT,
+        EASYDIFFUSION_TIMEOUT,
         EASYDIFFUSION_DEFAULT_STEPS, EASYDIFFUSION_DEFAULT_WIDTH, EASYDIFFUSION_DEFAULT_HEIGHT
     )
 except ImportError:
     EASYDIFFUSION_ENABLED = False
+    EASYDIFFUSION_URL = "http://localhost:7860"
+    EASYDIFFUSION_ENDPOINT = "/v1/sdapi/v1/txt2img"
+    EASYDIFFUSION_TIMEOUT = 120
+    EASYDIFFUSION_DEFAULT_STEPS = 20
+    EASYDIFFUSION_DEFAULT_WIDTH = 512
+    EASYDIFFUSION_DEFAULT_HEIGHT = 512
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("blockcoin-mcp")
@@ -75,7 +86,7 @@ mcp = FastMCP("BlockcoinWitres Memory", description="Когнитивная па
 _USER_ID_DESC = "Идентификатор пользователя (тот же адрес кошелька, что использует чат). Если не передан — используется общий default_user, а не личная память конкретного человека."
 
 # ============================================================
-# НОВЫЙ УНИВЕРСАЛЬНЫЙ ИНСТРУМЕНТ
+# УНИВЕРСАЛЬНЫЙ ИНСТРУМЕНТ
 # ============================================================
 @mcp.tool()
 async def execute_command(
@@ -194,9 +205,6 @@ async def forget(
     Удаляет факты, содержащие заданные ключевые слова, из указанного слоя памяти.
     """
     router = get_router(user_id, for_write=True)
-    # УЛУЧШЕНИЕ: раньше forget() умел удалять только из личной памяти, хотя
-    # remember() симметрично умеет писать во все три слоя — отозвать
-    # ошибочно сохранённый общий/глобальный факт через MCP было невозможно.
     scope_map = {
         "private": router.private_memory,
         "shared": router.shared_memory,
@@ -233,32 +241,64 @@ async def web_search(
 @mcp.tool()
 async def generate_image(
     prompt: str = Field(..., description="Описание изображения"),
-    steps: int = Field(EASYDIFFUSION_DEFAULT_STEPS, description="Количество шагов генерации"),
-    width: int = Field(EASYDIFFUSION_DEFAULT_WIDTH, description="Ширина"),
-    height: int = Field(EASYDIFFUSION_DEFAULT_HEIGHT, description="Высота")
+    steps: int = Field(20, description="Количество шагов (не используется, используется стандартное из конфига)"),
+    width: int = Field(512, description="Ширина (не используется, используется стандартная из конфига)"),
+    height: int = Field(512, description="Высота (не используется, используется стандартная из конфига)"),
+    cfg_scale: float = Field(7.0, description="Масштаб CFG (не используется)"),
+    sampler: str = Field("dpmpp_2m", description="Сэмплер (не используется)"),
+    seed: int = Field(-1, description="Зерно (-1 для случайного) (не используется)"),
+    enhance_prompt: bool = Field(True, description="Улучшить промпт через LLM перед генерацией"),
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
 ) -> Dict[str, Any]:
     """
-    Генерирует изображение через EasyDiffusion и возвращает base64-строку.
+    Генерирует изображение. Возвращает ссылку на файл.
     """
     if not EASYDIFFUSION_ENABLED:
-        return {"status": "error", "message": "Генерация отключена в конфиге."}
-    import aiohttp
+        return {"status": "error", "message": "Генерация отключена."}
+
+    assistant = await get_assistant(user_id or DEFAULT_USER)
+
+    # 1. Улучшение промпта (если включено)
+    final_prompt = prompt
+    if enhance_prompt:
+        final_prompt = await assistant.enhance_prompt(prompt)
+        logger.info(f"Original prompt: {prompt}\nEnhanced prompt: {final_prompt}")
+
+    # 2. Генерация изображения (используем общую функцию)
+    image_b64 = await gen_image(final_prompt, steps=steps, width=width, height=height)
+    if not image_b64:
+        return {"status": "error", "message": "Не удалось сгенерировать изображение"}
+
+    # 3. Сохранение на диск и формирование ссылки
+    output_dir = GENERATED_IMAGES_DIR
+    output_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = output_dir / f"image_{timestamp}.png"
     try:
-        payload = {"prompt": prompt, "steps": steps, "width": width, "height": height}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{EASYDIFFUSION_URL}/generate", json=payload,
-                                    timeout=aiohttp.ClientTimeout(total=EASYDIFFUSION_TIMEOUT)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    image_b64 = data.get("image_base64")
-                    if image_b64:
-                        return {"status": "ok", "image_base64": image_b64}
-                    else:
-                        return {"status": "error", "message": "Пустой ответ от EasyDiffusion"}
-                else:
-                    return {"status": "error", "message": f"HTTP {resp.status}: {await resp.text()}"}
+        with open(filename, "wb") as f:
+            f.write(base64.b64decode(image_b64))
+        file_path = str(filename.absolute())
+
+        # Базовый URL вашего FastAPI-сервера (можно задать через переменную окружения)
+        BASE_URL = os.getenv("SERVER_BASE_URL", "http://localhost:8000")
+        image_url = f"{BASE_URL}/generated_images/{filename.name}"
+        message = f"✅ Изображение сгенерировано. Откройте по ссылке: {image_url}"
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Failed to save image: {e}")
+        file_path = None
+        image_url = None
+        message = "⚠️ Изображение сгенерировано, но не удалось сохранить на диск."
+
+    return {
+        "status": "ok",
+        #"image_base64": image_b64,      # можно оставить или убрать
+        "file_path": file_path,
+        "url": image_url,
+        "message": message,
+        "original_prompt": prompt,
+        "enhanced_prompt": final_prompt if enhance_prompt else None
+    }
+
 
 @mcp.tool()
 async def research_topic(

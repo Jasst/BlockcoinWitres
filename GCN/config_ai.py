@@ -114,11 +114,15 @@ MEMORY_CONTROL_COMMANDS = {
 # Генерация изображений
 # -------------------------------
 EASYDIFFUSION_ENABLED = True
-EASYDIFFUSION_URL = "http://localhost:9000"
+EASYDIFFUSION_URL = "http://localhost:7860"
+EASYDIFFUSION_ENDPOINT = "/v1/sdapi/v1/txt2img"
 EASYDIFFUSION_TIMEOUT = 120
 EASYDIFFUSION_DEFAULT_STEPS = 20
 EASYDIFFUSION_DEFAULT_WIDTH = 512
 EASYDIFFUSION_DEFAULT_HEIGHT = 512
+EASYDIFFUSION_MODEL = "realismByStableYogi_ponyV65"   # <-- добавьте эту строку
+GENERATED_IMAGES_DIR = Path("E:/BlockcoinWitres/generated_images")
+GENERATED_IMAGES_DIR.mkdir(exist_ok=True)
 
 # -------------------------------
 # Прочее

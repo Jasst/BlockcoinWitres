@@ -30,6 +30,7 @@ from GCN.memory_graph import CognitiveMemory, Fact, Episode, Goal, GCNMemoryRout
 
 from GCN.llm_client import call_llm, call_llm_stream
 from GCN.web_search import deep_search
+from GCN.image_utils import enhance_prompt, generate_image
 
 from GCN.config_ai import *
 
@@ -1415,35 +1416,11 @@ class CognitiveController:
         yield "data: [DONE]\n\n"
 
     # ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====
-    async def enhance_prompt(self, prompt: str) -> str:
-        enhancement = await call_llm([
-            {"role": "system", "content": "Ты — эксперт по улучшению промптов. Добавь детали, стиль, освещение, сохрани суть."},
-            {"role": "user", "content": prompt}
-        ], temp=0.9)
-        return enhancement.strip() if enhancement else prompt
-
     async def generate_image(self, prompt: str) -> Optional[str]:
-        if not EASYDIFFUSION_ENABLED:
-            return None
-        try:
-            async with aiohttp.ClientSession() as session:
-                payload = {
-                    "prompt": prompt,
-                    "steps": EASYDIFFUSION_DEFAULT_STEPS,
-                    "width": EASYDIFFUSION_DEFAULT_WIDTH,
-                    "height": EASYDIFFUSION_DEFAULT_HEIGHT,
-                }
-                async with session.post(f"{EASYDIFFUSION_URL}/generate", json=payload,
-                                        timeout=aiohttp.ClientTimeout(total=EASYDIFFUSION_TIMEOUT)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("image_base64")
-                    else:
-                        logger.error(f"EasyDiffusion error: {resp.status}")
-                        return None
-        except Exception as e:
-            logger.error(f"Image generation failed: {e}")
-            return None
+        return await generate_image(prompt)
+
+    async def enhance_prompt(self, prompt: str) -> str:
+        return await enhance_prompt(prompt)
 
     def get_stats(self):
         memory_stats = self.memory.get_stats() if hasattr(self, 'memory') else {}
