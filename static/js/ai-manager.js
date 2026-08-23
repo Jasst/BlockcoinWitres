@@ -1058,7 +1058,7 @@ function _clearAiHistory() {
                     });
                     const data = await response.json();
                     if (response.ok && data.image_base64) {
-                        const imageMarkdown = `![generated](${data.image_base64})`;
+                        const imageMarkdown = `![generated](data:image/png;base64,${data.image_base64})`;
                         const finalText = `🎨 *Generated image for:*\n> ${rawPrompt}\n\n${imageMarkdown}`;
                         _displayAiMessage(finalText, false, null, true);
                     } else {
