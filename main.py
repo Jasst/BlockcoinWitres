@@ -3,8 +3,8 @@ main.py — FastAPI-приложение (PostgreSQL + WebSocket)
 """
 import logging
 import os
+from pathlib import Path
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI, HTTPException ,Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -71,7 +71,10 @@ if os.path.isdir(STATIC_FOLDER):
     app.mount('/static', StaticFiles(directory=STATIC_FOLDER), name='static')
 if os.path.isdir(UPLOAD_FOLDER):
     app.mount('/uploads', StaticFiles(directory=UPLOAD_FOLDER), name='uploads')
-
+# Добавляем раздачу папки generated_images
+generated_images_dir = Path("./generated_images")
+generated_images_dir.mkdir(exist_ok=True)
+app.mount('/generated_images', StaticFiles(directory=str(generated_images_dir)), name='generated_images')
 
 # ========== sw.js и manifest.json ==========
 @app.get('/sw.js', include_in_schema=False)

@@ -250,7 +250,7 @@ async def generate_image(
     user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
 ) -> Dict[str, Any]:
     """
-    Генерирует изображение. Использует общую функцию из image_utils.
+    Генерирует изображение. Возвращает ссылку на файл.
     """
     if not EASYDIFFUSION_ENABLED:
         return {"status": "error", "message": "Генерация отключена."}
@@ -268,7 +268,7 @@ async def generate_image(
     if not image_b64:
         return {"status": "error", "message": "Не удалось сгенерировать изображение"}
 
-    # 3. Сохранение на диск (специфика MCP)
+    # 3. Сохранение на диск и формирование ссылки
     output_dir = Path("./generated_images")
     output_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -277,16 +277,22 @@ async def generate_image(
         with open(filename, "wb") as f:
             f.write(base64.b64decode(image_b64))
         file_path = str(filename.absolute())
-        message = f"Изображение сохранено в {filename}"
+
+        # Базовый URL вашего FastAPI-сервера (можно задать через переменную окружения)
+        BASE_URL = os.getenv("SERVER_BASE_URL", "http://localhost:8000")
+        image_url = f"{BASE_URL}/generated_images/{filename.name}"
+        message = f"✅ Изображение сгенерировано. Откройте по ссылке: {image_url}"
     except Exception as e:
         logger.error(f"Failed to save image: {e}")
         file_path = None
-        message = "Изображение сгенерировано, но не сохранено"
+        image_url = None
+        message = "⚠️ Изображение сгенерировано, но не удалось сохранить на диск."
 
     return {
         "status": "ok",
-        "image_base64": image_b64,
+        #"image_base64": image_b64,      # можно оставить или убрать
         "file_path": file_path,
+        "url": image_url,
         "message": message,
         "original_prompt": prompt,
         "enhanced_prompt": final_prompt if enhance_prompt else None
