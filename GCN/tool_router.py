@@ -1,0 +1,311 @@
+"""
+tool_router.py — единая точка принятия решения "нужен ли инструмент, и какой".
+
+Зачем этот файл:
+Раньше браузерный чат (ai_assistant.py) пытался понять, вызывать ли внешний
+MCP-инструмент, угадывая JSON внутри обычного текстового ответа модели
+(поиск первой "{" и последней "}" по всей строке — см. историю правок).
+Это ломалось на любом ответе, где модель просто упоминала фигурные скобки,
+не давало few-shot примеров под конкретно эту задачу и смешивало "решение"
+и "финальный ответ" в одной генерации.
+
+В MCP-режиме (когда пользователь работает через внешнего клиента, например
+Claude Desktop, к mcp_server_blockcoin.py) всё работает надёжно, потому что:
+  1. Вызывающая модель использует НАТИВНЫЙ function calling — она получает
+     строго типизированные JSON Schema инструментов и возвращает tool_calls
+     отдельным полем, а не подмешивает JSON в текст ответа.
+  2. Схемы инструментов явные и самодокументирующиеся (Pydantic Field).
+  3. Нет гигантского конкурирующего системного промпта — инструменты и
+     диалог разделены протоколом.
+
+Этот модуль воспроизводит то же самое для локальной LM Studio-модели:
+  - Пытается использовать нативный tools/tool_calls (многие модели в LM
+    Studio его поддерживают — Qwen2.5-Instruct, Llama-3.1/3.3-Instruct,
+    Hermes-function-calling и т.д.).
+  - Если модель tool_calls не вернула (не умеет / бэкенд их не поддержал),
+    делает fallback: ОТДЕЛЬНЫЙ узкий вызов с few-shot примерами и строгим
+    парсингом (весь ответ обязан быть валидным JSON, а не подстрокой внутри
+    произвольного текста).
+  - Даёт ReAct-цикл (несколько раундов вызова инструментов подряд), а не
+    только один вызов и потом обязательно финальный ответ.
+  - Хранит "внутренние" инструменты (recall/remember/add_goal поверх
+    GCNMemoryRouter) и внешние MCP-инструменты в ОДНОМ реестре — так
+    браузерный чат получает те же возможности, что и mcp_server_blockcoin.py.
+"""
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Awaitable
+
+logger = logging.getLogger(__name__)
+
+MAX_TOOL_ITERATIONS = 3  # сколько раундов вызова инструментов разрешено за один ответ
+
+
+# =====================================================================
+# Реестр инструментов
+# =====================================================================
+@dataclass
+class ToolSpec:
+    """Единое описание инструмента — независимо от того, внутренний он или внешний MCP."""
+    qualified_name: str                       # уникальное имя для LLM, напр. "internal__recall"
+    description: str
+    parameters: Dict[str, Any]                 # JSON Schema (properties/required/...)
+    handler: Callable[[Dict[str, Any]], Awaitable[Any]]  # async def(arguments) -> результат
+    server: str = "internal"
+    original_tool_name: str = ""
+
+    def as_openai_tool(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.qualified_name,
+                "description": self.description[:1000],
+                "parameters": self.parameters or {"type": "object", "properties": {}},
+            },
+        }
+
+
+def _sanitize(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "_-" else "_" for c in name)[:64]
+
+
+class ToolRegistry:
+    def __init__(self):
+        self._tools: Dict[str, ToolSpec] = {}
+
+    def register(self, name: str, description: str, parameters: Dict[str, Any],
+                 handler: Callable[[Dict[str, Any]], Awaitable[Any]], server: str = "internal"):
+        qualified = _sanitize(f"{server}__{name}")
+        self._tools[qualified] = ToolSpec(
+            qualified_name=qualified,
+            description=description,
+            parameters=parameters,
+            handler=handler,
+            server=server,
+            original_tool_name=name,
+        )
+
+    def register_mcp_tools(self, mcp_manager, mcp_call: Callable[[str, str, Dict], Awaitable[str]]):
+        """Подтягивает инструменты из внешних MCP-серверов (mcp_client_manager) в тот же реестр."""
+        if not (hasattr(mcp_manager, "_initialized") and mcp_manager._initialized):
+            return
+        for t in mcp_manager.get_all_tools():
+            server = t.get("server", "unknown")
+            name = t["name"]
+
+            async def _handler(arguments: Dict[str, Any], _server=server, _name=name) -> str:
+                return await mcp_call(_server, _name, arguments)
+
+            self.register(
+                name=name,
+                description=t.get("description", ""),
+                parameters=t.get("inputSchema") or {"type": "object", "properties": {}},
+                handler=_handler,
+                server=server,
+            )
+
+    def is_empty(self) -> bool:
+        return not self._tools
+
+    def get(self, qualified_name: str) -> Optional[ToolSpec]:
+        return self._tools.get(qualified_name)
+
+    def as_openai_tools(self) -> List[Dict[str, Any]]:
+        return [t.as_openai_tool() for t in self._tools.values()]
+
+    def as_text_catalog(self) -> str:
+        """Человекочитаемый список для few-shot fallback промпта."""
+        lines = []
+        for t in self._tools.values():
+            props = (t.parameters or {}).get("properties", {})
+            arg_hint = ", ".join(props.keys()) if props else "без аргументов"
+            lines.append(f'- "{t.qualified_name}": {t.description.strip()[:150]} (аргументы: {arg_hint})')
+        return "\n".join(lines)
+
+
+# =====================================================================
+# УЛУЧШЕННЫЙ FEW-SHOT FALLBACK ПРОМПТ (распознаёт намерения из любого сообщения)
+# =====================================================================
+TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмента когнитивного ассистента.
+У тебя есть набор инструментов для работы с памятью и поиском. Твоя задача — решить, нужно ли вызвать какой-либо инструмент, чтобы ответить на запрос пользователя.
+
+Инструменты:
+{tools_catalog}
+
+Правила:
+- Если пользователь просит запомнить информацию (даже если сказано "запомни", "сохрани", "запомни глобально", "добавь в память") — вызови инструмент `internal__remember`.
+- Если пользователь просит вспомнить что-то (например, "что я говорил о ...", "напомни про ...", "что ты знаешь о ...", "вспомни") — вызови `internal__recall`.
+- Если пользователь упоминает цели (например, "добавь цель", "новая цель") — вызови `internal__add_goal`.
+- Если нужна актуальная информация из интернета — вызови `internal__web_search`.
+- Если запрос обычный, не требующий обращения к памяти или поиску — отвечай напрямую.
+
+Важно: ты можешь вызвать инструмент, даже если запрос не начинается с точной команды. Главное — понять намерение.
+
+Ответь ТОЛЬКО валидным JSON-объектом, без пояснений, без markdown, без ```.
+
+Формат для вызова инструмента:
+{{"action": "call_tool", "tool": "имя_инструмента", "arguments": {{...}}}}
+
+Формат для прямого ответа:
+{{"action": "answer_directly"}}
+
+Примеры:
+- Запрос: "Запомни, что мой любимый цвет синий" -> {{"action": "call_tool", "tool": "internal__remember", "arguments": {{"fact": "мой любимый цвет синий", "scope": "private"}}}}
+- Запрос: "Запомни глобально, что Земля круглая" -> {{"action": "call_tool", "tool": "internal__remember", "arguments": {{"fact": "Земля круглая", "scope": "global"}}}}
+- Запрос: "Напомни, что я говорил про проект" -> {{"action": "call_tool", "tool": "internal__recall", "arguments": {{"query": "проект", "top_k": 5}}}}
+- Запрос: "Вспомни мои цели" -> {{"action": "call_tool", "tool": "internal__recall", "arguments": {{"query": "цели", "top_k": 5}}}}
+- Запрос: "Добавь цель: выучить Python" -> {{"action": "call_tool", "tool": "internal__add_goal", "arguments": {{"description": "выучить Python", "priority": 0.7}}}}
+- Запрос: "Какой сегодня курс доллара?" -> {{"action": "call_tool", "tool": "internal__web_search", "arguments": {{"query": "курс доллара сегодня"}}}}
+- Запрос: "Спасибо, понятно" -> {{"action": "answer_directly"}}
+- Запрос: "Как дела?" -> {{"action": "answer_directly"}}
+
+Последние реплики диалога:
+{history_tail}
+
+Запрос пользователя: {message}
+
+Результаты уже вызванных на этом шаге инструментов (если есть):
+{tool_results_so_far}
+"""
+
+
+def _strict_parse_json_object(raw: str) -> Optional[Dict]:
+    """
+    Строгий парсинг: в отличие от старой логики (search('{')..rfind('}') по всему
+    тексту ответа), здесь мы принимаем JSON, только если ПОСЛЕ снятия markdown-
+    обёртки весь ответ целиком — валидный JSON-объект. Это не даёт случайной
+    фигурной скобке в обычном тексте ответа сломать парсинг.
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+# =====================================================================
+# Основной класс — принимает решение и выполняет ReAct-цикл
+# =====================================================================
+class ToolRouter:
+    def __init__(self, registry: ToolRegistry, llm_raw_caller, llm_text_caller):
+        """
+        registry        — ToolRegistry с зарегистрированными инструментами
+        llm_raw_caller   — async def(messages, temp, max_tokens, tools=None) -> raw message dict
+                            (см. GCN.llm_client.call_llm_raw); должен уметь передавать tools
+                            и возвращать tool_calls, если модель их поддерживает
+        llm_text_caller  — async def(messages, temp, max_tokens) -> str (обычный call_llm)
+        """
+        self.registry = registry
+        self.llm_raw_caller = llm_raw_caller
+        self.llm_text_caller = llm_text_caller
+
+    async def _execute_tool(self, qualified_name: str, arguments: Dict[str, Any]) -> str:
+        spec = self.registry.get(qualified_name)
+        if not spec:
+            return f"Ошибка: инструмент '{qualified_name}' не найден."
+        try:
+            result = await spec.handler(arguments)
+            if not isinstance(result, str):
+                result = json.dumps(result, ensure_ascii=False, default=str)
+            return result
+        except Exception as e:
+            logger.error(f"Tool '{qualified_name}' failed: {e}", exc_info=True)
+            return f"Ошибка вызова инструмента '{qualified_name}': {e}"
+
+    async def _decide_native(self, base_messages: List[Dict], temp: float) -> Optional[List[Dict]]:
+        """Пытается получить решение через нативный tool_calls. Возвращает список
+        {"tool": qualified_name, "arguments": {...}} или None, если модель tool_calls не вернула."""
+        tools = self.registry.as_openai_tools()
+        msg = await self.llm_raw_caller(base_messages, temp=temp, max_tokens=500, tools=tools)
+        tool_calls = msg.get("tool_calls") if msg else None
+        if not tool_calls:
+            return None
+        decisions = []
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            if name:
+                decisions.append({"tool": name, "arguments": args})
+        return decisions or None
+
+    async def _decide_fallback(self, message: str, history_tail: str,
+                                tool_results_so_far: str, temp: float) -> Optional[Dict]:
+        """Узкий отдельный вызов с few-shot примерами — для моделей без function calling."""
+        prompt = TOOL_DECISION_PROMPT.format(
+            tools_catalog=self.registry.as_text_catalog(),
+            history_tail=history_tail or "(пусто)",
+            message=message,
+            tool_results_so_far=tool_results_so_far or "(ещё не было)",
+        )
+        raw = await self.llm_text_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=300)
+        return _strict_parse_json_object(raw)
+
+    async def run(self, message: str, base_messages: List[Dict], history_tail: str = "") -> Dict[str, Any]:
+        """
+        Запускает ReAct-цикл: до MAX_TOOL_ITERATIONS раундов вызова инструментов,
+        затем возвращает собранные результаты — финальный текст ответа генерирует
+        вызывающий код (ai_assistant.py), передав tool_trace в _build_messages.
+
+        Возвращает:
+            {"tool_trace": [{"tool": ..., "arguments": ..., "result": ...}, ...],
+             "used_native": bool}
+        """
+        if self.registry.is_empty():
+            return {"tool_trace": [], "used_native": False}
+
+        tool_trace: List[Dict[str, Any]] = []
+        used_native = False
+
+        for _ in range(MAX_TOOL_ITERATIONS):
+            results_text = "\n".join(
+                f"- {t['tool']}({t['arguments']}) -> {str(t['result'])[:300]}" for t in tool_trace
+            )
+
+            decisions = await self._decide_native(base_messages, temp=0.0)
+            if decisions is not None:
+                used_native = True
+            else:
+                decision = await self._decide_fallback(message, history_tail, results_text, temp=0.0)
+                if not decision or decision.get("action") != "call_tool":
+                    break
+                decisions = [{"tool": decision.get("tool"), "arguments": decision.get("arguments", {})}]
+
+            if not decisions:
+                break
+
+            for d in decisions:
+                result = await self._execute_tool(d["tool"], d.get("arguments", {}))
+                tool_trace.append({"tool": d["tool"], "arguments": d.get("arguments", {}), "result": result})
+
+            # Если решали через fallback-промпт, дальше не зацикливаемся молча —
+            # даём модели решить явно на следующем витке, нужен ли ещё один вызов.
+            if not used_native and len(tool_trace) >= MAX_TOOL_ITERATIONS:
+                break
+
+        return {"tool_trace": tool_trace, "used_native": used_native}
+
+
+def build_tool_trace_context(tool_trace: List[Dict[str, Any]]) -> str:
+    """Форматирует результаты инструментов для вставки в промпт финального ответа."""
+    if not tool_trace:
+        return ""
+    lines = ["=== РЕЗУЛЬТАТЫ ВЫЗОВА ИНСТРУМЕНТОВ ==="]
+    for t in tool_trace:
+        lines.append(f"Инструмент: {t['tool']}\nАргументы: {t['arguments']}\nРезультат: {t['result']}\n")
+    lines.append("=== КОНЕЦ РЕЗУЛЬТАТОВ ===")
+    return "\n".join(lines)
