@@ -549,7 +549,8 @@ function _clearAiHistory() {
 }
 
     // ─── основная отправка ───
-    async function _sendToAi(messageText, imageFile) {
+    // ai-manager.js — функция _sendToAi (полностью, с исправлением)
+async function _sendToAi(messageText, imageFile) {
     // Проверка контейнера
     if (!_aiMessagesContainer) {
         _aiMessagesContainer = document.getElementById('aiMessagesContainer');
@@ -732,7 +733,22 @@ function _clearAiHistory() {
                                 window._aiUpdateTimer = null;
                             }, 50);
                         }
-                    } else if (data.error) {
+                    }
+                    // ======= НОВАЯ ОБРАБОТКА image_url =======
+                    else if (data.image_url) {
+    console.log('📸 image_url received:', data.image_url);  // <-- ДОБАВЛЕНО
+    const imageMarkdown = `![generated](${data.image_url})`;
+    const messageTextWithImage = `🎨 *Сгенерировано изображение:*\n\n${imageMarkdown}`;
+    _displayAiMessage(messageTextWithImage, false, null, true);
+    _saveAiMessage('assistant', messageTextWithImage, _currentAiSessionId);
+    if (!firstTokenReceived) {
+        _showAiTypingIndicator(false);
+        firstTokenReceived = true;
+    }
+    continue;
+}
+                    // ==============================================
+                    else if (data.error) {
                         markdownBody.textContent = '❌ ' + data.error;
                         firstTokenReceived = true;
                         streamFinished = true;

@@ -1,6 +1,7 @@
 """
 Централизованная конфигурация для всей AI-системы (когнитивная архитектура + GCN)
 """
+import os
 from pathlib import Path
 
 # -------------------------------
@@ -120,9 +121,25 @@ EASYDIFFUSION_TIMEOUT = 120
 EASYDIFFUSION_DEFAULT_STEPS = 20
 EASYDIFFUSION_DEFAULT_WIDTH = 512
 EASYDIFFUSION_DEFAULT_HEIGHT = 512
-EASYDIFFUSION_MODEL = "realisticVisionV60B1_v51HyperVAE"   # <-- добавьте эту строку
-GENERATED_IMAGES_DIR = Path("E:/BlockcoinWitres/generated_images")
-GENERATED_IMAGES_DIR.mkdir(exist_ok=True)
+EASYDIFFUSION_MODEL = "unstableIllusionPRO_pro"   # <-- добавьте эту строку
+# Раньше был жёстко зашит Windows-путь "E:/BlockcoinWitres/generated_images" —
+# на любой другой машине (в т.ч. на Linux self-hosted сервере) mkdir() на
+# этом пути падал бы сразу. По умолчанию кладём рядом с MEMORY_BASE_DIR,
+# путь можно переопределить через переменную окружения GENERATED_IMAGES_DIR.
+GENERATED_IMAGES_DIR = Path(
+    os.environ.get("GENERATED_IMAGES_DIR", str(MEMORY_BASE_DIR.parent / "generated_images"))
+)
+GENERATED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+# -------------------------------
+# Тайм-ауты и надёжность вызова инструментов (internal + MCP)
+# -------------------------------
+# Раньше вызов инструмента (особенно внешнего MCP-сервера) ничем не был
+# ограничен по времени — если сервер/локальная LLM внутри него подвиснет,
+# весь ответ чата зависал без вариантов восстановления.
+TOOL_CALL_TIMEOUT_SECONDS = 45
+# Периодичность повторных попыток подключиться к упавшим при старте MCP-серверам.
+MCP_RECONNECT_INTERVAL = 120
 
 # -------------------------------
 # Прочее
@@ -245,3 +262,17 @@ CONCEPT_MAX_PER_RUN = 5             # не больше стольких нов�
 # Кросс-слойное заземление (PRIVATE/SHARED -> GLOBAL через GROUNDS_IN)
 # -------------------------------
 CROSS_LAYER_GROUNDING_THRESHOLD = 0.75
+
+# -------------------------------
+# Автоинжекция памяти в промпт браузерного чата (ai_assistant.py)
+# -------------------------------
+# router.retrieve() всегда возвращает top_k результатов (ближайшие соседи по
+# эмбеддингам почти всегда находятся, даже для нерелевантных сообщений вроде
+# "нарисуй кота"). Без порога эти слаборелевантные факты безусловно попадали
+# в блок "КОНТЕКСТ ИЗ ДОЛГОСРОЧНОЙ ПАМЯТИ", который системный промпт называет
+# самым надёжным источником — отсюда "путаница" в чате, которой нет в MCP
+# (там recall — явный инструмент, вызывается по решению внешнего клиента, а
+# не подмешивается в каждое сообщение). Ниже этого порога факт всё ещё
+# участвует в predict_next/uncertainty/working memory, но не попадает в текст
+# промпта. Подберите под свою модель эмбеддингов, если понадобится.
+MEMORY_CONTEXT_MIN_SCORE = 0.15

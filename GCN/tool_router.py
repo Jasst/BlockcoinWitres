@@ -37,6 +37,12 @@ import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Awaitable
+import asyncio
+
+try:
+    from GCN.config_ai import TOOL_CALL_TIMEOUT_SECONDS
+except ImportError:
+    TOOL_CALL_TIMEOUT_SECONDS = 45
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +145,7 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - Если пользователь просит вспомнить что-то (например, "что я говорил о ...", "напомни про ...", "что ты знаешь о ...", "вспомни") — вызови `internal__recall`.
 - Если пользователь упоминает цели (например, "добавь цель", "новая цель") — вызови `internal__add_goal`.
 - Если нужна актуальная информация из интернета — вызови `internal__web_search`.
+- **Если пользователь просит сгенерировать изображение (например, "нарисуй", "сгенерируй изображение", "создай картинку", "покажи картинку", "визуализируй" и т.п.) — ОБЯЗАТЕЛЬНО вызови инструмент `internal__generate_image`. НЕ ОТВЕЧАЙ ТЕКСТОМ, пока не получишь результат от этого инструмента.**
 - Если запрос обычный, не требующий обращения к памяти или поиску — отвечай напрямую.
 
 Важно: ты можешь вызвать инструмент, даже если запрос не начинается с точной команды. Главное — понять намерение.
@@ -158,6 +165,9 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - Запрос: "Вспомни мои цели" -> {{"action": "call_tool", "tool": "internal__recall", "arguments": {{"query": "цели", "top_k": 5}}}}
 - Запрос: "Добавь цель: выучить Python" -> {{"action": "call_tool", "tool": "internal__add_goal", "arguments": {{"description": "выучить Python", "priority": 0.7}}}}
 - Запрос: "Какой сегодня курс доллара?" -> {{"action": "call_tool", "tool": "internal__web_search", "arguments": {{"query": "курс доллара сегодня"}}}}
+- Запрос: "Нарисуй красивую девушку" -> {{"action": "call_tool", "tool": "internal__generate_image", "arguments": {{"prompt": "красивая девушка", "enhance_prompt": true}}}}
+- Запрос: "Сгенерируй изображение заката" -> {{"action": "call_tool", "tool": "internal__generate_image", "arguments": {{"prompt": "закат", "enhance_prompt": true}}}}
+- Запрос: "Покажи картинку кота" -> {{"action": "call_tool", "tool": "internal__generate_image", "arguments": {{"prompt": "кот", "enhance_prompt": true}}}}
 - Запрос: "Спасибо, понятно" -> {{"action": "answer_directly"}}
 - Запрос: "Как дела?" -> {{"action": "answer_directly"}}
 
@@ -215,10 +225,19 @@ class ToolRouter:
         if not spec:
             return f"Ошибка: инструмент '{qualified_name}' не найден."
         try:
-            result = await spec.handler(arguments)
+            # Раньше вызов ничем не был ограничен по времени — зависший
+            # обработчик (особенно внешний MCP-инструмент) вешал весь ответ
+            # без возможности выйти. MCPToolManager.call_tool уже ставит свой
+            # таймаут для MCP-вызовов; это ещё один рубеж для внутренних
+            # обработчиков (например, если web_search/LLM-вызов внутри
+            # подвиснет по неучтённой причине).
+            result = await asyncio.wait_for(spec.handler(arguments), timeout=TOOL_CALL_TIMEOUT_SECONDS)
             if not isinstance(result, str):
                 result = json.dumps(result, ensure_ascii=False, default=str)
             return result
+        except asyncio.TimeoutError:
+            logger.error(f"Tool '{qualified_name}' timed out after {TOOL_CALL_TIMEOUT_SECONDS}s")
+            return f"Ошибка: инструмент '{qualified_name}' не ответил за {TOOL_CALL_TIMEOUT_SECONDS}с."
         except Exception as e:
             logger.error(f"Tool '{qualified_name}' failed: {e}", exc_info=True)
             return f"Ошибка вызова инструмента '{qualified_name}': {e}"
@@ -270,6 +289,11 @@ class ToolRouter:
 
         tool_trace: List[Dict[str, Any]] = []
         used_native = False
+        # Раньше при 3 итерациях цикла модель (особенно послабее локальная)
+        # могла трижды подряд решить вызвать один и тот же инструмент с теми
+        # же аргументами — впустую тратя раунды вместо того, чтобы перейти
+        # к финальному ответу с уже полученным результатом.
+        seen_calls: set = set()
 
         for _ in range(MAX_TOOL_ITERATIONS):
             results_text = "\n".join(
@@ -288,9 +312,21 @@ class ToolRouter:
             if not decisions:
                 break
 
+            new_calls_this_round = 0
             for d in decisions:
+                sig = (d.get("tool"), json.dumps(d.get("arguments", {}), sort_keys=True, ensure_ascii=False))
+                if sig in seen_calls:
+                    logger.info(f"ToolRouter: пропускаю повторный вызов {sig} — результат уже есть в tool_trace.")
+                    continue
+                seen_calls.add(sig)
+                new_calls_this_round += 1
                 result = await self._execute_tool(d["tool"], d.get("arguments", {}))
                 tool_trace.append({"tool": d["tool"], "arguments": d.get("arguments", {}), "result": result})
+
+            # Если модель просит только то, что уже вызывалось — новой
+            # информации не будет, дальше крутить цикл бессмысленно.
+            if new_calls_this_round == 0:
+                break
 
             # Если решали через fallback-промпт, дальше не зацикливаемся молча —
             # даём модели решить явно на следующем витке, нужен ли ещё один вызов.

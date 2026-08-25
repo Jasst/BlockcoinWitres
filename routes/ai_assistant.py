@@ -29,7 +29,7 @@ from GCN.GCN import AIAdapter, KnowledgeObject, KnowledgeType, MemoryScope
 from GCN.memory_graph import CognitiveMemory, Fact, Episode, Goal, GCNMemoryRouter
 
 from GCN.llm_client import call_llm, call_llm_raw, call_llm_stream
-from GCN.web_search import deep_search
+from GCN.web_search import deep_search, fetch_url
 from GCN.image_utils import enhance_prompt, generate_image
 from GCN.tool_router import ToolRegistry, ToolRouter, build_tool_trace_context
 
@@ -59,12 +59,20 @@ def _now() -> float:
 # 1. Умный триггер поиска (оставлен)
 # =====================================================================
 SEARCH_TRIGGER_KEYWORDS = [
+    # Раньше список включал 'рецепт', 'инструкция', 'пошагово', 'сравнение',
+    # 'обзор', 'анализ', 'докажи', 'проверь', 'правда ли', 'как делается' —
+    # это форсировало веб-поиск ДО того, как LLM-роутер (_route/ROUTER_PROMPT)
+    # успевал решить сам. При этом сам ROUTER_PROMPT в качестве примера явно
+    # учит модель НЕ искать по запросу "Как приготовить борщ?" — то есть
+    # эвристика и роутер прямо противоречили друг другу, и эвристика всегда
+    # побеждала первой, вызывая лишние поисковые запросы на обычные
+    # инструкции/рецепты/сравнения, не требующие свежих данных из интернета.
+    # Оставлены только маркеры, для которых нужны действительно свежие/точные
+    # данные (даты, курсы, новости, актуальные события).
     'сегодня', 'сейчас', 'новости', 'курс', 'погода', 'свежие',
-    'последние', 'завтра', 'найди', 'поищи', 'информацию', 'актуальные',
+    'последние', 'завтра', 'найди', 'поищи', 'актуальные',
     '2024', '2025', '2026', 'сколько стоит', 'какой сейчас', 'последние данные',
-    'факт', 'статистика', 'результаты', 'кто победил', 'когда выйдет',
-    'где находится', 'как делается', 'пошагово', 'инструкция', 'рецепт',
-    'сравнение', 'обзор', 'анализ', 'докажи', 'проверь', 'правда ли',
+    'статистика', 'результаты', 'кто победил', 'когда выйдет',
 ]
 
 def needs_search_heuristic(message: str) -> bool:
@@ -355,6 +363,226 @@ class CognitiveController:
             data = await deep_search(query, max_results=5)
             return {"context": data.get("context", ""), "sources": data.get("sources", [])}
 
+        async def _fetch_url(args: Dict) -> Dict:
+            url = args.get("url", "")
+            if not url:
+                return {"status": "error", "message": "url обязателен"}
+            return await fetch_url(url)
+
+        async def _forget(args: Dict) -> Dict:
+            query = args.get("query", "")
+            scope_str = (args.get("scope") or "private").lower()
+            scope_map = {"private": self.router.private_memory, "shared": self.router.shared_memory,
+                         "global": self.router.global_memory}
+            memory = scope_map.get(scope_str)
+            if memory is None or not query:
+                return {"status": "error", "message": "нужен query и корректный scope"}
+            memory.reload_if_stale()
+            to_remove = [f.id for f in memory.semantic_facts if query.lower() in f.text.lower()]
+            if not to_remove:
+                return {"status": "ok", "removed": 0, "scope": scope_str, "message": "Ничего не найдено."}
+            removed = memory._remove_facts(set(to_remove))
+            await memory._schedule_save()
+            return {"status": "ok", "removed": removed, "scope": scope_str}
+
+        async def _semantic_search(args: Dict) -> Dict:
+            query = args.get("query", "")
+            top_k = int(args.get("top_k", 5))
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            emb = memory.embed_text(query)
+            if emb is None:
+                return {"error": "Эмбеддинги недоступны."}
+            results = memory.store.semantic_search(emb, top_k=top_k * 2)
+            return {"results": [
+                {"text": memory.store.get(gcn_id).subject if memory.store.get(gcn_id) else "", "score": score}
+                for gcn_id, score in results[:top_k]
+            ]}
+
+        async def _get_episodes(args: Dict) -> Dict:
+            limit = int(args.get("limit", 5))
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            episodes = memory.episodic_memory[-limit:] if memory.episodic_memory else []
+            return {"episodes": [
+                {"user": ep.user_msg, "assistant": ep.assistant_msg, "timestamp": ep.timestamp}
+                for ep in reversed(episodes)
+            ], "count": len(episodes)}
+
+        async def _get_contradictions(args: Dict) -> Dict:
+            limit = int(args.get("limit", 5))
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            pairs = memory.get_unverified_contradictions(limit=limit)
+            return {"contradictions": [
+                {"a": {"text": a.text, "confidence": a.confidence, "id": a.id},
+                 "b": {"text": b.text, "confidence": b.confidence, "id": b.id}}
+                for a, b in pairs
+            ], "count": len(pairs)}
+
+        async def _get_goals(args: Dict) -> Dict:
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            goals = await memory.get_active_goals()
+            return {"goals": [
+                {"description": g.description, "priority": g.priority,
+                 "confidence": g.confidence, "status": g.status}
+                for g in goals
+            ], "count": len(goals)}
+
+        async def _graph_explore(args: Dict) -> Dict:
+            seed_text = args.get("seed_text", "")
+            depth = int(args.get("depth", 2))
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            seed_ids = [f.id for f in memory.semantic_facts if seed_text.lower() in f.text.lower()]
+            if not seed_ids:
+                return {"error": f"Факты с '{seed_text}' не найдены."}
+            activation = await memory.spread_activation(seed_ids[:3], max_depth=min(depth, 3))
+            sorted_items = sorted(activation.items(), key=lambda x: x[1], reverse=True)
+            return {"nodes": [
+                {"id": fid, "text": memory.facts_by_id.get(fid).text[:200] if memory.facts_by_id.get(fid) else "",
+                 "activation": act}
+                for fid, act in sorted_items[:20] if fid not in seed_ids
+            ]}
+
+        async def _explain_fact(args: Dict) -> Dict:
+            gcn_id = args.get("gcn_id", "")
+            self.router.refresh()
+            obj = (self.router.private_memory.store.get(gcn_id) or
+                   self.router.shared_memory.store.get(gcn_id) or
+                   self.router.global_memory.store.get(gcn_id))
+            if not obj:
+                return {"error": f"Объект {gcn_id} не найден ни в одном слое памяти."}
+            store = (self.router.private_memory.store if self.router.private_memory.store.get(gcn_id) else
+                     self.router.shared_memory.store if self.router.shared_memory.store.get(gcn_id) else
+                     self.router.global_memory.store)
+            contradictions = store._graph.get_neighbors(gcn_id, "CONTRADICTS")
+            grounds_in = store._graph.get_neighbors(gcn_id, "GROUNDS_IN")
+            abstracts_from = store._graph.get_neighbors(gcn_id, "ABSTRACTS_FROM")
+            confirming_authors = [e.split("author:", 1)[1] for e in obj.evidence if e.startswith("author:")]
+            return {
+                "id": obj.id, "type": obj.type.value, "scope": obj.scope.value, "text": obj.subject,
+                "confidence": obj.confidence, "version": obj.version, "author": obj.author,
+                "source_type": obj.source_type, "created": obj.created.isoformat(),
+                "confirming_authors": confirming_authors,
+                "contradicts": [t for _, t in contradictions],
+                "grounds_in_global": [t for _, t in grounds_in],
+                "abstracted_from": [t for _, t in abstracts_from],
+            }
+
+        async def _get_memory_stats(args: Dict) -> Dict:
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            return memory.get_stats()
+
+        async def _resolve_contradiction(args: Dict) -> Dict:
+            fact_id_a = args.get("fact_id_a")
+            fact_id_b = args.get("fact_id_b")
+            verdict = (args.get("verdict") or "").lower()
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+
+            def find_fact(fid):
+                if fid in memory.facts_by_id:
+                    return memory.facts_by_id[fid]
+                for f in memory.semantic_facts:
+                    if f.gcn_id == fid:
+                        return f
+                return None
+
+            fa, fb = find_fact(fact_id_a), find_fact(fact_id_b)
+            if not fa or not fb:
+                return {"status": "error", "message": f"Факты не найдены: A={fact_id_a}, B={fact_id_b}"}
+            if verdict == "a":
+                memory.gcn_store._graph.remove_relation(fa.gcn_id, "CONTRADICTS", fb.gcn_id)
+                memory.gcn_store._graph.remove_relation(fb.gcn_id, "CONTRADICTS", fa.gcn_id)
+                fa.contradicts.discard(fb.id)
+                fb.contradicts.discard(fa.id)
+                memory._remove_facts({fb.id})
+                await memory._schedule_save()
+                return {"status": "ok", "verdict": "a", "kept": fa.text, "removed": fb.text}
+            elif verdict == "b":
+                memory.gcn_store._graph.remove_relation(fa.gcn_id, "CONTRADICTS", fb.gcn_id)
+                memory.gcn_store._graph.remove_relation(fb.gcn_id, "CONTRADICTS", fa.gcn_id)
+                fa.contradicts.discard(fb.id)
+                fb.contradicts.discard(fa.id)
+                memory._remove_facts({fa.id})
+                await memory._schedule_save()
+                return {"status": "ok", "verdict": "b", "kept": fb.text, "removed": fa.text}
+            elif verdict == "both":
+                memory.gcn_store._graph.remove_relation(fa.gcn_id, "CONTRADICTS", fb.gcn_id)
+                memory.gcn_store._graph.remove_relation(fb.gcn_id, "CONTRADICTS", fa.gcn_id)
+                fa.contradicts.discard(fb.id)
+                fb.contradicts.discard(fa.id)
+                await memory._schedule_save()
+                return {"status": "ok", "verdict": "both", "message": "Противоречие снято, оба сохранены."}
+            elif verdict == "neither":
+                memory._remove_facts({fa.id, fb.id})
+                await memory._schedule_save()
+                return {"status": "ok", "verdict": "neither", "message": "Оба удалены."}
+            return {"status": "error", "message": f"Неизвестный вердикт: {verdict}"}
+
+        async def _generate_image_tool(args: Dict) -> Dict:
+            prompt = args.get("prompt", "")
+            if not prompt:
+                return {"status": "error", "message": "prompt обязателен"}
+            enhance = args.get("enhance_prompt", True)
+            final_prompt = await self.enhance_prompt(prompt) if enhance else prompt
+
+            image_b64 = await self.generate_image(
+                final_prompt,
+                steps=args.get("steps"), width=args.get("width"), height=args.get("height"),
+                cfg_scale=args.get("cfg_scale"), seed=args.get("seed"), sampler_name=args.get("sampler_name"),
+            )
+            if not image_b64:
+                return {"status": "error", "message": "Не удалось сгенерировать изображение"}
+
+            # --- СОХРАНЕНИЕ НА ДИСК ---
+            from GCN.config_ai import GENERATED_IMAGES_DIR
+            import base64, os
+            from datetime import datetime
+
+            output_dir = GENERATED_IMAGES_DIR
+            output_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = output_dir / f"image_{timestamp}.png"
+            with open(filename, "wb") as f:
+                f.write(base64.b64decode(image_b64))
+            file_path = str(filename.absolute())
+
+            # ✅ Используем переменную окружения или относительный путь
+            BASE_URL = os.getenv("SERVER_BASE_URL", "")
+            if not BASE_URL:
+                # fallback – если не задано, используем относительный путь
+                image_url = f"/generated_images/{filename.name}"
+            else:
+                image_url = f"{BASE_URL}/generated_images/{filename.name}"
+
+            logger.info(f"Image saved: {file_path}, URL: {image_url}")  # <-- ДОБАВЛЕНО
+
+            return {
+                "status": "ok",
+                "image_url": image_url,
+                "file_path": file_path,
+                "original_prompt": prompt,
+                "enhanced_prompt": final_prompt,
+                "message": f"Изображение сгенерировано: {image_url}"
+            }
+
+        async def _research_topic(args: Dict) -> Dict:
+            topic = args.get("topic", "")
+            if not topic:
+                return {"status": "error", "message": "topic обязателен"}
+            result = await self.research(topic)
+            return {
+                "topic": topic,
+                "hypotheses": result.get("hypotheses", []),
+                "evidence": result.get("evidence", []),
+                "answer": result.get("answer", ""),
+                "confidence": result.get("confidence", 0.0),
+            }
+
         self.tool_registry.register(
             name="recall",
             description="Поиск в памяти пользователя (личная/общая/глобальная) по теме или вопросу.",
@@ -391,15 +619,128 @@ class CognitiveController:
                         "required": ["query"]},
             handler=_web_search,
         )
+        self.tool_registry.register(
+            name="fetch_url",
+            description=("Прочитать содержимое конкретной ссылки целиком (например, файл на GitHub, "
+                          "документацию, статью), а не искать её текстом в поисковике. Используй, когда "
+                          "пользователь прислал прямой URL и просит прочитать/проанализировать содержимое."),
+            parameters={"type": "object",
+                        "properties": {"url": {"type": "string", "description": "Прямая ссылка (https://...)"}},
+                        "required": ["url"]},
+            handler=_fetch_url,
+        )
+        # ===== Инструменты для паритета с mcp_server_blockcoin.py =====
+        # Раньше эти операции были доступны только внешнему MCP-клиенту (через
+        # mcp_server_blockcoin.py), а браузерный чат из коробки не мог ни
+        # забыть факт по запросу, ни сделать чисто векторный поиск, ни
+        # посмотреть противоречия/цели/происхождение факта/статистику памяти —
+        # то самое "работает не как в MCP", про которое сообщал пользователь.
+        self.tool_registry.register(
+            name="forget",
+            description="Удалить факты, содержащие заданные ключевые слова, из указанного слоя памяти.",
+            parameters={"type": "object",
+                        "properties": {"query": {"type": "string", "description": "Ключевые слова для удаления"},
+                                       "scope": {"type": "string", "enum": ["private", "shared", "global"]}},
+                        "required": ["query"]},
+            handler=_forget,
+        )
+        self.tool_registry.register(
+            name="semantic_search",
+            description="Векторный поиск по смыслу в личной памяти (по эмбеддингам, а не по ключевым словам).",
+            parameters={"type": "object",
+                        "properties": {"query": {"type": "string"}, "top_k": {"type": "integer"}},
+                        "required": ["query"]},
+            handler=_semantic_search,
+        )
+        self.tool_registry.register(
+            name="get_episodes",
+            description="Вернуть последние диалоги (эпизоды) из личной памяти.",
+            parameters={"type": "object", "properties": {"limit": {"type": "integer"}}},
+            handler=_get_episodes,
+        )
+        self.tool_registry.register(
+            name="get_contradictions",
+            description="Вернуть неразрешённые противоречия в личной памяти.",
+            parameters={"type": "object", "properties": {"limit": {"type": "integer"}}},
+            handler=_get_contradictions,
+        )
+        self.tool_registry.register(
+            name="get_goals",
+            description="Вернуть активные цели пользователя.",
+            parameters={"type": "object", "properties": {}},
+            handler=_get_goals,
+        )
+        self.tool_registry.register(
+            name="graph_explore",
+            description="Исследовать граф ассоциативной памяти, начиная с фактов, содержащих seed_text.",
+            parameters={"type": "object",
+                        "properties": {"seed_text": {"type": "string"}, "depth": {"type": "integer"}},
+                        "required": ["seed_text"]},
+            handler=_graph_explore,
+        )
+        self.tool_registry.register(
+            name="explain_fact",
+            description=("Объяснить происхождение и статус факта памяти по его gcn_id: кто и когда создал, "
+                         "с чем противоречит — используй после recall/semantic_search, когда нужно "
+                         "обосновать уверенность в факте."),
+            parameters={"type": "object",
+                        "properties": {"gcn_id": {"type": "string"}},
+                        "required": ["gcn_id"]},
+            handler=_explain_fact,
+        )
+        self.tool_registry.register(
+            name="get_memory_stats",
+            description="Вернуть статистику по личной памяти пользователя.",
+            parameters={"type": "object", "properties": {}},
+            handler=_get_memory_stats,
+        )
+        self.tool_registry.register(
+            name="resolve_contradiction",
+            description=("Разрешить противоречие между двумя фактами (см. get_contradictions): "
+                          "verdict='a'/'b' оставляет один факт и удаляет другой, 'both' снимает "
+                          "противоречие сохранив оба, 'neither' удаляет оба."),
+            parameters={"type": "object",
+                        "properties": {"fact_id_a": {"type": "string"}, "fact_id_b": {"type": "string"},
+                                       "verdict": {"type": "string", "enum": ["a", "b", "both", "neither"]}},
+                        "required": ["fact_id_a", "fact_id_b", "verdict"]},
+            handler=_resolve_contradiction,
+        )
+        self.tool_registry.register(
+            name="generate_image",
+            description="Сгенерировать изображение по текстовому описанию через локальный EasyDiffusion.",
+            parameters={"type": "object",
+                        "properties": {
+                            "prompt": {"type": "string", "description": "Описание изображения"},
+                            "enhance_prompt": {"type": "boolean", "description": "Улучшить промпт через LLM"},
+                            "steps": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"},
+                            "cfg_scale": {"type": "number"}, "seed": {"type": "integer"},
+                            "sampler_name": {"type": "string"},
+                        },
+                        "required": ["prompt"]},
+            handler=_generate_image_tool,
+        )
+        self.tool_registry.register(
+            name="research_topic",
+            description="Глубокое исследование темы с генерацией гипотез и сбором доказательств из поиска.",
+            parameters={"type": "object",
+                        "properties": {"topic": {"type": "string"}},
+                        "required": ["topic"]},
+            handler=_research_topic,
+        )
 
     async def _ensure_external_tools_registered(self):
         """Внешние MCP-серверы инициализируются асинхронно (self._mcp_task) — их
-        инструменты добавляем в общий реестр, как только они станут доступны, но
-        не раньше одного раза за жизнь контроллера."""
-        if self._external_tools_registered:
-            return
+        инструменты добавляем в общий реестр, как только они станут доступны.
+        Дополнительно на каждый вызов просим менеджер повторить попытку для
+        серверов, которые не поднялись при старте (ensure_connected сам
+        ограничивает частоту попыток) — раньше сервер, временно недоступный в
+        момент старта процесса, оставался недоступен до перезапуска, даже если
+        поднимался через минуту после этого. register_mcp_tools просто
+        перезаписывает записи по тем же именам, так что повторные вызовы (в т.ч.
+        после реконнекта) безопасны и подхватывают новые инструменты."""
         if not self.mcp_manager._initialized:
             return
+        await self.mcp_manager.ensure_connected()
         self.tool_registry.register_mcp_tools(self.mcp_manager, self._handle_mcp_call)
         self._external_tools_registered = True
 
@@ -737,8 +1078,17 @@ class CognitiveController:
         sources = []
 
         if web_search and self.searcher:
-            route = await self._route(message)
-            search_query = route.get("search_query") or message
+            # Если пользователь прислал прямую ссылку, не даём LLM-роутеру
+            # переписать её в вольный поисковый запрос (легко теряет URL при
+            # перефразировании) — читаем ссылку напрямую, это и есть намерение
+            # пользователя ("прочитай эту страницу/файл").
+            direct_urls_in_message = re.findall(r'https?://\S+', message)
+            if direct_urls_in_message:
+                search_query = message
+                route = {"is_factual_time_sensitive": False}
+            else:
+                route = await self._route(message)
+                search_query = route.get("search_query") or message
             max_res = 7 if route.get("is_factual_time_sensitive") else MAX_PAGES_TO_FETCH
             search_data = await deep_search(search_query, max_results=max_res)
             if search_data["search_performed"]:
@@ -772,7 +1122,21 @@ class CognitiveController:
 
         relevant = await self.router.retrieve(message, top_k=7, include_private=True)
         memory_context = ""
-        if relevant:
+        # ИСПРАВЛЕНИЕ (причина №2 — "путаница" памяти в браузерном чате, которой
+        # нет в MCP-режиме): раньше блок "=== КОНТЕКСТ ИЗ ДОЛГОСРОЧНОЙ ПАМЯТИ ==="
+        # строился из ВСЕХ до 7 результатов router.retrieve() безусловно — retrieve
+        # всегда что-то возвращает (ближайшие соседи по эмбеддингам есть почти
+        # всегда), даже когда ни один факт реально не относится к вопросу
+        # ("нарисуй кота", "привет" и т.п.). Модель получала слабо релевантные или
+        # вовсе случайные факты в блоке, который система же промптом называет
+        # надёжным источником ("самый надёжный источник"), и путала их с реальным
+        # ответом. В MCP-режиме этого не происходит: там recall — это ЯВНЫЙ
+        # инструмент, который внешний клиент вызывает только когда сам решил, что
+        # нужна память, а не то, что подмешивается в КАЖДОЕ сообщение. Отсекаем
+        # низкорелевантные результаты здесь же, не трогая сам `relevant` — он
+        # по-прежнему используется ниже для predict_next/uncertainty/working memory.
+        context_facts = [f for f in relevant if f.get("_score", f.get("score", 0.0)) >= MEMORY_CONTEXT_MIN_SCORE]
+        if context_facts:
             type_labels = {
                 "claim": "факт", "concept": "концепт (обобщение)",
                 "episode": "прошлый диалог", "goal": "цель",
@@ -783,7 +1147,7 @@ class CognitiveController:
                 "global": "глобальный"
             }
             lines = []
-            for fact in relevant:
+            for fact in context_facts:
                 text = fact["text"][:300]
                 conf = fact.get("confidence", 0.5)
                 label = type_labels.get(fact.get("type"), "факт")
@@ -798,7 +1162,7 @@ class CognitiveController:
             # НОВОЕ: явно перечисляем непогашенные противоречия
             contradiction_lines = []
             seen_pairs = set()
-            for fact in relevant:
+            for fact in context_facts:
                 gcn_id = fact.get("gcn_id")
                 if not gcn_id:
                     continue
@@ -854,8 +1218,15 @@ class CognitiveController:
             goal_hint=goal_hint
         )
 
+        # search_meta изначально не содержало "context" — из-за этого при
+        # пересборке сообщений после срабатывания ToolRouter (см. process_input/
+        # stream_response, search_meta.get("context", "")) уже найденный веб-контент
+        # молча терялся и подменялся пустой строкой. Сохраняем его явно в обоих
+        # местах, откуда потом читают.
+        search_meta["context"] = search_context
         self._last_prepare_meta = {
             "search_meta": search_meta,
+            "search_context": search_context,
             "sources": sources,
             "memory_context": memory_context,
             "predictions": predictions,
@@ -989,7 +1360,9 @@ class CognitiveController:
                 message=message,
                 web_search=web_search,
                 search_context=search_meta.get("context", ""),
-                memory_context=self._last_prepare_meta.get("memory_context", ""),
+                memory_context=self._memory_context_for_rebuild(
+                    tool_trace, self._last_prepare_meta.get("memory_context", "")
+                ),
                 image_base64=image_base64,
                 image_mime=image_mime,
                 reasoning=reasoning,
@@ -1321,6 +1694,24 @@ class CognitiveController:
             except Exception as e:
                 logger.debug(f"Retract failed for {fact.gcn_id}: {e}")
 
+    # ===== ИСТОЧНИК ПАМЯТИ ПРИ ПЕРЕСБОРКЕ ПОСЛЕ ИНСТРУМЕНТОВ =====
+    @staticmethod
+    def _memory_context_for_rebuild(tool_trace: List[Dict[str, Any]], memory_context: str) -> str:
+        """
+        Вторая часть исправления "путаницы" памяти: если в этом же ходе уже был
+        явный вызов internal__recall / internal__semantic_search, не подмешиваем
+        ЕЩЁ и автоматический блок "КОНТЕКСТ ИЗ ДОЛГОСРОЧНОЙ ПАМЯТИ" в тот же
+        финальный промпт — иначе модель получает один и тот же (или слегка
+        разный по top_k/скорингу) набор фактов сразу в двух разных форматах
+        (автоблок текстом + JSON-результат инструмента), что и порождало
+        расхождения/путаницу, которых нет в MCP-режиме (там память приходит
+        только одним способом — через явный вызов инструмента).
+        """
+        recall_tools = {"internal__recall", "internal__semantic_search"}
+        if any(t.get("tool") in recall_tools for t in tool_trace):
+            return ""
+        return memory_context
+
     # ===== ПОСТРОЕНИЕ СООБЩЕНИЙ =====
     def _build_messages(self, message: str, web_search: bool, search_context: str,
                         memory_context: str, image_base64: Optional[str],
@@ -1465,6 +1856,39 @@ class CognitiveController:
                 )
                 tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
                 tool_trace = tool_run.get("tool_trace", [])
+                logger.info(f"Tool trace: {tool_trace}")  # ДОБАВЛЕНО
+
+                # Проверяем, не был ли вызван generate_image
+                #
+                # БАГ (была причина №1, почему картинка генерировалась, сохранялась
+                # на диск, но никогда не появлялась в чате): ToolRouter._execute_tool
+                # ВСЕГДА сериализует результат хэндлера в JSON-строку через
+                # json.dumps(...) перед тем как положить его в tool_trace (это нужно
+                # для текстового промпта финального ответа — build_tool_trace_context
+                # и few-shot fallback работают со строками). Из-за этого здесь
+                # `result` — это уже str, а не dict, и проверка `isinstance(result, dict)`
+                # была ЛОЖНОЙ ВСЕГДА, даже когда генерация прошла успешно и image_url
+                # реально был внутри. Именно поэтому в логах стабильно вылезало
+                # предупреждение "generate_image result does not contain image_url",
+                # хотя сам результат содержал image_url — просто в виде текста JSON.
+                for t in tool_trace:
+                    if t.get("tool") == "internal__generate_image":
+                        result = t.get("result")
+                        if isinstance(result, str):
+                            try:
+                                result = json.loads(result)
+                            except (json.JSONDecodeError, TypeError):
+                                logger.warning(
+                                    f"generate_image: не удалось распарсить результат инструмента как JSON: {result[:200]!r}"
+                                )
+                        logger.info(f"generate_image result: {result}")  # ДОБАВЛЕНО
+                        if isinstance(result, dict) and result.get("image_url"):
+                            image_url = result["image_url"]
+                            logger.info(f"Sending image_url event: {image_url}")  # ДОБАВЛЕНО
+                            yield f"data: {json.dumps({'image_url': image_url})}\n\n"
+                            break
+                        else:
+                            logger.warning("generate_image result does not contain image_url")  # ДОБАВЛЕНО
 
                 if tool_trace:
                     for t in tool_trace:
@@ -1477,7 +1901,9 @@ class CognitiveController:
                         message=message,
                         web_search=web_search,
                         search_context=search_meta.get("context", ""),
-                        memory_context=self._last_prepare_meta.get("memory_context", ""),
+                        memory_context=self._memory_context_for_rebuild(
+                            tool_trace, self._last_prepare_meta.get("memory_context", "")
+                        ),
                         image_base64=image_base64,
                         image_mime=image_mime,
                         reasoning=reasoning,
@@ -1556,8 +1982,12 @@ class CognitiveController:
         yield "data: [DONE]\n\n"
 
     # ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====
-    async def generate_image(self, prompt: str) -> Optional[str]:
-        return await generate_image(prompt)
+    async def generate_image(self, prompt: str, steps: Optional[int] = None,
+                              width: Optional[int] = None, height: Optional[int] = None,
+                              cfg_scale: Optional[float] = None, seed: Optional[int] = None,
+                              sampler_name: Optional[str] = None) -> Optional[str]:
+        return await generate_image(prompt, steps=steps, width=width, height=height,
+                                     cfg_scale=cfg_scale, seed=seed, sampler_name=sampler_name)
 
     async def enhance_prompt(self, prompt: str) -> str:
         return await enhance_prompt(prompt)

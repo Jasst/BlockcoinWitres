@@ -241,12 +241,12 @@ async def web_search(
 @mcp.tool()
 async def generate_image(
     prompt: str = Field(..., description="Описание изображения"),
-    steps: int = Field(20, description="Количество шагов (не используется, используется стандартное из конфига)"),
-    width: int = Field(512, description="Ширина (не используется, используется стандартная из конфига)"),
-    height: int = Field(512, description="Высота (не используется, используется стандартная из конфига)"),
-    cfg_scale: float = Field(7.0, description="Масштаб CFG (не используется)"),
-    sampler: str = Field("dpmpp_2m", description="Сэмплер (не используется)"),
-    seed: int = Field(-1, description="Зерно (-1 для случайного) (не используется)"),
+    steps: int = Field(20, description="Количество шагов диффузии"),
+    width: int = Field(512, description="Ширина изображения"),
+    height: int = Field(512, description="Высота изображения"),
+    cfg_scale: float = Field(7.0, description="Масштаб CFG (guidance scale)"),
+    sampler: str = Field("dpmpp_2m", description="Сэмплер"),
+    seed: int = Field(-1, description="Зерно (-1 для случайного)"),
     enhance_prompt: bool = Field(True, description="Улучшить промпт через LLM перед генерацией"),
     user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
 ) -> Dict[str, Any]:
@@ -265,7 +265,10 @@ async def generate_image(
         logger.info(f"Original prompt: {prompt}\nEnhanced prompt: {final_prompt}")
 
     # 2. Генерация изображения (используем общую функцию)
-    image_b64 = await gen_image(final_prompt, steps=steps, width=width, height=height)
+    # Раньше cfg_scale/sampler/seed принимались в схеме, но никуда не шли —
+    # теперь image_utils.generate_image реально их принимает и передаёт в EasyDiffusion.
+    image_b64 = await gen_image(final_prompt, steps=steps, width=width, height=height,
+                                 cfg_scale=cfg_scale, seed=seed, sampler_name=sampler)
     if not image_b64:
         return {"status": "error", "message": "Не удалось сгенерировать изображение"}
 
