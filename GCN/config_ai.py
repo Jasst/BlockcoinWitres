@@ -121,7 +121,7 @@ EASYDIFFUSION_TIMEOUT = 120
 EASYDIFFUSION_DEFAULT_STEPS = 20
 EASYDIFFUSION_DEFAULT_WIDTH = 512
 EASYDIFFUSION_DEFAULT_HEIGHT = 512
-EASYDIFFUSION_MODEL = "unstableIllusionPRO_pro"   # <-- добавьте эту строку
+EASYDIFFUSION_MODEL = "fallenleafNSFWXLPony_v0620steps.safetensors"   # <-- добавьте эту строку
 # Раньше был жёстко зашит Windows-путь "E:/BlockcoinWitres/generated_images" —
 # на любой другой машине (в т.ч. на Linux self-hosted сервере) mkdir() на
 # этом пути падал бы сразу. По умолчанию кладём рядом с MEMORY_BASE_DIR,
