@@ -776,22 +776,45 @@ class CognitiveMemory:
 
     # ==================== HEBBIAN / STDP ====================
     def _hebbian_update(self, source_id: int, target_id: int, coactivation_time: float):
+        """Обновляет вес синапса source->target по правилу STDP/Hebbian.
+
+        ИСПРАВЛЕНИЕ (мёртвые параметры конфигурации): STDP_LONG_TERM_POTENTIATION /
+        STDP_LONG_TERM_DEPRESSION, SYNAPSE_PLASTICITY_RATE и
+        SYNAPSE_COACTIVATION_THRESHOLD были объявлены в config_ai.py, но нигде не
+        читались — обе ветки STDP использовали один и тот же STDP_LEARNING_RATE
+        (депрессия отличалась только произвольным множителем 0.5), а
+        Synapse.plasticity выставлялось при создании и больше никогда не менялось:
+        метапластичности не было — часто подтверждаемые и совсем новые связи
+        учились с одинаковой скоростью.
+        Теперь: LTP и LTD используют раздельные константы; величина изменения
+        масштабируется текущей пластичностью синапса; синапсы, накопившие много
+        значимых совместных активаций, постепенно теряют пластичность
+        (стабилизируются) — так базовые, многократно подтверждённые ассоциации не
+        размываются каждым новым шумным сигналом, а действительно новые связи
+        остаются пластичными и быстро обучаются.
+        """
         key = (source_id, target_id)
         if key not in self.synapses:
             return
         syn = self.synapses[key]
         dt = coactivation_time - syn.last_activation
+        plastic = max(0.05, syn.plasticity)
         if dt > 0 and dt < STDP_TIME_WINDOW:
-            delta = STDP_LEARNING_RATE * (1.0 - dt / STDP_TIME_WINDOW)
+            # Пост-событие следует за пре-событием в разумном окне — потенциация.
+            delta = STDP_LONG_TERM_POTENTIATION * (1.0 - dt / STDP_TIME_WINDOW) * plastic
         elif dt < 0 and abs(dt) < STDP_TIME_WINDOW:
-            delta = -STDP_LEARNING_RATE * 0.5 * (1.0 - abs(dt) / STDP_TIME_WINDOW)
+            # Обратный порядок — депрессия (в норме слабее и медленнее LTP).
+            delta = -STDP_LONG_TERM_DEPRESSION * (1.0 - abs(dt) / STDP_TIME_WINDOW) * plastic
         else:
-            delta = HEBBIAN_LEARNING_RATE * 0.1
+            delta = HEBBIAN_LEARNING_RATE * 0.1 * plastic
         syn.weight = min(SYNAPSE_MAX_WEIGHT, max(SYNAPSE_MIN_WEIGHT, syn.weight + delta))
         syn.last_activation = coactivation_time
         syn.coactivation_count += 1
         syn.last_coactivation = coactivation_time
         syn.confidence = min(1.0, syn.confidence + 0.01)
+        # Метапластичность: значимое по модулю изменение постепенно "остужает" синапс.
+        if abs(delta) >= SYNAPSE_COACTIVATION_THRESHOLD * STDP_LONG_TERM_POTENTIATION:
+            syn.plasticity = max(0.05, syn.plasticity - SYNAPSE_PLASTICITY_RATE)
         self._sync_synapse_to_gcn(source_id, target_id)
         self._dirty = True
 
@@ -1100,7 +1123,17 @@ class CognitiveMemory:
                     user_facts = [f for f in self.semantic_facts if f.text == ep.user_msg]
                     ass_facts = [f for f in self.semantic_facts if f.text == ep.assistant_msg]
                     if user_facts and ass_facts:
-                        self._hebbian_update(user_facts[0].id, ass_facts[0].id, ep.timestamp)
+                        # ИСПРАВЛЕНИЕ: Episode хранит один timestamp на весь эпизод,
+                        # поэтому раньше оба вызова (user->assistant и assistant->user)
+                        # получали ОДИНАКОВОЕ coactivation_time: dt всегда было равно 0,
+                        # оба направления попадали в одну и ту же общую хеббовскую ветку,
+                        # и направленная асимметрия STDP — усиление именно причинного
+                        # направления "user сказал X -> assistant ответил Y", которое
+                        # реально использует predict_next(), — никогда не проявлялась.
+                        # Разносим "пре" (user) и "пост" (assistant) на 1 секунду —
+                        # реальный порядок реплик внутри эпизода нам известен, даже без
+                        # точных временных меток на каждую реплику в отдельности.
+                        self._hebbian_update(user_facts[0].id, ass_facts[0].id, ep.timestamp + 1.0)
                         self._hebbian_update(ass_facts[0].id, user_facts[0].id, ep.timestamp)
 
             # Обновляем confidence и importance
@@ -1507,8 +1540,14 @@ class GCNMemoryRouter:
                 # Длина и базовые фильтры
                 if not (20 < len(line) < 400):
                     continue
-                # Исключаем субъективные начала
-                if line[0].lower() in ('я', 'ты', 'мы', 'давайте', 'попробуйте'):
+                # Исключаем субъективные начала.
+                # ИСПРАВЛЕНИЕ: было `line[0].lower() in (...)` — line[0] это ОДИН
+                # символ строки, а не первое слово, поэтому сравнение с 'ты', 'мы',
+                # 'давайте', 'попробуйте' (длиннее одного символа) не могло сработать
+                # никогда — реально отфильтровывались только строки, начинавшиеся
+                # ровно с буквы "я". Сравниваем первое слово целиком.
+                first_word = line.split(maxsplit=1)[0].lower().strip('.,!?:;-—') if line.split() else ''
+                if first_word in ('я', 'ты', 'мы', 'давайте', 'попробуйте'):
                     continue
                 # Должен содержать ключевой глагол или цифры
                 if not re.search(r'(является|составляет|равен|находится|имеет|был|стал|\d)', line):

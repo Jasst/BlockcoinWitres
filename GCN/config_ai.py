@@ -121,7 +121,12 @@ EASYDIFFUSION_TIMEOUT = 120
 EASYDIFFUSION_DEFAULT_STEPS = 20
 EASYDIFFUSION_DEFAULT_WIDTH = 512
 EASYDIFFUSION_DEFAULT_HEIGHT = 512
-EASYDIFFUSION_MODEL = "fallenleafNSFWXLPony_v0620steps.safetensors"   # <-- добавьте эту строку
+
+EASYDIFFUSION_DEFAULT_LORA_USE = True
+EASYDIFFUSION_DEFAULT_LORA = "E:/Easy-Diffusion/models/lora/Realism Lora By Stable Yogi_V3_Lite.safetensors"
+EASYDIFFUSION_DEFAULT_LORA_WEIGHT = 0.8
+
+EASYDIFFUSION_MODEL = "realismByStableYogi_ponyV65.safetensors"   # <-- добавьте эту строку
 # Раньше был жёстко зашит Windows-путь "E:/BlockcoinWitres/generated_images" —
 # на любой другой машине (в т.ч. на Linux self-hosted сервере) mkdir() на
 # этом пути падал бы сразу. По умолчанию кладём рядом с MEMORY_BASE_DIR,

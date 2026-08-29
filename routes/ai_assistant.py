@@ -1242,17 +1242,31 @@ class CognitiveController:
         return messages, search_meta
 
 
-    # ===== ПРОЦЕССИНГ ВХОДА (изменён: добавлена классификация и автоизвлечение) =====
-    async def process_input(self, message: str, web_search: bool = False,
-                            image_base64: Optional[str] = None,
-                            image_mime: Optional[str] = None,
-                            reasoning: bool = False) -> Tuple[str, Dict]:
-        # Подтягиваем изменения, сделанные другими процессами (например, MCP)
-        self.router.refresh(include_private=True)
+    # ===== ОБЩИЙ ПРЕ-ПАЙПЛАЙН ПАМЯТИ =====
+    async def _run_memory_intent_pipeline(self, message: str) -> Optional[Tuple[str, Dict]]:
+        """
+        Общий первый этап обработки сообщения: явные команды памяти (regex),
+        классификация намерений store/forget/recall (LLM) и автоматическое
+        извлечение фактов.
 
-        # Обновляем время активности
-        self._last_activity_time = time.time()
+        ИСПРАВЛЕНИЕ (см. чат-ревью, пункт 3): раньше эти три шага существовали
+        ТОЛЬКО внутри process_input. stream_response их не вызывал вообще — он
+        сразу шёл в _ensure_external_tools_registered() + ToolRouter, минуя
+        classify_intent()/_auto_extract_facts(). Поскольку в браузерном чате по
+        умолчанию используется стриминг (LM_STUDIO_USE_STREAM=True в
+        config_ai.py), на практике это означало, что классификация намерений
+        почти никогда не отрабатывала в реальном UI — решения "запомнить/
+        вспомнить" принимал только few-shot fallback внутри ToolRouter, причём
+        не согласованно с этой веткой. Теперь оба входа (process_input и
+        stream_response) вызывают один и тот же метод — поведение одинаковое
+        независимо от режима.
 
+        Возвращает (response_text, meta), если сообщение уже полностью
+        обработано на этом этапе — вызывающий код должен вернуть/отдать этот
+        ответ пользователю и НЕ продолжать обычный пайплайн. Возвращает None,
+        если нужно продолжать как обычно (автоизвлечение фактов, если
+        сработало, уже выполнено как побочный эффект и в этом случае).
+        """
         # 1. Сначала проверяем команды памяти (старый способ для совместимости)
         cmd_response = await self._handle_memory_command(message)
         if cmd_response:
@@ -1317,7 +1331,8 @@ class CognitiveController:
                     response = "Вот что я знаю:\n" + context
                 return response, {"memory": "recalled"}
 
-        # 3. Автоматическое извлечение фактов (даже без команды)
+        # 3. Автоматическое извлечение фактов (даже без команды) — побочный
+        # эффект, не прерывает обработку сообщения.
         if AUTO_EXTRACT_FACTS and not any(cmd in message.lower() for cmd in MEMORY_CONTROL_COMMANDS.keys()):
             extracted = await self._auto_extract_facts(message)
             if extracted:
@@ -1335,6 +1350,26 @@ class CognitiveController:
                         self.memory.hierarchy.add_to_working(gcn_id)
                 await self.router.global_memory._schedule_save()
                 logger.info(f"Auto-extracted {len(extracted)} facts from message")
+
+        return None
+
+    # ===== ПРОЦЕССИНГ ВХОДА (изменён: добавлена классификация и автоизвлечение) =====
+    async def process_input(self, message: str, web_search: bool = False,
+                            image_base64: Optional[str] = None,
+                            image_mime: Optional[str] = None,
+                            reasoning: bool = False) -> Tuple[str, Dict]:
+        # Подтягиваем изменения, сделанные другими процессами (например, MCP)
+        self.router.refresh(include_private=True)
+
+        # Обновляем время активности
+        self._last_activity_time = time.time()
+
+        # 1-3. Команды памяти / классификация намерений / автоизвлечение —
+        # общий этап, вынесенный в _run_memory_intent_pipeline (используется
+        # и здесь, и в stream_response — см. исправление #3 из чат-ревью).
+        pipeline_result = await self._run_memory_intent_pipeline(message)
+        if pipeline_result:
+            return pipeline_result
 
         # 4. Обычная обработка (инструменты, если нужны, потом ответ)
         await self._ensure_external_tools_registered()
@@ -1832,9 +1867,15 @@ class CognitiveController:
 
         self._last_activity_time = time.time()
 
-        cmd_response = await self._handle_memory_command(message)
-        if cmd_response:
-            yield f"data: {json.dumps({'token': cmd_response[0]})}\n\n"
+        # ИСПРАВЛЕНИЕ (#3 из чат-ревью): раньше здесь проверялись только
+        # regex-команды памяти (_handle_memory_command), а classify_intent()/
+        # _auto_extract_facts() (шаги 2-3 в process_input) не вызывались вовсе —
+        # то есть в основном, стримингом, режиме браузерного чата эта ветка
+        # никогда не срабатывала. Теперь оба входа используют один и тот же
+        # _run_memory_intent_pipeline, так что поведение идентично process_input.
+        pipeline_result = await self._run_memory_intent_pipeline(message)
+        if pipeline_result:
+            yield f"data: {json.dumps({'token': pipeline_result[0]})}\n\n"
             yield "data: [DONE]\n\n"
             return
 

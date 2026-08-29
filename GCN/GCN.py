@@ -1074,7 +1074,24 @@ class MemoryStore:
             if not obj:
                 candidates.remove(obj_id)
                 continue
-            age_days = (now - obj.created).days
+            # ИСПРАВЛЕНИЕ: раньше "свежесть" считалась только от obj.created —
+            # даты первого создания факта. Из-за этого стабильное, часто
+            # подтверждаемое/вспоминаемое ядро знаний (record_access пишет
+            # last_accessed в obj.object) со временем неизбежно теряло весь
+            # freshness-баллы просто потому, что было создано давно, даже если
+            # к нему обращались вчера — а разовый шумовой факт недельной
+            # давности оказывался "свежее" только по дате создания. Теперь
+            # используем last_accessed из метаданных, если он есть, и только
+            # при его отсутствии откатываемся на created.
+            reference_time = obj.created
+            meta = obj.object if isinstance(obj.object, dict) else {}
+            last_accessed_raw = meta.get("last_accessed")
+            if last_accessed_raw:
+                try:
+                    reference_time = datetime.fromisoformat(last_accessed_raw)
+                except (ValueError, TypeError):
+                    pass
+            age_days = (now - reference_time).days
             recency = max(0.0, 1.0 - age_days / 365.0)
             scores[obj_id] = scores.get(obj_id, 0.0) + recency * weights['freshness']
             scores[obj_id] += obj.confidence * weights['confidence']

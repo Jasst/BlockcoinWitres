@@ -31,6 +31,54 @@ Claude Desktop, к mcp_server_blockcoin.py) всё работает надёжн
   - Хранит "внутренние" инструменты (recall/remember/add_goal поверх
     GCNMemoryRouter) и внешние MCP-инструменты в ОДНОМ реестре — так
     браузерный чат получает те же возможности, что и mcp_server_blockcoin.py.
+
+=====================================================================
+ИСПРАВЛЕНИЯ В ЭТОЙ ВЕРСИИ (см. чат-ревью) — что было не так и почему:
+=====================================================================
+
+1) ЦИКЛ БЫЛ "СЛЕП" К СОБСТВЕННЫМ РЕЗУЛЬТАТАМ В NATIVE-РЕЖИМЕ.
+   Раньше `_decide_native(base_messages, ...)` вызывался на каждой итерации
+   с ОДНИМ И ТЕМ ЖЕ неизменным `base_messages` — результаты уже выполненных
+   на предыдущих раундах инструментов (tool_trace) в него не попадали.
+   В fallback-режиме результаты передавались (`tool_results_so_far`), а в
+   native — нет. Из-за этого многошаговый ReAct (например: сначала
+   web_search, потом на основе найденного — recall) для моделей с нативным
+   function calling фактически не работал: модель на втором раунде не знала,
+   что первый инструмент уже отработал, и либо просила его снова (гасилось
+   дедупликацией seen_calls → цикл сразу обрывался), либо звала что-то ещё
+   вслепую. MAX_TOOL_ITERATIONS=3 реально давало эффект только в fallback-
+   режиме.
+   ИСПРАВЛЕНО: теперь используется `running_messages` — рабочая копия
+   диалога, которая после каждого раунда пополняется текстовым блоком с
+   результатами только что вызванных инструментов (тем же форматом, что и
+   build_tool_trace_context). Следующий раунд `_decide_native` видит эти
+   результаты и может принять осмысленное решение о следующем шаге.
+
+2) ЛИШНИЕ LLM-ВЫЗОВЫ НА КАЖДОЙ ИТЕРАЦИИ.
+   Раньше на каждом раунде сначала безусловно пробовался native-вызов, и
+   если он не вернул tool_calls — сразу пробовался fallback-вызов. Для
+   моделей без нативного function calling это означало 2 LLM-вызова на
+   каждый раунд решения (пустой native + fallback), а для моделей С
+   нативной поддержкой — лишний fallback-вызов после того, как native уже
+   один раз явно сказал "инструмент не нужен".
+   ИСПРАВЛЕНО:
+     - Если в рамках этого запуска native уже хоть раз вернул реальные
+       tool_calls (used_native=True), последующее "пустое" решение native
+       трактуется как осознанное "инструмент больше не нужен" — цикл
+       завершается СРАЗУ, без обращения к fallback-промпту.
+     - Добавлен адаптивный флаг `self._native_supported` на уровне
+       экземпляра ToolRouter (который живёт всё время сессии пользователя,
+       см. CognitiveController.__init__). Если native ни разу не сработал,
+       а fallback явно решил, что инструмент был нужен — это сильный сигнал,
+       что модель/бэкенд не поддерживает function calling. Флаг
+       фиксируется как False, и все последующие запросы в этой сессии сразу
+       идут в fallback, не тратя вызов на заведомо бесполезную native-
+       попытку.
+
+3) Мелкое: единый источник построения текстового блока результатов
+   (`build_tool_trace_context`) используется и для промежуточных раундов, и
+   для финального ответа — раньше промежуточный блок собирался отдельным
+   инлайн-форматом внутри `_decide_fallback`.
 """
 
 import json
@@ -147,6 +195,7 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - Если нужна актуальная информация из интернета — вызови `internal__web_search`.
 - **Если пользователь просит сгенерировать изображение (например, "нарисуй", "сгенерируй изображение", "создай картинку", "покажи картинку", "визуализируй" и т.п.) — ОБЯЗАТЕЛЬНО вызови инструмент `internal__generate_image`. НЕ ОТВЕЧАЙ ТЕКСТОМ, пока не получишь результат от этого инструмента.**
 - Если запрос обычный, не требующий обращения к памяти или поиску — отвечай напрямую.
+- Если ниже уже есть результаты вызванных инструментов и их достаточно, чтобы ответить — верни {{"action": "answer_directly"}}, не вызывай инструмент повторно.
 
 Важно: ты можешь вызвать инструмент, даже если запрос не начинается с точной команды. Главное — понять намерение.
 
@@ -219,6 +268,12 @@ class ToolRouter:
         self.registry = registry
         self.llm_raw_caller = llm_raw_caller
         self.llm_text_caller = llm_text_caller
+        # Адаптивный кэш поддержки нативного function calling текущим бэкендом/
+        # моделью. None = ещё не знаем. True = точно поддерживает (видели
+        # реальные tool_calls хотя бы раз). False = есть сильные основания
+        # считать, что не поддерживает (см. run()) — тогда не тратим вызов на
+        # заведомо бесполезную native-попытку в последующих запросах этой сессии.
+        self._native_supported: Optional[bool] = None
 
     async def _execute_tool(self, qualified_name: str, arguments: Dict[str, Any]) -> str:
         spec = self.registry.get(qualified_name)
@@ -242,11 +297,18 @@ class ToolRouter:
             logger.error(f"Tool '{qualified_name}' failed: {e}", exc_info=True)
             return f"Ошибка вызова инструмента '{qualified_name}': {e}"
 
-    async def _decide_native(self, base_messages: List[Dict], temp: float) -> Optional[List[Dict]]:
+    async def _decide_native(self, running_messages: List[Dict], temp: float) -> Optional[List[Dict]]:
         """Пытается получить решение через нативный tool_calls. Возвращает список
-        {"tool": qualified_name, "arguments": {...}} или None, если модель tool_calls не вернула."""
+        {"tool": qualified_name, "arguments": {...}} или None, если модель tool_calls не вернула.
+
+        ВАЖНО (исправление): теперь принимает `running_messages` — рабочую копию
+        диалога, которая на 2+ раунде уже содержит текстовый блок с результатами
+        предыдущих вызовов инструментов (см. run()). Раньше сюда всегда
+        передавался неизменный исходный `base_messages`, и модель на каждом
+        раунде "решала заново", не зная, что уже было сделано.
+        """
         tools = self.registry.as_openai_tools()
-        msg = await self.llm_raw_caller(base_messages, temp=temp, max_tokens=500, tools=tools)
+        msg = await self.llm_raw_caller(running_messages, temp=temp, max_tokens=500, tools=tools)
         tool_calls = msg.get("tool_calls") if msg else None
         if not tool_calls:
             return None
@@ -289,30 +351,57 @@ class ToolRouter:
 
         tool_trace: List[Dict[str, Any]] = []
         used_native = False
+        # Рабочая копия диалога, которую мы пополняем результатами инструментов
+        # между раундами — см. пункт 1 в шапке файла. Копируем список (не
+        # словари внутри), чтобы не мутировать base_messages вызывающего кода.
+        running_messages: List[Dict] = list(base_messages)
+
         # Раньше при 3 итерациях цикла модель (особенно послабее локальная)
         # могла трижды подряд решить вызвать один и тот же инструмент с теми
         # же аргументами — впустую тратя раунды вместо того, чтобы перейти
         # к финальному ответу с уже полученным результатом.
         seen_calls: set = set()
 
-        for _ in range(MAX_TOOL_ITERATIONS):
-            results_text = "\n".join(
-                f"- {t['tool']}({t['arguments']}) -> {str(t['result'])[:300]}" for t in tool_trace
-            )
+        for round_idx in range(MAX_TOOL_ITERATIONS):
+            decisions: Optional[List[Dict]] = None
 
-            decisions = await self._decide_native(base_messages, temp=0.0)
-            if decisions is not None:
-                used_native = True
-            else:
+            # Пропускаем native-попытку, если в этой сессии уже надёжно
+            # установлено, что бэкенд/модель не поддерживает function calling —
+            # экономим один LLM-вызов на каждый раунд (пункт 2 в шапке файла).
+            if self._native_supported is not False:
+                decisions = await self._decide_native(running_messages, temp=0.0)
+                if decisions is not None:
+                    used_native = True
+                    self._native_supported = True
+                elif used_native:
+                    # Native уже минимум раз сработал в этом запуске и теперь
+                    # явно вернул "инструментов не нужно" — доверяем этому
+                    # сигналу и завершаем цикл, не тратя fallback-вызов.
+                    break
+
+            if decisions is None and not used_native:
+                results_text = "\n".join(
+                    f"- {t['tool']}({t['arguments']}) -> {str(t['result'])[:300]}" for t in tool_trace
+                )
                 decision = await self._decide_fallback(message, history_tail, results_text, temp=0.0)
                 if not decision or decision.get("action") != "call_tool":
                     break
                 decisions = [{"tool": decision.get("tool"), "arguments": decision.get("arguments", {})}]
 
+                # Сильный сигнал, что native вообще не поддерживается этим
+                # бэкендом: за весь запуск он ни разу не вернул tool_calls,
+                # а fallback тем временем уверенно решил, что инструмент
+                # нужен. Фиксируем это на уровне сессии (self._native_supported),
+                # чтобы следующие сообщения пользователя не тратили вызов на
+                # заведомо бесполезную native-попытку.
+                if self._native_supported is None:
+                    self._native_supported = False
+
             if not decisions:
                 break
 
             new_calls_this_round = 0
+            round_results: List[Dict[str, Any]] = []
             for d in decisions:
                 sig = (d.get("tool"), json.dumps(d.get("arguments", {}), sort_keys=True, ensure_ascii=False))
                 if sig in seen_calls:
@@ -321,15 +410,31 @@ class ToolRouter:
                 seen_calls.add(sig)
                 new_calls_this_round += 1
                 result = await self._execute_tool(d["tool"], d.get("arguments", {}))
-                tool_trace.append({"tool": d["tool"], "arguments": d.get("arguments", {}), "result": result})
+                entry = {"tool": d["tool"], "arguments": d.get("arguments", {}), "result": result}
+                tool_trace.append(entry)
+                round_results.append(entry)
 
             # Если модель просит только то, что уже вызывалось — новой
             # информации не будет, дальше крутить цикл бессмысленно.
             if new_calls_this_round == 0:
                 break
 
-            # Если решали через fallback-промпт, дальше не зацикливаемся молча —
-            # даём модели решить явно на следующем витке, нужен ли ещё один вызов.
+            # ИСПРАВЛЕНИЕ (пункт 1 в шапке файла): пополняем running_messages
+            # результатами именно этого раунда, чтобы на следующей итерации
+            # _decide_native (и, если понадобится, _decide_fallback через
+            # tool_trace) видели, что уже было сделано, а не решали заново
+            # вслепую по исходному base_messages.
+            running_messages = running_messages + [{
+                "role": "user",
+                "content": (
+                    "[Результаты только что вызванных инструментов — используй их, "
+                    "не вызывай те же инструменты с теми же аргументами повторно]\n"
+                    + build_tool_trace_context(round_results)
+                ),
+            }]
+
+            # Если решали через fallback-промпт и уже набрали максимум раундов —
+            # не крутим цикл дальше молча.
             if not used_native and len(tool_trace) >= MAX_TOOL_ITERATIONS:
                 break
 
