@@ -88,13 +88,39 @@ from typing import Any, Callable, Dict, List, Optional, Awaitable
 import asyncio
 
 try:
-    from GCN.config_ai import TOOL_CALL_TIMEOUT_SECONDS
+    from GCN.config_ai import (
+        TOOL_CALL_TIMEOUT_SECONDS,
+        TOOL_PARALLEL_EXECUTION,
+        TOOL_PLANNING_ENABLED,
+        TOOL_PLANNING_MIN_LEN,
+        MAX_SUBTASKS,
+    )
 except ImportError:
     TOOL_CALL_TIMEOUT_SECONDS = 45
+    TOOL_PARALLEL_EXECUTION = True
+    TOOL_PLANNING_ENABLED = True
+    TOOL_PLANNING_MIN_LEN = 140
+    MAX_SUBTASKS = 4
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 3  # сколько раундов вызова инструментов разрешено за один ответ
+
+# Простые маркеры составного/многочастного запроса — пункт №4 (планирование).
+# Эвристика намеренно дешёвая: полноценная классификация "сложности" запроса
+# сама по себе стоила бы отдельного LLM-вызова на КАЖДОЕ сообщение, что
+# для простых запросов ("привет", "сколько будет 2+2") было бы чистыми
+# накладными расходами без пользы.
+_COMPOUND_MARKERS = (" и ", " а также ", " затем ", " потом ", " после этого ", ";", " или ")
+
+
+def _looks_compound(message: str) -> bool:
+    if len(message) >= TOOL_PLANNING_MIN_LEN:
+        return True
+    if message.count("?") >= 2:
+        return True
+    lowered = f" {message.lower()} "
+    return any(marker in lowered for marker in _COMPOUND_MARKERS)
 
 
 # =====================================================================
@@ -324,6 +350,42 @@ class ToolRouter:
                 decisions.append({"tool": name, "arguments": args})
         return decisions or None
 
+    async def _plan_subtasks(self, message: str) -> str:
+        """
+        ПУНКТ №4 (планирование): раньше ReAct-цикл был полностью реактивным
+        — на каждом раунде модель заново решала, какой СЛЕДУЮЩИЙ инструмент
+        вызвать, не имея явного плана на составной запрос ("сравни X и Y,
+        потом посчитай Z"). Из-за этого сложные многочастные запросы часто
+        закрывались после первого/второго раунда неполным ответом — модель
+        решала одну подзадачу и не "помнила", что вопрос был из нескольких
+        частей. Для запросов, которые эвристически выглядят как составные
+        (_looks_compound), делаем ОДИН дешёвый предварительный вызов,
+        раскладывающий запрос на подзадачи, и дальше передаём этот список
+        как ориентир в промпт выбора инструмента на каждом раунде — как
+        native, так и fallback (см. run()).
+
+        Возвращает пустую строку при простом запросе, отключённой настройке
+        или сбое LLM — вызывающий код в этом случае просто не добавляет
+        блок плана и работает как раньше.
+        """
+        if not TOOL_PLANNING_ENABLED or not _looks_compound(message):
+            return ""
+        prompt = (
+            f"Разбей следующий запрос пользователя на список из максимум {MAX_SUBTASKS} "
+            "независимых подзадач, которые нужно выполнить, чтобы дать ПОЛНЫЙ ответ. "
+            "Если запрос на самом деле простой и состоит из одной части — верни всего "
+            "один пункт.\n\n"
+            f"Запрос: {message}\n\n"
+            "Ответь только нумерованным списком подзадач, без пояснений и без markdown."
+        )
+        try:
+            raw = await self.llm_text_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=200)
+        except Exception as e:
+            logger.debug(f"Planning step failed, continuing without a plan: {e}")
+            return ""
+        lines = [l.strip(" -•\t") for l in (raw or "").split("\n") if l.strip()]
+        return "\n".join(lines[:MAX_SUBTASKS])
+
     async def _decide_fallback(self, message: str, history_tail: str,
                                 tool_results_so_far: str, temp: float) -> Optional[Dict]:
         """Узкий отдельный вызов с few-shot примерами — для моделей без function calling."""
@@ -355,6 +417,22 @@ class ToolRouter:
         # между раундами — см. пункт 1 в шапке файла. Копируем список (не
         # словари внутри), чтобы не мутировать base_messages вызывающего кода.
         running_messages: List[Dict] = list(base_messages)
+
+        # ПУНКТ №4: план подзадач (пусто для простых запросов/при отключённой
+        # настройке/при сбое LLM — см. _plan_subtasks). Добавляем его в
+        # running_messages ОДИН раз, до первого раунда, чтобы он был виден
+        # native-декодеру на каждой последующей итерации точно так же, как
+        # результаты уже вызванных инструментов.
+        plan_text = await self._plan_subtasks(message)
+        if plan_text:
+            running_messages = running_messages + [{
+                "role": "user",
+                "content": (
+                    "[План подзадач для этого запроса — учитывай ВСЕ пункты при выборе "
+                    f"инструментов и не считай запрос закрытым, пока не покрыт весь план]\n{plan_text}"
+                ),
+            }]
+            history_tail = f"[План подзадач]\n{plan_text}\n\n{history_tail}" if history_tail else f"[План подзадач]\n{plan_text}"
 
         # Раньше при 3 итерациях цикла модель (особенно послабее локальная)
         # могла трижды подряд решить вызвать один и тот же инструмент с теми
@@ -400,19 +478,49 @@ class ToolRouter:
             if not decisions:
                 break
 
-            new_calls_this_round = 0
-            round_results: List[Dict[str, Any]] = []
+            # Сначала отфильтровываем повторы (дедупликация не зависит от
+            # того, выполняем ли мы дальше последовательно или параллельно).
+            to_execute: List[Dict[str, Any]] = []
             for d in decisions:
                 sig = (d.get("tool"), json.dumps(d.get("arguments", {}), sort_keys=True, ensure_ascii=False))
                 if sig in seen_calls:
                     logger.info(f"ToolRouter: пропускаю повторный вызов {sig} — результат уже есть в tool_trace.")
                     continue
                 seen_calls.add(sig)
-                new_calls_this_round += 1
-                result = await self._execute_tool(d["tool"], d.get("arguments", {}))
-                entry = {"tool": d["tool"], "arguments": d.get("arguments", {}), "result": result}
-                tool_trace.append(entry)
-                round_results.append(entry)
+                to_execute.append(d)
+
+            new_calls_this_round = len(to_execute)
+            round_results: List[Dict[str, Any]] = []
+            if to_execute:
+                # ПУНКТ №5: раньше несколько независимых вызовов инструментов
+                # одного раунда (например, native tool_calls с 2-3 вызовами
+                # сразу) выполнялись строго по очереди — await в цикле — хотя
+                # ничто не мешает им идти параллельно (свой таймаут и своя
+                # обработка ошибок у каждого уже есть в _execute_tool).
+                # Последовательное ожидание впустую тратило время и раунды
+                # ReAct-цикла. return_exceptions=True — дополнительная
+                # подстраховка: _execute_tool и так ловит исключения сам,
+                # но так один сорвавшийся gather-таск не обрушит остальные.
+                if TOOL_PARALLEL_EXECUTION and len(to_execute) > 1:
+                    results = await asyncio.gather(
+                        *[self._execute_tool(d["tool"], d.get("arguments", {})) for d in to_execute],
+                        return_exceptions=True,
+                    )
+                else:
+                    results = []
+                    for d in to_execute:
+                        try:
+                            results.append(await self._execute_tool(d["tool"], d.get("arguments", {})))
+                        except Exception as e:
+                            results.append(e)
+
+                for d, result in zip(to_execute, results):
+                    if isinstance(result, Exception):
+                        logger.error(f"Tool '{d['tool']}' raised during parallel execution: {result}")
+                        result = f"Ошибка вызова инструмента '{d['tool']}': {result}"
+                    entry = {"tool": d["tool"], "arguments": d.get("arguments", {}), "result": result}
+                    tool_trace.append(entry)
+                    round_results.append(entry)
 
             # Если модель просит только то, что уже вызывалось — новой
             # информации не будет, дальше крутить цикл бессмысленно.

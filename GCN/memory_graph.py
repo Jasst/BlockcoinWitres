@@ -74,7 +74,9 @@ except ImportError:
     REPLAY_BATCH_SIZE = 20
     REPLAY_MIX_RATIO = (0.4, 0.3, 0.2, 0.1)
     MEMORY_USE_EMBEDDINGS = True
-    EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
+    EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
+    EMBEDDING_QUERY_PREFIX = "query: "
+    EMBEDDING_PASSAGE_PREFIX = "passage: "
     FAISS_NLIST = 200
     FAISS_NPROBE = 30
     FAISS_REBUILD_THRESHOLD = 300
@@ -100,6 +102,9 @@ except ImportError:
     CONCEPT_MAX_SCAN = 2000
     CONCEPT_MAX_PER_RUN = 5
     CROSS_LAYER_GROUNDING_THRESHOLD = 0.75
+    RERANK_ENABLED = True
+    RERANK_CANDIDATE_MULTIPLIER = 3
+    RERANK_MAX_CANDIDATES = 20
 
 
 # =====================================================================
@@ -454,21 +459,36 @@ class CognitiveMemory:
             return 0.0
         return len(kw1 & kw2) / (len(kw1 | kw2) + 1e-6)
 
-    def _get_embedding(self, text: str) -> np.ndarray:
+    def _get_embedding(self, text: str, is_query: bool = False) -> np.ndarray:
+        # ИСПРАВЛЕНИЕ (пункт №1): модели семейства e5 (в т.ч. новый дефолт
+        # EMBEDDING_MODEL="intfloat/multilingual-e5-large") обучены с
+        # асимметричными префиксами — текст запроса и текст сохраняемого
+        # факта/пассажа должны эмбеддиться по-разному, иначе теряется
+        # заметная часть качества поиска, ради которой модель вообще
+        # переключалась. Для моделей, не нуждающихся в префиксах, обе
+        # константы в конфиге можно оставить пустыми строками — тогда
+        # поведение не меняется.
         if not self.use_embeddings or self.embedder is None:
             return np.zeros(self.embedding_dim if self.embedding_dim else 128)
-        return self.embedder.encode(text, convert_to_numpy=True)
+        prefix = EMBEDDING_QUERY_PREFIX if is_query else EMBEDDING_PASSAGE_PREFIX
+        text_to_encode = f"{prefix}{text}" if prefix else text
+        return self.embedder.encode(text_to_encode, convert_to_numpy=True)
 
-    def embed_text(self, text: str) -> Optional[List[float]]:
+    def embed_text(self, text: str, is_query: bool = False) -> Optional[List[float]]:
         """
         Публичная обёртка над _get_embedding() для внешних вызывающих
         (GCNMemoryRouter). Возвращает None, если эмбеддинги отключены —
         вызывающий код должен уметь работать без вектора (fallback на
         keyword-поиск), а не падать.
+
+        is_query=True — использовать префикс запроса (EMBEDDING_QUERY_PREFIX)
+        вместо префикса пассажа/факта; передавайте True для текста, по
+        которому идёт поиск (semantic_search и т.п.), False (по умолчанию)
+        — для текста, который сохраняется как знание/концепт.
         """
         if not self.use_embeddings or self.embedder is None:
             return None
-        return self._get_embedding(text).tolist()
+        return self._get_embedding(text, is_query=is_query).tolist()
 
     # ==================== ДОБАВЛЕНИЕ ФАКТОВ ====================
     def _add_fact(self, text: str, ftype: str, importance: float = 1.0,
@@ -907,10 +927,11 @@ class CognitiveMemory:
             if time.time() - ts < self._cache_ttl:
                 return result
 
-        # Генерируем вектор запроса
+        # Генерируем вектор запроса (is_query=True — асимметричный префикс e5,
+        # см. пункт №1 в шапке файла и _get_embedding)
         query_vector = None
         if self.use_embeddings:
-            query_vector = self._get_embedding(query).tolist()
+            query_vector = self._get_embedding(query, is_query=True).tolist()
 
         # start_node для графового компонента гибридного поиска.
         # Раньше сюда всегда передавался None — весь граф Hebbian/STDP
@@ -1376,7 +1397,96 @@ class GCNMemoryRouter:
 
         # Сортируем по _score
         unique.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
-        return unique[:top_k]
+
+        # ИСПРАВЛЕНИЕ (пункт №2 из анализа интеллекта): раньше здесь сразу
+        # обрезалось до top_k по линейной взвешенной сумме скоров — это
+        # хорошо отсеивает явно нерелевантное, но плохо разруливает
+        # "похожее по вектору, но не по сути" (близкая по эмбеддингу, но
+        # для данного вопроса бесполезная формулировка могла обойти в счёте
+        # действительно нужный факт). Даём LLM-судье посмотреть на candidate
+        # pool целиком (с запасом) и выбрать + упорядочить только реально
+        # релевантные — при сбое/пустом ответе всегда безопасно
+        # откатываемся на исходный порядок по _score.
+        reranked = await self._llm_rerank(query, unique, top_k)
+        return reranked if reranked is not None else unique[:top_k]
+
+    async def _llm_rerank(self, query: str, candidates: List[Dict], top_k: int) -> Optional[List[Dict]]:
+        """
+        Лёгкий LLM-реранкер поверх уже найденных гибридным поиском
+        кандидатов (см. пункт №2 в комментарии в retrieve()). Возвращает
+        None, если реранкинг не выполнялся или не удался — в этом случае
+        вызывающий код обязан откатиться на исходный порядок по _score,
+        чтобы одиночный сбой LLM никогда не приводил к пустому результату
+        поиска по памяти.
+        """
+        if not RERANK_ENABLED or self._llm_caller is None:
+            return None
+        if len(candidates) <= top_k:
+            # Реранкинг имеет смысл только когда есть из чего выбирать —
+            # если кандидатов и так не больше top_k, LLM-вызов ничего не даст.
+            return None
+
+        pool = candidates[:min(len(candidates), RERANK_MAX_CANDIDATES,
+                                max(top_k * RERANK_CANDIDATE_MULTIPLIER, top_k))]
+        listing = "\n".join(f"{i}. {c.get('text', '')[:300]}" for i, c in enumerate(pool))
+        prompt = (
+            "Ниже — вопрос пользователя и пронумерованный список фактов/эпизодов/концептов "
+            "из памяти ассистента, найденных по этому вопросу.\n\n"
+            f"Вопрос: {query}\n\n"
+            f"Список:\n{listing}\n\n"
+            f"Выбери из списка только те пункты, которые РЕАЛЬНО помогают ответить на вопрос "
+            f"(не более {top_k} штук), и упорядочи их по убыванию релевантности. Не выбирай "
+            "пункты, которые лишь формально похожи по теме, но не отвечают на вопрос.\n"
+            "Ответь ТОЛЬКО JSON-массивом номеров, без пояснений, без markdown. "
+            "Пример: [3, 0, 7]. Если ни один пункт не релевантен — верни []."
+        )
+        try:
+            raw = await self._llm_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=120)
+        except Exception as e:
+            logger.debug(f"LLM-реранкинг памяти не удался, откат на исходный порядок: {e}")
+            return None
+
+        indices = self._parse_index_list(raw, max_index=len(pool) - 1)
+        if indices is None:
+            return None
+        if not indices:
+            # LLM явно сказала "ничего релевантного" — доверяем этому вместо
+            # того, чтобы молча подсунуть модели произвольные топ-факты по
+            # эмбеддингу (см. исходную проблему MEMORY_CONTEXT_MIN_SCORE).
+            return []
+        return [pool[i] for i in indices[:top_k]]
+
+    @staticmethod
+    def _parse_index_list(raw: str, max_index: int) -> Optional[List[int]]:
+        """Строгий разбор ответа LLM-реранкера: ожидаем JSON-массив целых
+        чисел, ничего больше. Возвращает None при любой неоднозначности —
+        вызывающий код должен трактовать это как "реранкинг не удался"."""
+        if not raw:
+            return None
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        match = re.search(r"\[[^\[\]]*\]", text)
+        if not match:
+            return None
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, list):
+            return None
+        seen = set()
+        result = []
+        for item in parsed:
+            if isinstance(item, bool) or not isinstance(item, int):
+                continue
+            if 0 <= item <= max_index and item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
 
     def _pull_grounded_concepts(self, results: List[Dict], source_store: "MemoryStore") -> List[Dict]:
         """Для топовых результатов данного слоя подтягивает связанные GLOBAL-концепты

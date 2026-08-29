@@ -241,6 +241,26 @@ async def classify_intent(message: str) -> Dict:
         logger.debug(f"Intent classification failed: {e}")
     return {"intent": "none", "content": "", "confidence": 0.0}
 
+# ПУНКТ №3 (верификация/критик): промпт для дешёвого второго прохода после
+# генерации финального ответа. Не переписывает ответ — только проверяет,
+# нет ли в нём конкретных фактических утверждений, не подтверждённых тем,
+# что реально было передано модели (память/поиск/результаты инструментов).
+VERIFICATION_PROMPT = """Ты — проверяющий модуль когнитивного ассистента.
+
+Вопрос пользователя: {message}
+
+Материалы, которые были доступны ассистенту при ответе (личная память, результаты поиска, результаты инструментов):
+{evidence}
+
+Черновой ответ ассистента:
+{response}
+
+Проверь: есть ли в черновом ответе конкретные фактические утверждения (цифры, даты, имена, названия, источники, события), которых НЕТ в материалах выше и которые не являются общеизвестными базовыми знаниями?
+
+Если ответ корректен и ничего существенного не выдумано — ответь ровно одним словом: OK
+Если есть подозрительные непроверяемые утверждения — кратко, 1-2 предложения на русском, перечисли, что именно вызывает сомнение. Не переписывай сам ответ, не добавляй ничего лишнего.
+"""
+
 # =====================================================================
 # 3. КОГНИТИВНЫЙ КОНТРОЛЛЕР (изменён)
 # =====================================================================
@@ -260,8 +280,12 @@ class CognitiveController:
 
         self.memory = self.router.private_memory
 
+        # пункт №1: AIAdapter.retrieve()/.query() эмбеддит именно текст запроса —
+        # используем embed_text(is_query=True), а не сырой self.memory.embedder.encode(),
+        # чтобы асимметричный префикс e5 применялся и здесь, а не только в
+        # retrieve_hybrid().
         embedder_func = (
-            (lambda text: self.memory.embedder.encode(text, convert_to_numpy=True).tolist())
+            (lambda text: self.memory.embed_text(text, is_query=True))
             if self.memory.use_embeddings and self.memory.embedder is not None
             else None
         )
@@ -390,7 +414,7 @@ class CognitiveController:
             top_k = int(args.get("top_k", 5))
             memory = self.router.private_memory
             memory.reload_if_stale()
-            emb = memory.embed_text(query)
+            emb = memory.embed_text(query, is_query=True)  # пункт №1: это текст запроса, не факта
             if emb is None:
                 return {"error": "Эмбеддинги недоступны."}
             results = memory.store.semantic_search(emb, top_k=top_k * 2)
@@ -894,6 +918,40 @@ class CognitiveController:
         await self.memory._schedule_save()
 
     # ===== РЕФЛЕКСИЯ =====
+    async def _verify_response(self, message: str, response: str, evidence_text: str) -> Optional[str]:
+        """
+        ПУНКТ №3 (верификация/критик): дешёвый второй проход LLM после
+        генерации ответа — проверяет, нет ли в ответе конкретных
+        фактических утверждений, не подтверждённых материалами, которые
+        реально были доступны модели (память/поиск/результаты
+        инструментов). Не переписывает ответ — возвращает короткую
+        пометку (или None, если всё в порядке / проверка отключена /
+        ответ слишком короткий, чтобы её имело смысл проверять / сам
+        LLM-вызов сорвался). Никогда не бросает исключение наружу и
+        никогда не блокирует основной ответ при сбое.
+        """
+        if not RESPONSE_VERIFICATION_ENABLED or not response:
+            return None
+        if len(response.split()) < VERIFICATION_MIN_WORDS:
+            return None
+        prompt = VERIFICATION_PROMPT.format(
+            message=message,
+            evidence=evidence_text.strip() or
+                     "(материалов не передавалось — ответ должен опираться только на общие "
+                     "знания, без конкретных выдуманных фактов, цифр, дат, имён и источников)",
+            response=response[:4000],
+        )
+        try:
+            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.0,
+                                  max_tokens=VERIFICATION_MAX_TOKENS)
+        except Exception as e:
+            logger.debug(f"Response verification step failed, skipping: {e}")
+            return None
+        note = (raw or "").strip()
+        if not note or note.upper().startswith("OK"):
+            return None
+        return note[:400]
+
     def _compute_prediction_error(self, predicted: List[str], actual: str) -> float:
         if not predicted or not actual:
             return 1.0
@@ -1412,6 +1470,19 @@ class CognitiveController:
 
         response = await call_llm(messages)
 
+        # ПУНКТ №3: верификация ответа перед тем, как он попадёт в историю/
+        # эпизодическую память — если попадёт с пометкой, пометка тоже
+        # сохранится и будет видна при последующей сборке контекста.
+        if response:
+            evidence_text = "\n".join(filter(None, [
+                self._last_prepare_meta.get("memory_context", ""),
+                search_meta.get("context", ""),
+                build_tool_trace_context(tool_trace) if tool_trace else "",
+            ]))
+            note = await self._verify_response(message, response, evidence_text)
+            if note:
+                response = f"{response}\n\n⚠️ Уточнение: {note}"
+
         self.history.append({"role": "user", "content": message})
         if response:
             self.history.append({"role": "assistant", "content": response})
@@ -1889,6 +1960,11 @@ class CognitiveController:
             yield f"data: {json.dumps({'sources': search_meta['sources']})}\n\n"
 
         full_response = ""
+        tool_trace: List[Dict[str, Any]] = []
+        # process_input() уже делает верификацию (пункт №3) сама — если пойдём
+        # через неё (ветка else ниже, LM_STUDIO_USE_STREAM=False), пропускаем
+        # повторную проверку здесь же, чтобы не тратить второй LLM-вызов зря.
+        already_verified = False
         try:
             if LM_STUDIO_USE_STREAM:
                 # Решение "нужен ли инструмент" через ToolRouter
@@ -1963,6 +2039,7 @@ class CognitiveController:
             else:
                 response, _ = await self.process_input(message, web_search, image_base64, image_mime, reasoning)
                 full_response = response
+                already_verified = True
                 if char_by_char is None:
                     char_by_char = STREAM_CHAR_BY_CHAR
                 if char_by_char:
@@ -1976,6 +2053,23 @@ class CognitiveController:
             logger.error(f"Stream error: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
+
+        # ПУНКТ №3: верификация — здесь ответ уже отдан пользователю
+        # токенами, откатить/переписать сами отправленные токены нельзя,
+        # поэтому при обнаруженной проблеме досылаем короткую пометку
+        # отдельным SSE-событием и добавляем её в full_response, чтобы
+        # история/эпизодическая память видели итоговый текст целиком.
+        if full_response and not already_verified:
+            evidence_text = "\n".join(filter(None, [
+                self._last_prepare_meta.get("memory_context", ""),
+                search_meta.get("context", ""),
+                build_tool_trace_context(tool_trace) if tool_trace else "",
+            ]))
+            note = await self._verify_response(message, full_response, evidence_text)
+            if note:
+                caveat = f"\n\n⚠️ Уточнение: {note}"
+                yield f"data: {json.dumps({'token': caveat})}\n\n"
+                full_response += caveat
 
         self.history.append({"role": "user", "content": message})
         if full_response:
