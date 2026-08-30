@@ -4,6 +4,7 @@
 Добавлены: классификация намерений, автоматическое извлечение фактов, улучшенные команды.
 """
 import sys
+import os
 import uuid
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,9 +29,10 @@ from GCN.mcp_client_manager import MCPToolManager
 from GCN.GCN import AIAdapter, KnowledgeObject, KnowledgeType, MemoryScope
 from GCN.memory_graph import CognitiveMemory, Fact, Episode, Goal, GCNMemoryRouter
 
-from GCN.llm_client import call_llm, call_llm_stream
-from GCN.web_search import deep_search
+from GCN.llm_client import call_llm, call_llm_raw, call_llm_stream
+from GCN.web_search import deep_search, fetch_url
 from GCN.image_utils import enhance_prompt, generate_image
+from GCN.tool_router import ToolRegistry, ToolRouter, build_tool_trace_context
 
 from GCN.config_ai import *
 
@@ -58,12 +60,20 @@ def _now() -> float:
 # 1. Умный триггер поиска (оставлен)
 # =====================================================================
 SEARCH_TRIGGER_KEYWORDS = [
+    # Раньше список включал 'рецепт', 'инструкция', 'пошагово', 'сравнение',
+    # 'обзор', 'анализ', 'докажи', 'проверь', 'правда ли', 'как делается' —
+    # это форсировало веб-поиск ДО того, как LLM-роутер (_route/ROUTER_PROMPT)
+    # успевал решить сам. При этом сам ROUTER_PROMPT в качестве примера явно
+    # учит модель НЕ искать по запросу "Как приготовить борщ?" — то есть
+    # эвристика и роутер прямо противоречили друг другу, и эвристика всегда
+    # побеждала первой, вызывая лишние поисковые запросы на обычные
+    # инструкции/рецепты/сравнения, не требующие свежих данных из интернета.
+    # Оставлены только маркеры, для которых нужны действительно свежие/точные
+    # данные (даты, курсы, новости, актуальные события).
     'сегодня', 'сейчас', 'новости', 'курс', 'погода', 'свежие',
-    'последние', 'завтра', 'найди', 'поищи', 'информацию', 'актуальные',
+    'последние', 'завтра', 'найди', 'поищи', 'актуальные',
     '2024', '2025', '2026', 'сколько стоит', 'какой сейчас', 'последние данные',
-    'факт', 'статистика', 'результаты', 'кто победил', 'когда выйдет',
-    'где находится', 'как делается', 'пошагово', 'инструкция', 'рецепт',
-    'сравнение', 'обзор', 'анализ', 'докажи', 'проверь', 'правда ли',
+    'статистика', 'результаты', 'кто победил', 'когда выйдет',
 ]
 
 def needs_search_heuristic(message: str) -> bool:
@@ -196,21 +206,23 @@ INTENT_CLASSIFICATION_PROMPT = """Проанализируй сообщение 
 Если да, укажи команду и извлеки сущности.
 
 Возможные команды:
-- "store" — запомнить факт (пользователь хочет, чтобы ты запомнил информацию).
+- "store" — запомнить факт (пользователь хочет, чтобы ты запомнил информацию). Может быть уточнение "глобально" -> scope="global".
 - "forget" — забыть факт (удалить информацию).
 - "recall" — вспомнить информацию по теме.
 - "none" — обычный вопрос, не связанный с управлением памятью.
 
 Также извлеки "content" — текст, который нужно запомнить/забыть/или тему для поиска.
+Если в сообщении есть "глобально" или "global" и команда "store", установи scope="global".
 
 Ответь ТОЛЬКО валидным JSON:
-{{"intent": "store|forget|recall|none", "content": "извлечённый текст или пустая строка", "confidence": 0.0-1.0}}
+{{"intent": "store|forget|recall|none", "content": "извлечённый текст или пустая строка", "scope": "private|shared|global", "confidence": 0.0-1.0}}
 
 Примеры:
-- "Запомни, что мой любимый цвет синий" -> {{"intent": "store", "content": "мой любимый цвет синий", "confidence": 0.95}}
-- "Забудь всё о погоде" -> {{"intent": "forget", "content": "погода", "confidence": 0.9}}
-- "Что ты знаешь о Питоне?" -> {{"intent": "recall", "content": "Питон", "confidence": 0.95}}
-- "Как дела?" -> {{"intent": "none", "content": "", "confidence": 1.0}}
+- "Запомни, что мой любимый цвет синий" -> {{"intent": "store", "content": "мой любимый цвет синий", "scope": "private", "confidence": 0.95}}
+- "Запомни глобально, что Земля круглая" -> {{"intent": "store", "content": "Земля круглая", "scope": "global", "confidence": 0.95}}
+- "Забудь всё о погоде" -> {{"intent": "forget", "content": "погода", "scope": "private", "confidence": 0.9}}
+- "Что ты знаешь о Питоне?" -> {{"intent": "recall", "content": "Питон", "scope": "private", "confidence": 0.95}}
+- "Как дела?" -> {{"intent": "none", "content": "", "scope": "private", "confidence": 1.0}}
 
 Сообщение: {message}
 """
@@ -229,6 +241,26 @@ async def classify_intent(message: str) -> Dict:
     except Exception as e:
         logger.debug(f"Intent classification failed: {e}")
     return {"intent": "none", "content": "", "confidence": 0.0}
+
+# ПУНКТ №3 (верификация/критик): промпт для дешёвого второго прохода после
+# генерации финального ответа. Не переписывает ответ — только проверяет,
+# нет ли в нём конкретных фактических утверждений, не подтверждённых тем,
+# что реально было передано модели (память/поиск/результаты инструментов).
+VERIFICATION_PROMPT = """Ты — проверяющий модуль когнитивного ассистента.
+
+Вопрос пользователя: {message}
+
+Материалы, которые были доступны ассистенту при ответе (личная память, результаты поиска, результаты инструментов):
+{evidence}
+
+Черновой ответ ассистента:
+{response}
+
+Проверь: есть ли в черновом ответе конкретные фактические утверждения (цифры, даты, имена, названия, источники, события), которых НЕТ в материалах выше и которые не являются общеизвестными базовыми знаниями?
+
+Если ответ корректен и ничего существенного не выдумано — ответь ровно одним словом: OK
+Если есть подозрительные непроверяемые утверждения — кратко, 1-2 предложения на русском, перечисли, что именно вызывает сомнение. Не переписывай сам ответ, не добавляй ничего лишнего.
+"""
 
 # =====================================================================
 # 3. КОГНИТИВНЫЙ КОНТРОЛЛЕР (изменён)
@@ -249,8 +281,12 @@ class CognitiveController:
 
         self.memory = self.router.private_memory
 
+        # пункт №1: AIAdapter.retrieve()/.query() эмбеддит именно текст запроса —
+        # используем embed_text(is_query=True), а не сырой self.memory.embedder.encode(),
+        # чтобы асимметричный префикс e5 применялся и здесь, а не только в
+        # retrieve_hybrid().
         embedder_func = (
-            (lambda text: self.memory.embedder.encode(text, convert_to_numpy=True).tolist())
+            (lambda text: self.memory.embed_text(text, is_query=True))
             if self.memory.use_embeddings and self.memory.embedder is not None
             else None
         )
@@ -262,6 +298,17 @@ class CognitiveController:
 
         self._searcher = None
         self._last_ddg_call = 0.0
+
+        # УЛУЧШЕНИЕ: asyncio.create_task(...), вызванный без сохранения
+        # ссылки на Task, — известная ловушка: цикл событий хранит на него
+        # только слабую ссылку, и сборщик мусора может оборвать задачу
+        # прямо посреди выполнения (см. предупреждение в документации
+        # asyncio.create_task). Раньше именно так запускались auto-research
+        # из рефлексии и _quick_correction — то есть "тихая" потеря фоновой
+        # работы была возможна не только в теории. Теперь такие
+        # fire-and-forget задачи регистрируются в self._background_tasks и
+        # снимаются оттуда по завершении через add_done_callback.
+        self._background_tasks: set = set()
 
         self._consolidation_task = None
         self._planner_task = None
@@ -282,19 +329,459 @@ class CognitiveController:
         self.mcp_manager = MCPToolManager()
         self._mcp_task = asyncio.create_task(self.mcp_manager.initialize())
 
+        # ===== Единый реестр инструментов (internal + внешние MCP) =====
+        # Раньше внешние MCP-инструменты (mcp_manager) были единственным источником
+        # тулов у браузерного чата, а собственные возможности памяти (recall/remember/
+        # add_goal) были доступны только снаружи — через mcp_server_blockcoin.py.
+        # Из-за этого чат в браузере был "слепее", чем внешний MCP-клиент, даже для
+        # своих же данных. Теперь оба набора инструментов регистрируются в одном
+        # ToolRegistry с теми же именами/семантикой, что и в mcp_server_blockcoin.py.
+        self.tool_registry = ToolRegistry()
+        self._register_internal_tools()
+        self.tool_router = ToolRouter(
+            registry=self.tool_registry,
+            llm_raw_caller=call_llm_raw,
+            llm_text_caller=call_llm,
+        )
+        self._external_tools_registered = False
+
         # Для отслеживания бездействия
         self._last_activity_time = time.time()
         self._idle_consolidation_done = False
 
         logger.info(f"CognitiveController (GCN) initialized for {user_id[:16]}")
 
-    async def _handle_mcp_call(self, decision: Dict) -> str:
-        """Выполняет вызов внешнего MCP-инструмента."""
-        server = decision.get("server")
-        tool = decision.get("tool")
-        args = decision.get("arguments", {})
-        if not server or not tool:
-            return "Ошибка: не указан сервер или инструмент"
+    def _register_internal_tools(self):
+        """
+        Регистрирует те же операции над памятью, что уже отдаются наружу через
+        mcp_server_blockcoin.py (recall/remember/add_goal), напрямую на self.router —
+        без круга через самодельный JSON-формат mcp_call. Схемы аргументов совпадают
+        с Pydantic Field-описаниями в MCP-сервере, чтобы поведение не расходилось.
+        """
+
+        async def _recall(args: Dict) -> Dict:
+            query = args.get("query", "")
+            top_k = int(args.get("top_k", 5))
+            results = await self.router.retrieve(query, top_k=top_k, include_private=True)
+            return {
+                "results": [
+                    {"text": r.get("text", ""), "confidence": r.get("confidence", 0.0),
+                     "scope": r.get("scope", "private")}
+                    for r in results[:top_k]
+                ]
+            }
+
+        async def _remember(args: Dict) -> Dict:
+            fact = args.get("fact", "")
+            if not fact:
+                return {"status": "error", "message": "fact обязателен"}
+            scope_str = (args.get("scope") or "private").lower()
+            scope_enum = {"private": MemoryScope.PRIVATE, "shared": MemoryScope.SHARED,
+                          "global": MemoryScope.GLOBAL}.get(scope_str, MemoryScope.PRIVATE)
+            obj_id = self.router.add_knowledge(
+                subject=fact, predicate="is_fact", obj="true",
+                scope=scope_enum, confidence=0.7, author=self.router.user_id,
+                source_type="tool_call",
+            )
+            await self.memory._schedule_save()
+            return {"status": "ok", "id": obj_id, "fact": fact}
+
+        async def _add_goal(args: Dict) -> Dict:
+            description = args.get("description", "")
+            priority = float(args.get("priority", 0.5))
+            if not description:
+                return {"status": "error", "message": "description обязателен"}
+            gid = await self.memory.add_goal(description, priority)
+            return {"status": "ok", "id": gid, "description": description}
+
+        async def _web_search(args: Dict) -> Dict:
+            query = args.get("query", "")
+            data = await deep_search(query, max_results=5)
+            return {"context": data.get("context", ""), "sources": data.get("sources", [])}
+
+        async def _fetch_url(args: Dict) -> Dict:
+            url = args.get("url", "")
+            if not url:
+                return {"status": "error", "message": "url обязателен"}
+            return await fetch_url(url)
+
+        async def _forget(args: Dict) -> Dict:
+            query = args.get("query", "")
+            scope_str = (args.get("scope") or "private").lower()
+            scope_map = {"private": self.router.private_memory, "shared": self.router.shared_memory,
+                         "global": self.router.global_memory}
+            memory = scope_map.get(scope_str)
+            if memory is None or not query:
+                return {"status": "error", "message": "нужен query и корректный scope"}
+            memory.reload_if_stale()
+            to_remove = [f.id for f in memory.semantic_facts if query.lower() in f.text.lower()]
+            if not to_remove:
+                return {"status": "ok", "removed": 0, "scope": scope_str, "message": "Ничего не найдено."}
+            removed = memory._remove_facts(set(to_remove))
+            await memory._schedule_save()
+            return {"status": "ok", "removed": removed, "scope": scope_str}
+
+        async def _semantic_search(args: Dict) -> Dict:
+            query = args.get("query", "")
+            top_k = int(args.get("top_k", 5))
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            emb = memory.embed_text(query, is_query=True)  # пункт №1: это текст запроса, не факта
+            if emb is None:
+                return {"error": "Эмбеддинги недоступны."}
+            results = memory.store.semantic_search(emb, top_k=top_k * 2)
+            return {"results": [
+                {"text": memory.store.get(gcn_id).subject if memory.store.get(gcn_id) else "", "score": score}
+                for gcn_id, score in results[:top_k]
+            ]}
+
+        async def _get_episodes(args: Dict) -> Dict:
+            limit = int(args.get("limit", 5))
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            episodes = memory.episodic_memory[-limit:] if memory.episodic_memory else []
+            return {"episodes": [
+                {"user": ep.user_msg, "assistant": ep.assistant_msg, "timestamp": ep.timestamp}
+                for ep in reversed(episodes)
+            ], "count": len(episodes)}
+
+        async def _get_contradictions(args: Dict) -> Dict:
+            limit = int(args.get("limit", 5))
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            pairs = memory.get_unverified_contradictions(limit=limit)
+            return {"contradictions": [
+                {"a": {"text": a.text, "confidence": a.confidence, "id": a.id},
+                 "b": {"text": b.text, "confidence": b.confidence, "id": b.id}}
+                for a, b in pairs
+            ], "count": len(pairs)}
+
+        async def _get_goals(args: Dict) -> Dict:
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            goals = await memory.get_active_goals()
+            return {"goals": [
+                {"description": g.description, "priority": g.priority,
+                 "confidence": g.confidence, "status": g.status}
+                for g in goals
+            ], "count": len(goals)}
+
+        async def _graph_explore(args: Dict) -> Dict:
+            seed_text = args.get("seed_text", "")
+            depth = int(args.get("depth", 2))
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            seed_ids = [f.id for f in memory.semantic_facts if seed_text.lower() in f.text.lower()]
+            if not seed_ids:
+                return {"error": f"Факты с '{seed_text}' не найдены."}
+            activation = await memory.spread_activation(seed_ids[:3], max_depth=min(depth, 3))
+            sorted_items = sorted(activation.items(), key=lambda x: x[1], reverse=True)
+            return {"nodes": [
+                {"id": fid, "text": memory.facts_by_id.get(fid).text[:200] if memory.facts_by_id.get(fid) else "",
+                 "activation": act}
+                for fid, act in sorted_items[:20] if fid not in seed_ids
+            ]}
+
+        async def _explain_fact(args: Dict) -> Dict:
+            gcn_id = args.get("gcn_id", "")
+            self.router.refresh()
+            obj = (self.router.private_memory.store.get(gcn_id) or
+                   self.router.shared_memory.store.get(gcn_id) or
+                   self.router.global_memory.store.get(gcn_id))
+            if not obj:
+                return {"error": f"Объект {gcn_id} не найден ни в одном слое памяти."}
+            store = (self.router.private_memory.store if self.router.private_memory.store.get(gcn_id) else
+                     self.router.shared_memory.store if self.router.shared_memory.store.get(gcn_id) else
+                     self.router.global_memory.store)
+            contradictions = store._graph.get_neighbors(gcn_id, "CONTRADICTS")
+            grounds_in = store._graph.get_neighbors(gcn_id, "GROUNDS_IN")
+            abstracts_from = store._graph.get_neighbors(gcn_id, "ABSTRACTS_FROM")
+            confirming_authors = [e.split("author:", 1)[1] for e in obj.evidence if e.startswith("author:")]
+            return {
+                "id": obj.id, "type": obj.type.value, "scope": obj.scope.value, "text": obj.subject,
+                "confidence": obj.confidence, "version": obj.version, "author": obj.author,
+                "source_type": obj.source_type, "created": obj.created.isoformat(),
+                "confirming_authors": confirming_authors,
+                "contradicts": [t for _, t in contradictions],
+                "grounds_in_global": [t for _, t in grounds_in],
+                "abstracted_from": [t for _, t in abstracts_from],
+            }
+
+        async def _get_memory_stats(args: Dict) -> Dict:
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+            return memory.get_stats()
+
+        async def _resolve_contradiction(args: Dict) -> Dict:
+            fact_id_a = args.get("fact_id_a")
+            fact_id_b = args.get("fact_id_b")
+            verdict = (args.get("verdict") or "").lower()
+            memory = self.router.private_memory
+            memory.reload_if_stale()
+
+            def find_fact(fid):
+                if fid in memory.facts_by_id:
+                    return memory.facts_by_id[fid]
+                for f in memory.semantic_facts:
+                    if f.gcn_id == fid:
+                        return f
+                return None
+
+            fa, fb = find_fact(fact_id_a), find_fact(fact_id_b)
+            if not fa or not fb:
+                return {"status": "error", "message": f"Факты не найдены: A={fact_id_a}, B={fact_id_b}"}
+            if verdict == "a":
+                memory.gcn_store._graph.remove_relation(fa.gcn_id, "CONTRADICTS", fb.gcn_id)
+                memory.gcn_store._graph.remove_relation(fb.gcn_id, "CONTRADICTS", fa.gcn_id)
+                fa.contradicts.discard(fb.id)
+                fb.contradicts.discard(fa.id)
+                memory._remove_facts({fb.id})
+                await memory._schedule_save()
+                return {"status": "ok", "verdict": "a", "kept": fa.text, "removed": fb.text}
+            elif verdict == "b":
+                memory.gcn_store._graph.remove_relation(fa.gcn_id, "CONTRADICTS", fb.gcn_id)
+                memory.gcn_store._graph.remove_relation(fb.gcn_id, "CONTRADICTS", fa.gcn_id)
+                fa.contradicts.discard(fb.id)
+                fb.contradicts.discard(fa.id)
+                memory._remove_facts({fa.id})
+                await memory._schedule_save()
+                return {"status": "ok", "verdict": "b", "kept": fb.text, "removed": fa.text}
+            elif verdict == "both":
+                memory.gcn_store._graph.remove_relation(fa.gcn_id, "CONTRADICTS", fb.gcn_id)
+                memory.gcn_store._graph.remove_relation(fb.gcn_id, "CONTRADICTS", fa.gcn_id)
+                fa.contradicts.discard(fb.id)
+                fb.contradicts.discard(fa.id)
+                await memory._schedule_save()
+                return {"status": "ok", "verdict": "both", "message": "Противоречие снято, оба сохранены."}
+            elif verdict == "neither":
+                memory._remove_facts({fa.id, fb.id})
+                await memory._schedule_save()
+                return {"status": "ok", "verdict": "neither", "message": "Оба удалены."}
+            return {"status": "error", "message": f"Неизвестный вердикт: {verdict}"}
+
+        async def _generate_image_tool(args: Dict) -> Dict:
+            prompt = args.get("prompt", "")
+            if not prompt:
+                return {"status": "error", "message": "prompt обязателен"}
+            enhance = args.get("enhance_prompt", True)
+            final_prompt = await self.enhance_prompt(prompt) if enhance else prompt
+
+            image_b64 = await self.generate_image(
+                final_prompt,
+                steps=args.get("steps"), width=args.get("width"), height=args.get("height"),
+                cfg_scale=args.get("cfg_scale"), seed=args.get("seed"), sampler_name=args.get("sampler_name"),
+            )
+            if not image_b64:
+                return {"status": "error", "message": "Не удалось сгенерировать изображение"}
+
+            # --- СОХРАНЕНИЕ НА ДИСК ---
+            from GCN.config_ai import GENERATED_IMAGES_DIR
+            import base64, os
+            from datetime import datetime
+
+            output_dir = GENERATED_IMAGES_DIR
+            output_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = output_dir / f"image_{timestamp}.png"
+            with open(filename, "wb") as f:
+                f.write(base64.b64decode(image_b64))
+            file_path = str(filename.absolute())
+
+            # ✅ Используем переменную окружения или относительный путь
+            BASE_URL = os.getenv("SERVER_BASE_URL", "")
+            if not BASE_URL:
+                # fallback – если не задано, используем относительный путь
+                image_url = f"/generated_images/{filename.name}"
+            else:
+                image_url = f"{BASE_URL}/generated_images/{filename.name}"
+
+            logger.info(f"Image saved: {file_path}, URL: {image_url}")  # <-- ДОБАВЛЕНО
+
+            return {
+                "status": "ok",
+                "image_url": image_url,
+                "file_path": file_path,
+                "original_prompt": prompt,
+                "enhanced_prompt": final_prompt,
+                "message": f"Изображение сгенерировано: {image_url}"
+            }
+
+        async def _research_topic(args: Dict) -> Dict:
+            topic = args.get("topic", "")
+            if not topic:
+                return {"status": "error", "message": "topic обязателен"}
+            result = await self.research(topic)
+            return {
+                "topic": topic,
+                "hypotheses": result.get("hypotheses", []),
+                "evidence": result.get("evidence", []),
+                "answer": result.get("answer", ""),
+                "confidence": result.get("confidence", 0.0),
+            }
+
+        self.tool_registry.register(
+            name="recall",
+            description="Поиск в памяти пользователя (личная/общая/глобальная) по теме или вопросу.",
+            parameters={"type": "object",
+                        "properties": {"query": {"type": "string", "description": "Тема или вопрос для поиска"},
+                                       "top_k": {"type": "integer", "description": "Сколько результатов вернуть"}},
+                        "required": ["query"]},
+            handler=_recall,
+        )
+        self.tool_registry.register(
+            name="remember",
+            description="Сохранить факт в память пользователя.",
+            parameters={"type": "object",
+                        "properties": {"fact": {"type": "string", "description": "Текст факта для сохранения"},
+                                       "scope": {"type": "string", "enum": ["private", "shared", "global"],
+                                                 "description": "Скоуп памяти"}},
+                        "required": ["fact"]},
+            handler=_remember,
+        )
+        self.tool_registry.register(
+            name="add_goal",
+            description="Добавить новую активную цель пользователя.",
+            parameters={"type": "object",
+                        "properties": {"description": {"type": "string"},
+                                       "priority": {"type": "number", "description": "0..1"}},
+                        "required": ["description"]},
+            handler=_add_goal,
+        )
+        self.tool_registry.register(
+            name="web_search",
+            description="Найти актуальную информацию в интернете (курсы, новости, факты после обучения модели).",
+            parameters={"type": "object",
+                        "properties": {"query": {"type": "string", "description": "Поисковый запрос"}},
+                        "required": ["query"]},
+            handler=_web_search,
+        )
+        self.tool_registry.register(
+            name="fetch_url",
+            description=("Прочитать содержимое конкретной ссылки целиком (например, файл на GitHub, "
+                          "документацию, статью), а не искать её текстом в поисковике. Используй, когда "
+                          "пользователь прислал прямой URL и просит прочитать/проанализировать содержимое."),
+            parameters={"type": "object",
+                        "properties": {"url": {"type": "string", "description": "Прямая ссылка (https://...)"}},
+                        "required": ["url"]},
+            handler=_fetch_url,
+        )
+        # ===== Инструменты для паритета с mcp_server_blockcoin.py =====
+        # Раньше эти операции были доступны только внешнему MCP-клиенту (через
+        # mcp_server_blockcoin.py), а браузерный чат из коробки не мог ни
+        # забыть факт по запросу, ни сделать чисто векторный поиск, ни
+        # посмотреть противоречия/цели/происхождение факта/статистику памяти —
+        # то самое "работает не как в MCP", про которое сообщал пользователь.
+        self.tool_registry.register(
+            name="forget",
+            description="Удалить факты, содержащие заданные ключевые слова, из указанного слоя памяти.",
+            parameters={"type": "object",
+                        "properties": {"query": {"type": "string", "description": "Ключевые слова для удаления"},
+                                       "scope": {"type": "string", "enum": ["private", "shared", "global"]}},
+                        "required": ["query"]},
+            handler=_forget,
+        )
+        self.tool_registry.register(
+            name="semantic_search",
+            description="Векторный поиск по смыслу в личной памяти (по эмбеддингам, а не по ключевым словам).",
+            parameters={"type": "object",
+                        "properties": {"query": {"type": "string"}, "top_k": {"type": "integer"}},
+                        "required": ["query"]},
+            handler=_semantic_search,
+        )
+        self.tool_registry.register(
+            name="get_episodes",
+            description="Вернуть последние диалоги (эпизоды) из личной памяти.",
+            parameters={"type": "object", "properties": {"limit": {"type": "integer"}}},
+            handler=_get_episodes,
+        )
+        self.tool_registry.register(
+            name="get_contradictions",
+            description="Вернуть неразрешённые противоречия в личной памяти.",
+            parameters={"type": "object", "properties": {"limit": {"type": "integer"}}},
+            handler=_get_contradictions,
+        )
+        self.tool_registry.register(
+            name="get_goals",
+            description="Вернуть активные цели пользователя.",
+            parameters={"type": "object", "properties": {}},
+            handler=_get_goals,
+        )
+        self.tool_registry.register(
+            name="graph_explore",
+            description="Исследовать граф ассоциативной памяти, начиная с фактов, содержащих seed_text.",
+            parameters={"type": "object",
+                        "properties": {"seed_text": {"type": "string"}, "depth": {"type": "integer"}},
+                        "required": ["seed_text"]},
+            handler=_graph_explore,
+        )
+        self.tool_registry.register(
+            name="explain_fact",
+            description=("Объяснить происхождение и статус факта памяти по его gcn_id: кто и когда создал, "
+                         "с чем противоречит — используй после recall/semantic_search, когда нужно "
+                         "обосновать уверенность в факте."),
+            parameters={"type": "object",
+                        "properties": {"gcn_id": {"type": "string"}},
+                        "required": ["gcn_id"]},
+            handler=_explain_fact,
+        )
+        self.tool_registry.register(
+            name="get_memory_stats",
+            description="Вернуть статистику по личной памяти пользователя.",
+            parameters={"type": "object", "properties": {}},
+            handler=_get_memory_stats,
+        )
+        self.tool_registry.register(
+            name="resolve_contradiction",
+            description=("Разрешить противоречие между двумя фактами (см. get_contradictions): "
+                          "verdict='a'/'b' оставляет один факт и удаляет другой, 'both' снимает "
+                          "противоречие сохранив оба, 'neither' удаляет оба."),
+            parameters={"type": "object",
+                        "properties": {"fact_id_a": {"type": "string"}, "fact_id_b": {"type": "string"},
+                                       "verdict": {"type": "string", "enum": ["a", "b", "both", "neither"]}},
+                        "required": ["fact_id_a", "fact_id_b", "verdict"]},
+            handler=_resolve_contradiction,
+        )
+        self.tool_registry.register(
+            name="generate_image",
+            description="Сгенерировать изображение по текстовому описанию через локальный EasyDiffusion.",
+            parameters={"type": "object",
+                        "properties": {
+                            "prompt": {"type": "string", "description": "Описание изображения"},
+                            "enhance_prompt": {"type": "boolean", "description": "Улучшить промпт через LLM"},
+                            "steps": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"},
+                            "cfg_scale": {"type": "number"}, "seed": {"type": "integer"},
+                            "sampler_name": {"type": "string"},
+                        },
+                        "required": ["prompt"]},
+            handler=_generate_image_tool,
+        )
+        self.tool_registry.register(
+            name="research_topic",
+            description="Глубокое исследование темы с генерацией гипотез и сбором доказательств из поиска.",
+            parameters={"type": "object",
+                        "properties": {"topic": {"type": "string"}},
+                        "required": ["topic"]},
+            handler=_research_topic,
+        )
+
+    async def _ensure_external_tools_registered(self):
+        """Внешние MCP-серверы инициализируются асинхронно (self._mcp_task) — их
+        инструменты добавляем в общий реестр, как только они станут доступны.
+        Дополнительно на каждый вызов просим менеджер повторить попытку для
+        серверов, которые не поднялись при старте (ensure_connected сам
+        ограничивает частоту попыток) — раньше сервер, временно недоступный в
+        момент старта процесса, оставался недоступен до перезапуска, даже если
+        поднимался через минуту после этого. register_mcp_tools просто
+        перезаписывает записи по тем же именам, так что повторные вызовы (в т.ч.
+        после реконнекта) безопасны и подхватывают новые инструменты."""
+        if not self.mcp_manager._initialized:
+            return
+        await self.mcp_manager.ensure_connected()
+        self.tool_registry.register_mcp_tools(self.mcp_manager, self._handle_mcp_call)
+        self._external_tools_registered = True
+
+    async def _handle_mcp_call(self, server: str, tool: str, args: Dict) -> str:
+        """Выполняет вызов внешнего MCP-инструмента (используется ToolRegistry как handler)."""
         try:
             result = await self.mcp_manager.call_tool(server, tool, args)
             return result
@@ -443,6 +930,40 @@ class CognitiveController:
         await self.memory._schedule_save()
 
     # ===== РЕФЛЕКСИЯ =====
+    async def _verify_response(self, message: str, response: str, evidence_text: str) -> Optional[str]:
+        """
+        ПУНКТ №3 (верификация/критик): дешёвый второй проход LLM после
+        генерации ответа — проверяет, нет ли в ответе конкретных
+        фактических утверждений, не подтверждённых материалами, которые
+        реально были доступны модели (память/поиск/результаты
+        инструментов). Не переписывает ответ — возвращает короткую
+        пометку (или None, если всё в порядке / проверка отключена /
+        ответ слишком короткий, чтобы её имело смысл проверять / сам
+        LLM-вызов сорвался). Никогда не бросает исключение наружу и
+        никогда не блокирует основной ответ при сбое.
+        """
+        if not RESPONSE_VERIFICATION_ENABLED or not response:
+            return None
+        if len(response.split()) < VERIFICATION_MIN_WORDS:
+            return None
+        prompt = VERIFICATION_PROMPT.format(
+            message=message,
+            evidence=evidence_text.strip() or
+                     "(материалов не передавалось — ответ должен опираться только на общие "
+                     "знания, без конкретных выдуманных фактов, цифр, дат, имён и источников)",
+            response=response[:4000],
+        )
+        try:
+            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.0,
+                                  max_tokens=VERIFICATION_MAX_TOKENS)
+        except Exception as e:
+            logger.debug(f"Response verification step failed, skipping: {e}")
+            return None
+        note = (raw or "").strip()
+        if not note or note.upper().startswith("OK"):
+            return None
+        return note[:400]
+
     def _compute_prediction_error(self, predicted: List[str], actual: str) -> float:
         if not predicted or not actual:
             return 1.0
@@ -511,7 +1032,7 @@ class CognitiveController:
             for topic in topics_to_research[:3]:
                 if isinstance(topic, str) and topic.strip():
                     logger.info(f"[Reflection] Auto-research for topic: {topic}")
-                    asyncio.create_task(self.research(topic.strip()))
+                    self._spawn_background_task(self.research(topic.strip()), name=f"auto-research:{topic.strip()[:40]}")
 
         # НОВОЕ: сохраняем предложенные рефлексией концепты как низкоуверенные
         # CONCEPT-узлы личной памяти пользователя (не глобальной — это гипотеза
@@ -564,13 +1085,12 @@ class CognitiveController:
 
     # ===== НОВЫЙ МЕТОД: автоматическое извлечение фактов из сообщения =====
     async def _auto_extract_facts(self, message: str) -> List[str]:
-        """Извлекает факты из сообщения пользователя для автоматического запоминания."""
+        """Извлекает факты из сообщения пользователя и сохраняет через роутер (глобально)."""
         if not AUTO_EXTRACT_FACTS:
             return []
         # Пропускаем, если сообщение является командой (чтобы не дублировать)
         if any(message.lower().startswith(cmd) for cmd in MEMORY_CONTROL_COMMANDS.keys()):
             return []
-        # Используем тот же метод, что и для извлечения из поиска
         prompt = (
             "Извлеки из сообщения пользователя объективные факты, которые могут быть полезны для запоминания. "
             "Факты должны быть краткими утверждениями, содержащими конкретную информацию. "
@@ -596,7 +1116,22 @@ class CognitiveController:
             if not re.search(r'(является|составляет|равен|находится|имеет|был|стал|\d)', line):
                 continue
             facts.append(line[:300])
-        return facts[:3]
+        # Сохраняем через роутер в глобальную память
+        for fact in facts[:3]:
+            gcn_id = self.router.add_knowledge(
+                subject=fact,
+                predicate="is_fact",
+                obj="true",
+                scope=MemoryScope.GLOBAL,
+                confidence=AUTO_EXTRACT_CONFIDENCE,
+                author=self.user_id,
+                source_type="auto_extraction"
+            )
+            if gcn_id:
+                self.memory.hierarchy.add_to_working(gcn_id)
+        if facts:
+            await self.router.global_memory._schedule_save()
+        return facts
 
     # ===== ОСНОВНАЯ ЛОГИКА ПОДГОТОВКИ СООБЩЕНИЙ =====
     async def _prepare_messages(self, message: str, web_search: bool = False,
@@ -613,8 +1148,17 @@ class CognitiveController:
         sources = []
 
         if web_search and self.searcher:
-            route = await self._route(message)
-            search_query = route.get("search_query") or message
+            # Если пользователь прислал прямую ссылку, не даём LLM-роутеру
+            # переписать её в вольный поисковый запрос (легко теряет URL при
+            # перефразировании) — читаем ссылку напрямую, это и есть намерение
+            # пользователя ("прочитай эту страницу/файл").
+            direct_urls_in_message = re.findall(r'https?://\S+', message)
+            if direct_urls_in_message:
+                search_query = message
+                route = {"is_factual_time_sensitive": False}
+            else:
+                route = await self._route(message)
+                search_query = route.get("search_query") or message
             max_res = 7 if route.get("is_factual_time_sensitive") else MAX_PAGES_TO_FETCH
             search_data = await deep_search(search_query, max_results=max_res)
             if search_data["search_performed"]:
@@ -648,7 +1192,21 @@ class CognitiveController:
 
         relevant = await self.router.retrieve(message, top_k=7, include_private=True)
         memory_context = ""
-        if relevant:
+        # ИСПРАВЛЕНИЕ (причина №2 — "путаница" памяти в браузерном чате, которой
+        # нет в MCP-режиме): раньше блок "=== КОНТЕКСТ ИЗ ДОЛГОСРОЧНОЙ ПАМЯТИ ==="
+        # строился из ВСЕХ до 7 результатов router.retrieve() безусловно — retrieve
+        # всегда что-то возвращает (ближайшие соседи по эмбеддингам есть почти
+        # всегда), даже когда ни один факт реально не относится к вопросу
+        # ("нарисуй кота", "привет" и т.п.). Модель получала слабо релевантные или
+        # вовсе случайные факты в блоке, который система же промптом называет
+        # надёжным источником ("самый надёжный источник"), и путала их с реальным
+        # ответом. В MCP-режиме этого не происходит: там recall — это ЯВНЫЙ
+        # инструмент, который внешний клиент вызывает только когда сам решил, что
+        # нужна память, а не то, что подмешивается в КАЖДОЕ сообщение. Отсекаем
+        # низкорелевантные результаты здесь же, не трогая сам `relevant` — он
+        # по-прежнему используется ниже для predict_next/uncertainty/working memory.
+        context_facts = [f for f in relevant if f.get("_score", f.get("score", 0.0)) >= MEMORY_CONTEXT_MIN_SCORE]
+        if context_facts:
             type_labels = {
                 "claim": "факт", "concept": "концепт (обобщение)",
                 "episode": "прошлый диалог", "goal": "цель",
@@ -659,7 +1217,7 @@ class CognitiveController:
                 "global": "глобальный"
             }
             lines = []
-            for fact in relevant:
+            for fact in context_facts:
                 text = fact["text"][:300]
                 conf = fact.get("confidence", 0.5)
                 label = type_labels.get(fact.get("type"), "факт")
@@ -674,7 +1232,7 @@ class CognitiveController:
             # НОВОЕ: явно перечисляем непогашенные противоречия
             contradiction_lines = []
             seen_pairs = set()
-            for fact in relevant:
+            for fact in context_facts:
                 gcn_id = fact.get("gcn_id")
                 if not gcn_id:
                     continue
@@ -730,8 +1288,15 @@ class CognitiveController:
             goal_hint=goal_hint
         )
 
+        # search_meta изначально не содержало "context" — из-за этого при
+        # пересборке сообщений после срабатывания ToolRouter (см. process_input/
+        # stream_response, search_meta.get("context", "")) уже найденный веб-контент
+        # молча терялся и подменялся пустой строкой. Сохраняем его явно в обоих
+        # местах, откуда потом читают.
+        search_meta["context"] = search_context
         self._last_prepare_meta = {
             "search_meta": search_meta,
+            "search_context": search_context,
             "sources": sources,
             "memory_context": memory_context,
             "predictions": predictions,
@@ -747,36 +1312,64 @@ class CognitiveController:
         return messages, search_meta
 
 
-    # ===== ПРОЦЕССИНГ ВХОДА (изменён: добавлена классификация и автоизвлечение) =====
-    async def process_input(self, message: str, web_search: bool = False,
-                            image_base64: Optional[str] = None,
-                            image_mime: Optional[str] = None,
-                            reasoning: bool = False) -> Tuple[str, Dict]:
-        # Обновляем время активности
-        self._last_activity_time = time.time()
+    # ===== ОБЩИЙ ПРЕ-ПАЙПЛАЙН ПАМЯТИ =====
+    async def _run_memory_intent_pipeline(self, message: str) -> Optional[Tuple[str, Dict]]:
+        """
+        Общий первый этап обработки сообщения: явные команды памяти (regex),
+        классификация намерений store/forget/recall (LLM) и автоматическое
+        извлечение фактов.
 
+        ИСПРАВЛЕНИЕ (см. чат-ревью, пункт 3): раньше эти три шага существовали
+        ТОЛЬКО внутри process_input. stream_response их не вызывал вообще — он
+        сразу шёл в _ensure_external_tools_registered() + ToolRouter, минуя
+        classify_intent()/_auto_extract_facts(). Поскольку в браузерном чате по
+        умолчанию используется стриминг (LM_STUDIO_USE_STREAM=True в
+        config_ai.py), на практике это означало, что классификация намерений
+        почти никогда не отрабатывала в реальном UI — решения "запомнить/
+        вспомнить" принимал только few-shot fallback внутри ToolRouter, причём
+        не согласованно с этой веткой. Теперь оба входа (process_input и
+        stream_response) вызывают один и тот же метод — поведение одинаковое
+        независимо от режима.
+
+        Возвращает (response_text, meta), если сообщение уже полностью
+        обработано на этом этапе — вызывающий код должен вернуть/отдать этот
+        ответ пользователю и НЕ продолжать обычный пайплайн. Возвращает None,
+        если нужно продолжать как обычно (автоизвлечение фактов, если
+        сработало, уже выполнено как побочный эффект и в этом случае).
+        """
         # 1. Сначала проверяем команды памяти (старый способ для совместимости)
         cmd_response = await self._handle_memory_command(message)
         if cmd_response:
             return cmd_response[0], cmd_response[1]
 
-        # 2. Новая классификация намерений
+        # 2. Новая классификация намерений (использует улучшенный промпт)
         if ENABLE_INTENT_CLASSIFICATION:
             intent_data = await classify_intent(message)
             intent = intent_data.get("intent", "none")
             content = intent_data.get("content", "")
             confidence = intent_data.get("confidence", 0.0)
+            scope_str = intent_data.get("scope", "private")
+            scope_enum = {"private": MemoryScope.PRIVATE, "shared": MemoryScope.SHARED,
+                          "global": MemoryScope.GLOBAL}.get(scope_str, MemoryScope.PRIVATE)
 
             if intent == "store" and content and confidence > 0.6:
-                # Сохраняем факт в private память
-                fid = self.memory._add_fact(content, 'auto', confidence=0.7, importance=1.2)
-                fact = self.memory.facts_by_id.get(fid)
-                if fact and fact.gcn_id:
-                    self.memory.hierarchy.add_to_working(fact.gcn_id)
-                await self.memory._schedule_save()
-                return f"✅ Запомнил: {content}", {"memory": "auto_stored", "id": fid}
+                # Сохраняем через роутер (с инжекцией, дедупликацией)
+                gcn_id = self.router.add_knowledge(
+                    subject=content,
+                    predicate="is_fact",
+                    obj="true",
+                    scope=scope_enum,
+                    confidence=0.9,
+                    author=self.user_id,
+                    source_type="auto_classified"
+                )
+                if gcn_id:
+                    self.memory.hierarchy.add_to_working(gcn_id)
+                await self.router.private_memory._schedule_save() if scope_enum == MemoryScope.PRIVATE else await self.router.global_memory._schedule_save()
+                return f"✅ Запомнил ({scope_enum.value}): {content}", {"memory": "auto_stored", "id": gcn_id}
 
             elif intent == "forget" and content and confidence > 0.6:
+                # Удаляем из private памяти (можно расширить на другие слои)
                 to_remove = {f.id for f in self.memory.semantic_facts if content.lower() in f.text.lower()}
                 if to_remove:
                     removed = self.memory._remove_facts(to_remove)
@@ -785,95 +1378,122 @@ class CognitiveController:
                 else:
                     return f"Ничего не найдено для удаления по '{content}'", {"memory": "no_match"}
 
-
-            # ===== НОВЫЙ КОД (С SCOPE) =====
-
             elif intent == "recall" and content and confidence > 0.6:
-
-                facts = await self.memory.retrieve_hybrid(content, top_k=5, use_graph=True)
-
+                # Используем router.retrieve() для поиска по всем слоям
+                facts = await self.router.retrieve(content, top_k=7, include_private=True)
                 if not facts:
                     return "Ничего не найдено.", {"memory": "no_recall"}
 
                 scope_labels = {"private": "личный", "shared": "общий", "global": "глобальный"}
-
                 context_lines = []
-
                 for f in facts[:5]:
                     scope = f.get("scope", "private")
-
                     scope_label = scope_labels.get(scope, scope)
-
                     context_lines.append(f"- [{scope_label}] {f['text']}")
-
                 context = "\n".join(context_lines)
 
-                # Используем LLM для связного ответа
-
                 messages = [
-
                     {"role": "system", "content": "Ты — ассистент. На основе фактов дай связный ответ."},
-
                     {"role": "user", "content": f"Вопрос: {content}\n\nФакты:\n{context}"}
-
                 ]
-
                 response = await call_llm(messages, temp=0.6, max_tokens=500)
-
                 if not response:
                     response = "Вот что я знаю:\n" + context
-
                 return response, {"memory": "recalled"}
-            # Если intent == "none" или низкая уверенность, идём дальше
 
-        # 3. Автоматическое извлечение фактов (даже без команды)
+        # 3. Автоматическое извлечение фактов (даже без команды) — побочный
+        # эффект, не прерывает обработку сообщения.
         if AUTO_EXTRACT_FACTS and not any(cmd in message.lower() for cmd in MEMORY_CONTROL_COMMANDS.keys()):
             extracted = await self._auto_extract_facts(message)
             if extracted:
                 for fact in extracted:
-                    fid = self.memory._add_fact(fact, 'auto_extracted', confidence=AUTO_EXTRACT_CONFIDENCE, importance=0.8)
-                    fact_obj = self.memory.facts_by_id.get(fid)
-                    if fact_obj and fact_obj.gcn_id:
-                        self.memory.hierarchy.add_to_working(fact_obj.gcn_id)
-                await self.memory._schedule_save()
+                    gcn_id = self.router.add_knowledge(
+                        subject=fact,
+                        predicate="is_fact",
+                        obj="true",
+                        scope=MemoryScope.GLOBAL,
+                        confidence=AUTO_EXTRACT_CONFIDENCE,
+                        author=self.user_id,
+                        source_type="auto_extraction"
+                    )
+                    if gcn_id:
+                        self.memory.hierarchy.add_to_working(gcn_id)
+                await self.router.global_memory._schedule_save()
                 logger.info(f"Auto-extracted {len(extracted)} facts from message")
 
-        # 4. Обычная обработка (поиск, генерация ответа)
+        return None
+
+    # ===== ПРОЦЕССИНГ ВХОДА (изменён: добавлена классификация и автоизвлечение) =====
+    async def process_input(self, message: str, web_search: bool = False,
+                            image_base64: Optional[str] = None,
+                            image_mime: Optional[str] = None,
+                            reasoning: bool = False) -> Tuple[str, Dict]:
+        # Подтягиваем изменения, сделанные другими процессами (например, MCP)
+        self.router.refresh(include_private=True)
+
+        # Обновляем время активности
+        self._last_activity_time = time.time()
+
+        # 1-3. Команды памяти / классификация намерений / автоизвлечение —
+        # общий этап, вынесенный в _run_memory_intent_pipeline (используется
+        # и здесь, и в stream_response — см. исправление #3 из чат-ревью).
+        pipeline_result = await self._run_memory_intent_pipeline(message)
+        if pipeline_result:
+            return pipeline_result
+
+        # 4. Обычная обработка (инструменты, если нужны, потом ответ)
+        await self._ensure_external_tools_registered()
+
         messages, search_meta = await self._prepare_messages(
             message, web_search, image_base64, image_mime, reasoning
         )
 
+        # РЕШЕНИЕ (нужен ли инструмент) через ToolRouter
+        history_tail = "\n".join(
+            f"{m.get('role')}: {str(m.get('content'))[:200]}" for m in self.history[-6:]
+        )
+        tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
+        tool_trace = tool_run.get("tool_trace", [])
+
+        if tool_trace:
+            for t in tool_trace:
+                self.history.append({
+                    "role": "assistant",
+                    "content": f"[инструмент {t['tool']}] {str(t['result'])[:500]}"
+                })
+            messages = self._build_messages(
+                message=message,
+                web_search=web_search,
+                search_context=search_meta.get("context", ""),
+                memory_context=self._memory_context_for_rebuild(
+                    tool_trace, self._last_prepare_meta.get("memory_context", "")
+                ),
+                image_base64=image_base64,
+                image_mime=image_mime,
+                reasoning=reasoning,
+                uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
+                predictions=self._last_prepare_meta.get("predictions", []),
+                goal_hint=self._last_prepare_meta.get("goal_hint", "")
+            )
+            messages.append({
+                "role": "user",
+                "content": build_tool_trace_context(tool_trace) + "\n\nТеперь дай финальный ответ пользователю."
+            })
+
         response = await call_llm(messages)
 
-        try:
-            raw_text = response.strip()
-            start = raw_text.find("{")
-            end = raw_text.rfind("}") + 1
-            if start != -1 and end > start:
-                decision = json.loads(raw_text[start:end])
-                if decision.get("action") == "mcp_call":
-                    tool_result = await self._handle_mcp_call(decision)
-                    self.history.append({"role": "assistant", "content": f"Результат вызова: {tool_result}"})
-                    messages = self._build_messages(
-                        message=message,
-                        web_search=web_search,
-                        search_context=search_meta.get("context", ""),
-                        memory_context=self._last_prepare_meta.get("memory_context", ""),
-                        image_base64=image_base64,
-                        image_mime=image_mime,
-                        reasoning=reasoning,
-                        uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
-                        predictions=self._last_prepare_meta.get("predictions", []),
-                        goal_hint=self._last_prepare_meta.get("goal_hint", "")
-                    )
-                    messages.append({"role": "user",
-                                     "content": f"Результат вызова инструмента: {tool_result}\nТеперь дай финальный ответ пользователю."})
-                    final_response = await call_llm(messages)
-                    response = final_response
-                elif decision.get("action") == "reply":
-                    response = decision.get("message", response)
-        except json.JSONDecodeError:
-            pass
+        # ПУНКТ №3: верификация ответа перед тем, как он попадёт в историю/
+        # эпизодическую память — если попадёт с пометкой, пометка тоже
+        # сохранится и будет видна при последующей сборке контекста.
+        if response:
+            evidence_text = "\n".join(filter(None, [
+                self._last_prepare_meta.get("memory_context", ""),
+                search_meta.get("context", ""),
+                build_tool_trace_context(tool_trace) if tool_trace else "",
+            ]))
+            note = await self._verify_response(message, response, evidence_text)
+            if note:
+                response = f"{response}\n\n⚠️ Уточнение: {note}"
 
         self.history.append({"role": "user", "content": message})
         if response:
@@ -904,12 +1524,13 @@ class CognitiveController:
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
             if error > 0.85:
-                asyncio.create_task(self._quick_correction(message, predictions, response))
+                self._spawn_background_task(self._quick_correction(message, predictions, response), name="quick-correction")
 
         return response, search_meta
 
     # ===== ИЗВЛЕЧЕНИЕ ФАКТОВ (без изменений) =====
     async def _extract_facts_llm(self, text: str) -> List[str]:
+        """Извлекает факты из текста и сохраняет их через роутер в глобальную память."""
         prompt = (
             "Извлеки из текста только объективные, проверяемые факты. "
             "Факт должен быть кратким утверждением, содержащим конкретную информацию "
@@ -942,7 +1563,23 @@ class CognitiveController:
             if not re.search(r'(является|составляет|равен|находится|имеет|был|стал|\d)', line):
                 continue
             facts.append(line[:300])
-        return facts[:10]
+
+        # Сохраняем через роутер
+        for fact in facts[:10]:
+            gcn_id = self.router.add_knowledge(
+                subject=fact,
+                predicate="is_fact",
+                obj="true",
+                scope=MemoryScope.GLOBAL,
+                confidence=GLOBAL_FACT_CONFIDENCE_THRESHOLD,  # из config_ai
+                author=self.user_id,
+                source_type="web_search_extraction"
+            )
+            if gcn_id:
+                self.memory.hierarchy.add_to_working(gcn_id)
+        if facts:
+            await self.router.global_memory._schedule_save()
+        return facts
 
     def _extract_facts_from_text(self, text: str) -> List[str]:
         sentences = re.split(r'[.!?]', text)
@@ -961,69 +1598,81 @@ class CognitiveController:
                 rest = message[len(cmd):].strip()
                 if not rest:
                     continue
+
                 if action == "store":
-                    # Проверяем на глобальность
-                    is_global = any(word in rest.lower() for word in ("глобально", "global"))
-                    if is_global:
-                        clean_rest = rest
-                        for word in ("глобально", "global"):
-                            clean_rest = clean_rest.replace(word, "").strip()
-                        clean_rest = " ".join(clean_rest.split())
-                        try:
-                            prompt = (
-                                "Если факт структурирован и содержит достаточно информации по теме, запомни как есть, полный текст. Иначе извлеки из запроса пользователя объективный факт (утверждение, которое может быть проверено или использовано как знание). "
-                                "Игнорируй мнения, временные события, эмоции, инструкции и пожелания. "
-                                "Сформулируй факт как краткое предложение в настоящем времени (или прошедшем, если это не теряет актуальности). "
-                                "Ответь только фактом, без пояснений. Или полным текстом, если факт структурирован.\n\n"
-                                f"Запрос: {clean_rest}"
-                            )
-                            fact_text = await call_llm([{"role": "user", "content": prompt}], temp=0.3, max_tokens=150)
-                            fact_text = fact_text.strip()
-                            if len(fact_text) < 5:
-                                fact_text = clean_rest
-                        except Exception:
-                            fact_text = clean_rest
+                    # Определяем скоуп (как в MCP)
+                    is_global = any(w in rest.lower() for w in ("глобально", "global"))
+                    scope = MemoryScope.GLOBAL if is_global else MemoryScope.PRIVATE
 
-                        gcn_id = self.router.add_knowledge(
-                            subject=fact_text,
-                            predicate="is_fact",
-                            obj="true",
-                            scope=MemoryScope.GLOBAL,
-                            confidence=1.0,
-                            source_type="user_command"
+                    # Очищаем текст от флагов "глобально"/"global"
+                    clean_rest = rest
+                    for word in ("глобально", "global"):
+                        clean_rest = clean_rest.replace(word, "").strip()
+                    clean_rest = " ".join(clean_rest.split())
+
+                    # Если есть возможность, улучшим факт через LLM (как раньше)
+                    try:
+                        prompt = (
+                            "Если факт структурирован и содержит достаточно информации по теме, запомни как есть, полный текст. Иначе извлеки из запроса пользователя объективный факт (утверждение, которое может быть проверено или использовано как знание). "
+                            "Игнорируй мнения, временные события, эмоции, инструкции и пожелания. "
+                            "Сформулируй факт как краткое предложение в настоящем времени (или прошедшем, если это не теряет актуальности). "
+                            "Ответь только фактом, без пояснений. Или полным текстом, если факт структурирован.\n\n"
+                            f"Запрос: {clean_rest}"
                         )
+                        fact_text = await call_llm([{"role": "user", "content": prompt}], temp=0.3, max_tokens=150)
+                        fact_text = fact_text.strip()
+                        if len(fact_text) < 5:
+                            fact_text = clean_rest
+                    except Exception:
+                        fact_text = clean_rest
+
+                    # Запись через роутер (с инжекцией, дедупликацией и т.д.)
+                    gcn_id = self.router.add_knowledge(
+                        subject=fact_text,
+                        predicate="is_fact",
+                        obj="true",
+                        scope=scope,
+                        confidence=1.0 if scope == MemoryScope.GLOBAL else 0.9,
+                        author=self.user_id,
+                        source_type="user_command"
+                    )
+
+                    # Добавляем в рабочую память
+                    if gcn_id:
+                        self.memory.hierarchy.add_to_working(gcn_id)
+
+                    # Сохраняем соответствующий слой
+                    if scope == MemoryScope.GLOBAL:
                         await self.router.global_memory._schedule_save()
-                        response = f"Запомнил глобально: {fact_text}"
-                        return response, {"memory": "stored_global", "id": gcn_id}
-
+                    elif scope == MemoryScope.SHARED:
+                        await self.router.shared_memory._schedule_save()
                     else:
-                        fid = self.memory._add_fact(rest, 'command', confidence=1.0, importance=1.5)
-                        fact = self.memory.facts_by_id.get(fid)
-                        if fact and fact.gcn_id:
-                            self.memory.hierarchy.add_to_working(fact.gcn_id)
-                        await self.memory._schedule_save()
+                        await self.router.private_memory._schedule_save()
 
-                        messages = [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию. "
-                                    "Подтверди, что ты запомнил, кратко и естественно, возможно, с уточнением или перефразировкой, "
-                                    "чтобы показать понимание."
-                                )
-                            },
-                            {
-                                "role": "user",
-                                "content": f"Запомни: {rest}"
-                            }
-                        ]
-                        response = await call_llm(messages, temp=0.5, max_tokens=150)
-                        if response:
-                            return response, {"memory": "stored", "id": fid}
-                        else:
-                            return f"Запомнил: {rest}", {"memory": "stored", "id": fid}
+                    # Формируем ответ (можно через LLM для красоты)
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию. "
+                                "Подтверди, что ты запомнил, кратко и естественно, возможно, с уточнением или перефразировкой, "
+                                "чтобы показать понимание."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Запомни: {fact_text} (скоуп: {scope.value})"
+                        }
+                    ]
+                    response = await call_llm(messages, temp=0.5, max_tokens=150)
+                    if response:
+                        return response, {"memory": "stored", "scope": scope.value, "id": gcn_id}
+                    else:
+                        return f"Запомнил ({scope.value}): {fact_text}", {"memory": "stored", "scope": scope.value,
+                                                                          "id": gcn_id}
 
                 elif action == "forget":
+                    # Оставляем существующую логику (удаление из private памяти)
                     to_remove_ids = {f.id for f in self.memory.semantic_facts if rest.lower() in f.text.lower()}
                     if to_remove_ids:
                         removed = self.memory._remove_facts(to_remove_ids)
@@ -1051,7 +1700,9 @@ class CognitiveController:
                         return "Ничего не найдено для удаления.", {"memory": "no_match"}
 
                 elif action == "recall":
-                    facts = await self.memory.retrieve_hybrid(rest, top_k=7, use_graph=True)
+                    # Используем router.retrieve() для поиска по всем слоям
+                    facts = await self.router.retrieve(rest, top_k=7, include_private=True)
+
                     if not facts:
                         return "Ничего не найдено по вашему запросу.", {"memory": "no_recall"}
 
@@ -1060,7 +1711,8 @@ class CognitiveController:
                     for f in facts[:5]:
                         scope = f.get("scope", "private")
                         scope_label = scope_labels.get(scope, scope)
-                        context_lines.append(f"- [{scope_label}] {f['text']}")
+                        context_lines.append(
+                            f"- [{scope_label}] {f['text']} (уверенность: {f.get('confidence', 0.5):.2f})")
                     context = "\n".join(context_lines)
 
                     messages = [
@@ -1160,6 +1812,24 @@ class CognitiveController:
             except Exception as e:
                 logger.debug(f"Retract failed for {fact.gcn_id}: {e}")
 
+    # ===== ИСТОЧНИК ПАМЯТИ ПРИ ПЕРЕСБОРКЕ ПОСЛЕ ИНСТРУМЕНТОВ =====
+    @staticmethod
+    def _memory_context_for_rebuild(tool_trace: List[Dict[str, Any]], memory_context: str) -> str:
+        """
+        Вторая часть исправления "путаницы" памяти: если в этом же ходе уже был
+        явный вызов internal__recall / internal__semantic_search, не подмешиваем
+        ЕЩЁ и автоматический блок "КОНТЕКСТ ИЗ ДОЛГОСРОЧНОЙ ПАМЯТИ" в тот же
+        финальный промпт — иначе модель получает один и тот же (или слегка
+        разный по top_k/скорингу) набор фактов сразу в двух разных форматах
+        (автоблок текстом + JSON-результат инструмента), что и порождало
+        расхождения/путаницу, которых нет в MCP-режиме (там память приходит
+        только одним способом — через явный вызов инструмента).
+        """
+        recall_tools = {"internal__recall", "internal__semantic_search"}
+        if any(t.get("tool") in recall_tools for t in tool_trace):
+            return ""
+        return memory_context
+
     # ===== ПОСТРОЕНИЕ СООБЩЕНИЙ =====
     def _build_messages(self, message: str, web_search: bool, search_context: str,
                         memory_context: str, image_base64: Optional[str],
@@ -1197,20 +1867,12 @@ class CognitiveController:
         if web_search:
             system_parts.append("Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
 
-        if hasattr(self, 'mcp_manager') and self.mcp_manager._initialized:
-            external_tools = self.mcp_manager.get_all_tools()
-            if external_tools:
-                system_parts.append("=== ВНЕШНИЕ ИНСТРУМЕНТЫ (MCP) ===")
-                system_parts.append("Ты можешь вызывать их, используя JSON-действие:")
-                system_parts.append(
-                    '{"action": "mcp_call", "server": "имя_сервера", "tool": "имя_инструмента", "arguments": {...}}')
-                system_parts.append("Доступные инструменты:")
-                for t in external_tools:
-                    server = t.get("server", "unknown")
-                    name = t["name"]
-                    desc = t.get("description", "")
-                    system_parts.append(f"- {server}/{name}: {desc}")
-                system_parts.append("")
+        # Примечание: раньше здесь был текстовый блок с инструкцией эмитировать
+        # {"action": "mcp_call", ...} прямо в финальном ответе. Это убрано —
+        # решение "нужен ли инструмент" теперь принимается ОТДЕЛЬНЫМ шагом
+        # (GCN.tool_router.ToolRouter, вызывается до _build_messages), поэтому
+        # генерация финального ответа больше не должна ничего "решать" и не
+        # путается между текстом для пользователя и JSON-командой.
 
         system_content = "\n".join(system_parts)
         messages = [{"role": "system", "content": system_content}]
@@ -1283,13 +1945,24 @@ class CognitiveController:
     async def stream_response(self, message: str, web_search: bool = False,
                               image_base64: str = None, image_mime: str = None,
                               reasoning: bool = False, char_by_char: bool = None):
+        # Подтягиваем изменения, сделанные другими процессами (например, MCP)
+        self.router.refresh(include_private=True)
+
         self._last_activity_time = time.time()
 
-        cmd_response = await self._handle_memory_command(message)
-        if cmd_response:
-            yield f"data: {json.dumps({'token': cmd_response[0]})}\n\n"
+        # ИСПРАВЛЕНИЕ (#3 из чат-ревью): раньше здесь проверялись только
+        # regex-команды памяти (_handle_memory_command), а classify_intent()/
+        # _auto_extract_facts() (шаги 2-3 в process_input) не вызывались вовсе —
+        # то есть в основном, стримингом, режиме браузерного чата эта ветка
+        # никогда не срабатывала. Теперь оба входа используют один и тот же
+        # _run_memory_intent_pipeline, так что поведение идентично process_input.
+        pipeline_result = await self._run_memory_intent_pipeline(message)
+        if pipeline_result:
+            yield f"data: {json.dumps({'token': pipeline_result[0]})}\n\n"
             yield "data: [DONE]\n\n"
             return
+
+        await self._ensure_external_tools_registered()
 
         messages, search_meta = await self._prepare_messages(
             message, web_search, image_base64, image_mime, reasoning
@@ -1299,63 +1972,86 @@ class CognitiveController:
             yield f"data: {json.dumps({'sources': search_meta['sources']})}\n\n"
 
         full_response = ""
+        tool_trace: List[Dict[str, Any]] = []
+        # process_input() уже делает верификацию (пункт №3) сама — если пойдём
+        # через неё (ветка else ниже, LM_STUDIO_USE_STREAM=False), пропускаем
+        # повторную проверку здесь же, чтобы не тратить второй LLM-вызов зря.
+        already_verified = False
         try:
             if LM_STUDIO_USE_STREAM:
-                looks_like_json: Optional[bool] = None
-                json_buffer = ""
+                # Решение "нужен ли инструмент" через ToolRouter
+                history_tail = "\n".join(
+                    f"{m.get('role')}: {str(m.get('content'))[:200]}" for m in self.history[-6:]
+                )
+                tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
+                tool_trace = tool_run.get("tool_trace", [])
+                logger.info(f"Tool trace: {tool_trace}")  # ДОБАВЛЕНО
+
+                # Проверяем, не был ли вызван generate_image
+                #
+                # БАГ (была причина №1, почему картинка генерировалась, сохранялась
+                # на диск, но никогда не появлялась в чате): ToolRouter._execute_tool
+                # ВСЕГДА сериализует результат хэндлера в JSON-строку через
+                # json.dumps(...) перед тем как положить его в tool_trace (это нужно
+                # для текстового промпта финального ответа — build_tool_trace_context
+                # и few-shot fallback работают со строками). Из-за этого здесь
+                # `result` — это уже str, а не dict, и проверка `isinstance(result, dict)`
+                # была ЛОЖНОЙ ВСЕГДА, даже когда генерация прошла успешно и image_url
+                # реально был внутри. Именно поэтому в логах стабильно вылезало
+                # предупреждение "generate_image result does not contain image_url",
+                # хотя сам результат содержал image_url — просто в виде текста JSON.
+                for t in tool_trace:
+                    if t.get("tool") == "internal__generate_image":
+                        result = t.get("result")
+                        if isinstance(result, str):
+                            try:
+                                result = json.loads(result)
+                            except (json.JSONDecodeError, TypeError):
+                                logger.warning(
+                                    f"generate_image: не удалось распарсить результат инструмента как JSON: {result[:200]!r}"
+                                )
+                        logger.info(f"generate_image result: {result}")  # ДОБАВЛЕНО
+                        if isinstance(result, dict) and result.get("image_url"):
+                            image_url = result["image_url"]
+                            logger.info(f"Sending image_url event: {image_url}")  # ДОБАВЛЕНО
+                            yield f"data: {json.dumps({'image_url': image_url})}\n\n"
+                            break
+                        else:
+                            logger.warning("generate_image result does not contain image_url")  # ДОБАВЛЕНО
+
+                if tool_trace:
+                    for t in tool_trace:
+                        yield f"data: {json.dumps({'tool_call': t['tool'], 'result_preview': str(t['result'])[:200]})}\n\n"
+                        self.history.append({
+                            "role": "assistant",
+                            "content": f"[инструмент {t['tool']}] {str(t['result'])[:500]}"
+                        })
+                    messages = self._build_messages(
+                        message=message,
+                        web_search=web_search,
+                        search_context=search_meta.get("context", ""),
+                        memory_context=self._memory_context_for_rebuild(
+                            tool_trace, self._last_prepare_meta.get("memory_context", "")
+                        ),
+                        image_base64=image_base64,
+                        image_mime=image_mime,
+                        reasoning=reasoning,
+                        uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
+                        predictions=self._last_prepare_meta.get("predictions", []),
+                        goal_hint=self._last_prepare_meta.get("goal_hint", "")
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": build_tool_trace_context(tool_trace) + "\n\nТеперь дай финальный ответ пользователю."
+                    })
 
                 async for token in call_llm_stream(messages):
                     full_response += token
-
-                    if looks_like_json is None:
-                        stripped = full_response.lstrip()
-                        if stripped:
-                            looks_like_json = stripped.startswith("{")
-
-                    if looks_like_json:
-                        json_buffer += token
-                    elif looks_like_json is False:
-                        yield f"data: {json.dumps({'token': token})}\n\n"
-
-                if looks_like_json:
-                    try:
-                        raw_text = full_response.strip()
-                        start = raw_text.find("{")
-                        end = raw_text.rfind("}") + 1
-                        decision = json.loads(raw_text[start:end]) if start != -1 and end > start else None
-                    except json.JSONDecodeError:
-                        decision = None
-
-                    if decision and decision.get("action") == "mcp_call":
-                        tool_result = await self._handle_mcp_call(decision)
-                        messages = self._build_messages(
-                            message=message,
-                            web_search=web_search,
-                            search_context=search_meta.get("context", ""),
-                            memory_context=self._last_prepare_meta.get("memory_context", ""),
-                            image_base64=image_base64,
-                            image_mime=image_mime,
-                            reasoning=reasoning,
-                            uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
-                            predictions=self._last_prepare_meta.get("predictions", []),
-                            goal_hint=self._last_prepare_meta.get("goal_hint", "")
-                        )
-                        messages.append({"role": "user",
-                                         "content": f"Результат вызова инструмента: {tool_result}\nТеперь дай финальный ответ пользователю."})
-                        full_response = ""
-                        async for token in call_llm_stream(messages):
-                            full_response += token
-                            yield f"data: {json.dumps({'token': token})}\n\n"
-                    elif decision and decision.get("action") == "reply":
-                        full_response = decision.get("message", full_response)
-                        for word in full_response.split():
-                            yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-                    else:
-                        for word in full_response.split():
-                            yield f"data: {json.dumps({'token': word + ' '})}\n\n"
+                    yield f"data: {json.dumps({'token': token})}\n\n"
             else:
                 response, _ = await self.process_input(message, web_search, image_base64, image_mime, reasoning)
                 full_response = response
+                already_verified = True
                 if char_by_char is None:
                     char_by_char = STREAM_CHAR_BY_CHAR
                 if char_by_char:
@@ -1369,6 +2065,23 @@ class CognitiveController:
             logger.error(f"Stream error: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
+
+        # ПУНКТ №3: верификация — здесь ответ уже отдан пользователю
+        # токенами, откатить/переписать сами отправленные токены нельзя,
+        # поэтому при обнаруженной проблеме досылаем короткую пометку
+        # отдельным SSE-событием и добавляем её в full_response, чтобы
+        # история/эпизодическая память видели итоговый текст целиком.
+        if full_response and not already_verified:
+            evidence_text = "\n".join(filter(None, [
+                self._last_prepare_meta.get("memory_context", ""),
+                search_meta.get("context", ""),
+                build_tool_trace_context(tool_trace) if tool_trace else "",
+            ]))
+            note = await self._verify_response(message, full_response, evidence_text)
+            if note:
+                caveat = f"\n\n⚠️ Уточнение: {note}"
+                yield f"data: {json.dumps({'token': caveat})}\n\n"
+                full_response += caveat
 
         self.history.append({"role": "user", "content": message})
         if full_response:
@@ -1411,13 +2124,17 @@ class CognitiveController:
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
             if error > 0.85:
-                asyncio.create_task(self._quick_correction(message, predictions, full_response))
+                self._spawn_background_task(self._quick_correction(message, predictions, full_response), name="quick-correction")
 
         yield "data: [DONE]\n\n"
 
     # ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====
-    async def generate_image(self, prompt: str) -> Optional[str]:
-        return await generate_image(prompt)
+    async def generate_image(self, prompt: str, steps: Optional[int] = None,
+                              width: Optional[int] = None, height: Optional[int] = None,
+                              cfg_scale: Optional[float] = None, seed: Optional[int] = None,
+                              sampler_name: Optional[str] = None) -> Optional[str]:
+        return await generate_image(prompt, steps=steps, width=width, height=height,
+                                     cfg_scale=cfg_scale, seed=seed, sampler_name=sampler_name)
 
     async def enhance_prompt(self, prompt: str) -> str:
         return await enhance_prompt(prompt)
@@ -1438,6 +2155,17 @@ class CognitiveController:
                            reasoning: bool = False):
         return await self.process_input(message, web_search, image_base64, image_mime, reasoning)
 
+    def _spawn_background_task(self, coro, name: str = "") -> "asyncio.Task":
+        """
+        Запускает fire-and-forget корутину как задачу, сохраняя на неё сильную
+        ссылку в self._background_tasks (снимается автоматически по завершении),
+        чтобы GC не мог оборвать её на середине — см. комментарий в __init__.
+        """
+        task = asyncio.create_task(coro, name=name or None)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def shutdown(self):
         if self._consolidation_task:
             self._consolidation_task.cancel()
@@ -1449,19 +2177,69 @@ class CognitiveController:
             self._reflection_task.cancel()
         if self._idle_task:
             self._idle_task.cancel()
+        for task in list(self._background_tasks):
+            task.cancel()
         await self.memory.shutdown()
 
 # =====================================================================
 # Фабрика ассистентов
 # =====================================================================
-_assistants: Dict[str, CognitiveController] = {}
+_assistants: "OrderedDict[str, CognitiveController]" = OrderedDict()
 _assistants_lock = asyncio.Lock()
+_assistant_last_used: Dict[str, float] = {}
+
+# УЛУЧШЕНИЕ: раньше _assistants был обычным dict, из которого записи никогда
+# не удалялись. Каждая запись — это не просто объект в памяти: __init__
+# запускает 5 фоновых asyncio-задач (_consolidation_task/_planner_task/
+# _research_task/_reflection_task/_idle_task) плюс _mcp_task, и все они крутятся
+# бесконечно, пока процесс жив — даже для пользователя, зашедшего один раз
+# полгода назад. shutdown() уже умеет корректно их отменять (используется в
+# shutdown_all() при остановке процесса), но при штатной работе он никогда не
+# вызывался для отдельного простаивающего пользователя. Теперь применяем ту же
+# LRU+TTL-схему, что и для роутеров памяти MCP-сервера: неактивные
+# CognitiveController выгружаются по времени простоя/лимиту количества, с
+# явным await assistant.shutdown() перед удалением.
+_ASSISTANT_MAX_IDLE_SECONDS = int(os.environ.get("ASSISTANT_MAX_IDLE_SECONDS", "3600"))  # 1 час
+_ASSISTANT_MAX_COUNT = int(os.environ.get("ASSISTANT_MAX_COUNT", "50"))
+
+
+async def _evict_stale_assistants(exclude_uid: Optional[str] = None) -> None:
+    now = time.time()
+    stale = [
+        uid for uid, ts in _assistant_last_used.items()
+        if uid != exclude_uid and now - ts > _ASSISTANT_MAX_IDLE_SECONDS
+    ]
+    for uid in stale:
+        assistant = _assistants.pop(uid, None)
+        _assistant_last_used.pop(uid, None)
+        if assistant is not None:
+            try:
+                await assistant.shutdown()
+            except Exception as e:
+                logger.error(f"Ошибка при выгрузке ассистента {uid[:16]}: {e}")
+            logger.info(f"Ассистент {uid[:16]} выгружен из памяти (простой > {_ASSISTANT_MAX_IDLE_SECONDS}с)")
+
+    while len(_assistants) > _ASSISTANT_MAX_COUNT:
+        oldest_uid, oldest_assistant = next(iter(_assistants.items()))
+        if oldest_uid == exclude_uid:
+            break
+        _assistants.pop(oldest_uid, None)
+        _assistant_last_used.pop(oldest_uid, None)
+        try:
+            await oldest_assistant.shutdown()
+        except Exception as e:
+            logger.error(f"Ошибка при выгрузке ассистента {oldest_uid[:16]}: {e}")
+        logger.info(f"Ассистент {oldest_uid[:16]} выгружен по лимиту количества (LRU, max={_ASSISTANT_MAX_COUNT})")
+
 
 async def get_assistant(user_id: str):
     async with _assistants_lock:
+        await _evict_stale_assistants(exclude_uid=user_id)
         if user_id not in _assistants:
             _assistants[user_id] = CognitiveController(user_id)
             logger.info(f"Создан когнитивный ассистент для {user_id[:16]}")
+        _assistants.move_to_end(user_id)
+        _assistant_last_used[user_id] = time.time()
         return _assistants[user_id]
 
 # =====================================================================

@@ -419,6 +419,51 @@ def _coerce_scope(raw: Any) -> MemoryScope:
     return MemoryScope.GLOBAL
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _cross_process_file_lock(path: str, timeout: float = 15.0, poll: float = 0.05, stale_after: float = 30.0):
+    """
+    Простая межпроцессная advisory-блокировка на файл через os.O_CREAT|O_EXCL —
+    работает и на Windows, и на Linux без внешних зависимостей (fcntl/msvcrt
+    платформозависимы и требовали бы ветвления). Раньше save() защищал только
+    self._lock (threading.RLock) — это блокирует потоки ВНУТРИ одного процесса,
+    но никак не мешает второму процессу (например, mcp_server_blockcoin.py,
+    работающему параллельно с чатом) писать в тот же gcn_state.json одновременно.
+    stale_after — если .lock-файл старше этого времени, считаем, что владевший
+    им процесс упал и не снял блокировку, и забираем её сами, а не виснем вечно.
+    """
+    lock_path = f"{path}.lock"
+    start = time.time()
+    fd = None
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock_path) > stale_after:
+                    os.remove(lock_path)
+                    continue
+            except OSError:
+                pass
+            if time.time() - start > timeout:
+                raise TimeoutError(f"Не удалось получить файловую блокировку {lock_path} за {timeout}с")
+            time.sleep(poll)
+    try:
+        yield
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
+
+
 class MemoryStore:
     def __init__(self, embedding_dim: Optional[int] = None):
         self._objects: Dict[str, KnowledgeObject] = {}
@@ -1029,7 +1074,24 @@ class MemoryStore:
             if not obj:
                 candidates.remove(obj_id)
                 continue
-            age_days = (now - obj.created).days
+            # ИСПРАВЛЕНИЕ: раньше "свежесть" считалась только от obj.created —
+            # даты первого создания факта. Из-за этого стабильное, часто
+            # подтверждаемое/вспоминаемое ядро знаний (record_access пишет
+            # last_accessed в obj.object) со временем неизбежно теряло весь
+            # freshness-баллы просто потому, что было создано давно, даже если
+            # к нему обращались вчера — а разовый шумовой факт недельной
+            # давности оказывался "свежее" только по дате создания. Теперь
+            # используем last_accessed из метаданных, если он есть, и только
+            # при его отсутствии откатываемся на created.
+            reference_time = obj.created
+            meta = obj.object if isinstance(obj.object, dict) else {}
+            last_accessed_raw = meta.get("last_accessed")
+            if last_accessed_raw:
+                try:
+                    reference_time = datetime.fromisoformat(last_accessed_raw)
+                except (ValueError, TypeError):
+                    pass
+            age_days = (now - reference_time).days
             recency = max(0.0, 1.0 - age_days / 365.0)
             scores[obj_id] = scores.get(obj_id, 0.0) + recency * weights['freshness']
             scores[obj_id] += obj.confidence * weights['confidence']
@@ -1110,43 +1172,59 @@ class MemoryStore:
     def save(self, path: str):
         """Синхронное сохранение. Перед записью подтягивает изменения,
         сделанные другим процессом с момента нашей последней загрузки —
-        см. _merge_disk_state()."""
-        with self._lock:
-            if os.path.exists(path):
-                try:
-                    disk_mtime = os.path.getmtime(path)
-                    if self._loaded_mtime is None or disk_mtime > self._loaded_mtime:
-                        self._merge_disk_state(path)
-                except OSError:
-                    pass
-            objects_data = {}
-            for k, v in self._objects.items():
-                od = dict(v.__dict__)
-                od["type"] = v.type.value
-                od["created"] = v.created.isoformat()
-                od["provenance"] = None
-                od["scope"] = v.scope.value if isinstance(v.scope, MemoryScope) else v.scope
-                objects_data[k] = od
-            data = {
-                "objects": objects_data,
-                "events": [
-                    {**e.__dict__, "type": e.type.value, "timestamp": e.timestamp.isoformat()}
-                    for e in self._events
-                ],
-                "graph_edges": dict(self._graph._edges),
-                "graph_edge_meta": {
-                    "|".join(k): v for k, v in self._graph._edge_meta.items()
-                },
-                "embeddings": self._embedding_index,
-                "faiss_dirty": self._faiss_dirty,
-                "embedding_dim": self.embedding_dim,
-            }
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, default=str, indent=2, ensure_ascii=False)
-        try:
-            self._loaded_mtime = os.path.getmtime(path)
-        except OSError:
-            self._loaded_mtime = time.time()
+        см. _merge_disk_state(). Теперь также защищено межпроцессной
+        файловой блокировкой и пишет через tmp+rename, чтобы падение
+        процесса посреди записи не оставляло битый gcn_state.json."""
+        with _cross_process_file_lock(path):
+            with self._lock:
+                if os.path.exists(path):
+                    try:
+                        disk_mtime = os.path.getmtime(path)
+                        if self._loaded_mtime is None or disk_mtime > self._loaded_mtime:
+                            self._merge_disk_state(path)
+                    except OSError:
+                        pass
+                objects_data = {}
+                for k, v in self._objects.items():
+                    od = dict(v.__dict__)
+                    od["type"] = v.type.value
+                    od["created"] = v.created.isoformat()
+                    od["provenance"] = None
+                    od["scope"] = v.scope.value if isinstance(v.scope, MemoryScope) else v.scope
+                    objects_data[k] = od
+                data = {
+                    "objects": objects_data,
+                    "events": [
+                        {**e.__dict__, "type": e.type.value, "timestamp": e.timestamp.isoformat()}
+                        for e in self._events
+                    ],
+                    "graph_edges": dict(self._graph._edges),
+                    "graph_edge_meta": {
+                        "|".join(k): v for k, v in self._graph._edge_meta.items()
+                    },
+                    "embeddings": self._embedding_index,
+                    "faiss_dirty": self._faiss_dirty,
+                    "embedding_dim": self.embedding_dim,
+                }
+            # Атомарная запись: сначала во временный файл в той же директории
+            # (чтобы rename был атомарным на одной ФС), затем os.replace().
+            # Раньше писали сразу в path — конкурентный читатель (или crash
+            # посреди json.dump) мог увидеть/оставить наполовину записанный JSON.
+            tmp_path = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+            try:
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, default=str, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, path)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+            try:
+                self._loaded_mtime = os.path.getmtime(path)
+            except OSError:
+                self._loaded_mtime = time.time()
 
     def load(self, path: str):
         """Синхронная загрузка."""
@@ -1339,7 +1417,7 @@ if __name__ == "__main__":
     user_id, ass_id = store.add_episode("Что такое GCN?", "GCN это графовая свёрточная сеть", "Alice")
     # Добавляем цель
     goal_id = store.add_goal("Изучить графовые нейросети", "Alice", priority=0.8)
-    # Активные цели
+    # Активные целиф
     goals = store.get_active_goals()
     print("Active goals:", [g.subject for g in goals])
     # Гибридный поиск (заглушка вектора)

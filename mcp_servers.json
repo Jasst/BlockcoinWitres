@@ -1,13 +1,10 @@
 {
-  "servers": {
+  "mcpServers": {
     "blockcoin-memory": {
-      "command": "python",
-      "args": ["mcp_server_blockcoin.py"],
-      "env": {"PYTHONPATH": "."}
-    },
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+      "command": "E:\\BlockcoinWitres\\.venv\\Scripts\\python.exe",
+      "args": [
+        "E:\\BlockcoinWitres\\mcp_server_blockcoin.py"
+      ]
     }
   }
 }
