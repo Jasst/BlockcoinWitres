@@ -12,6 +12,8 @@ MCP Сервер для BlockcoinWitres (GCN Cognitive Memory) – Рефакт�
 import asyncio
 import logging
 import sys
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, Dict, Any
 import random
@@ -49,9 +51,58 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("blockcoin-mcp")
 
 DEFAULT_USER = "default_user"
-_routers: Dict[str, GCNMemoryRouter] = {}
 
-def get_router(user_id: Optional[str], for_write: bool = False) -> GCNMemoryRouter:
+# УЛУЧШЕНИЕ: раньше _routers был обычным dict без выгрузки — на каждый новый
+# user_id (адрес кошелька) создавался GCNMemoryRouter (эмбеддинги + граф в
+# памяти процесса) и никогда не освобождался. Для долгоживущего MCP-сервера
+# с большим числом разных пользователей это неограниченная утечка памяти.
+# Теперь роутеры хранятся в OrderedDict как LRU: при каждом обращении
+# сдвигаются в конец, неактивные дольше MCP_ROUTER_MAX_IDLE_SECONDS и/или
+# роутеры сверх MCP_ROUTER_MAX_COUNT выгружаются — но не молча, а с
+# сохранением всех трёх слоёв памяти на диск перед выгрузкой, чтобы не
+# потерять несохранённые изменения.
+_ROUTER_MAX_IDLE_SECONDS = int(os.getenv("MCP_ROUTER_MAX_IDLE_SECONDS", "1800"))  # 30 минут
+_ROUTER_MAX_COUNT = int(os.getenv("MCP_ROUTER_MAX_COUNT", "50"))
+
+_routers: "OrderedDict[str, GCNMemoryRouter]" = OrderedDict()
+_router_last_used: Dict[str, float] = {}
+_router_lock = asyncio.Lock()
+
+
+async def _save_router(uid: str, router: GCNMemoryRouter) -> None:
+    for mem in (router.private_memory, router.shared_memory, router.global_memory):
+        try:
+            await mem._save_async()
+        except Exception as e:
+            logger.error(f"Ошибка сохранения памяти при выгрузке роутера {uid[:16]}: {e}")
+
+
+async def _evict_stale_routers(exclude_uid: Optional[str] = None) -> None:
+    now = time.time()
+    stale = [
+        uid for uid, ts in _router_last_used.items()
+        if uid != exclude_uid and now - ts > _ROUTER_MAX_IDLE_SECONDS
+    ]
+    for uid in stale:
+        router = _routers.pop(uid, None)
+        _router_last_used.pop(uid, None)
+        if router is not None:
+            await _save_router(uid, router)
+            logger.info(f"Роутер {uid[:16]} выгружен из памяти (простой > {_ROUTER_MAX_IDLE_SECONDS}с)")
+
+    while len(_routers) > _ROUTER_MAX_COUNT:
+        oldest_uid, oldest_router = next(iter(_routers.items()))
+        if oldest_uid == exclude_uid:
+            # текущий пользователь — самый старый в LRU (например, единственный
+            # активный при MAX_COUNT=1): выгружать нечего, выходим.
+            break
+        _routers.pop(oldest_uid, None)
+        _router_last_used.pop(oldest_uid, None)
+        await _save_router(oldest_uid, oldest_router)
+        logger.info(f"Роутер {oldest_uid[:16]} выгружен по лимиту количества (LRU, max={_ROUTER_MAX_COUNT})")
+
+
+async def get_router(user_id: Optional[str], for_write: bool = False) -> GCNMemoryRouter:
     """
     УЛУЧШЕНИЕ: раньше отсутствие user_id для ЛЮБОГО инструмента (в т.ч.
     remember/forget/add_goal — то есть операций записи) тихо утекало в
@@ -62,6 +113,9 @@ def get_router(user_id: Optional[str], for_write: bool = False) -> GCNMemoryRout
     (for_write=True) теперь это жёсткий отказ, а не предупреждение — молчаливая
     порча памяти становится невозможной в принципе. Для read-тулов поведение
     прежнее (можно посмотреть общую default-память, это безопасно).
+
+    Теперь также async: перед выдачей/созданием роутера выполняет LRU/TTL-
+    выгрузку неактивных роутеров (см. _evict_stale_routers).
     """
     uid = user_id or DEFAULT_USER
     if uid == DEFAULT_USER:
@@ -76,14 +130,39 @@ def get_router(user_id: Optional[str], for_write: bool = False) -> GCNMemoryRout
             "это НЕ приватная память реального пользователя чата. "
             "Передавайте user_id (адрес кошелька) явно."
         )
-    if uid not in _routers:
-        _routers[uid] = GCNMemoryRouter(uid, Path(MEMORY_BASE_DIR))
-        logger.info(f"Память MCP инициализирована для {uid[:16]}")
-    return _routers[uid]
+
+    async with _router_lock:
+        await _evict_stale_routers(exclude_uid=uid)
+        if uid not in _routers:
+            _routers[uid] = GCNMemoryRouter(uid, Path(MEMORY_BASE_DIR))
+            logger.info(f"Память MCP инициализирована для {uid[:16]}")
+        _routers.move_to_end(uid)
+        _router_last_used[uid] = time.time()
+        return _routers[uid]
 
 mcp = FastMCP("BlockcoinWitres Memory", description="Когнитивная память с веб-поиском и генерацией")
 
 _USER_ID_DESC = "Идентификатор пользователя (тот же адрес кошелька, что использует чат). Если не передан — используется общий default_user, а не личная память конкретного человека."
+
+# УЛУЧШЕНИЕ: TOOL_CALL_TIMEOUT_SECONDS в mcp_client_manager.py защищает НАШ
+# чат, когда он сам выступает MCP-клиентом. Но когда этот файл работает как
+# MCP-сервер для внешних клиентов (Claude Desktop и т.п.), у его тулов не было
+# никакого таймаута — зависший LLM/EasyDiffusion/DDG вызов внутри
+# execute_command/web_search/generate_image/research_topic вешал сессию
+# клиента навсегда. _with_timeout оборачивает такие тулы явным лимитом.
+_MCP_TOOL_TIMEOUT_SECONDS = int(os.getenv("MCP_TOOL_TIMEOUT_SECONDS", "120"))
+
+
+async def _with_timeout(coro, tool_name: str, timeout: Optional[float] = None) -> Any:
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout or _MCP_TOOL_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.error(f"Тул '{tool_name}' превысил таймаут {timeout or _MCP_TOOL_TIMEOUT_SECONDS}с")
+        return {
+            "status": "error",
+            "error": "timeout",
+            "message": f"'{tool_name}' не ответил за {timeout or _MCP_TOOL_TIMEOUT_SECONDS}с — операция прервана.",
+        }
 
 # ============================================================
 # УНИВЕРСАЛЬНЫЙ ИНСТРУМЕНТ
@@ -91,14 +170,30 @@ _USER_ID_DESC = "Идентификатор пользователя (тот ж�
 @mcp.tool()
 async def execute_command(
     command: str = Field(..., description="Любая команда на естественном языке (например, 'запомни, что ...' или 'что ты знаешь о ...')"),
+    allow_web_search: bool = Field(
+        True,
+        description="Разрешить пайплайну использовать веб-поиск, если команда его требует.",
+    ),
     user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
 ) -> Dict[str, Any]:
     """
     Выполняет любую команду через тот же пайплайн, что и обычный чат.
     Возвращает структурированный ответ с результатом и метаданными.
     """
+    # ИСПРАВЛЕНО: раньше web_search был жёстко зашит в False, хотя тул
+    # заявлен как универсальный вход "любая команда на естественном языке" —
+    # команда вида "найди в интернете ..." просто не могла воспользоваться
+    # поиском через этот тул. Теперь управляется явным параметром (по
+    # умолчанию включено, как и в обычном чате).
     assistant = await get_assistant(user_id or DEFAULT_USER)
-    response, meta = await assistant.process_input(command, web_search=False)
+
+    async def _run():
+        return await assistant.process_input(command, web_search=allow_web_search)
+
+    result = await _with_timeout(_run(), "execute_command")
+    if isinstance(result, dict) and result.get("error") == "timeout":
+        return result
+    response, meta = result
     return {
         "result": response,
         "meta": meta,
@@ -119,7 +214,7 @@ async def recall(
     """
     Поиск в памяти с фильтром по скоупу. Возвращает список фактов с уверенностью.
     """
-    router = get_router(user_id)
+    router = await get_router(user_id)
     results = await router.retrieve(query, top_k=top_k*2, include_private=True)
     if scope:
         scope_lower = scope.lower()
@@ -153,16 +248,28 @@ async def recall(
 @mcp.tool()
 async def remember(
     fact: str = Field(..., description="Факт для запоминания"),
-    scope: Optional[str] = Field("private", description="Скоуп: 'private', 'shared', 'global'"),
+    scope: Optional[str] = Field(
+        None,
+        description="Скоуп: 'private', 'shared', 'global'. Если не передан явно — "
+                    "определяется автоматически по наличию слов 'глобально'/'global' в тексте факта.",
+    ),
     user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
 ) -> Dict[str, Any]:
     """
     Сохраняет факт в указанный скоуп. Если scope не указан, определяется автоматически по наличию слов "глобально"/"global".
     """
-    router = get_router(user_id, for_write=True)
+    router = await get_router(user_id, for_write=True)
     router.refresh()
 
-    if scope is None or scope.lower() == "private":
+    # ИСПРАВЛЕНО: раньше default для scope был строкой "private" (не None), из-за
+    # чего условие `scope is None or scope.lower() == "private"` было истинным
+    # и для дефолта, И для ЛЮБОГО явного scope="private" — то есть явный запрос
+    # "сохрани приватно" всё равно прогонялся через эвристику по ключевым словам
+    # и мог молча уйти в GLOBAL, если факт случайно содержал подстроку "global"
+    # (например "global variable"). Теперь автоопределение срабатывает ТОЛЬКО
+    # когда scope не передан вовсе; любой явный scope — единственный источник
+    # истины и никогда не переопределяется эвристикой.
+    if scope is None:
         if "глобально" in fact.lower() or "global" in fact.lower():
             scope_enum = MemoryScope.GLOBAL
         else:
@@ -199,12 +306,22 @@ async def remember(
 async def forget(
     query: str = Field(..., description="Ключевые слова для удаления фактов"),
     scope: str = Field("private", description="Из какого слоя удалять: 'private', 'shared' или 'global'"),
+    dry_run: bool = Field(
+        True,
+        description="Если True (по умолчанию) — только показывает, какие факты БУДУТ удалены, "
+                    "ничего не удаляя. Передайте False, чтобы выполнить удаление по-настоящему.",
+    ),
     user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
 ) -> Dict[str, Any]:
     """
     Удаляет факты, содержащие заданные ключевые слова, из указанного слоя памяти.
     """
-    router = get_router(user_id, for_write=True)
+    # ИСПРАВЛЕНО: удаление шло по грубому substring-совпадению без всякого
+    # подтверждения — короткий/частый query мог снести кучу не связанных
+    # между собой фактов за один вызов. dry_run=True по умолчанию делает
+    # первый вызов безопасным просмотром кандидатов; реальное удаление
+    # требует явного dry_run=False.
+    router = await get_router(user_id, for_write=True)
     scope_map = {
         "private": router.private_memory,
         "shared": router.shared_memory,
@@ -214,10 +331,20 @@ async def forget(
     if memory is None:
         return {"status": "error", "message": f"Неизвестный scope: {scope}"}
     memory.reload_if_stale()
-    to_remove = [f.id for f in memory.semantic_facts if query.lower() in f.text.lower()]
+    to_remove = [f for f in memory.semantic_facts if query.lower() in f.text.lower()]
     if not to_remove:
         return {"status": "ok", "removed": 0, "scope": scope.lower(), "message": "Ничего не найдено."}
-    removed = memory._remove_facts(set(to_remove))
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "would_remove": len(to_remove),
+            "scope": scope.lower(),
+            "candidates": [{"id": f.id, "text": f.text[:200]} for f in to_remove[:20]],
+            "message": "Ничего не удалено. Повторите вызов с dry_run=False, чтобы удалить эти факты.",
+        }
+
+    removed = memory._remove_facts({f.id for f in to_remove})
     await memory._schedule_save()
     return {"status": "ok", "removed": removed, "scope": scope.lower()}
 
@@ -229,7 +356,9 @@ async def web_search(
     """
     Выполняет поиск в DuckDuckGo и возвращает извлечённый контекст и источники.
     """
-    data = await deep_search(query, max_results=max_results)
+    data = await _with_timeout(deep_search(query, max_results=max_results), "web_search")
+    if isinstance(data, dict) and data.get("error") == "timeout":
+        return data
     return {
         "query": query,
         "search_performed": data["search_performed"],
@@ -258,17 +387,27 @@ async def generate_image(
 
     assistant = await get_assistant(user_id or DEFAULT_USER)
 
-    # 1. Улучшение промпта (если включено)
-    final_prompt = prompt
-    if enhance_prompt:
-        final_prompt = await assistant.enhance_prompt(prompt)
-        logger.info(f"Original prompt: {prompt}\nEnhanced prompt: {final_prompt}")
+    async def _run():
+        # 1. Улучшение промпта (если включено)
+        fp = prompt
+        if enhance_prompt:
+            fp = await assistant.enhance_prompt(prompt)
+            logger.info(f"Original prompt: {prompt}\nEnhanced prompt: {fp}")
 
-    # 2. Генерация изображения (используем общую функцию)
-    # Раньше cfg_scale/sampler/seed принимались в схеме, но никуда не шли —
-    # теперь image_utils.generate_image реально их принимает и передаёт в EasyDiffusion.
-    image_b64 = await gen_image(final_prompt, steps=steps, width=width, height=height,
-                                 cfg_scale=cfg_scale, seed=seed, sampler_name=sampler)
+        # 2. Генерация изображения (используем общую функцию)
+        # Раньше cfg_scale/sampler/seed принимались в схеме, но никуда не шли —
+        # теперь image_utils.generate_image реально их принимает и передаёт в EasyDiffusion.
+        img = await gen_image(fp, steps=steps, width=width, height=height,
+                               cfg_scale=cfg_scale, seed=seed, sampler_name=sampler)
+        return fp, img
+
+    # Диффузия при большом steps/размере честно может занимать дольше общего
+    # дефолта — отдельный таймаут для этого тула (см. _MCP_TOOL_TIMEOUT_SECONDS).
+    image_timeout = float(os.getenv("MCP_IMAGE_TOOL_TIMEOUT_SECONDS", "300"))
+    run_result = await _with_timeout(_run(), "generate_image", timeout=image_timeout)
+    if isinstance(run_result, dict) and run_result.get("error") == "timeout":
+        return run_result
+    final_prompt, image_b64 = run_result
     if not image_b64:
         return {"status": "error", "message": "Не удалось сгенерировать изображение"}
 
@@ -313,7 +452,12 @@ async def research_topic(
     Глубокое исследование темы с генерацией гипотез и сбором доказательств.
     """
     assistant = await get_assistant(user_id or DEFAULT_USER)
-    result = await assistant.research(topic)
+    # research может делать несколько раундов поиска (depth итераций) — даём
+    # ему больше времени, чем дефолтному тулу.
+    research_timeout = float(os.getenv("MCP_RESEARCH_TOOL_TIMEOUT_SECONDS", "240"))
+    result = await _with_timeout(assistant.research(topic), "research_topic", timeout=research_timeout)
+    if isinstance(result, dict) and result.get("error") == "timeout":
+        return result
     return {
         "topic": topic,
         "hypotheses": result.get("hypotheses", []),
@@ -330,7 +474,7 @@ async def get_episodes(
     """
     Возвращает последние диалоги (эпизоды) из личной памяти.
     """
-    memory = get_router(user_id).private_memory
+    memory = (await get_router(user_id)).private_memory
     memory.reload_if_stale()
     episodes = memory.episodic_memory[-limit:] if memory.episodic_memory else []
     return {
@@ -349,7 +493,7 @@ async def get_contradictions(
     """
     Возвращает неразрешённые противоречия из личной памяти.
     """
-    memory = get_router(user_id).private_memory
+    memory = (await get_router(user_id)).private_memory
     memory.reload_if_stale()
     pairs = memory.get_unverified_contradictions(limit=limit)
     return {
@@ -374,7 +518,7 @@ async def resolve_contradiction(
     """
     Ручное разрешение противоречия.
     """
-    memory = get_router(user_id, for_write=True).private_memory
+    memory = (await get_router(user_id, for_write=True)).private_memory
     memory.reload_if_stale()
 
     def find_fact(fid):
@@ -428,7 +572,7 @@ async def get_goals(
     """
     Возвращает активные цели пользователя.
     """
-    memory = get_router(user_id).private_memory
+    memory = (await get_router(user_id)).private_memory
     memory.reload_if_stale()
     goals = await memory.get_active_goals()
     return {
@@ -448,7 +592,7 @@ async def add_goal(
     """
     Добавляет новую цель в личную память.
     """
-    memory = get_router(user_id, for_write=True).private_memory
+    memory = (await get_router(user_id, for_write=True)).private_memory
     memory.reload_if_stale()
     gid = await memory.add_goal(description, priority)
     return {"status": "ok", "id": gid, "description": description}
@@ -462,7 +606,7 @@ async def semantic_search(
     """
     Векторный поиск по смыслу (использует эмбеддинги).
     """
-    memory = get_router(user_id).private_memory
+    memory = (await get_router(user_id)).private_memory
     memory.reload_if_stale()
     emb = memory.embed_text(query)
     if emb is None:
@@ -484,7 +628,7 @@ async def graph_explore(
     """
     Исследует граф синапсов, начиная с фактов, содержащих seed_text.
     """
-    memory = get_router(user_id).private_memory
+    memory = (await get_router(user_id)).private_memory
     memory.reload_if_stale()
     seed_ids = [f.id for f in memory.semantic_facts if seed_text.lower() in f.text.lower()]
     if not seed_ids:
@@ -511,7 +655,7 @@ async def explain_fact(
     пользователь, ни агент не могли спросить "почему ты в этом уверен" и
     получить настоящий ответ вместо додумывания моделью.
     """
-    router = get_router(user_id)
+    router = await get_router(user_id)
     router.refresh()
     obj = (router.private_memory.store.get(gcn_id) or
            router.shared_memory.store.get(gcn_id) or
@@ -551,7 +695,7 @@ async def get_memory_stats(
     """
     Возвращает статистику по личной памяти.
     """
-    memory = get_router(user_id).private_memory
+    memory = (await get_router(user_id)).private_memory
     memory.reload_if_stale()
     stats = memory.get_stats()
     return stats
@@ -561,7 +705,7 @@ async def get_memory_stats(
 # ============================================================
 @mcp.resource("memory://{user_id}/facts")
 async def list_facts(user_id: str) -> Dict[str, Any]:
-    memory = get_router(user_id).private_memory
+    memory = (await get_router(user_id)).private_memory
     memory.reload_if_stale()
     facts = memory.semantic_facts[:20]
     return {
@@ -571,7 +715,7 @@ async def list_facts(user_id: str) -> Dict[str, Any]:
 
 @mcp.resource("memory://{user_id}/fact/{fact_id}")
 async def get_fact(user_id: str, fact_id: str) -> Dict[str, Any]:
-    memory = get_router(user_id).private_memory
+    memory = (await get_router(user_id)).private_memory
     memory.reload_if_stale()
     obj = memory.store.get(fact_id)
     if not obj:

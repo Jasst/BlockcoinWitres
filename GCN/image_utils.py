@@ -23,6 +23,41 @@ logger = logging.getLogger(__name__)
 # ---- Кеш текущей модели (чтобы не отправлять /options при каждом вызове) ----
 _current_model = None
 
+# УЛУЧШЕНИЕ: как и в llm_client.py — переиспользуемая сессия вместо новой
+# на каждый вызов к тому же локальному EasyDiffusion-хосту.
+_session: Optional[aiohttp.ClientSession] = None
+_session_lock = asyncio.Lock()
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        async with _session_lock:
+            if _session is None or _session.closed:
+                _session = aiohttp.ClientSession()
+    return _session
+
+
+async def close_session() -> None:
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
+
+
+def _round_to_multiple(value: int, multiple: int = 8) -> int:
+    """
+    УЛУЧШЕНИЕ: Stable Diffusion (и большинство совместимых с A1111 бэкендов,
+    включая EasyDiffusion) требует width/height, кратные 8 (обычно 64 для
+    некоторых моделей/VAE) — иначе тихо получаем артефакты или прямую ошибку
+    API. Раньше произвольные width/height от вызывающего кода (в т.ч. из
+    mcp_server_blockcoin.generate_image, где это открытые параметры Field)
+    шли в payload без всякой проверки.
+    """
+    if value <= 0:
+        return multiple
+    return max(multiple, round(value / multiple) * multiple)
+
 async def set_easy_diffusion_model(model_name: str) -> bool:
     """
     Устанавливает модель через /v1/sdapi/v1/options.

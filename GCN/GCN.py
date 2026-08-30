@@ -1417,7 +1417,7 @@ if __name__ == "__main__":
     user_id, ass_id = store.add_episode("Что такое GCN?", "GCN это графовая свёрточная сеть", "Alice")
     # Добавляем цель
     goal_id = store.add_goal("Изучить графовые нейросети", "Alice", priority=0.8)
-    # Активные цели
+    # Активные целиф
     goals = store.get_active_goals()
     print("Active goals:", [g.subject for g in goals])
     # Гибридный поиск (заглушка вектора)

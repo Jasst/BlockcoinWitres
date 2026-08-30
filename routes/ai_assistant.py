@@ -4,6 +4,7 @@
 Добавлены: классификация намерений, автоматическое извлечение фактов, улучшенные команды.
 """
 import sys
+import os
 import uuid
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -297,6 +298,17 @@ class CognitiveController:
 
         self._searcher = None
         self._last_ddg_call = 0.0
+
+        # УЛУЧШЕНИЕ: asyncio.create_task(...), вызванный без сохранения
+        # ссылки на Task, — известная ловушка: цикл событий хранит на него
+        # только слабую ссылку, и сборщик мусора может оборвать задачу
+        # прямо посреди выполнения (см. предупреждение в документации
+        # asyncio.create_task). Раньше именно так запускались auto-research
+        # из рефлексии и _quick_correction — то есть "тихая" потеря фоновой
+        # работы была возможна не только в теории. Теперь такие
+        # fire-and-forget задачи регистрируются в self._background_tasks и
+        # снимаются оттуда по завершении через add_done_callback.
+        self._background_tasks: set = set()
 
         self._consolidation_task = None
         self._planner_task = None
@@ -1020,7 +1032,7 @@ class CognitiveController:
             for topic in topics_to_research[:3]:
                 if isinstance(topic, str) and topic.strip():
                     logger.info(f"[Reflection] Auto-research for topic: {topic}")
-                    asyncio.create_task(self.research(topic.strip()))
+                    self._spawn_background_task(self.research(topic.strip()), name=f"auto-research:{topic.strip()[:40]}")
 
         # НОВОЕ: сохраняем предложенные рефлексией концепты как низкоуверенные
         # CONCEPT-узлы личной памяти пользователя (не глобальной — это гипотеза
@@ -1512,7 +1524,7 @@ class CognitiveController:
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
             if error > 0.85:
-                asyncio.create_task(self._quick_correction(message, predictions, response))
+                self._spawn_background_task(self._quick_correction(message, predictions, response), name="quick-correction")
 
         return response, search_meta
 
@@ -2112,7 +2124,7 @@ class CognitiveController:
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
             if error > 0.85:
-                asyncio.create_task(self._quick_correction(message, predictions, full_response))
+                self._spawn_background_task(self._quick_correction(message, predictions, full_response), name="quick-correction")
 
         yield "data: [DONE]\n\n"
 
@@ -2143,6 +2155,17 @@ class CognitiveController:
                            reasoning: bool = False):
         return await self.process_input(message, web_search, image_base64, image_mime, reasoning)
 
+    def _spawn_background_task(self, coro, name: str = "") -> "asyncio.Task":
+        """
+        Запускает fire-and-forget корутину как задачу, сохраняя на неё сильную
+        ссылку в self._background_tasks (снимается автоматически по завершении),
+        чтобы GC не мог оборвать её на середине — см. комментарий в __init__.
+        """
+        task = asyncio.create_task(coro, name=name or None)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def shutdown(self):
         if self._consolidation_task:
             self._consolidation_task.cancel()
@@ -2154,19 +2177,69 @@ class CognitiveController:
             self._reflection_task.cancel()
         if self._idle_task:
             self._idle_task.cancel()
+        for task in list(self._background_tasks):
+            task.cancel()
         await self.memory.shutdown()
 
 # =====================================================================
 # Фабрика ассистентов
 # =====================================================================
-_assistants: Dict[str, CognitiveController] = {}
+_assistants: "OrderedDict[str, CognitiveController]" = OrderedDict()
 _assistants_lock = asyncio.Lock()
+_assistant_last_used: Dict[str, float] = {}
+
+# УЛУЧШЕНИЕ: раньше _assistants был обычным dict, из которого записи никогда
+# не удалялись. Каждая запись — это не просто объект в памяти: __init__
+# запускает 5 фоновых asyncio-задач (_consolidation_task/_planner_task/
+# _research_task/_reflection_task/_idle_task) плюс _mcp_task, и все они крутятся
+# бесконечно, пока процесс жив — даже для пользователя, зашедшего один раз
+# полгода назад. shutdown() уже умеет корректно их отменять (используется в
+# shutdown_all() при остановке процесса), но при штатной работе он никогда не
+# вызывался для отдельного простаивающего пользователя. Теперь применяем ту же
+# LRU+TTL-схему, что и для роутеров памяти MCP-сервера: неактивные
+# CognitiveController выгружаются по времени простоя/лимиту количества, с
+# явным await assistant.shutdown() перед удалением.
+_ASSISTANT_MAX_IDLE_SECONDS = int(os.environ.get("ASSISTANT_MAX_IDLE_SECONDS", "3600"))  # 1 час
+_ASSISTANT_MAX_COUNT = int(os.environ.get("ASSISTANT_MAX_COUNT", "50"))
+
+
+async def _evict_stale_assistants(exclude_uid: Optional[str] = None) -> None:
+    now = time.time()
+    stale = [
+        uid for uid, ts in _assistant_last_used.items()
+        if uid != exclude_uid and now - ts > _ASSISTANT_MAX_IDLE_SECONDS
+    ]
+    for uid in stale:
+        assistant = _assistants.pop(uid, None)
+        _assistant_last_used.pop(uid, None)
+        if assistant is not None:
+            try:
+                await assistant.shutdown()
+            except Exception as e:
+                logger.error(f"Ошибка при выгрузке ассистента {uid[:16]}: {e}")
+            logger.info(f"Ассистент {uid[:16]} выгружен из памяти (простой > {_ASSISTANT_MAX_IDLE_SECONDS}с)")
+
+    while len(_assistants) > _ASSISTANT_MAX_COUNT:
+        oldest_uid, oldest_assistant = next(iter(_assistants.items()))
+        if oldest_uid == exclude_uid:
+            break
+        _assistants.pop(oldest_uid, None)
+        _assistant_last_used.pop(oldest_uid, None)
+        try:
+            await oldest_assistant.shutdown()
+        except Exception as e:
+            logger.error(f"Ошибка при выгрузке ассистента {oldest_uid[:16]}: {e}")
+        logger.info(f"Ассистент {oldest_uid[:16]} выгружен по лимиту количества (LRU, max={_ASSISTANT_MAX_COUNT})")
+
 
 async def get_assistant(user_id: str):
     async with _assistants_lock:
+        await _evict_stale_assistants(exclude_uid=user_id)
         if user_id not in _assistants:
             _assistants[user_id] = CognitiveController(user_id)
             logger.info(f"Создан когнитивный ассистент для {user_id[:16]}")
+        _assistants.move_to_end(user_id)
+        _assistant_last_used[user_id] = time.time()
         return _assistants[user_id]
 
 # =====================================================================
