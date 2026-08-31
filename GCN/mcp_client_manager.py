@@ -71,6 +71,7 @@ class MCPToolManager:
         """Подключиться ко всем серверам из конфига."""
         if self._initialized:
             return
+        logger.info(f"Загрузка MCP конфига из: {self.config_path}")  # <-- ДОБАВЛЕНО
         if not self.config_path.exists():
             logger.warning(f"Файл конфигурации MCP не найден: {self.config_path}")
             self._initialized = True
@@ -79,7 +80,7 @@ class MCPToolManager:
         with open(self.config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
 
-        servers = config.get("servers", {})
+        servers = config.get("mcpServers", {})
         self._server_configs = servers
         for name, cfg in servers.items():
             await self._connect_one(name, cfg)
@@ -87,11 +88,10 @@ class MCPToolManager:
         self._initialized = True
 
     async def _connect_one(self, name: str, cfg: Dict) -> bool:
+        logger.info(f"Connecting to MCP server '{name}' with config: {cfg}")
         stack = AsyncExitStack()
         try:
             if cfg.get("url"):
-                # Удалённый MCP-сервер (SSE). Локальные stdio-серверы (наш
-                # собственный mcp_server_blockcoin.py) продолжают работать как раньше.
                 if not SSE_AVAILABLE:
                     raise RuntimeError(
                         "cfg содержит 'url', но пакет mcp не предоставляет mcp.client.sse "
@@ -99,18 +99,25 @@ class MCPToolManager:
                     )
                 url = cfg["url"]
                 headers = cfg.get("headers") or {}
+                headers = {**headers, "Accept": "text/event-stream"}
+                logger.info(f"Connecting via SSE to {url}")
                 read, write = await stack.enter_async_context(sse_client(url, headers=headers))
             else:
                 command = cfg.get("command")
                 args = cfg.get("args", [])
                 env = cfg.get("env", {})
+                logger.info(f"Connecting via stdio: command={command}, args={args}")
                 server_params = StdioServerParameters(command=command, args=args, env=env)
                 read, write = await stack.enter_async_context(stdio_client(server_params))
 
+            logger.info(f"Creating session for '{name}'")
             session = await stack.enter_async_context(ClientSession(read, write))
+            logger.info(f"Initializing session for '{name}'")
             await session.initialize()
+            logger.info(f"Listing tools for '{name}'")
             response = await session.list_tools()
             tools = [tool.model_dump() for tool in response.tools]
+            logger.info(f"Received {len(tools)} tools for '{name}'")
 
             self.sessions[name] = session
             self.tools[name] = tools
@@ -119,7 +126,7 @@ class MCPToolManager:
             logger.info(f"MCP сервер '{name}' загружен, инструментов: {len(tools)}")
             return True
         except Exception as e:
-            logger.error(f"Ошибка подключения к MCP серверу '{name}': {e}")
+            logger.exception(f"Ошибка подключения к MCP серверу '{name}': {e}")
             self._failed_servers[name] = time.time()
             try:
                 await stack.aclose()

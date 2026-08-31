@@ -43,6 +43,29 @@ from GCN.config_ai import *
 
 logger = logging.getLogger(__name__)
 
+# ===== Глобальный MCP-менеджер =====
+_global_mcp_manager: Optional[MCPToolManager] = None
+_global_mcp_initialized = False
+
+async def init_global_mcp():
+    """Инициализирует глобальный MCP-менеджер при старте приложения."""
+    global _global_mcp_manager, _global_mcp_initialized
+    if _global_mcp_initialized:
+        return
+    _global_mcp_manager = MCPToolManager()
+    logger.info(f"Global MCP config path: {_global_mcp_manager.config_path}")
+    try:
+        await _global_mcp_manager.initialize()
+        _global_mcp_initialized = True
+        logger.info("✅ Global MCP manager initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize global MCP: {e}", exc_info=True)
+        _global_mcp_initialized = False
+
+def get_global_mcp_manager() -> Optional[MCPToolManager]:
+    """Возвращает глобальный экземпляр MCP-менеджера (если он инициализирован)."""
+    return _global_mcp_manager
+
 try:
     from ddgs import DDGS
     DDGS_AVAILABLE = True
@@ -264,7 +287,7 @@ class CognitiveController:
     принятие решений, обучение.
     """
 
-    def __init__(self, user_id: str):
+    def __init__(self, user_id: str, mcp_manager: Optional[MCPToolManager] = None):
         self.user_id = user_id
         self.user_dir = MEMORY_BASE_DIR / user_id
         self.user_dir.mkdir(parents=True, exist_ok=True)
@@ -320,24 +343,175 @@ class CognitiveController:
         self.reflection_interval = REFLECTION_INTERVAL
         self._last_reflection_time = time.time()
 
-        self.mcp_manager = MCPToolManager()
-        self._mcp_task = asyncio.create_task(self.mcp_manager.initialize())
+        # ===== ИЗМЕНЕНИЕ: создание MCP-менеджера =====
+        if mcp_manager is not None:
+            # Используем переданный (глобальный) менеджер
+            self.mcp_manager = mcp_manager
+            self._mcp_task = None  # уже инициализирован
+        else:
+            # Создаём локальный (для обратной совместимости)
+            self.mcp_manager = MCPToolManager()
+            logger.info(f"MCP config path: {self.mcp_manager.config_path}")
+            self._mcp_task = asyncio.create_task(self.mcp_manager.initialize())
+        # ===== КОНЕЦ ИЗМЕНЕНИЙ =====
 
         # ===== Реестр инструментов = только внешние MCP =====
-        # Раньше здесь дублировался набор хендлеров (recall/remember/add_goal/
-        # web_search/forget/semantic_search/... /generate_image/research_topic),
-        # которые уже реализованы как инструменты mcp_server_blockcoin.py. Это
-        # был единственный источник рассинхронизации поведения между браузерным
-        # чатом и внешним MCP-клиентом — теперь оба используют один и тот же код
-        # инструментов через MCPToolManager, здесь ничего не задублировано.
-        # Реестр наполняется исключительно через _ensure_external_tools_registered()
-        # (register_mcp_tools), вызываемый перед каждым запросом.
         self.tool_registry = ToolRegistry()
         self.tool_router = ToolRouter(
             registry=self.tool_registry,
             llm_raw_caller=call_llm_raw,
             llm_text_caller=call_llm,
         )
+
+        # Регистрация внутренних инструментов
+        async def _internal_recall(args: Dict) -> str:
+            query = args.get("query", "")
+            top_k = args.get("top_k", 5)
+            scope = args.get("scope")  # может быть None
+            results = await self.memory_service.recall(query, top_k, scope)
+            if not results:
+                return "Ничего не найдено."
+            # Форматируем результат как текст
+            lines = []
+            for f in results[:5]:
+                lines.append(f"- {f['text']} (уверенность: {f.get('confidence', 0.5):.2f})")
+            return "\n".join(lines)
+
+        async def _internal_remember(args: Dict) -> str:
+            fact = args.get("fact", "")
+            scope = args.get("scope", "private")
+            result = await self.memory_service.remember(fact, scope)
+            if result.get("id"):
+                return f"Запомнил: {result['fact']} (скоуп: {scope})"
+            return "Не удалось запомнить."
+
+        async def _internal_add_goal(args: Dict) -> str:
+            description = args.get("description", "")
+            priority = args.get("priority", 0.5)
+            result = await self.memory_service.add_goal(description, priority)
+            return f"Цель добавлена: {description} (приоритет: {priority})"
+
+        async def _internal_web_search(args: Dict) -> str:
+            query = args.get("query", "")
+            max_results = args.get("max_results", 5)
+            data = await deep_search(query, max_results=max_results)
+            if not data.get("search_performed"):
+                return "Поиск не дал результатов."
+            context = data.get("context", "")
+            sources = data.get("sources", [])
+            if context:
+                return f"Найдено {len(sources)} источников.\n{context[:2000]}"
+            return "Ничего не найдено."
+
+        async def _internal_generate_image(args: Dict) -> str:
+            prompt = args.get("prompt", "")
+            enhance = args.get("enhance_prompt", True)
+            steps = args.get("steps", 20)
+            width = args.get("width", 512)
+            height = args.get("height", 512)
+            cfg_scale = args.get("cfg_scale", 7.0)
+            seed = args.get("seed", -1)
+            sampler = args.get("sampler", "dpmpp_2m")
+            if enhance:
+                prompt = await self.enhance_prompt(prompt)
+            image_b64 = await self.generate_image(prompt, steps=steps, width=width,
+                                                  height=height, cfg_scale=cfg_scale,
+                                                  seed=seed, sampler_name=sampler)
+            if image_b64:
+                # Сохраняем и возвращаем ссылку (как в MCP-инструменте)
+                from GCN.config_ai import GENERATED_IMAGES_DIR
+                import base64
+                from datetime import datetime
+                output_dir = GENERATED_IMAGES_DIR
+                output_dir.mkdir(exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = output_dir / f"image_{timestamp}.png"
+                with open(filename, "wb") as f:
+                    f.write(base64.b64decode(image_b64))
+                BASE_URL = os.getenv("SERVER_BASE_URL", "http://localhost:8000")
+                image_url = f"{BASE_URL}/generated_images/{filename.name}"
+                return f"Изображение сгенерировано: {image_url}"
+            return "Не удалось сгенерировать изображение."
+
+        # Регистрируем в tool_registry
+        self.tool_registry.register(
+            name="recall",
+            description="Поиск в памяти по запросу. Аргументы: query (str), top_k (int, опционально), scope (str, опционально: private/shared/global)",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer", "default": 5},
+                    "scope": {"type": "string", "enum": ["private", "shared", "global"]}
+                },
+                "required": ["query"]
+            },
+            handler=_internal_recall,
+            server="internal"
+        )
+        self.tool_registry.register(
+            name="remember",
+            description="Запоминает факт. Аргументы: fact (str), scope (str, опционально: private/shared/global, по умолчанию private)",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string"},
+                    "scope": {"type": "string", "enum": ["private", "shared", "global"]}
+                },
+                "required": ["fact"]
+            },
+            handler=_internal_remember,
+            server="internal"
+        )
+        self.tool_registry.register(
+            name="add_goal",
+            description="Добавляет новую цель. Аргументы: description (str), priority (float, опционально, 0-1)",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "priority": {"type": "number", "default": 0.5}
+                },
+                "required": ["description"]
+            },
+            handler=_internal_add_goal,
+            server="internal"
+        )
+        self.tool_registry.register(
+            name="web_search",
+            description="Выполняет поиск в интернете. Аргументы: query (str), max_results (int, опционально)",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 5}
+                },
+                "required": ["query"]
+            },
+            handler=_internal_web_search,
+            server="internal"
+        )
+        self.tool_registry.register(
+            name="generate_image",
+            description="Генерирует изображение по текстовому описанию. Аргументы: prompt (str), enhance_prompt (bool, опционально), steps, width, height, cfg_scale, seed, sampler",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "enhance_prompt": {"type": "boolean", "default": True},
+                    "steps": {"type": "integer", "default": 20},
+                    "width": {"type": "integer", "default": 512},
+                    "height": {"type": "integer", "default": 512},
+                    "cfg_scale": {"type": "number", "default": 7.0},
+                    "seed": {"type": "integer", "default": -1},
+                    "sampler": {"type": "string", "default": "dpmpp_2m"}
+                },
+                "required": ["prompt"]
+            },
+            handler=_internal_generate_image,
+            server="internal"
+        )
+
         self._external_tools_registered = False
 
         # Для отслеживания бездействия
@@ -347,17 +521,28 @@ class CognitiveController:
         logger.info(f"CognitiveController (GCN) initialized for {user_id[:16]}")
 
     async def _ensure_external_tools_registered(self):
-        """Внешние MCP-серверы инициализируются асинхронно (self._mcp_task) — их
-        инструменты добавляем в общий реестр, как только они станут доступны.
-        Дополнительно на каждый вызов просим менеджер повторить попытку для
-        серверов, которые не поднялись при старте (ensure_connected сам
-        ограничивает частоту попыток) — раньше сервер, временно недоступный в
-        момент старта процесса, оставался недоступен до перезапуска, даже если
-        поднимался через минуту после этого. register_mcp_tools просто
-        перезаписывает записи по тем же именам, так что повторные вызовы (в т.ч.
-        после реконнекта) безопасны и подхватывают новые инструменты."""
+        """Регистрирует внешние MCP-инструменты в ToolRegistry, если они ещё не зарегистрированы."""
+        if self._external_tools_registered:
+            return
+
+        # Если менеджер уже инициализирован (глобальный) – сразу регистрируем
+        if self.mcp_manager._initialized:
+            await self.mcp_manager.ensure_connected()
+            self.tool_registry.register_mcp_tools(self.mcp_manager, self._handle_mcp_call)
+            self._external_tools_registered = True
+            return
+
+        # Если менеджер ещё не инициализирован (локальный) – ждём завершения задачи
+        if self._mcp_task is not None:
+            try:
+                await self._mcp_task
+            except Exception as e:
+                logger.error(f"MCP initialization failed: {e}", exc_info=True)
+                return
+
         if not self.mcp_manager._initialized:
             return
+
         await self.mcp_manager.ensure_connected()
         self.tool_registry.register_mcp_tools(self.mcp_manager, self._handle_mcp_call)
         self._external_tools_registered = True
@@ -874,24 +1059,18 @@ class CognitiveController:
         классификация намерений store/forget/recall (LLM) и автоматическое
         извлечение фактов.
 
-        ИСПРАВЛЕНИЕ (см. чат-ревью, пункт 3): раньше эти три шага существовали
-        ТОЛЬКО внутри process_input. stream_response их не вызывал вообще — он
-        сразу шёл в _ensure_external_tools_registered() + ToolRouter, минуя
-        classify_intent()/_auto_extract_facts(). Поскольку в браузерном чате по
-        умолчанию используется стриминг (LM_STUDIO_USE_STREAM=True в
-        config_ai.py), на практике это означало, что классификация намерений
-        почти никогда не отрабатывала в реальном UI — решения "запомнить/
-        вспомнить" принимал только few-shot fallback внутри ToolRouter, причём
-        не согласованно с этой веткой. Теперь оба входа (process_input и
-        stream_response) вызывают один и тот же метод — поведение одинаковое
-        независимо от режима.
-
-        Возвращает (response_text, meta), если сообщение уже полностью
-        обработано на этом этапе — вызывающий код должен вернуть/отдать этот
-        ответ пользователю и НЕ продолжать обычный пайплайн. Возвращает None,
-        если нужно продолжать как обычно (автоизвлечение фактов, если
-        сработало, уже выполнено как побочный эффект и в этом случае).
+        ИСПРАВЛЕНИЕ: временно отключаем предварительную обработку, чтобы все запросы
+        шли через ToolRouter. Это позволяет использовать MCP-инструменты для команд
+        памяти (запомни/вспомни/забудь) так же, как в MCP-режиме.
         """
+        # ===== ВРЕМЕННОЕ ОТКЛЮЧЕНИЕ =====
+        # Возвращаем None, чтобы основной пайплайн продолжил обработку
+        # без перехвата команд памяти.
+        return None
+
+        # Весь код ниже (команды, классификация, автоизвлечение) временно не выполняется.
+        # При необходимости его можно будет вернуть, убрав return None.
+
         # 1. Сначала проверяем команды памяти (старый способ для совместимости)
         cmd_response = await self._handle_memory_command(message)
         if cmd_response:
@@ -908,7 +1087,6 @@ class CognitiveController:
                           "global": MemoryScope.GLOBAL}.get(scope_str, MemoryScope.PRIVATE)
 
             if intent == "store" and content and confidence > 0.6:
-                # ИЗМЕНЕНИЕ: через сервис
                 result = await self.memory_service.remember(content, scope=scope_str)
                 if result.get("id"):
                     self.memory.hierarchy.add_to_working(result["id"])
@@ -916,7 +1094,6 @@ class CognitiveController:
                 return f"✅ Запомнил ({scope_enum.value}): {content}", {"memory": "auto_stored", "id": result.get("id")}
 
             elif intent == "forget" and content and confidence > 0.6:
-                # ИЗМЕНЕНИЕ: через сервис (удаляем из private, можно расширить на другие слои)
                 result = await self.memory_service.forget(content, scope="private", dry_run=False)
                 if result.get("removed", 0) > 0:
                     return f"✅ Удалено {result['removed']} фактов по запросу '{content}'", {"memory": "auto_forgot"}
@@ -924,7 +1101,6 @@ class CognitiveController:
                     return f"Ничего не найдено для удаления по '{content}'", {"memory": "no_match"}
 
             elif intent == "recall" and content and confidence > 0.6:
-                # ИЗМЕНЕНИЕ: через сервис
                 facts = await self.memory_service.recall(content, top_k=7)
                 if not facts:
                     return "Ничего не найдено.", {"memory": "no_recall"}
@@ -1696,7 +1872,8 @@ async def get_assistant(user_id: str):
     async with _assistants_lock:
         await _evict_stale_assistants(exclude_uid=user_id)
         if user_id not in _assistants:
-            _assistants[user_id] = CognitiveController(user_id)
+            mcp_mgr = get_global_mcp_manager()  # получаем глобальный (может быть None)
+            _assistants[user_id] = CognitiveController(user_id, mcp_manager=mcp_mgr)
             logger.info(f"Создан когнитивный ассистент для {user_id[:16]}")
         _assistants.move_to_end(user_id)
         _assistant_last_used[user_id] = time.time()
@@ -1845,8 +2022,14 @@ def start_global_merge_task():
 async def _global_merge_loop():
     global_mem = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
     shared_mem = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
-    concept_router = GCNMemoryRouter("system:consolidation", MEMORY_BASE_DIR)
-    concept_router.set_llm_caller(call_llm)
+    # Создаём роутер для формирования концептов с безопасным именем пользователя
+    try:
+        concept_router = GCNMemoryRouter("system_consolidation", MEMORY_BASE_DIR)
+        concept_router.set_llm_caller(call_llm)
+    except Exception as e:
+        logger.error(f"Не удалось создать роутер для консолидации концептов: {e}")
+        concept_router = None
+
     while True:
         await asyncio.sleep(CONSOLIDATION_INTERVAL)
         try:
@@ -1860,11 +2043,12 @@ async def _global_merge_loop():
             await shared_mem.deep_consolidation()
         except Exception as e:
             logger.error(f"Global deep consolidation error: {e}")
-        try:
-            await concept_router.form_concepts(MemoryScope.GLOBAL)
-            await concept_router.form_concepts(MemoryScope.SHARED)
-        except Exception as e:
-            logger.error(f"Concept formation error: {e}")
+        if concept_router is not None:
+            try:
+                await concept_router.form_concepts(MemoryScope.GLOBAL)
+                await concept_router.form_concepts(MemoryScope.SHARED)
+            except Exception as e:
+                logger.error(f"Concept formation error: {e}")
 
 @router.on_event("startup")
 async def _on_router_startup():
