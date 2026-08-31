@@ -54,7 +54,7 @@ if __name__ == '__main__':
     cpu_count = multiprocessing.cpu_count()
     mode      = os.getenv('UVICORN_MODE', 'auto')
     port      = int(os.getenv('PORT', 8000))
-    host      = os.getenv('HOST', '127.0.0.1')
+    host      = os.getenv('HOST', '0.0.0.0')
     is_prod   = os.getenv('FLASK_ENV') == 'production'
 
     # Worker / thread counts
@@ -105,4 +105,6 @@ if __name__ == '__main__':
             loop='asyncio',
             access_log=True,
             server_header=False,
+            timeout_keep_alive=300,  # добавьте
+            timeout_graceful_shutdown=30,  # добавьте
         )

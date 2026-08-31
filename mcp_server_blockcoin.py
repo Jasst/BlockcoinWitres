@@ -22,6 +22,7 @@ import os
 import base64
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
+
 from pydantic import Field
 from GCN.llm_client import call_llm
 from GCN.memory_graph import GCNMemoryRouter, MemoryScope
@@ -140,8 +141,29 @@ async def get_router(user_id: Optional[str], for_write: bool = False) -> GCNMemo
         _router_last_used[uid] = time.time()
         return _routers[uid]
 
-mcp = FastMCP("BlockcoinWitres Memory", description="Когнитивная память с веб-поиском и генерацией")
+from mcp.server.transport_security import TransportSecuritySettings
 
+_MCP_ALLOWED_HOSTS = [
+    "blockcoin.ru", "blockcoin.ru:*",
+    "www.blockcoin.ru", "www.blockcoin.ru:*",
+    "blockchat.ru", "blockchat.ru:*",
+    "www.blockchat.ru", "www.blockchat.ru:*",
+    "127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*",
+]
+_MCP_ALLOWED_ORIGINS = [
+    "https://blockcoin.ru", "https://www.blockcoin.ru",
+    "https://blockchat.ru", "https://www.blockchat.ru",
+]
+
+mcp = FastMCP(
+    "BlockcoinWitres Memory",
+    instructions="Когнитивная память с веб-поиском и генерацией",
+    streamable_http_path="/",
+    transport_security=TransportSecuritySettings(
+        allowed_hosts=_MCP_ALLOWED_HOSTS,
+        allowed_origins=_MCP_ALLOWED_ORIGINS,
+    ),
+)
 _USER_ID_DESC = "Идентификатор пользователя (тот же адрес кошелька, что использует чат). Если не передан — используется общий default_user, а не личная память конкретного человека."
 
 # УЛУЧШЕНИЕ: TOOL_CALL_TIMEOUT_SECONDS в mcp_client_manager.py защищает НАШ

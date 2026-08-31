@@ -16,6 +16,7 @@ from config import CONFIG, SECRET_KEY, STATIC_FOLDER, UPLOAD_FOLDER
 from database import init_db, close_db, Blockchain
 from setup import setup_logging, get_rate_limit_stats
 from services.wallet import init_wallet_service
+from mcp_server_blockcoin import mcp   # <-- импорт вашего MCP-объекта
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -36,9 +37,13 @@ async def lifespan(app: FastAPI):
     start_global_merge_task()
     logger.info("🌍 Global AI learning task started")
 
-    yield
+    async with mcp.session_manager.run():
+        yield
+
     await close_db()
     logger.info("Shutdown complete")
+
+
 
 
 app = FastAPI(
@@ -76,6 +81,8 @@ if os.path.isdir(UPLOAD_FOLDER):
 
 # Добавляем раздачу папки generated_images
 app.mount('/generated_images', StaticFiles(directory=str(GENERATED_IMAGES_DIR)), name='generated_images')
+
+app.mount("/mcp", mcp.streamable_http_app())
 
 # ========== sw.js и manifest.json ==========
 @app.get('/sw.js', include_in_schema=False)

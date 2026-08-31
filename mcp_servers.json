@@ -1,5 +1,6 @@
+
 {
-  "mcpServers": {
+  "servers": {
     "blockcoin-memory": {
       "command": "E:\\BlockcoinWitres\\.venv\\Scripts\\python.exe",
       "args": [
@@ -8,3 +9,4 @@
     }
   }
 }
+
