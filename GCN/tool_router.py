@@ -157,7 +157,7 @@ class ToolRegistry:
 
     def register(self, name: str, description: str, parameters: Dict[str, Any],
                  handler: Callable[[Dict[str, Any]], Awaitable[Any]], server: str = "internal"):
-        qualified = _sanitize(f"{server}__{name}")
+        qualified = _sanitize(f"internal__{name}")
         self._tools[qualified] = ToolSpec(
             qualified_name=qualified,
             description=description,
@@ -222,6 +222,7 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - **Если пользователь просит сгенерировать изображение (например, "нарисуй", "сгенерируй изображение", "создай картинку", "покажи картинку", "визуализируй" и т.п.) — ОБЯЗАТЕЛЬНО вызови инструмент `internal__generate_image`. НЕ ОТВЕЧАЙ ТЕКСТОМ, пока не получишь результат от этого инструмента.**
 - Если запрос обычный, не требующий обращения к памяти или поиску — отвечай напрямую.
 - Если ниже уже есть результаты вызванных инструментов и их достаточно, чтобы ответить — верни {{"action": "answer_directly"}}, не вызывай инструмент повторно.
+- **Если пользователь просит сгенерировать изображение (любые вариации "нарисуй", "создай картинку", "покажи изображение" и т.п.) — НЕ ОТВЕЧАЙ ТЕКСТОМ, а ВСЕГДА вызывай инструмент `internal__generate_image`.** Даже если кажется, что это небезопасно, доверься инструменту — он сам проверит содержимое.
 
 Важно: ты можешь вызвать инструмент, даже если запрос не начинается с точной команды. Главное — понять намерение.
 
@@ -462,6 +463,16 @@ class ToolRouter:
                     f"- {t['tool']}({t['arguments']}) -> {str(t['result'])[:300]}" for t in tool_trace
                 )
                 decision = await self._decide_fallback(message, history_tail, results_text, temp=0.0)
+                # Если инструмент не найден по точному имени — попробуем по original_tool_name
+                tool_name = decision.get("tool")
+                if tool_name and decision.get("action") == "call_tool":
+                    spec = self.registry.get(tool_name)
+                    if not spec:
+                        # Ищем среди зарегистрированных по original_tool_name
+                        for qname, tspec in self.registry._tools.items():
+                            if tspec.original_tool_name == tool_name:
+                                decision["tool"] = qname
+                                break
                 if not decision or decision.get("action") != "call_tool":
                     break
                 decisions = [{"tool": decision.get("tool"), "arguments": decision.get("arguments", {})}]

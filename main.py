@@ -5,7 +5,7 @@ import logging
 import os
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException ,Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse
@@ -16,9 +16,15 @@ from config import CONFIG, SECRET_KEY, STATIC_FOLDER, UPLOAD_FOLDER
 from database import init_db, close_db, Blockchain
 from setup import setup_logging, get_rate_limit_stats
 from services.wallet import init_wallet_service
+from mcp_server_blockcoin import mcp
+from routes.ai_assistant import start_global_merge_task, init_global_mcp
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+# Явно устанавливаем уровень логирования для модуля с MCP
+logging.getLogger("routes.ai_assistant").setLevel(logging.INFO)
+logging.getLogger("GCN.mcp_client_manager").setLevel(logging.INFO)
 
 
 @asynccontextmanager
@@ -36,7 +42,19 @@ async def lifespan(app: FastAPI):
     start_global_merge_task()
     logger.info("🌍 Global AI learning task started")
 
-    yield
+    # ===== ИНИЦИАЛИЗАЦИЯ ГЛОБАЛЬНОГО MCP =====
+    print("DEBUG: About to call init_global_mcp")  # <--- отладка
+    try:
+        await init_global_mcp()
+        print("DEBUG: init_global_mcp finished successfully")  # <--- отладка
+        logger.info("🌐 Global MCP manager initialized at startup")
+    except Exception as e:
+        print(f"DEBUG: init_global_mcp failed with {e}")  # <--- отладка
+        logger.error(f"❌ Failed to initialize global MCP: {e}", exc_info=True)
+
+    async with mcp.session_manager.run():
+        yield
+
     await close_db()
     logger.info("Shutdown complete")
 
@@ -60,24 +78,19 @@ app.add_middleware(
 )
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
-
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(status_code=500, content={'error': 'Internal server error'})
-
 
 if os.path.isdir(STATIC_FOLDER):
     app.mount('/static', StaticFiles(directory=STATIC_FOLDER), name='static')
 if os.path.isdir(UPLOAD_FOLDER):
     app.mount('/uploads', StaticFiles(directory=UPLOAD_FOLDER), name='uploads')
 
-
-
-# Добавляем раздачу папки generated_images
 app.mount('/generated_images', StaticFiles(directory=str(GENERATED_IMAGES_DIR)), name='generated_images')
+app.mount("/mcp", mcp.streamable_http_app())
 
-# ========== sw.js и manifest.json ==========
 @app.get('/sw.js', include_in_schema=False)
 async def serve_sw():
     sw_path = os.path.join(STATIC_FOLDER, 'sw.js')
@@ -98,17 +111,12 @@ async def serve_manifest():
     return FileResponse(manifest_path, media_type='application/manifest+json',
                         headers={'Cache-Control': 'public, max-age=86400'})
 
-
-# ========== favicon.ico (чтобы убрать 404) ==========
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():
     favicon_path = os.path.join(STATIC_FOLDER, 'favicon.ico')
     if os.path.exists(favicon_path):
         return FileResponse(favicon_path, media_type='image/x-icon')
-    # Если файла нет – возвращаем пустой ответ 204 (No Content), чтобы не было 404
-    raise HTTPException(204)  # или 404, но лучше 204
-# ==================================================
-
+    raise HTTPException(204)
 
 from routes.auth import router as auth_router
 from routes.messages import router as messages_router
@@ -134,16 +142,31 @@ app.include_router(ai_router)
 app.include_router(ws_router)
 app.include_router(push_router)
 
-
 @app.middleware('http')
 async def add_cache_headers(request: Request, call_next):
-    response = await call_next(request)
+    if request.url.path.startswith("/mcp"):
+        try:
+            return await call_next(request)
+        except RuntimeError as e:
+            if "No response returned" in str(e):
+                return JSONResponse(status_code=204, content={})
+            raise
+        except Exception as e:
+            logger.error(f"MCP error: {e}")
+            return JSONResponse(status_code=500, content={"error": "MCP internal error"})
+
+    try:
+        response = await call_next(request)
+    except RuntimeError as e:
+        if "No response returned" in str(e):
+            return JSONResponse(status_code=204, content={})
+        raise
+
     if request.url.path in ['/', '/login', '/create_wallet']:
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
     return response
-
 
 @app.get('/health', tags=['health'])
 async def health_check(request: Request):
@@ -157,16 +180,13 @@ async def health_check(request: Request):
         'websocket': await manager.get_stats(),
     }
 
-
 @app.get('/health/db', tags=['health'])
 async def health_db(request: Request):
     return await request.app.state.blockchain.health_check()
 
-
 @app.get('/health/performance', tags=['health'])
 async def health_performance(request: Request):
     return await request.app.state.blockchain.get_performance_stats()
-
 
 @app.get('/health/notifier', tags=['health'])
 async def health_notifier():
