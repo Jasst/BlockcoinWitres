@@ -9,7 +9,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import os
 import base64
 from datetime import datetime
@@ -142,19 +142,68 @@ async def forget(
 
 @mcp.tool()
 async def web_search(
-    query: str = Field(..., description="Поисковый запрос"),
-    max_results: int = Field(5, description="Максимальное число страниц для анализа", ge=1, le=10)
+    query: Optional[str] = Field(None, description="Один поисковый запрос (или URL для прямого чтения страницы)"),
+    queries: Optional[List[str]] = Field(
+        None, description="Несколько поисковых запросов для составного вопроса — выполняются параллельно"
+    ),
+    max_results: int = Field(5, description="Максимальное число страниц для анализа на каждый запрос", ge=1, le=10)
 ) -> Dict[str, Any]:
-    """Выполняет поиск в DuckDuckGo и возвращает извлечённый контекст и источники."""
-    data = await _with_timeout(deep_search(query, max_results=max_results), "web_search")
-    if isinstance(data, dict) and data.get("error") == "timeout":
-        return data
+    """Выполняет поиск в DuckDuckGo (один или несколько запросов параллельно) и
+    возвращает извлечённый контекст и источники.
+
+    ИСПРАВЛЕНИЕ (унификация с браузерным чатом): раньше этот инструмент
+    поддерживал только один query, тогда как внутренний internal__web_search
+    в ai_assistant.py/tool_router.py умел лишь один запрос за раунд ReAct-
+    цикла — оба пути были одинаково ограничены. Теперь оба принимают либо
+    query, либо queries (список), и ведут себя идентично: одна и та же
+    логика deep_search, одна и та же семантика результата, чтобы MCP-клиент
+    (например, Claude Desktop) и браузерный чат давали согласованные
+    результаты на один и тот же составной вопрос.
+    """
+    query_list: List[str]
+    if queries:
+        query_list = [q.strip() for q in queries if q and q.strip()][:4]
+    elif query and query.strip():
+        query_list = [query.strip()]
+    else:
+        return {"error": "Нужно указать query или queries"}
+
+    results = await asyncio.gather(
+        *[_with_timeout(deep_search(q, max_results=max_results), "web_search") for q in query_list],
+        return_exceptions=True
+    )
+
+    seen_urls = set()
+    merged_sources: List[Dict[str, Any]] = []
+    context_parts: List[str] = []
+    any_ok = False
+    for q, data in zip(query_list, results):
+        if isinstance(data, Exception):
+            logger.warning(f"web_search: запрос '{q}' упал с ошибкой: {data}")
+            continue
+        if isinstance(data, dict) and data.get("error") == "timeout":
+            # Таймаут одного из подзапросов не должен обрушивать остальные —
+            # возвращаем то, что успело собраться по другим запросам.
+            logger.warning(f"web_search: запрос '{q}' не уложился в таймаут")
+            continue
+        if not data.get("search_performed"):
+            continue
+        any_ok = True
+        for s in data.get("sources", []):
+            url = s.get("url")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                merged_sources.append(s)
+        if data.get("context"):
+            label = f"[Подзапрос: {q}]\n" if len(query_list) > 1 else ""
+            context_parts.append(f"{label}{data['context']}")
+
     return {
-        "query": query,
-        "search_performed": data["search_performed"],
-        "sources": data.get("sources", []),
-        "context": data.get("context", ""),
-        "chunks_found": data.get("chunks_found", 0)
+        "queries": query_list,
+        "search_performed": any_ok,
+        "sources": merged_sources,
+        "context": "\n\n---\n\n".join(context_parts),
+        "chunks_found": len(context_parts)
     }
 
 @mcp.tool()

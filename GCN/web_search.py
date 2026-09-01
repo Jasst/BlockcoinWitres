@@ -343,6 +343,53 @@ class ChunkRanker:
         return chunks
 
 
+# ---------- Оценка доверия к источнику (пункт №3 плана улучшений) ----------
+# Раньше результаты DDG сортировались/фильтровались только по текстовому
+# совпадению сниппета с запросом (ChunkRanker.score_text) — авторитетность
+# домена никак не учитывалась, а .gov/.edu/крупное СМИ и случайный форум/
+# сайт-агрегатор были равнозначны. Это не полноценная проверка фактов
+# (нужен был бы отдельный сервис), а лёгкий, бесплатный (без доп. запросов)
+# сигнал, который двигает более надёжные источники выше в очереди на
+# скачивание и помечает их для модели прямо в тексте контекста.
+_TRUSTED_DOMAINS_HIGH = (
+    ".gov", ".gov.ru", ".edu", ".mil",
+    "wikipedia.org", "who.int", "un.org",
+    "cbr.ru",  # Банк России — официальный источник курсов валют
+)
+_TRUSTED_DOMAINS_MEDIUM = (
+    "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "bloomberg.com",
+    "tass.ru", "ria.ru", "interfax.ru", "kommersant.ru", "vedomosti.ru",
+    "nature.com", "sciencedirect.com", "arxiv.org", "github.com",
+    "docs.python.org", "developer.mozilla.org", "stackoverflow.com",
+)
+# Явно ненадёжные/спамные домены-агрегаторы контента — не блокируем (страница
+# может быть единственным результатом по редкому запросу), но не даём буст.
+_LOW_TRUST_MARKERS = ("pinterest.", "quora.com",)
+
+DOMAIN_TRUST_BOOST_HIGH = 0.35
+DOMAIN_TRUST_BOOST_MEDIUM = 0.15
+
+
+def domain_trust(url: str) -> Tuple[str, float]:
+    """Возвращает (метка_для_человека, буст_к_скору) на основе домена URL.
+    Метка пустая и буст 0.0, если домен не входит ни в один список — это
+    НЕ штраф, просто отсутствие дополнительного сигнала доверия."""
+    if not url:
+        return "", 0.0
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return "", 0.0
+    host = host[4:] if host.startswith("www.") else host
+    if any(host == d or host.endswith("." + d.lstrip(".")) or d in host for d in _TRUSTED_DOMAINS_HIGH):
+        return "высокая", DOMAIN_TRUST_BOOST_HIGH
+    if any(d in host for d in _TRUSTED_DOMAINS_MEDIUM):
+        return "средняя", DOMAIN_TRUST_BOOST_MEDIUM
+    if any(m in host for m in _LOW_TRUST_MARKERS):
+        return "", 0.0
+    return "", 0.0
+
+
 # ---------- Утилиты ----------
 def hash_query(q: str) -> str:
     return hashlib.sha256(q.lower().strip().encode()).hexdigest()[:32]
@@ -533,8 +580,17 @@ async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict
     # из конфига, но нигде не использовался. Совсем нерелевантные по тексту
     # сниппета результаты (0 общих слов с запросом) уходят в конец очереди и не
     # съедают бюджет max_results, если есть более релевантные варианты.
-    scored = [(ChunkRanker.score_text(query, f"{r.get('title', '')} {r.get('snippet', '')}"), r)
-              for r in ddg_results]
+    # ДОБАВЛЕНО (пункт №3 плана улучшений): к текстовой релевантности добавляется
+    # буст за авторитетность домена (domain_trust) — при близких по тексту
+    # сниппетах официальный/крупный источник (.gov, Reuters, cbr.ru и т.п.)
+    # уходит на скачивание раньше случайного сайта-агрегатора. Это буст, а не
+    # фильтр: нерелевантный, но "надёжный" домен всё равно не обгонит явно
+    # релевантный результат с большим текстовым совпадением.
+    scored = [
+        (ChunkRanker.score_text(query, f"{r.get('title', '')} {r.get('snippet', '')}")
+         + domain_trust(r.get('url', ''))[1], r)
+        for r in ddg_results
+    ]
     scored.sort(key=lambda x: x[0], reverse=True)
     # MIN_RELEVANCE_THRESHOLD импортировался из конфига, но нигде не применялся —
     # отфильтровываем сниппеты, которые совсем не пересекаются по смыслу с
@@ -580,10 +636,15 @@ async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict
                 deep_text, _ = await _fetcher.fetch_with_links(best_href)
                 if deep_text and ChunkRanker.score_text(query, deep_text) > page_score:
                     logger.info(f"deep_search: {url} нерелевантна, перешёл по ссылке -> {best_href}")
-                    sources.append({"title": f"{url_to_title.get(url, url)} → подробнее", "url": best_href})
+                    hop_trust_label, _ = domain_trust(best_href)
+                    hop_source = {"title": f"{url_to_title.get(url, url)} → подробнее", "url": best_href}
+                    if hop_trust_label:
+                        hop_source["reliability"] = hop_trust_label
+                    sources.append(hop_source)
                     excerpt = best_excerpt(query, deep_text, max_chars=3000)
+                    hop_suffix = f" [надёжность источника: {hop_trust_label}]" if hop_trust_label else ""
                     context_parts.append(
-                        f"Источник: {url_to_title.get(url, url)} (подробности по ссылке со страницы)\n"
+                        f"Источник: {url_to_title.get(url, url)} (подробности по ссылке со страницы){hop_suffix}\n"
                         f"URL: {best_href}\n{excerpt}"
                     )
                     continue  # верхнеуровневую нерелевантную страницу отдельно не добавляем
@@ -593,7 +654,16 @@ async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict
         # игнорирующая релевантность. Теперь выбираем чанки, реально относящиеся
         # к запросу (см. best_excerpt/ChunkRanker), вместо первых символов страницы.
         excerpt = best_excerpt(query, text, max_chars=3000)
-        context_parts.append(f"Источник: {url_to_title.get(url, url)}\nURL: {url}\n{excerpt}")
+        # ДОБАВЛЕНО (пункт №3): помечаем в тексте контекста и в метаданных
+        # источника его уровень доверия по домену, если он определён — модель
+        # видит это прямо рядом с текстом (не нужно самой гадать по URL), а
+        # вызывающий код (search_meta["sources"]) получает поле "reliability"
+        # для отображения в клиенте, если понадобится.
+        trust_label, _ = domain_trust(url)
+        if trust_label:
+            sources[-1]["reliability"] = trust_label
+        reliability_suffix = f" [надёжность источника: {trust_label}]" if trust_label else ""
+        context_parts.append(f"Источник: {url_to_title.get(url, url)}{reliability_suffix}\nURL: {url}\n{excerpt}")
 
     context = "\n\n---\n\n".join(context_parts)
     result = {
@@ -624,5 +694,6 @@ __all__ = [
     'normalize_raw_url',
     'extract_urls',
     'best_excerpt',
+    'domain_trust',
     'close_search_resources'
 ]
