@@ -975,48 +975,53 @@ class CognitiveMemory:
 
     # ==================== ГИБРИДНЫЙ ПОИСК ====================
     async def retrieve_hybrid(self, query: str, top_k: int = 5, use_graph: bool = True) -> List[Dict]:
-        """Гибридный поиск через GCN с преобразованием результата в старый формат."""
+        """
+        Гибридный поиск через GCN с преобразованием результата в старый формат.
+        Добавлена адаптивная корректировка весов в зависимости от типа запроса.
+        """
         cache_key = f"hybrid_{query}_{top_k}_{use_graph}"
         if cache_key in self._cache:
             result, ts = self._cache[cache_key]
             if time.time() - ts < self._cache_ttl:
                 return result
 
-        # Генерируем вектор запроса (is_query=True — асимметричный префикс e5,
-        # см. пункт №1 в шапке файла и _get_embedding)
+        # Генерируем вектор запроса (is_query=True — асимметричный префикс e5)
         query_vector = None
         if self.use_embeddings:
             query_vector = self._get_embedding(query, is_query=True).tolist()
 
-        # start_node для графового компонента гибридного поиска.
-        # Раньше сюда всегда передавался None — весь граф Hebbian/STDP
-        # синапсов, который старательно строится в _create_synapse()/
-        # _hebbian_update(), никогда не участвовал в retrieve_hybrid():
-        # вес HYBRID_WEIGHT_GRAPH существовал только на бумаге. Берём
-        # последний активный элемент рабочей памяти как точку старта
-        # обхода графа — так соседи по синапсам реально попадают в
-        # кандидаты поиска.
         start_node = self.hierarchy.working_memory[-1] if use_graph and self.hierarchy.working_memory else None
 
-        # Выполняем поиск в GCN (top_k*3 — с запасом: дальше не фильтруем по
-        # типу и подмешиваем activation-буст, поэтому порядок может измениться)
+        # ===== АДАПТИВНАЯ КОРРЕКТИРОВКА ВЕСОВ =====
+        weights = self._dynamic_weights.copy()
+
+        # Определяем тип запроса
+        if self._is_time_sensitive(query):
+            # Временные запросы (курсы, новости) – повышаем свежесть
+            weights['freshness'] = min(0.8, weights.get('freshness', 0.15) + 0.3)
+            weights['semantic'] = max(0.2, weights.get('semantic', 0.40) - 0.1)
+            weights['graph'] = max(0.1, weights.get('graph', 0.20) - 0.05)
+        elif self._is_factual(query):
+            # Фактологические запросы – повышаем семантику и граф
+            weights['semantic'] = min(0.7, weights.get('semantic', 0.40) + 0.2)
+            weights['graph'] = min(0.5, weights.get('graph', 0.20) + 0.1)
+            weights['freshness'] = max(0.05, weights.get('freshness', 0.15) - 0.05)
+
+        # Нормируем веса
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+        # =========================================
+
+        # Выполняем поиск в GCN с модифицированными весами
         gcn_results = self.gcn_store.hybrid_retrieve(
             query_vector=query_vector,
             start_node=start_node,
             top_k=top_k * 3,
-            weights = self._dynamic_weights
+            weights=weights
         )
 
-        # УЛУЧШЕНИЕ (spreading activation → скоринг): раньше spread_activation()
-        # — полноценная многошаговая Hebbian/STDP-активация по графу синапсов —
-        # вообще не вызывалась из retrieve_hybrid. Единственным "графовым"
-        # вкладом был одношаговый обход GCN-графа от start_node; вес
-        # HYBRID_WEIGHT_GRAPH существовал только на бумаге, а вся дорогая
-        # ассоциативная сеть, которую строит _hebbian_update()/_create_synapse(),
-        # была мёртвым кодом с точки зрения того, что реально видит модель.
-        # Теперь прогоняем активацию от текущей рабочей памяти (working_memory
-        # как seed) и используем результат как буст к итоговому скору —
-        # ассоциативно связанные факты реально всплывают выше при поиске.
+        # Применяем spreading activation для графового буста
         activation_map: Dict[int, float] = {}
         if use_graph and self.hierarchy.working_memory:
             seed_local_ids = []
@@ -1030,13 +1035,6 @@ class CognitiveMemory:
                 except Exception as e:
                     logger.debug(f"spread_activation failed in retrieve_hybrid: {e}")
 
-        # Преобразуем в формат, ожидаемый ai_assistant.py.
-        # УЛУЧШЕНИЕ (все типы знаний, не только CLAIM): раньше сюда попадали
-        # ТОЛЬКО KnowledgeType.CLAIM — эпизоды, процедуры, концепты,
-        # гипотезы/цели и связи физически лежали в MemoryStore и участвовали
-        # в графе, но были полностью невидимы для retrieval. Модель не могла
-        # "вспомнить" эпизод по факту или концепт по ключевому слову. Теперь
-        # конвертируем любой тип, с разметкой meta по типу.
         result = []
         for obj in gcn_results:
             meta = obj.object if isinstance(obj.object, dict) else {}
@@ -1062,8 +1060,6 @@ class CognitiveMemory:
             elif obj.type == KnowledgeType.CONCEPT:
                 text = obj.subject
                 item_type = "concept"
-                # обобщения по умолчанию чуть весомее сырых фактов — это сжатый,
-                # уже провалидированный консолидацией слой знаний
                 importance = meta.get("importance", 1.2)
             else:
                 text = obj.subject
@@ -1079,7 +1075,7 @@ class CognitiveMemory:
                 "text": text,
                 "type": item_type,
                 "timestamp": obj.created.timestamp(),
-                "score": final_score,      # confidence + activation-буст
+                "score": final_score,
                 "confidence": obj.confidence,
                 "importance": importance,
                 "activation": activation_boost,
@@ -1087,16 +1083,31 @@ class CognitiveMemory:
                 "scope": obj.scope.value,
             })
 
-        # Сортируем по score (уже учитывает activation) и ограничиваем top_k
         result.sort(key=lambda x: x["score"], reverse=True)
         result = result[:top_k]
 
-        # Сохраняем в кэш
         self._cache[cache_key] = (result, time.time())
         if len(self._cache) > self._cache_maxsize:
             oldest = sorted(self._cache.items(), key=lambda x: x[1][1])[0][0]
             del self._cache[oldest]
         return result
+
+    def _is_time_sensitive(self, query: str) -> bool:
+        """Эвристика для запросов, требующих актуальных данных."""
+        time_markers = [
+            'сегодня', 'сейчас', 'курс', 'погода', 'новости', 'свежие',
+            'завтра', 'вчера', 'актуальные', 'последние', '2024', '2025', '2026'
+        ]
+        return any(m in query.lower() for m in time_markers)
+
+    def _is_factual(self, query: str) -> bool:
+        """Эвристика для фактических запросов с числами или единицами."""
+        import re
+        patterns = [
+            r'\b\d+[.,]?\d*\s*(?:USD|EUR|RUB|₽|$|€|%|кг|км|г|м|см|мм|MB|GB|TB)\b',
+            r'\b(?:курс|цена|стоимость|тариф|скорость|температура|вес|рост|расстояние)\b'
+        ]
+        return any(re.search(p, query, re.IGNORECASE) for p in patterns)
 
     def _sync_goal_from_gcn(self, gcn_id: str):
         """Обновляет локальный Goal по данным из GCN."""

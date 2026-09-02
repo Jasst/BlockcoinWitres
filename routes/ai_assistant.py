@@ -1262,25 +1262,29 @@ class CognitiveController:
                             image_base64: Optional[str] = None,
                             image_mime: Optional[str] = None,
                             reasoning: bool = False) -> Tuple[str, Dict]:
-        # Подтягиваем изменения, сделанные другими процессами (например, MCP)
+        # Подтягиваем изменения, сделанные другими процессами
         self.memory_service.refresh()
-
-        # Обновляем время активности
         self._last_activity_time = time.time()
 
-        # 1-3. Команды памяти / классификация намерений / автоизвлечение —
-        # общий этап, вынесенный в _run_memory_intent_pipeline (используется
-        # и здесь, и в stream_response — см. исправление #3 из чат-ревью).
+        # 1-3. Команды памяти / классификация намерений / автоизвлечение
         pipeline_result = await self._run_memory_intent_pipeline(message)
         if pipeline_result:
             return pipeline_result
 
-        # 4. Обычная обработка (инструменты, если нужны, потом ответ)
         await self._ensure_external_tools_registered()
 
         messages, search_meta = await self._prepare_messages(
             message, web_search, image_base64, image_mime, reasoning
         )
+        uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
+
+        # === НОВОЕ: активное уточнение ===
+        if uncertainty > 0.7 and not web_search and not reasoning:
+            clarification = await self._ask_clarification(message, uncertainty)
+            if clarification:
+                self.history.append({"role": "assistant", "content": clarification})
+                self._save_history()
+                return clarification, {"clarification": True, "uncertainty": uncertainty}
 
         # РЕШЕНИЕ (нужен ли инструмент) через ToolRouter
         history_tail = "\n".join(
@@ -1295,13 +1299,7 @@ class CognitiveController:
         tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
         tool_trace = tool_run.get("tool_trace", [])
 
-        # ИСПРАВЛЕНИЕ (см. _prepare_messages/self._web_search_results_this_turn):
-        # забираем структурированные результаты всех internal__web_search
-        # вызовов, сделанных ToolRouter'ом за этот ход, — единственное место,
-        # где теперь реально происходит поиск. Отсюда же (а не из отдельного
-        # синхронного deep_search, как раньше) берутся source-метки для
-        # клиента, текст для извлечения фактов в глобальную память и evidence
-        # для _verify_response.
+        # Обработка результатов поиска (из внутреннего web_search)
         if self._web_search_results_this_turn:
             seen_urls = set()
             merged_sources: List[Dict] = []
@@ -1323,11 +1321,14 @@ class CognitiveController:
             if EXTRACT_FACTS_FROM_SEARCH and search_context:
                 try:
                     if EXTRACT_FACTS_WITH_LLM:
-                        facts = await self._extract_facts_llm(search_context)
+                        # Используем улучшенную версию _extract_facts_llm (см. п.5)
+                        facts = await self._extract_facts_llm(search_context, sources)
                     else:
                         facts = self._extract_facts_from_text(search_context)
                     for f in facts:
-                        await self.memory_service.remember(f, scope="global")
+                        # f может быть строкой или словарём – адаптируем
+                        text = f.get("text", f) if isinstance(f, dict) else f
+                        await self.memory_service.remember(text, scope="global")
                     if facts:
                         await self.memory_service.global_memory._schedule_save()
                     logger.info(f"Extracted {len(facts)} facts from web search -> global memory")
@@ -1361,9 +1362,7 @@ class CognitiveController:
 
         response = await call_llm(messages)
 
-        # ПУНКТ №3: верификация ответа перед тем, как он попадёт в историю/
-        # эпизодическую память — если попадёт с пометкой, пометка тоже
-        # сохранится и будет видна при последующей сборке контекста.
+        # Верификация ответа (пункт №3)
         if response:
             evidence_text = "\n".join(filter(None, [
                 self._last_prepare_meta.get("memory_context", ""),
@@ -1382,7 +1381,6 @@ class CognitiveController:
         if response:
             uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
             salience = 1.0 - uncertainty
-            # ИЗМЕНЕНИЕ: через сервис
             await self.memory_service.add_episode(message, response, salience=salience)
 
             relevant = self._last_prepare_meta.get("relevant", [])
@@ -1411,56 +1409,53 @@ class CognitiveController:
         return response, search_meta
 
     # ===== ИЗВЛЕЧЕНИЕ ФАКТОВ (без изменений) =====
-    async def _extract_facts_llm(self, text: str) -> List[str]:
+    async def _extract_facts_llm(self, context: str, sources: List[Dict] = None) -> List[Dict]:
         """
-        Извлекает факты из текста. ЧИСТЫЙ экстрактор — не сохраняет сам.
+        Извлекает факты с метаданными (источник, дата) из текста.
+        Возвращает список словарей с полями: text, source, date.
+        """
+        if not context:
+            return []
 
-        ИСПРАВЛЕНИЕ (тот же баг задвоения, что и в _auto_extract_facts): раньше
-        этот метод сам сохранял первые 10 фактов через memory_service.remember(),
-        а все три вызывающих места (process_input, stream_response x2) заново
-        сохраняли ВЕСЬ возвращённый список — двойное сохранение = двойное
-        "усиление" (submit_candidate._reinforce) одного и того же факта из
-        одного извлечения, искусственно раздувающее evidence/confidence
-        глобальных фактов, извлечённых из веб-поиска. Сохранение теперь
-        выполняется один раз, только вызывающим кодом.
-        """
+        # Формируем аннотации источников
+        source_annotations = ""
+        if sources:
+            for s in sources[:5]:
+                url = s.get('url', '')
+                reliability = s.get('reliability', 'неизвестна')
+                source_annotations += f"- {url} (надёжность: {reliability})\n"
+
         prompt = (
-            "Извлеки из текста только объективные, проверяемые факты. "
-            "Факт должен быть кратким утверждением, содержащим конкретную информацию "
-            "(числа, даты, имена, определения). "
-            "НЕ включай: мнения, прогнозы, инструкции, общие фразы. "
-            "Каждый факт — отдельное предложение. "
-            "Верни только факты, каждый с новой строки, без нумерации.\n\n"
-            f"ТЕКСТ:\n{text[:4000]}"
+                "Извлеки из текста только объективные, проверяемые факты. Для каждого факта укажи:"
+                "   текст факта (кратко, предложением),"
+                "   возможный источник (URL из списка, если он упоминается в тексте или очевидно связан),"
+                "   ориентировочную дату (если указана в тексте или актуальна на текущую дату)."
+                "Факты должны быть краткими утверждениями, содержащими конкретную информацию (числа, даты, имена)."
+                "НЕ включай: мнения, прогнозы, инструкции, общие фразы."
+                "Верни ответ в виде JSON-списка объектов с полями: text, source, date."
+                "Если источник неясен, укажи 'неизвестен'. Если дата не указана, укажи 'неизвестна'."
+                "\n\nСписок источников (URL и надёжность):\n" + source_annotations +
+                "\n\nТЕКСТ:\n" + context[:4000]
         )
+
         try:
-            raw = await call_llm(
-                [{"role": "user", "content": prompt}],
-                temp=0.2,
-                max_tokens=300
-            )
+            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.2, max_tokens=500)
+            # Очистка от маркдауна и извлечение JSON
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.strip("`")
+                if raw.lower().startswith("json"):
+                    raw = raw[4:]
+            raw = raw.strip()
+            facts = json.loads(raw)
+            if isinstance(facts, list):
+                return facts[:10]
         except Exception as e:
-            logger.warning(f"LLM fact extraction call failed: {e}")
-            return []
-
-        if not raw:
-            return []
-
-        facts = []
-        for line in raw.split('\n'):
-            line = line.strip().strip('-•*').strip()
-            if not (20 < len(line) < 400):
-                continue
-            if line[0].lower() in ('я', 'ты', 'мы', 'давайте', 'попробуйте'):
-                continue
-            if not re.search(r'(является|составляет|равен|находится|имеет|был|стал|\d)', line):
-                continue
-            facts.append(line[:300])
-
-        # Сохранение НЕ выполняется здесь — см. docstring. Тот же лимит,
-        # что раньше применялся к сохранению, теперь применяется к возврату,
-        # чтобы вызывающий код не сохранял больше, чем было задумано.
-        return facts[:10]
+            logger.warning(f"LLM fact extraction failed: {e}")
+            # fallback: извлекаем простые предложения
+            simple = self._extract_facts_from_text(context)
+            return [{"text": s, "source": "unknown", "date": "unknown"} for s in simple[:5]]
+        return []
 
     def _extract_facts_from_text(self, text: str) -> List[str]:
         sentences = re.split(r'[.!?]', text)
@@ -1683,51 +1678,53 @@ class CognitiveController:
                         memory_context: str, image_base64: Optional[str],
                         image_mime: Optional[str], reasoning: bool,
                         uncertainty: float, predictions: List[str], goal_hint: str) -> List[Dict]:
+        """Строит сообщения для LLM с разделением концептов и фактов."""
         # Защита от None
         memory_context = memory_context or ""
         search_context = search_context or ""
+
+        # === РАЗДЕЛЕНИЕ КОНЦЕПТОВ И ФАКТОВ ===
+        concepts = []
+        facts = []
+        if memory_context:
+            lines = memory_context.split('\n')
+            for line in lines:
+                if '[концепт' in line or 'концепт (обобщение)' in line:
+                    concepts.append(line)
+                else:
+                    facts.append(line)
+        concepts_block = "\n".join(concepts) if concepts else ""
+        facts_block = "\n".join(facts) if facts else ""
+
         system_parts = [
             "Ты — когнитивный AI-ассистент с доступом к трём источникам знаний:",
-            "1. ЛИЧНАЯ ПАМЯТЬ (факты, которые пользователь просил запомнить или извлечены из диалога) — самый надёжный источник.",
-            "2. РЕЗУЛЬТАТЫ ПОИСКА В ИНТЕРНЕТЕ (актуальные данные) — используй, если они есть и релевантны.",
-            "3. ГЛОБАЛЬНАЯ ПАМЯТЬ (общие факты, накопленные из разных диалогов) — менее приоритетны.",
+            "1. ОБОБЩЁННЫЕ ЗНАНИЯ (КОНЦЕПТЫ) — сжатые, проверенные обобщения, используй их как основу.",
+            "2. ЛИЧНАЯ ПАМЯТЬ (конкретные факты) — детали, которые подтверждают или уточняют концепты.",
+            "3. РЕЗУЛЬТАТЫ ПОИСКА В ИНТЕРНЕТЕ — актуальные данные, если они есть.",
             "",
             "ПРАВИЛА ОТВЕТА:",
+            "- Если есть концепты по теме, начинай ответ с них, затем добавляй детали из фактов.",
             "- Всегда отдавай приоритет личной памяти над поиском, если информация совпадает.",
             "- Если информация из разных источников противоречит, укажи это и предложи пользователю уточнить.",
-            "- Для фактов из поиска указывай источник (URL или название), если он известен.",
             "- Если ты не уверен в ответе (уверенность < 0.7), честно скажи об этом.",
-            "- Ответ должен быть структурирован: краткое вступление, основная часть, вывод (если нужно).",
-            "- Если в контексте есть несколько фактов по теме, объедини их в связное объяснение, не перечисляй просто список.",
-            "- Не выдумывай фактов, которых нет в предоставленном контексте. Если информации недостаточно, скажи об этом прямо.",
-            "- В контексте факты помечены типом: [концепт (обобщение)] — это уже консолидированное коллективное знание, "
-            "более общее и надёжное, чем разовый [факт]; [прошлый диалог] — эпизод, а не факт, используй его как контекст беседы.",
-            "- Если в блоке 'НЕРАЗРЕШЁННЫЕ ПРОТИВОРЕЧИЯ В ПАМЯТИ' есть пары — это не ошибка поиска, а зафиксированное "
-            "системой расхождение источников; обязательно назови обе стороны и не выбирай одну молча.",
+            "- Не выдумывай фактов, которых нет в предоставленном контексте.",
         ]
 
         if uncertainty > 0.6:
-            system_parts.append(f"Твоя уверенность в ответе низкая ({uncertainty:.2f}). Если не знаешь – скажи об этом.")
+            system_parts.append(
+                f"Твоя уверенность в ответе низкая ({uncertainty:.2f}). Если не знаешь – скажи об этом.")
         if predictions:
             system_parts.append(f"Возможное продолжение темы: {', '.join(predictions[:3])}.")
         if goal_hint:
             system_parts.append(f"Учитывай активные цели: {goal_hint}.")
         if reasoning:
             system_parts.append(
-                "Перед ответом покажи рассуждения: начни с 💭 РАССУЖДЕНИЕ: и заканчивая ---, затем финальный ответ.")
+                "Перед ответом покажи рассуждения: начни с 💭 РАССУЖДЕНИЕ: и заканчивая ---, затем финальный ответ."
+            )
         if search_context:
-            # search_context уже реально получен (второй, "после ReAct" вызов
-            # _build_messages, см. process_input/stream_response) — данные
-            # действительно есть, можно на них ссылаться как на источник.
-            system_parts.append("Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
+            system_parts.append(
+                "Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
         elif web_search:
-            # ИСПРАВЛЕНИЕ: раньше эта ветка утверждала "ты выполнил поиск" ещё
-            # до того, как поиск действительно происходил (поиск раньше делался
-            # синхронно в _prepare_messages ДО первого построения messages —
-            # после отказа от этого в пользу ToolRouter здесь на первом вызове
-            # search_context ещё пуст). Теперь это инструкция, а не утверждение
-            # о свершившемся факте — решение вызывать инструмент web_search
-            # остаётся за ReAct-циклом (ToolRouter.run).
             system_parts.append(
                 "Пользователю нужны актуальные данные из интернета (курсы, цены, новости, свежие "
                 "события) или в его сообщении есть прямая ссылка — обязательно вызови инструмент "
@@ -1742,8 +1739,10 @@ class CognitiveController:
                 messages.append(item)
 
         user_blocks = []
-        if memory_context:
-            user_blocks.append(memory_context)
+        if concepts_block:
+            user_blocks.append(f"=== ОБОБЩЁННЫЕ ЗНАНИЯ (КОНЦЕПТЫ) ===\n{concepts_block}\n")
+        if facts_block:
+            user_blocks.append(f"=== КОНКРЕТНЫЕ ФАКТЫ ===\n{facts_block}\n")
         if search_context:
             user_blocks.append(
                 f"=== ДАННЫЕ ИЗ ИНТЕРНЕТА (актуальны на {datetime.now(timezone.utc).strftime('%Y-%m-%d')}) ===\n\n"
@@ -1810,12 +1809,7 @@ class CognitiveController:
 
         self._last_activity_time = time.time()
 
-        # ИСПРАВЛЕНИЕ (#3 из чат-ревью): раньше здесь проверялись только
-        # regex-команды памяти (_handle_memory_command), а classify_intent()/
-        # _auto_extract_facts() (шаги 2-3 в process_input) не вызывались вовсе —
-        # то есть в основном, стримингом, режиме браузерного чата эта ветка
-        # никогда не срабатывала. Теперь оба входа используют один и тот же
-        # _run_memory_intent_pipeline, так что поведение идентично process_input.
+        # ИСПРАВЛЕНИЕ (#3 из чат-ревью): используем общий пайплайн памяти
         pipeline_result = await self._run_memory_intent_pipeline(message)
         if pipeline_result:
             yield f"data: {json.dumps({'token': pipeline_result[0]})}\n\n"
@@ -1827,12 +1821,17 @@ class CognitiveController:
         messages, search_meta = await self._prepare_messages(
             message, web_search, image_base64, image_mime, reasoning
         )
+        uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
 
-        # ===== ЗАЩИТА ОТ None =====
-        if not search_meta or not isinstance(search_meta, dict):
-            search_meta = {}
-        elif not isinstance(search_meta, dict):
-            search_meta = {}
+        # === НОВОЕ: активное уточнение ===
+        if uncertainty > 0.7 and not web_search and not reasoning:
+            clarification = await self._ask_clarification(message, uncertainty)
+            if clarification:
+                yield f"data: {json.dumps({'token': clarification})}\n\n"
+                yield "data: [DONE]\n\n"
+                self.history.append({"role": "assistant", "content": clarification})
+                self._save_history()
+                return
 
         full_response = ""
         tool_trace: List[Dict[str, Any]] = []
@@ -1854,10 +1853,7 @@ class CognitiveController:
                     f"ToolRouter decisions for '{message[:50]}': used_native={tool_run.get('used_native')}, trace_len={len(tool_trace)}")
                 logger.info(f"Tool trace: {tool_trace}")
 
-                # ИСПРАВЛЕНИЕ (см. process_input): поиск теперь происходит
-                # только внутри ReAct-цикла, через internal__web_search —
-                # забираем накопленные результаты отсюда же, единообразно с
-                # нестриминговым путём, вместо отдельного синхронного deep_search.
+                # Обработка результатов поиска (из внутреннего web_search)
                 if self._web_search_results_this_turn:
                     seen_urls = set()
                     merged_sources: List[Dict] = []
@@ -1877,11 +1873,14 @@ class CognitiveController:
                     if EXTRACT_FACTS_FROM_SEARCH and search_meta["context"]:
                         try:
                             if EXTRACT_FACTS_WITH_LLM:
-                                facts = await self._extract_facts_llm(search_meta["context"])
+                                # Используем улучшенную версию _extract_facts_llm с метаданными
+                                facts = await self._extract_facts_llm(search_meta["context"], merged_sources)
                             else:
                                 facts = self._extract_facts_from_text(search_meta["context"])
                             for f in facts:
-                                await self.memory_service.remember(f, scope="global")
+                                # f может быть строкой или словарём – адаптируем
+                                text = f.get("text", f) if isinstance(f, dict) else f
+                                await self.memory_service.remember(text, scope="global")
                             if facts:
                                 await self.memory_service.global_memory._schedule_save()
                             logger.info(f"Extracted {len(facts)} facts from web search -> global memory")
@@ -1940,7 +1939,8 @@ class CognitiveController:
                     full_response += token
                     yield f"data: {json.dumps({'token': token})}\n\n"
             else:
-                response, inner_meta = await self.process_input(message, web_search, image_base64, image_mime, reasoning)
+                response, inner_meta = await self.process_input(message, web_search, image_base64, image_mime,
+                                                                reasoning)
                 full_response = response
                 already_verified = True
                 if isinstance(inner_meta, dict) and inner_meta.get("sources"):
@@ -2015,9 +2015,9 @@ class CognitiveController:
             })
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
-            if error > 0.85 and len(response) > 50 and not response.strip().lower().startswith(
+            if error > 0.85 and len(full_response) > 50 and not full_response.strip().lower().startswith(
                     ("привет", "здравствуйте", "hello")):
-                self._spawn_background_task(self._quick_correction(message, predictions, response),
+                self._spawn_background_task(self._quick_correction(message, predictions, full_response),
                                             name="quick-correction")
 
         yield "data: [DONE]\n\n"
@@ -2030,8 +2030,21 @@ class CognitiveController:
         return await generate_image(prompt, steps=steps, width=width, height=height,
                                      cfg_scale=cfg_scale, seed=seed, sampler_name=sampler_name)
 
-
-
+    async def _ask_clarification(self, message: str, uncertainty: float) -> Optional[str]:
+        """Генерирует уточняющий вопрос, если неопределённость высока."""
+        if uncertainty < 0.7:
+            return None
+        prompt = (
+            f"Пользователь спросил: '{message}'. Ты не уверен в ответе (уверенность {uncertainty:.2f}). "
+            "Сформулируй один уточняющий вопрос, который поможет тебе дать точный ответ. "
+            "Вопрос должен быть конкретным и вежливым. Ответь только вопросом, без пояснений."
+        )
+        try:
+            question = await call_llm([{"role": "user", "content": prompt}], temp=0.3, max_tokens=100)
+            return question.strip()
+        except Exception as e:
+            logger.debug(f"Clarification generation failed: {e}")
+            return None
 
     async def enhance_prompt(self, prompt: str) -> str:
         return await enhance_prompt(prompt)
