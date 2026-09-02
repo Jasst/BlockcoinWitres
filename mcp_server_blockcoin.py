@@ -82,6 +82,9 @@ async def _with_timeout(coro, tool_name: str, timeout: Optional[float] = None) -
 # ИНСТРУМЕНТЫ
 # ============================================================
 
+# Добавить глобальный словарь для отслеживания последних вызовов
+_last_commands = {}
+
 @mcp.tool()
 async def execute_command(
     command: str = Field(..., description="Любая команда на естественном языке"),
@@ -89,6 +92,17 @@ async def execute_command(
     user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
 ) -> Dict[str, Any]:
     """Выполняет любую команду через тот же пайплайн, что и обычный чат."""
+    # === ИСПРАВЛЕНИЕ: дедупликация быстрых повторных вызовов ===
+    key = f"{user_id or DEFAULT_USER}:{command}"
+    now = time.time()
+    if key in _last_commands and now - _last_commands[key] < 10:
+        return {
+            "status": "error",
+            "error": "duplicate",
+            "message": "Предыдущий вызов этой команды ещё обрабатывается (или выполнен менее 10 секунд назад)."
+        }
+    _last_commands[key] = now
+
     assistant = await get_assistant(user_id or DEFAULT_USER)
     async def _run():
         return await assistant.process_input(command, web_search=allow_web_search)
@@ -96,11 +110,23 @@ async def execute_command(
     if isinstance(result, dict) and result.get("error") == "timeout":
         return result
     response, meta = result
+
+    # === ИСПРАВЛЕНИЕ: если ответ содержит ошибку, возвращаем чёткий статус ===
+    if "ошибка" in response.lower() or "не удалось" in response.lower() or "404" in response:
+        return {
+            "status": "error",
+            "message": response,
+            "meta": meta,
+            "user_id": user_id or DEFAULT_USER,
+            "timestamp": time.time()
+        }
+
     return {
+        "status": "ok",
         "result": response,
         "meta": meta,
         "user_id": user_id or DEFAULT_USER,
-        "timestamp": asyncio.get_event_loop().time()
+        "timestamp": time.time()
     }
 
 @mcp.tool()
@@ -266,6 +292,35 @@ async def generate_image(
         "original_prompt": prompt,
         "enhanced_prompt": final_prompt if enhance_prompt else None
     }
+
+@mcp.tool()
+async def fetch_github_file(
+    path: str = Field(..., description="Путь к файлу в репозитории, например 'GCN/config_ai.py'"),
+    repo: str = Field("Jasst/BlockcoinWitres", description="Репозиторий в формате owner/repo"),
+    branch: str = Field("main", description="Ветка"),
+    max_lines: int = Field(500, description="Максимальное количество строк для возврата (для больших файлов)")
+) -> Dict[str, Any]:
+    """
+    Загружает содержимое файла из публичного репозитория GitHub через raw-ссылку.
+    Использует aiohttp, не требует curl.
+    """
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path.lstrip('/')}"
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    content = await resp.text()
+                    # Обрезаем до max_lines, если нужно
+                    lines = content.splitlines()
+                    if len(lines) > max_lines:
+                        content = "\n".join(lines[:max_lines]) + f"\n... (обрезано, всего {len(lines)} строк)"
+                    return {"status": "ok", "content": content, "url": url, "size": len(content)}
+                else:
+                    error_text = await resp.text()
+                    return {"status": "error", "code": resp.status, "message": error_text[:500]}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @mcp.tool()
 async def research_topic(

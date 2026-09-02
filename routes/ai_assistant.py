@@ -600,6 +600,82 @@ class CognitiveController:
                 return "Инструменты не зарегистрированы."
             return "Доступные инструменты:\n" + "\n".join(lines)
 
+        async def _internal_fetch_github_file(args: Dict) -> str:
+            path = args.get("path", "")
+            repo = args.get("repo", "Jasst/BlockcoinWitres")
+            branch = args.get("branch", "main")
+            max_lines = args.get("max_lines", 500)
+            if not path:
+                return "Ошибка: не указан путь к файлу (path)."
+
+            # === ИСПРАВЛЕНИЕ: определяем, является ли путь папкой ===
+            # Считаем папкой, если путь заканчивается на "/" или не содержит расширения
+            is_dir = path.endswith("/") or "." not in path.split("/")[-1]
+
+            if is_dir:
+                # Используем GitHub REST API для получения содержимого директории
+                api_url = f"https://api.github.com/repos/{repo}/contents/{path.lstrip('/')}?ref={branch}"
+                try:
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(api_url, timeout=15) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                files = [item["name"] for item in data if item["type"] == "file"]
+                                dirs = [item["name"] for item in data if item["type"] == "dir"]
+                                result = f"Содержимое директории `{path}`:\n"
+                                if dirs:
+                                    result += "📁 Папки: " + ", ".join(dirs) + "\n"
+                                if files:
+                                    result += "📄 Файлы: " + ", ".join(files) + "\n"
+                                return result
+                            else:
+                                return f"Ошибка API GitHub: {resp.status}"
+                except Exception as e:
+                    return f"Ошибка: {str(e)}"
+            else:
+                # Старая логика для файлов
+                url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path.lstrip('/')}"
+                try:
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, timeout=15) as resp:
+                            if resp.status == 200:
+                                content = await resp.text()
+                                lines = content.splitlines()
+                                if len(lines) > max_lines:
+                                    content = "\n".join(
+                                        lines[:max_lines]) + f"\n... (обрезано, всего {len(lines)} строк)"
+                                return f"Файл {path} из репозитория {repo}:\n\n```\n{content}\n```"
+                            else:
+                                return f"Ошибка загрузки: {resp.status}"
+                except Exception as e:
+                    return f"Ошибка: {str(e)}"
+
+        self.tool_registry.register(
+            name="fetch_github_file",
+            description=(
+                "Загружает содержимое файла из публичного репозитория GitHub. "
+                "Используй этот инструмент, когда пользователь просит прочитать файлы с GitHub. "
+                "Аргументы: path (str, обязательный, путь к файлу, например 'GCN/config_ai.py'), "
+                "repo (str, опционально, owner/repo, по умолчанию 'Jasst/BlockcoinWitres'), "
+                "branch (str, опционально, ветка, по умолчанию 'main'), "
+                "max_lines (int, опционально, максимум строк для возврата, по умолчанию 500)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Путь к файлу в репозитории"},
+                    "repo": {"type": "string", "description": "Репозиторий в формате owner/repo"},
+                    "branch": {"type": "string", "description": "Ветка"},
+                    "max_lines": {"type": "integer", "default": 500}
+                },
+                "required": ["path"]
+            },
+            handler=_internal_fetch_github_file,
+            server="internal"
+        )
+
         self.tool_registry.register(
             name="list_tools",
             description="Возвращает список всех доступных инструментов с краткими описаниями",
@@ -1708,6 +1784,10 @@ class CognitiveController:
             "- Если информация из разных источников противоречит, укажи это и предложи пользователю уточнить.",
             "- Если ты не уверен в ответе (уверенность < 0.7), честно скажи об этом.",
             "- Не выдумывай фактов, которых нет в предоставленном контексте.",
+            "Если пользователь явно просит что-то сделать (запомнить, найти, сгенерировать, "
+            "добавить цель) – используй соответствующие инструменты из своего набора. Не пытайся "
+            "ответить текстом, если для выполнения действия нужен вызов инструмента – это "
+            "будет обработано автоматически. Просто вызови нужный инструмент через JSON."
         ]
 
         if uncertainty > 0.6:
