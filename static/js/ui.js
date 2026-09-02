@@ -151,7 +151,7 @@
         }
 
         const timeStr = Utils.formatTimestamp(msg.timestamp);
-const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" title="${t('delete')}"><img src="/static/icons/Remove.png" width="16" height="16" alt="Delete"></button>` : '';
+        const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" title="${t('delete')}"><img src="/static/icons/Remove.png" width="16" height="16" alt="Delete"></button>` : '';
         let statusHtml = '';
         if (msg.is_mine) {
             const st = msg.status || 'sent';
@@ -281,16 +281,25 @@ const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" 
     }
 
     // ========== ДИНАМИЧЕСКИЙ ОТСТУП ПОД ПОЛЕ ВВОДА ==========
-    function adjustMessagesPadding() {
-        const chatPanel = document.querySelector('.chat-panel');
-        if (!chatPanel) return;
-        const inputArea = chatPanel.querySelector('.input-area');
-        const messages = document.getElementById('messagesContainer');
-        if (inputArea && messages) {
+    window.adjustMessagesPadding = function() {
+        const aiContainer = document.getElementById('aiChatContainer');
+        const isAiActive = aiContainer && !aiContainer.classList.contains('hidden');
+        let messages, inputArea;
+
+        if (isAiActive) {
+            messages = document.getElementById('aiMessagesContainer');
+            inputArea = aiContainer.querySelector('.input-area');
+        } else {
+            messages = document.getElementById('messagesContainer');
+            const chatPanel = document.querySelector('.chat-panel');
+            inputArea = chatPanel ? chatPanel.querySelector('.input-area') : null;
+        }
+
+        if (messages && inputArea) {
             const height = inputArea.offsetHeight;
             messages.style.paddingBottom = (height + 20) + 'px';
         }
-    }
+    };
 
     async function selectConversation(address, name, isGroup) {
         if (State.topObserver) { State.topObserver.disconnect(); State.topObserver = null; }
@@ -360,10 +369,8 @@ const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" 
         State.pendingImageData = null;
        if (window.stopStatusPolling) window.stopStatusPolling();
        if (window.startStatusPolling) window.startStatusPolling();
-       // ИСПРАВЛЕНИЕ: перезапускаем поллинг статусов пользователей для свежих данных
        if (window.stopUserStatusPolling) window.stopUserStatusPolling();
        if (window.startUserStatusPolling) window.startUserStatusPolling();
-
 
         if (container) {
             container.querySelectorAll('[data-object-url]').forEach(el => {
@@ -416,7 +423,7 @@ const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" 
             if (cached.length && (wasAtBottom || forceScroll)) {
                 markConversationAsRead(chatWithAddress, cached[cached.length-1].id);
             }
-            adjustMessagesPadding(); // FIX: added dynamic padding
+            adjustMessagesPadding();
         } else if (!isNewMessage) {
             container.innerHTML = `<div class="loading">${t('loading_messages')}</div>`;
             container.classList.add('loading');
@@ -451,7 +458,7 @@ const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" 
                     _enableChatControls();
                 }
                 container.classList.remove('loading');
-                adjustMessagesPadding(); // FIX
+                adjustMessagesPadding();
                 return;
             }
 
@@ -485,7 +492,7 @@ const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" 
                 if ((wasAtBottom || forceScroll) && newMessages.length) {
                     markConversationAsRead(chatWithAddress, newMessages[newMessages.length-1].id);
                 }
-                adjustMessagesPadding(); // FIX
+                adjustMessagesPadding();
             }
 
             if (!isNewMessage && cached.length === 0 && newMessages.length) setupTopObserver();
@@ -610,7 +617,7 @@ const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" 
 
             const msgElement = createMessageElement(decrypted);
             container.appendChild(msgElement);
-            adjustMessagesPadding(); // FIX
+            adjustMessagesPadding();
 
             if (wasAtBottom) {
                 setTimeout(() => container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' }), 50);
@@ -642,7 +649,6 @@ const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" 
     const item = document.querySelector(`.conversation-item[data-address="${chatId}"]`);
     if (item && item.parentNode === container) {
         container.insertBefore(item, container.firstChild);
-        // Дополнительно: обновить активный класс, если нужно
         item.classList.add('new-message-highlight');
         setTimeout(() => item.classList.remove('new-message-highlight'), 500);
     }
@@ -662,17 +668,23 @@ const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" 
     window.fetchUserStatuses = fetchUserStatuses;
     window.openImageModal = openImageModal;
     window.closeImageModal = closeImageModal;
-    window.adjustMessagesPadding = adjustMessagesPadding; // FIX: экспорт для вызовов из actions.js
+    window.adjustMessagesPadding = adjustMessagesPadding;
 
-    // ========== ИНИЦИАЛИЗАЦИЯ ДИНАМИЧЕСКОГО ОТСТУПА ==========
+    // ========== ИНИЦИАЛИЗАЦИЯ ==========
     document.addEventListener('DOMContentLoaded', () => {
         const inputArea = document.querySelector('.chat-panel .input-area');
         if (inputArea && window.ResizeObserver) {
             const resizeObserver = new ResizeObserver(() => adjustMessagesPadding());
             resizeObserver.observe(inputArea);
         }
+
+        const aiInputArea = document.querySelector('#aiChatContainer .input-area');
+        if (aiInputArea && window.ResizeObserver) {
+            const aiResizeObserver = new ResizeObserver(() => adjustMessagesPadding());
+            aiResizeObserver.observe(aiInputArea);
+        }
+
         window.addEventListener('resize', () => adjustMessagesPadding());
-        // первичный вызов через короткую задержку, чтобы DOM точно отрисовался
         setTimeout(adjustMessagesPadding, 100);
     });
 })();

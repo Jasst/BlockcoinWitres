@@ -124,7 +124,7 @@ async def call_llm_stream(
         "max_tokens": max_tokens,
         "stream": True,
     }
-    timeout = aiohttp.ClientTimeout(total=LM_STUDIO_STREAM_TIMEOUT)  # убедитесь, что константа определена в config_ai
+    timeout = aiohttp.ClientTimeout(total=LM_STUDIO_STREAM_TIMEOUT)
     try:
         session = await _get_session()
         async with session.post(LM_STUDIO_URL, json=payload, headers=headers, timeout=timeout) as resp:
@@ -149,6 +149,8 @@ async def call_llm_stream(
                             yield content
                     except json.JSONDecodeError:
                         continue
+            # Если ничего не было выдано, отправляем пустую строку (не None)
+            yield ""
     except asyncio.CancelledError:
         logger.debug("Stream cancelled")
         raise

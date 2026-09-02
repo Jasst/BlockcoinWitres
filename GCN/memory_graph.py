@@ -158,6 +158,22 @@ class Episode:
     salience: float = 0.0
     prediction_error: float = 0.0
     accessed_count: int = 0
+    # ДОБАВЛЕНО (см. deep_consolidation): раньше Episode не хранил, каким
+    # именно локальным Fact соответствуют его реплики — deep_consolidation
+    # находил их линейным сканированием ВСЕХ semantic_facts по точному
+    # совпадению текста (без фильтра по типу), на каждый эпизод из
+    # REPLAY_BATCH_SIZE при каждом deep_consolidation. Два последствия:
+    # (1) O(n) скан на эпизод вместо O(1) — при большом числе фактов заметно
+    # медленнее; (2) при повторяющемся тексте сообщения ("привет", "спасибо")
+    # или при совпадении с фактом другого типа (например, извлечённым из
+    # этого же сообщения глобальным фактом) брался facts[0] — произвольный, не
+    # обязательно тот факт, что реально относится к этому эпизоду. Теперь ID
+    # проставляются напрямую при создании (add_episode) или один раз при
+    # восстановлении из GCN (_rebuild_caches_from_gcn), и Hebbian-обновление
+    # обращается к facts_by_id за O(1). None — для старых данных без этих
+    # полей; тогда используется прежний textual fallback (см. deep_consolidation).
+    user_fact_id: Optional[int] = None
+    assistant_fact_id: Optional[int] = None
 
 
 @dataclass
@@ -371,6 +387,15 @@ class CognitiveMemory:
 
         self.episodic_memory = []
         # Восстанавливаем эпизоды из GCN
+        # ДОБАВЛЕНО: индекс (текст, тип) -> id локального факта, строится один
+        # раз за весь rebuild (а не по одному скану на эпизод в deep_consolidation,
+        # см. Episode.user_fact_id/assistant_fact_id) — используется ниже, чтобы
+        # восстановленные из GCN эпизоды тоже получили привязку к фактам.
+        text_type_to_fid: Dict[Tuple[str, str], int] = {}
+        for f in self.semantic_facts:
+            if f.type in ('user', 'assistant'):
+                text_type_to_fid.setdefault((f.text, f.type), f.id)
+
         user_events = [obj for obj in self.gcn_store.get_all_episodes(self.user_id) if obj.predicate == "user_message"]
         for user_obj in user_events:
             neighbors = self.gcn_store._graph.get_neighbors(user_obj.id, "replied_with")
@@ -382,7 +407,9 @@ class CognitiveMemory:
                         user_msg=user_obj.subject,
                         assistant_msg=ass_obj.subject,
                         timestamp=user_obj.created.timestamp(),
-                        salience=user_obj.object.get("salience", 0.0) if isinstance(user_obj.object, dict) else 0.0
+                        salience=user_obj.object.get("salience", 0.0) if isinstance(user_obj.object, dict) else 0.0,
+                        user_fact_id=text_type_to_fid.get((user_obj.subject, 'user')),
+                        assistant_fact_id=text_type_to_fid.get((ass_obj.subject, 'assistant')),
                     )
                     self.episodic_memory.append(episode)
                     self._next_episode_id += 1
@@ -544,11 +571,37 @@ class CognitiveMemory:
         else:
             similar = self._find_similar_keyword(fid, top_k=20)
 
+        # ИСПРАВЛЕНИЕ (серьёзный баг синаптического графа): оба хелпера выше
+        # (_find_similar_by_embedding/_find_similar_keyword) возвращают пары
+        # (fact.id, sim) — то есть ID факта, а НЕ индекс в списке
+        # self.semantic_facts. Код ниже раньше трактовал это значение как
+        # индекс списка (`self.semantic_facts[other_idx]`) и даже содержал
+        # проверку "пропустить последний индекс" — по всей видимости, попытку
+        # исключить только что добавленный факт себя, в предположении, что он
+        # всегда последний в списке.
+        #
+        # Пока список только пополняется и ID совпадает с позицией (свежая
+        # сессия, ни одного удаления), баг случайно не проявлялся. Но:
+        #   - после удаления любого факта (light_consolidation/deep_consolidation
+        #     чистят дубликаты, есть explicit forget) список сдвигается, и
+        #     ID перестаёт совпадать с индексом для всех фактов после удалённого;
+        #   - после перезапуска процесса кэш восстанавливается в
+        #     _rebuild_caches_from_gcn() в порядке итерации GCN-хранилища,
+        #     который не гарантированно совпадает с порядком по ID.
+        # В обоих случаях self.semantic_facts[other_idx] тихо возвращал СОВСЕМ
+        # ДРУГОЙ факт (не IndexError, а неверный результат) — синапсы Hebbian/
+        # STDP создавались между случайными парами фактов, а
+        # _detect_contradictions проверяла противоречие не с теми кандидатами.
+        # Это без исключений «работало», просто наполняло ассоциативный граф
+        # шумом — отсюда и вопрос, есть ли слабо работающие места.
+        #
+        # Исправление: искать факт по ID через facts_by_id (O(1), как и
+        # везде в остальном файле), а не по индексу списка.
         similar_ids = []
-        for other_idx, sim in similar:
-            if other_idx >= len(self.semantic_facts) or other_idx == len(self.semantic_facts) - 1:
+        for other_id, sim in similar:
+            other = self.facts_by_id.get(other_id)
+            if other is None or other_id == fid:
                 continue
-            other = self.semantic_facts[other_idx]
             similar_ids.append(other.id)
             if sim > 0.45:
                 self._create_synapse(fid, other.id, weight=sim * 0.5)
@@ -736,6 +789,8 @@ class CognitiveMemory:
             timestamp=time.time(),
             importance=1.0,
             salience=salience,
+            user_fact_id=user_fid,
+            assistant_fact_id=assistant_fid,
         )
         self._next_episode_id += 1
         self.episodic_memory.append(episode)
@@ -920,48 +975,53 @@ class CognitiveMemory:
 
     # ==================== ГИБРИДНЫЙ ПОИСК ====================
     async def retrieve_hybrid(self, query: str, top_k: int = 5, use_graph: bool = True) -> List[Dict]:
-        """Гибридный поиск через GCN с преобразованием результата в старый формат."""
+        """
+        Гибридный поиск через GCN с преобразованием результата в старый формат.
+        Добавлена адаптивная корректировка весов в зависимости от типа запроса.
+        """
         cache_key = f"hybrid_{query}_{top_k}_{use_graph}"
         if cache_key in self._cache:
             result, ts = self._cache[cache_key]
             if time.time() - ts < self._cache_ttl:
                 return result
 
-        # Генерируем вектор запроса (is_query=True — асимметричный префикс e5,
-        # см. пункт №1 в шапке файла и _get_embedding)
+        # Генерируем вектор запроса (is_query=True — асимметричный префикс e5)
         query_vector = None
         if self.use_embeddings:
             query_vector = self._get_embedding(query, is_query=True).tolist()
 
-        # start_node для графового компонента гибридного поиска.
-        # Раньше сюда всегда передавался None — весь граф Hebbian/STDP
-        # синапсов, который старательно строится в _create_synapse()/
-        # _hebbian_update(), никогда не участвовал в retrieve_hybrid():
-        # вес HYBRID_WEIGHT_GRAPH существовал только на бумаге. Берём
-        # последний активный элемент рабочей памяти как точку старта
-        # обхода графа — так соседи по синапсам реально попадают в
-        # кандидаты поиска.
         start_node = self.hierarchy.working_memory[-1] if use_graph and self.hierarchy.working_memory else None
 
-        # Выполняем поиск в GCN (top_k*3 — с запасом: дальше не фильтруем по
-        # типу и подмешиваем activation-буст, поэтому порядок может измениться)
+        # ===== АДАПТИВНАЯ КОРРЕКТИРОВКА ВЕСОВ =====
+        weights = self._dynamic_weights.copy()
+
+        # Определяем тип запроса
+        if self._is_time_sensitive(query):
+            # Временные запросы (курсы, новости) – повышаем свежесть
+            weights['freshness'] = min(0.8, weights.get('freshness', 0.15) + 0.3)
+            weights['semantic'] = max(0.2, weights.get('semantic', 0.40) - 0.1)
+            weights['graph'] = max(0.1, weights.get('graph', 0.20) - 0.05)
+        elif self._is_factual(query):
+            # Фактологические запросы – повышаем семантику и граф
+            weights['semantic'] = min(0.7, weights.get('semantic', 0.40) + 0.2)
+            weights['graph'] = min(0.5, weights.get('graph', 0.20) + 0.1)
+            weights['freshness'] = max(0.05, weights.get('freshness', 0.15) - 0.05)
+
+        # Нормируем веса
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+        # =========================================
+
+        # Выполняем поиск в GCN с модифицированными весами
         gcn_results = self.gcn_store.hybrid_retrieve(
             query_vector=query_vector,
             start_node=start_node,
             top_k=top_k * 3,
-            weights = self._dynamic_weights
+            weights=weights
         )
 
-        # УЛУЧШЕНИЕ (spreading activation → скоринг): раньше spread_activation()
-        # — полноценная многошаговая Hebbian/STDP-активация по графу синапсов —
-        # вообще не вызывалась из retrieve_hybrid. Единственным "графовым"
-        # вкладом был одношаговый обход GCN-графа от start_node; вес
-        # HYBRID_WEIGHT_GRAPH существовал только на бумаге, а вся дорогая
-        # ассоциативная сеть, которую строит _hebbian_update()/_create_synapse(),
-        # была мёртвым кодом с точки зрения того, что реально видит модель.
-        # Теперь прогоняем активацию от текущей рабочей памяти (working_memory
-        # как seed) и используем результат как буст к итоговому скору —
-        # ассоциативно связанные факты реально всплывают выше при поиске.
+        # Применяем spreading activation для графового буста
         activation_map: Dict[int, float] = {}
         if use_graph and self.hierarchy.working_memory:
             seed_local_ids = []
@@ -975,13 +1035,6 @@ class CognitiveMemory:
                 except Exception as e:
                     logger.debug(f"spread_activation failed in retrieve_hybrid: {e}")
 
-        # Преобразуем в формат, ожидаемый ai_assistant.py.
-        # УЛУЧШЕНИЕ (все типы знаний, не только CLAIM): раньше сюда попадали
-        # ТОЛЬКО KnowledgeType.CLAIM — эпизоды, процедуры, концепты,
-        # гипотезы/цели и связи физически лежали в MemoryStore и участвовали
-        # в графе, но были полностью невидимы для retrieval. Модель не могла
-        # "вспомнить" эпизод по факту или концепт по ключевому слову. Теперь
-        # конвертируем любой тип, с разметкой meta по типу.
         result = []
         for obj in gcn_results:
             meta = obj.object if isinstance(obj.object, dict) else {}
@@ -1007,8 +1060,6 @@ class CognitiveMemory:
             elif obj.type == KnowledgeType.CONCEPT:
                 text = obj.subject
                 item_type = "concept"
-                # обобщения по умолчанию чуть весомее сырых фактов — это сжатый,
-                # уже провалидированный консолидацией слой знаний
                 importance = meta.get("importance", 1.2)
             else:
                 text = obj.subject
@@ -1024,7 +1075,7 @@ class CognitiveMemory:
                 "text": text,
                 "type": item_type,
                 "timestamp": obj.created.timestamp(),
-                "score": final_score,      # confidence + activation-буст
+                "score": final_score,
                 "confidence": obj.confidence,
                 "importance": importance,
                 "activation": activation_boost,
@@ -1032,16 +1083,31 @@ class CognitiveMemory:
                 "scope": obj.scope.value,
             })
 
-        # Сортируем по score (уже учитывает activation) и ограничиваем top_k
         result.sort(key=lambda x: x["score"], reverse=True)
         result = result[:top_k]
 
-        # Сохраняем в кэш
         self._cache[cache_key] = (result, time.time())
         if len(self._cache) > self._cache_maxsize:
             oldest = sorted(self._cache.items(), key=lambda x: x[1][1])[0][0]
             del self._cache[oldest]
         return result
+
+    def _is_time_sensitive(self, query: str) -> bool:
+        """Эвристика для запросов, требующих актуальных данных."""
+        time_markers = [
+            'сегодня', 'сейчас', 'курс', 'погода', 'новости', 'свежие',
+            'завтра', 'вчера', 'актуальные', 'последние', '2024', '2025', '2026'
+        ]
+        return any(m in query.lower() for m in time_markers)
+
+    def _is_factual(self, query: str) -> bool:
+        """Эвристика для фактических запросов с числами или единицами."""
+        import re
+        patterns = [
+            r'\b\d+[.,]?\d*\s*(?:USD|EUR|RUB|₽|$|€|%|кг|км|г|м|см|мм|MB|GB|TB)\b',
+            r'\b(?:курс|цена|стоимость|тариф|скорость|температура|вес|рост|расстояние)\b'
+        ]
+        return any(re.search(p, query, re.IGNORECASE) for p in patterns)
 
     def _sync_goal_from_gcn(self, gcn_id: str):
         """Обновляет локальный Goal по данным из GCN."""
@@ -1141,9 +1207,25 @@ class CognitiveMemory:
                 self.episodic_memory.sort(key=lambda e: (e.importance * (1 + e.salience), e.timestamp), reverse=True)
                 replay_candidates = self.episodic_memory[:REPLAY_BATCH_SIZE]
                 for ep in replay_candidates:
-                    user_facts = [f for f in self.semantic_facts if f.text == ep.user_msg]
-                    ass_facts = [f for f in self.semantic_facts if f.text == ep.assistant_msg]
-                    if user_facts and ass_facts:
+                    # ИСПРАВЛЕНИЕ (см. Episode.user_fact_id/assistant_fact_id):
+                    # раньше здесь на КАЖДЫЙ эпизод делался линейный скан всех
+                    # semantic_facts по точному совпадению текста, вообще без
+                    # фильтра по типу — при повторяющемся тексте сообщения
+                    # ("привет", "спасибо") или совпадении с фактом другого типа
+                    # брался facts[0], произвольный и не обязательно тот, что
+                    # реально относится к этому эпизоду. Теперь сперва O(1)
+                    # обращение по id; textual-скан остаётся только как fallback
+                    # для эпизодов, восстановленных из данных без этих полей, и
+                    # теперь ЯВНО фильтрует по типу факта.
+                    user_fact = self.facts_by_id.get(ep.user_fact_id) if ep.user_fact_id is not None else None
+                    ass_fact = self.facts_by_id.get(ep.assistant_fact_id) if ep.assistant_fact_id is not None else None
+                    if user_fact is None:
+                        user_fact = next((f for f in self.semantic_facts
+                                           if f.text == ep.user_msg and f.type == 'user'), None)
+                    if ass_fact is None:
+                        ass_fact = next((f for f in self.semantic_facts
+                                          if f.text == ep.assistant_msg and f.type == 'assistant'), None)
+                    if user_fact and ass_fact:
                         # ИСПРАВЛЕНИЕ: Episode хранит один timestamp на весь эпизод,
                         # поэтому раньше оба вызова (user->assistant и assistant->user)
                         # получали ОДИНАКОВОЕ coactivation_time: dt всегда было равно 0,
@@ -1154,8 +1236,8 @@ class CognitiveMemory:
                         # Разносим "пре" (user) и "пост" (assistant) на 1 секунду —
                         # реальный порядок реплик внутри эпизода нам известен, даже без
                         # точных временных меток на каждую реплику в отдельности.
-                        self._hebbian_update(user_facts[0].id, ass_facts[0].id, ep.timestamp + 1.0)
-                        self._hebbian_update(ass_facts[0].id, user_facts[0].id, ep.timestamp)
+                        self._hebbian_update(user_fact.id, ass_fact.id, ep.timestamp + 1.0)
+                        self._hebbian_update(ass_fact.id, user_fact.id, ep.timestamp)
 
             # Обновляем confidence и importance
             now = time.time()

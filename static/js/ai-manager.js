@@ -69,51 +69,59 @@
     // =================================================================
     // 2. ПЕРЕОПРЕДЕЛЕНИЕ selectConversation
     // =================================================================
-    const _origSelectConversation = window.selectConversation;
-    window.selectConversation = function(address, name, isGroup) {
-        if (address && address.startsWith('ai_')) {
-            // Наша логика для AI-сессий
-            if (window.State) {
-                window.State.currentChatAddress = address;
-                window.State.currentChatIsGroup = false;
-                window.State.currentChatPartnerAddress = '';
-            }
-            const mainContainer = document.getElementById('messagesContainer');
-            const mainInputArea = document.querySelector('.chat-panel .input-area:not(#aiChatContainer .input-area)');
-            const mainChatHeader = document.querySelector('.chat-panel .chat-panel-header:not(#aiChatContainer .chat-panel-header)');
-            const aiContainer = document.getElementById('aiChatContainer');
-
-            if (mainContainer) mainContainer.style.display = 'none';
-            if (mainInputArea) mainInputArea.style.display = 'none';
-            if (mainChatHeader) mainChatHeader.style.display = 'none';
-            if (aiContainer) {
-                aiContainer.classList.remove('hidden');
-                if (typeof window._initAiChatSession === 'function') {
-                    window._initAiChatSession(address);
-                }
-            }
-            const displayName = name || (address.slice(3, 8) + '…');
-            const nameEl = document.getElementById('currentChatName');
-            if (nameEl) nameEl.textContent = '🤖 ' + displayName;
-            const subtitleEl = document.getElementById('chatSubtitle');
-            if (subtitleEl) subtitleEl.textContent = 'AI Assistant';
-
-            // Включаем элементы управления
-            if (typeof window._enableChatControls === 'function') window._enableChatControls();
-            document.querySelectorAll('.conversation-item').forEach(item => item.classList.remove('active'));
-            const activeItem = document.querySelector(`.conversation-item[data-address="${address}"]`);
-            if (activeItem) activeItem.classList.add('active');
-
-            // ========== ФИКС: для мобильных устройств показываем чат-панель ==========
-            if (window.innerWidth < 768 && typeof window.showChatPanel === 'function') {
-                window.showChatPanel();
-            }
-
-            return;
+    // =================================================================
+// 2. ПЕРЕОПРЕДЕЛЕНИЕ selectConversation
+// =================================================================
+const _origSelectConversation = window.selectConversation;
+window.selectConversation = function(address, name, isGroup) {
+    if (address && address.startsWith('ai_')) {
+        // Наша логика для AI-сессий
+        if (window.State) {
+            window.State.currentChatAddress = address;
+            window.State.currentChatIsGroup = false;
+            window.State.currentChatPartnerAddress = '';
         }
-        // Не AI – вызываем оригинал
-        if (_origSelectConversation) _origSelectConversation(address, name, isGroup);
-    };
+        const mainContainer = document.getElementById('messagesContainer');
+        const mainInputArea = document.querySelector('.chat-panel .input-area:not(#aiChatContainer .input-area)');
+        const mainChatHeader = document.querySelector('.chat-panel .chat-panel-header:not(#aiChatContainer .chat-panel-header)');
+        const aiContainer = document.getElementById('aiChatContainer');
+
+        if (mainContainer) mainContainer.style.display = 'none';
+        if (mainInputArea) mainInputArea.style.display = 'none';
+        if (mainChatHeader) mainChatHeader.style.display = 'none';
+        if (aiContainer) {
+            aiContainer.classList.remove('hidden');
+            if (typeof window._initAiChatSession === 'function') {
+                window._initAiChatSession(address);
+            }
+        }
+        const displayName = name || (address.slice(3, 8) + '…');
+        const nameEl = document.getElementById('currentChatName');
+        if (nameEl) nameEl.textContent = '🤖 ' + displayName;
+        const subtitleEl = document.getElementById('chatSubtitle');
+        if (subtitleEl) subtitleEl.textContent = 'AI Assistant';
+
+        // Включаем элементы управления
+        if (typeof window._enableChatControls === 'function') window._enableChatControls();
+        document.querySelectorAll('.conversation-item').forEach(item => item.classList.remove('active'));
+        const activeItem = document.querySelector(`.conversation-item[data-address="${address}"]`);
+        if (activeItem) activeItem.classList.add('active');
+
+        // ========== ФИКС: для мобильных устройств показываем чат-панель ==========
+        if (window.innerWidth < 768 && typeof window.showChatPanel === 'function') {
+            window.showChatPanel();
+        }
+
+        // ✅ ДОБАВЛЕНО: пересчёт отступа после переключения на AI‑чат
+        if (typeof window.adjustMessagesPadding === 'function') {
+            setTimeout(window.adjustMessagesPadding, 50);
+        }
+
+        return;
+    }
+    // Не AI – вызываем оригинал
+    if (_origSelectConversation) _origSelectConversation(address, name, isGroup);
+};
 
     // =================================================================
     // 3. ПОЛНАЯ ЗАМЕНА AI-ЧАТА (на основе AiChat.js с сессиями)
@@ -502,12 +510,10 @@ function _clearAiHistory() {
         }
     }
     function _displayAiMessage(text, isUser, imagePreview = null, saveToStorage = true) {
-    // <-- ИЗМЕНЕНИЕ: проверка и инициализация контейнера
     if (!_aiMessagesContainer) {
         _aiMessagesContainer = document.getElementById('aiMessagesContainer');
-        if (!_aiMessagesContainer) return; // если всё ещё нет – выходим
+        if (!_aiMessagesContainer) return;
     }
-    // <-- КОНЕЦ ИЗМЕНЕНИЯ
 
     const msgDiv = document.createElement('div');
     msgDiv.className = `message ${isUser ? 'sent' : 'received'} animate-fade`;
@@ -544,6 +550,11 @@ function _clearAiHistory() {
     _aiMessagesContainer.scrollTop = _aiMessagesContainer.scrollHeight;
     if (saveToStorage && text && !text.includes('Привет! Я AI-ассистент')) {
         _saveAiMessage(isUser ? 'user' : 'assistant', text, _currentAiSessionId);
+    }
+
+    // ✅ Добавлено: пересчёт отступа после добавления сообщения
+    if (typeof window.adjustMessagesPadding === 'function') {
+        window.adjustMessagesPadding();
     }
     return msgDiv;
 }
@@ -834,51 +845,65 @@ async function _sendToAi(messageText, imageFile) {
 
     // ─── превью изображения ───
     function _showImagePreview(file) {
-        const oldPreview = document.getElementById('aiImagePreview');
-        if (oldPreview) oldPreview.remove();
-        const previewContainer = document.createElement('div');
-        previewContainer.id = 'aiImagePreview';
-        previewContainer.style.cssText = `
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 8px 12px;
-            margin: 8px 16px 0 16px;
-            background: var(--bg-secondary);
-            border-radius: var(--radius-md);
-            border: 1px solid var(--border-color);
-        `;
-        const blobUrl = URL.createObjectURL(file);
+    const oldPreview = document.getElementById('aiImagePreview');
+    if (oldPreview) oldPreview.remove();
+    const previewContainer = document.createElement('div');
+    previewContainer.id = 'aiImagePreview';
+    previewContainer.style.cssText = `
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        margin: 8px 16px 0 16px;
+        background: var(--bg-secondary);
+        border-radius: var(--radius-md);
+        border: 1px solid var(--border-color);
+    `;
+    const blobUrl = URL.createObjectURL(file);
+    if (_currentImagePreviewUrl) URL.revokeObjectURL(_currentImagePreviewUrl);
+    _currentImagePreviewUrl = blobUrl;
+    previewContainer.innerHTML = `
+        <img src="${blobUrl}" style="width: 40px; height: 40px; object-fit: cover; border-radius: 6px;">
+        <span style="font-size: 13px; color: var(--text-secondary); flex: 1;">${_escapeHtml(file.name)}</span>
+        <button type="button" id="clearAiImage" class="btn btn-icon" style="font-size: 16px; padding: 4px;">✕</button>
+    `;
+    const form = document.querySelector('#aiChatContainer .input-area');
+    if (form) {
+        form.insertBefore(previewContainer, form.firstChild);
+    } else {
+        const container = document.getElementById('aiChatContainer');
+        if (container) container.appendChild(previewContainer);
+    }
+    document.getElementById('clearAiImage')?.addEventListener('click', () => {
         if (_currentImagePreviewUrl) URL.revokeObjectURL(_currentImagePreviewUrl);
-        _currentImagePreviewUrl = blobUrl;
-        previewContainer.innerHTML = `
-            <img src="${blobUrl}" style="width: 40px; height: 40px; object-fit: cover; border-radius: 6px;">
-            <span style="font-size: 13px; color: var(--text-secondary); flex: 1;">${_escapeHtml(file.name)}</span>
-            <button type="button" id="clearAiImage" class="btn btn-icon" style="font-size: 16px; padding: 4px;">✕</button>
-        `;
-        const form = document.querySelector('#aiChatContainer .input-area');
-        if (form) {
-            form.insertBefore(previewContainer, form.firstChild);
-        } else {
-            const container = document.getElementById('aiChatContainer');
-            if (container) container.appendChild(previewContainer);
-        }
-        document.getElementById('clearAiImage')?.addEventListener('click', () => {
-            if (_currentImagePreviewUrl) URL.revokeObjectURL(_currentImagePreviewUrl);
-            _pendingImageFile = null;
-            previewContainer.remove();
-            _currentImagePreviewUrl = null;
-        });
-    }
-    function _clearImagePreview() {
-        const previewDiv = document.getElementById('aiImagePreview');
-        if (previewDiv) previewDiv.remove();
-        if (_currentImagePreviewUrl) {
-            URL.revokeObjectURL(_currentImagePreviewUrl);
-            _currentImagePreviewUrl = null;
-        }
         _pendingImageFile = null;
+        previewContainer.remove();
+        _currentImagePreviewUrl = null;
+        // ✅ Добавлено: пересчёт отступа после удаления превью
+        if (typeof window.adjustMessagesPadding === 'function') {
+            window.adjustMessagesPadding();
+        }
+    });
+
+    // ✅ Добавлено: пересчёт отступа после добавления превью
+    if (typeof window.adjustMessagesPadding === 'function') {
+        window.adjustMessagesPadding();
     }
+}
+    function _clearImagePreview() {
+    const previewDiv = document.getElementById('aiImagePreview');
+    if (previewDiv) previewDiv.remove();
+    if (_currentImagePreviewUrl) {
+        URL.revokeObjectURL(_currentImagePreviewUrl);
+        _currentImagePreviewUrl = null;
+    }
+    _pendingImageFile = null;
+
+    // ✅ Добавлено: пересчёт отступа после очистки превью
+    if (typeof window.adjustMessagesPadding === 'function') {
+        window.adjustMessagesPadding();
+    }
+}
 
     // ─── остановка генерации ───
     function _stopAiGeneration() {
@@ -1149,28 +1174,33 @@ async function _sendToAi(messageText, imageFile) {
 
     // ─── инициализация сессии ───
     function _initAiChatSession(sessionId) {
-        if (_aiChatActive && _currentAiSessionId === sessionId) return;
-        _aiChatActive = true;
-        _currentAiSessionId = sessionId || null;
-        _aiNameSet = false;
+    if (_aiChatActive && _currentAiSessionId === sessionId) return;
+    _aiChatActive = true;
+    _currentAiSessionId = sessionId || null;
+    _aiNameSet = false;
 
-        _aiMessagesContainer = document.getElementById('aiMessagesContainer');
-        _aiMessageInput = document.getElementById('aiMessageInput');
-        _aiSendBtn = document.getElementById('aiSendBtn');
-        _aiAttachBtn = document.getElementById('aiAttachBtn');
-        _aiReasoningBtn = document.getElementById('aiReasoningBtn');
-        _aiInternetBtn = document.getElementById('aiInternetBtn');
-        _aiImageInput = document.getElementById('aiImageInput');
-        _aiClearHistoryBtn = document.getElementById('aiClearHistoryBtn');
-        _closeAiChatBtn = document.getElementById('closeAiChatBtn');
-        _aiStopBtn = document.getElementById('aiStopBtn');
-        _aiNewChatBtn = document.getElementById('aiNewChatBtn');
-        _aiImageGenBtn = document.getElementById('aiImageGenBtn');
-        if (!_aiMessagesContainer) return;
-        _loadAiHistory(_currentAiSessionId);
-        _setupAiUI();
-        if (_aiStopBtn) _aiStopBtn.style.display = 'none';
+    _aiMessagesContainer = document.getElementById('aiMessagesContainer');
+    _aiMessageInput = document.getElementById('aiMessageInput');
+    _aiSendBtn = document.getElementById('aiSendBtn');
+    _aiAttachBtn = document.getElementById('aiAttachBtn');
+    _aiReasoningBtn = document.getElementById('aiReasoningBtn');
+    _aiInternetBtn = document.getElementById('aiInternetBtn');
+    _aiImageInput = document.getElementById('aiImageInput');
+    _aiClearHistoryBtn = document.getElementById('aiClearHistoryBtn');
+    _closeAiChatBtn = document.getElementById('closeAiChatBtn');
+    _aiStopBtn = document.getElementById('aiStopBtn');
+    _aiNewChatBtn = document.getElementById('aiNewChatBtn');
+    _aiImageGenBtn = document.getElementById('aiImageGenBtn');
+    if (!_aiMessagesContainer) return;
+    _loadAiHistory(_currentAiSessionId);
+    _setupAiUI();
+    if (_aiStopBtn) _aiStopBtn.style.display = 'none';
+
+    // ✅ Добавлено: пересчёт отступа
+    if (typeof window.adjustMessagesPadding === 'function') {
+        window.adjustMessagesPadding();
     }
+}
 
     // ─── экспорт ───
     window._initAiChatSession = _initAiChatSession;

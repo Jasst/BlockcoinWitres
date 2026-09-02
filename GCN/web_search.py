@@ -29,6 +29,19 @@ try:
 except ImportError:
     DDGS_AVAILABLE = False
 
+# === ДОБАВЛЕНО: попытка импорта библиотек для PDF ===
+try:
+    import pypdf
+    PDF_AVAILABLE = True
+except ImportError:
+    try:
+        import pdfplumber
+        PDF_AVAILABLE = True
+    except ImportError:
+        PDF_AVAILABLE = False
+        logger = logging.getLogger(__name__)
+        logger.info("Для чтения PDF установите pypdf или pdfplumber")
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,10 +75,6 @@ class SearchCache:
 URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
 
 # github.com/<user>/<repo>/blob/<branch>/<path> -> raw.githubusercontent.com/...
-# Обычная HTML-страница blob'а у GitHub — это React-приложение, реальный код
-# лежит внутри вложенного JSON внутри <script>, а не в видимом тексте страницы,
-# поэтому BeautifulSoup с неё практически ничего полезного не вытаскивал.
-# Raw-хост отдаёт файл как чистый текст — именно то, что нужно для чтения кода.
 _GITHUB_BLOB_RE = re.compile(
     r'^https?://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)$'
 )
@@ -82,6 +91,30 @@ def normalize_raw_url(url: str) -> str:
 
 def extract_urls(text: str) -> List[str]:
     return URL_RE.findall(text or "")
+
+
+# === ДОБАВЛЕНО: функция извлечения текста из PDF ===
+def _extract_pdf_text(raw_bytes: bytes) -> str:
+    """Извлекает текст из PDF, если доступна одна из библиотек."""
+    if not PDF_AVAILABLE:
+        return ""
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(raw_bytes))
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception:
+        try:
+            import pdfplumber
+            with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+                text = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
+            return text
+        except Exception as e:
+            logger.debug(f"PDF extraction failed: {e}")
+            return ""
 
 
 # ---------- Загрузчик страниц ----------
@@ -101,17 +134,14 @@ class WebPageFetcher:
             )
         return self._session
 
-    # Раньше сюда попадал только "text/html"/"application/xhtml" — из-за этого
-    # молча отбрасывалось всё, что не рендерит HTML: raw.githubusercontent.com
-    # (text/plain), .py/.md/.json/.yaml файлы, gist-раблы и т.д. Именно это
-    # объясняло "не читает гит и файлы там" — запрос доходил до сервера,
-    # получал 200 OK, и текст просто выкидывался на этой проверке.
+    # Расширенный список текстовых типов (добавлен application/octet-stream)
     TEXTUAL_CONTENT_TYPES = (
         "text/html", "application/xhtml", "text/plain", "text/markdown",
         "text/x-markdown", "application/json", "text/csv", "text/xml",
         "application/xml", "text/javascript", "application/javascript",
         "application/x-yaml", "text/yaml", "text/x-python", "text/x-python-script",
         "text/x-c", "text/x-csrc", "text/x-java-source", "application/x-sh",
+        "application/octet-stream",  # <-- добавлено для GitHub raw и др.
     )
 
     async def fetch(self, url: str) -> str:
@@ -123,10 +153,20 @@ class WebPageFetcher:
                     return ""
                 content_type = resp.headers.get("Content-Type", "").lower()
                 is_textual = any(t in content_type for t in self.TEXTUAL_CONTENT_TYPES)
+
+                # === НОВОЕ: обработка PDF ===
+                if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
+                    raw_bytes = await resp.read()
+                    text = _extract_pdf_text(raw_bytes)
+                    if text:
+                        return self._clean_plain_text(text)
+                    return ""
+
                 # Если Content-Type вообще не задан (бывает у некоторых raw-раздач),
                 # не отбрасываем сразу — пробуем прочитать как текст.
                 if content_type and not is_textual:
                     return ""
+
                 raw = await resp.text(errors="replace")
                 if "text/html" in content_type or "application/xhtml" in content_type:
                     return self._extract_text(raw)
@@ -140,7 +180,6 @@ class WebPageFetcher:
     @staticmethod
     def _clean_plain_text(text: str) -> str:
         lines = [line.rstrip() for line in text.splitlines()]
-        # схлопываем длинные последовательности пустых строк, но не режем контент
         cleaned = []
         blank_run = 0
         for line in lines:
@@ -176,16 +215,8 @@ class WebPageFetcher:
             return ""
 
     def _extract_text_and_links(self, html: str, base_url: str) -> Tuple[str, List[Tuple[str, str]]]:
-        """
-        Как _extract_text, но дополнительно собирает ссылки из того же
-        содержательного блока (main/article/...), которые ведут на тот же домен.
-        Нужно для "второго прыжка": когда сама страница малоинформативна
-        (например, это оглавление/лендинг), но по ссылкам с неё можно дойти
-        до страницы, которая реально отвечает на запрос — вместо того, чтобы
-        просто отдать модели верхнеуровневый нерелевантный текст.
-        Ограничено тем же доменом намеренно — не хотим по ссылке с одной
-        страницы улетать на случайный сторонний сайт без запроса пользователя.
-        """
+        """Как _extract_text, но дополнительно собирает ссылки из того же
+        содержательного блока (main/article/...), которые ведут на тот же домен."""
         try:
             soup = BeautifulSoup(html, "lxml")
             for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript"]):
@@ -226,9 +257,7 @@ class WebPageFetcher:
             return "", []
 
     async def fetch_with_links(self, url: str) -> Tuple[str, List[Tuple[str, str]]]:
-        """Как fetch(), но для HTML-страниц дополнительно возвращает ссылки
-        с той же страницы (см. _extract_text_and_links) — основа для перехода
-        "вглубь", когда верхний уровень оказался нерелевантным."""
+        """Как fetch(), но для HTML-страниц дополнительно возвращает ссылки."""
         url = normalize_raw_url(url)
         try:
             session = await self._get_session()
@@ -237,8 +266,18 @@ class WebPageFetcher:
                     return "", []
                 content_type = resp.headers.get("Content-Type", "").lower()
                 is_textual = any(t in content_type for t in self.TEXTUAL_CONTENT_TYPES)
+
+                # PDF – возвращаем текст без ссылок
+                if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
+                    raw_bytes = await resp.read()
+                    text = _extract_pdf_text(raw_bytes)
+                    if text:
+                        return self._clean_plain_text(text), []
+                    return "", []
+
                 if content_type and not is_textual:
                     return "", []
+
                 raw = await resp.text(errors="replace")
                 if "text/html" in content_type or "application/xhtml" in content_type:
                     final_url = str(resp.url)
@@ -312,13 +351,6 @@ class ChunkRanker:
 
     @staticmethod
     def score_text(query: str, text: str) -> float:
-        """
-        Та же формула, что и в score_chunks, но для одного куска текста целиком
-        (сниппета DDG, текста анкора ссылки, всей страницы) — раньше эта оценка
-        считалась только внутри чанков одной уже скачанной страницы. Используется
-        для отбора/сортировки результатов ПЕРЕД скачиванием (по сниппету) и для
-        решения "стоит ли переходить по ссылке вглубь" (см. deep_search).
-        """
         q_tokens = set(ChunkRanker._tokenize(query))
         if not q_tokens:
             return 0.0
@@ -343,31 +375,47 @@ class ChunkRanker:
         return chunks
 
 
+# ---------- Оценка доверия к источнику ----------
+_TRUSTED_DOMAINS_HIGH = (
+    ".gov", ".gov.ru", ".edu", ".mil",
+    "wikipedia.org", "who.int", "un.org",
+    "cbr.ru",
+)
+_TRUSTED_DOMAINS_MEDIUM = (
+    "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "bloomberg.com",
+    "tass.ru", "ria.ru", "interfax.ru", "kommersant.ru", "vedomosti.ru",
+    "nature.com", "sciencedirect.com", "arxiv.org", "github.com",
+    "docs.python.org", "developer.mozilla.org", "stackoverflow.com",
+)
+_LOW_TRUST_MARKERS = ("pinterest.", "quora.com",)
+
+DOMAIN_TRUST_BOOST_HIGH = 0.35
+DOMAIN_TRUST_BOOST_MEDIUM = 0.15
+
+
+def domain_trust(url: str) -> Tuple[str, float]:
+    if not url:
+        return "", 0.0
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return "", 0.0
+    host = host[4:] if host.startswith("www.") else host
+    if any(host == d or host.endswith("." + d.lstrip(".")) or d in host for d in _TRUSTED_DOMAINS_HIGH):
+        return "высокая", DOMAIN_TRUST_BOOST_HIGH
+    if any(d in host for d in _TRUSTED_DOMAINS_MEDIUM):
+        return "средняя", DOMAIN_TRUST_BOOST_MEDIUM
+    if any(m in host for m in _LOW_TRUST_MARKERS):
+        return "", 0.0
+    return "", 0.0
+
+
 # ---------- Утилиты ----------
 def hash_query(q: str) -> str:
     return hashlib.sha256(q.lower().strip().encode()).hexdigest()[:32]
 
 
 def content_has_currency_numbers(text: str) -> bool:
-    """
-    Определяет, стоит ли считать текст (обычно — поисковый запрос) достаточно
-    "чувствительным ко времени" (курс валюты, цена), чтобы обходить кеш в
-    deep_search.
-
-    ИСПРАВЛЕНИЕ: раньше все паттерны требовали, чтобы в самом тексте уже было
-    отформатированное число вида "95.40" — то есть текст должен был уже
-    СОДЕРЖАТЬ курс/цену. Но deep_search вызывает эту функцию на пользовательском
-    ЗАПРОСЕ (query), а не на найденном тексте — а в запросе вида "какой сегодня
-    курс доллара" числа по определению ещё нет: пользователь как раз его
-    спрашивает. Из-за этого функция практически никогда не возвращала True на
-    реальных вопросах о курсах/ценах, skip_cache молча не срабатывал, и
-    deep_search мог до 5 минут (SEARCH_CACHE_TTL) отдавать устаревший курс на
-    повторный вопрос — ровно то, что комментарий над вызовом в deep_search
-    обещал предотвращать. Теперь дополнительно ловим сами ТЕМЫ курса/цены по
-    ключевым словам, не требуя, чтобы число уже было в тексте; числовые
-    паттерны оставлены как есть — они по-прежнему полезны, когда текст уже
-    содержит цифры (например, при проверке уже найденного контента).
-    """
     if not text:
         return False
     numeric_patterns = [
@@ -378,8 +426,6 @@ def content_has_currency_numbers(text: str) -> bool:
     for pat in numeric_patterns:
         if re.search(pat, text, re.IGNORECASE):
             return True
-    # Тематические маркеры "текущего курса/цены" — срабатывают даже если
-    # числа в тексте ещё нет (типичный случай для самого запроса).
     topic_words = (
         "курс", "доллар", "евро", "биткоин", "bitcoin", "btc", "эфириум", "eth",
         "акци", "котировк", "цена", "стоимост", "прайс", "price", "exchange rate",
@@ -390,8 +436,7 @@ def content_has_currency_numbers(text: str) -> bool:
     return False
 
 
-# ---------- Модульные синглтоны (были локальными — кеш и коннекшн-пул
-# создавались заново на каждый вызов deep_search и не работали вообще) ----------
+# ---------- Модульные синглтоны ----------
 _search_cache = SearchCache()
 _fetcher = WebPageFetcher()
 _ddg_lock = asyncio.Lock()
@@ -399,8 +444,6 @@ _last_ddg_call = 0.0
 
 
 async def search_ddg(query: str, max_results: int = 5) -> List[Dict]:
-    """DDG-поиск с троттлингом и ретраями (раньше это было только в неиспользуемом
-    CognitiveController.search_ddg — реальный путь вызова шёл в обход)."""
     if not DDGS_AVAILABLE:
         return []
     global _last_ddg_call
@@ -430,12 +473,6 @@ async def search_ddg(query: str, max_results: int = 5) -> List[Dict]:
 
 
 async def fetch_url(url: str, max_chars: int = PAGE_CONTENT_MAX_CHARS) -> Dict[str, Any]:
-    """
-    Прямое чтение конкретной ссылки (без похода в DDG) — используется, когда
-    пользователь сам прислал URL (например, ссылку на файл в гитхабе) и хочет,
-    чтобы ассистент прочитал именно её, а не то, что найдётся по текстовому
-    поиску по этой ссылке как по строке.
-    """
     url = url.strip()
     text = await _fetcher.fetch(url)
     if not text:
@@ -447,25 +484,14 @@ async def fetch_url(url: str, max_chars: int = PAGE_CONTENT_MAX_CHARS) -> Dict[s
     return {"url": url, "title": url, "text": text, "ok": True}
 
 
-# ---------- Извлечение наиболее релевantного отрывка ----------
+# ---------- Извлечение наиболее релевантного отрывка ----------
 def best_excerpt(query: str, text: str, max_chars: int = 3000) -> str:
-    """
-    Раньше на этом месте был плоский text[:3000] — если релевантная часть
-    страницы лежала не в начале (частый случай для длинных статей/доков),
-    в контекст модели попадал нерелевантный кусок (шапка, вступление, меню),
-    а ChunkRanker/chunk_text были объявлены и никогда не вызывались.
-    Разбиваем текст на чанки, ранжируем по совпадению с запросом и берём
-    столько лучших чанков, сколько влезает в max_chars, сохраняя их исходный
-    порядок в странице (для связности), а не порядок по убыванию скора.
-    """
     if len(text) <= max_chars:
         return text
     chunks = ChunkRanker.chunk_text(text)
     if len(chunks) <= 1:
         return text[:max_chars]
     scored = ChunkRanker.score_chunks(query, chunks)
-    # если ни один чанк не пересёкся с запросом лексически (score==0 везде),
-    # ранжирование бессмысленно — возвращаемся к началу текста как и раньше
     if all(score <= 0 for score, _ in scored):
         return text[:max_chars]
     chunk_index = {c: i for i, c in enumerate(chunks)}
@@ -484,9 +510,7 @@ def best_excerpt(query: str, text: str, max_chars: int = 3000) -> str:
 
 
 async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict[str, Any]:
-    # Если в запросе есть прямые ссылки — читаем их напрямую, а не гоняем как
-    # текст через DDG (где сама ссылка, скорее всего, не совпадёт с чужими
-    # проиндексированными страницами и просто ничего полезного не найдёт).
+    # Обработка прямых ссылок
     direct_urls = extract_urls(query)
     if direct_urls:
         fetched = await asyncio.gather(*[fetch_url(u) for u in direct_urls[:max_results]])
@@ -503,18 +527,11 @@ async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict
                 "chunks_found": len(context_parts),
             }
             return result
-        # Ссылка есть, но прочитать не удалось (например, требует JS) —
-        # падаем обратно на обычный поиск по остальному тексту запроса,
-        # а не молча возвращаем пустоту.
         remainder = URL_RE.sub("", query).strip()
         if remainder:
             query = remainder
 
     cache_key = hash_query(query)
-
-    # Курсы/цены устаревают быстро — для таких запросов кеш сознательно
-    # обходим, чтобы не отдавать протухшие цифры (раньше это никогда не
-    # срабатывало, т.к. кеш был всегда пуст).
     skip_cache = content_has_currency_numbers(query)
 
     if not skip_cache:
@@ -526,22 +543,13 @@ async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict
     if not ddg_results:
         return {"sources": [], "context": "Поиск не дал результатов.", "search_performed": False}
 
-    # НОВОЕ: сортируем результаты DDG по релевантности сниппета запросу ДО того,
-    # как тратить сетевые запросы на скачивание страниц. Раньше страницы
-    # скачивались строго в порядке выдачи DDG без какого-либо анализа того,
-    # отвечает ли сниппет вообще на запрос — MIN_RELEVANCE_THRESHOLD импортировался
-    # из конфига, но нигде не использовался. Совсем нерелевантные по тексту
-    # сниппета результаты (0 общих слов с запросом) уходят в конец очереди и не
-    # съедают бюджет max_results, если есть более релевантные варианты.
-    scored = [(ChunkRanker.score_text(query, f"{r.get('title', '')} {r.get('snippet', '')}"), r)
-              for r in ddg_results]
+    # Сортировка с учётом доверия к домену
+    scored = [
+        (ChunkRanker.score_text(query, f"{r.get('title', '')} {r.get('snippet', '')}")
+         + domain_trust(r.get('url', ''))[1], r)
+        for r in ddg_results
+    ]
     scored.sort(key=lambda x: x[0], reverse=True)
-    # MIN_RELEVANCE_THRESHOLD импортировался из конфига, но нигде не применялся —
-    # отфильтровываем сниппеты, которые совсем не пересекаются по смыслу с
-    # запросом, НО только если после фильтра хоть что-то остаётся: для редких/
-    # узкоспециальных запросов сниппеты DDG иногда формулируются совсем другими
-    # словами, чем сам запрос, и жёсткий порог без запасного варианта оставил бы
-    # поиск ни с чем вместо результата похуже, но хоть какого-то.
     above_threshold = [r for s, r in scored if s >= MIN_RELEVANCE_THRESHOLD]
     ordered_results = above_threshold if above_threshold else [r for _, r in scored]
 
@@ -551,10 +559,11 @@ async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict
     url_to_title = {r["url"]: r["title"] for r in ddg_results}
     sources = []
     context_parts = []
-    # НОВОЕ: "второй прыжок" — не более нескольких доп. переходов за один вызов
-    # deep_search, чтобы не превращать поиск в неограниченный обход сайта.
+
+    # === УЛУЧШЕНИЕ: множественные переходы по ссылкам ===
     MAX_EXTRA_HOPS = 3
     extra_hops_used = 0
+
     for url, text, links in fetched:
         if not text:
             snippet = next((r["snippet"] for r in ddg_results if r["url"] == url), "")
@@ -564,36 +573,50 @@ async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict
                 continue
 
         page_score = ChunkRanker.score_text(query, text)
-        # Страница скачалась, но по тексту ни одного общего слова с запросом —
-        # частый случай для лендингов/оглавлений документации, где реальный
-        # ответ лежит на подстранице. Вместо того чтобы отдать модели заведомо
-        # нерелевантный текст, пробуем один переход по самой релевантной ссылке
-        # с этой же страницы (по совпадению текста ссылки с запросом).
+
+        # Если страница нерелевантна, но имеет ссылки – пробуем перейти по нескольким лучшим
         if page_score <= 0 and links and extra_hops_used < MAX_EXTRA_HOPS:
-            best_href, best_link_score = None, 0.0
+            # Ранжируем ссылки по релевантности анкора
+            scored_links = []
             for anchor_text, href in links:
                 s = ChunkRanker.score_text(query, anchor_text)
-                if s > best_link_score:
-                    best_link_score, best_href = s, href
-            if best_href and best_link_score > 0:
-                extra_hops_used += 1
-                deep_text, _ = await _fetcher.fetch_with_links(best_href)
-                if deep_text and ChunkRanker.score_text(query, deep_text) > page_score:
-                    logger.info(f"deep_search: {url} нерелевантна, перешёл по ссылке -> {best_href}")
-                    sources.append({"title": f"{url_to_title.get(url, url)} → подробнее", "url": best_href})
-                    excerpt = best_excerpt(query, deep_text, max_chars=3000)
-                    context_parts.append(
-                        f"Источник: {url_to_title.get(url, url)} (подробности по ссылке со страницы)\n"
-                        f"URL: {best_href}\n{excerpt}"
-                    )
-                    continue  # верхнеуровневую нерелевантную страницу отдельно не добавляем
+                if s > 0:
+                    scored_links.append((s, href))
+            scored_links.sort(key=lambda x: x[0], reverse=True)
+            # Берём до 3 лучших (но не больше оставшихся hop'ов)
+            take = min(3, MAX_EXTRA_HOPS - extra_hops_used, len(scored_links))
+            if take > 0:
+                best_hrefs = [href for _, href in scored_links[:take]]
+                # Параллельно скачиваем их
+                tasks = [_fetcher.fetch_with_links(h) for h in best_hrefs]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for (href, deep_text, deep_links), res in zip(best_hrefs, results):
+                    if isinstance(res, Exception):
+                        continue
+                    if deep_text and ChunkRanker.score_text(query, deep_text) > page_score:
+                        extra_hops_used += 1
+                        hop_trust_label, _ = domain_trust(href)
+                        hop_source = {"title": f"{url_to_title.get(url, url)} → подробнее", "url": href}
+                        if hop_trust_label:
+                            hop_source["reliability"] = hop_trust_label
+                        sources.append(hop_source)
+                        excerpt = best_excerpt(query, deep_text, max_chars=3000)
+                        hop_suffix = f" [надёжность источника: {hop_trust_label}]" if hop_trust_label else ""
+                        context_parts.append(
+                            f"Источник: {url_to_title.get(url, url)} (подробности по ссылке со страницы){hop_suffix}\n"
+                            f"URL: {href}\n{excerpt}"
+                        )
+                # после обработки ссылок пропускаем добавление самой нерелевантной страницы
+                continue
 
+        # Обычная обработка релевантной страницы
         sources.append({"title": url_to_title.get(url, url), "url": url})
-        # Раньше здесь стояло text[:1000] (потом text[:3000]) — плоская обрезка,
-        # игнорирующая релевантность. Теперь выбираем чанки, реально относящиеся
-        # к запросу (см. best_excerpt/ChunkRanker), вместо первых символов страницы.
         excerpt = best_excerpt(query, text, max_chars=3000)
-        context_parts.append(f"Источник: {url_to_title.get(url, url)}\nURL: {url}\n{excerpt}")
+        trust_label, _ = domain_trust(url)
+        if trust_label:
+            sources[-1]["reliability"] = trust_label
+        reliability_suffix = f" [надёжность источника: {trust_label}]" if trust_label else ""
+        context_parts.append(f"Источник: {url_to_title.get(url, url)}{reliability_suffix}\nURL: {url}\n{excerpt}")
 
     context = "\n\n---\n\n".join(context_parts)
     result = {
@@ -608,7 +631,6 @@ async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict
 
 
 async def close_search_resources():
-    """Вызывать при остановке приложения — закрывает переиспользуемую aiohttp-сессию."""
     await _fetcher.close()
 
 
@@ -624,5 +646,6 @@ __all__ = [
     'normalize_raw_url',
     'extract_urls',
     'best_excerpt',
+    'domain_trust',
     'close_search_resources'
 ]

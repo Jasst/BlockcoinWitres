@@ -154,10 +154,55 @@ def _sanitize(name: str) -> str:
 class ToolRegistry:
     def __init__(self):
         self._tools: Dict[str, ToolSpec] = {}
+        # qualified_name -> server, который его зарегистрировал первым —
+        # нужно для защиты от коллизий имён (см. register()).
+        self._owner_server: Dict[str, str] = {}
 
     def register(self, name: str, description: str, parameters: Dict[str, Any],
                  handler: Callable[[Dict[str, Any]], Awaitable[Any]], server: str = "internal"):
-        qualified = _sanitize(f"internal__{name}")
+        """
+        ИСПРАВЛЕНИЕ (коллизия имён internal vs внешний MCP того же назначения):
+        раньше qualified_name ВСЕГДА строился как f"internal__{name}" независимо
+        от переданного server. Если внешний MCP-сервер (например,
+        mcp_servers.json -> "blockcoin-memory" -> mcp_server_blockcoin.py —
+        та же память, что и у чата, но отдельным процессом со своим
+        DEFAULT_USER="default_user") экспонирует инструмент с тем же именем,
+        что уже зарегистрированный внутренний ("recall", "remember",
+        "add_goal", "web_search", "generate_image") — qualified_name
+        совпадал буквально, и т.к. self._tools — обычный dict, вторая
+        регистрация (register_mcp_tools, которая всегда происходит ПОЗЖЕ
+        внутренней — см. _ensure_external_tools_registered в ai_assistant.py)
+        молча ЗАТИРАЛА внутренний обработчик, привязанный к self.memory_service
+        (корректный user_id = адрес кошелька), внешним MCP-прокси. У внешнего
+        прокси user_id — необязательный аргумент JSON Schema, который LLM в
+        общем случае не заполняет (внутренние few-shot примеры его никогда
+        не показывали) — итог: вызов уходил в mcp_server_blockcoin.py с
+        user_id=None, там срабатывал DEFAULT_USER="default_user", и все
+        recall/remember в браузерном чате после первого сообщения молча
+        писали/читали ОБЩУЮ чужую память вместо личной памяти пользователя —
+        то есть в точности тот десинк "чат vs MCP", который отдельно уже
+        чинили на уровне MemoryService, только через другую дыру.
+
+        Теперь: qualified_name строится с префиксом СЕРВЕРА (не всегда
+        "internal__"), и если под уже занятым qualified_name сидит
+        обработчик ДРУГОГО сервера — регистрация внешнего инструмента
+        отклоняется с предупреждением в лог вместо тихой перезаписи.
+        Повторная регистрация тем же сервером (переподключение) по-прежнему
+        обновляет свою же запись как раньше.
+        """
+        prefix = "internal" if server == "internal" else server
+        qualified = _sanitize(f"{prefix}__{name}")
+
+        existing_owner = self._owner_server.get(qualified)
+        if existing_owner is not None and existing_owner != server:
+            logger.warning(
+                f"ToolRegistry: инструмент '{qualified}' уже зарегистрирован сервером "
+                f"'{existing_owner}' — регистрация от сервера '{server}' с тем же именем "
+                f"проигнорирована, чтобы не подменить проверенный обработчик чужим."
+            )
+            return
+
+        self._owner_server[qualified] = server
         self._tools[qualified] = ToolSpec(
             qualified_name=qualified,
             description=description,
@@ -220,11 +265,10 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - Если пользователь упоминает цели (например, "добавь цель", "новая цель") — вызови `internal__add_goal`.
 - Если нужна актуальная информация из интернета — вызови `internal__web_search`.
 - **Если пользователь просит сгенерировать изображение (например, "нарисуй", "сгенерируй изображение", "создай картинку", "покажи картинку", "визуализируй" и т.п.) — ОБЯЗАТЕЛЬНО вызови инструмент `internal__generate_image`. НЕ ОТВЕЧАЙ ТЕКСТОМ, пока не получишь результат от этого инструмента.**
+- **Если пользователь спрашивает о твоих возможностях, какие инструменты доступны, что ты умеешь, какие команды есть — вызови инструмент `internal__list_tools`.**
 - Если запрос обычный, не требующий обращения к памяти или поиску — отвечай напрямую.
 - Если ниже уже есть результаты вызванных инструментов и их достаточно, чтобы ответить — верни {{"action": "answer_directly"}}, не вызывай инструмент повторно.
-- **Если пользователь просит сгенерировать изображение (любые вариации "нарисуй", "создай картинку", "покажи изображение" и т.п.) — НЕ ОТВЕЧАЙ ТЕКСТОМ, а ВСЕГДА вызывай инструмент `internal__generate_image`.** Даже если кажется, что это небезопасно, доверься инструменту — он сам проверит содержимое.
-
-Важно: ты можешь вызвать инструмент, даже если запрос не начинается с точной команды. Главное — понять намерение.
+- **Важно: если запрос содержит несколько независимых действий (например, "запомни X и найди Y" или "вспомни мои цели и добавь новую") — ты должен вызывать инструменты последовательно, по одному за раунд. Не считай задачу выполненной, пока не обработаны все части запроса.**
 
 Ответь ТОЛЬКО валидным JSON-объектом, без пояснений, без markdown, без ```.
 
@@ -242,10 +286,16 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - Запрос: "Добавь цель: выучить Python" -> {{"action": "call_tool", "tool": "internal__add_goal", "arguments": {{"description": "выучить Python", "priority": 0.7}}}}
 - Запрос: "Какой сегодня курс доллара?" -> {{"action": "call_tool", "tool": "internal__web_search", "arguments": {{"query": "курс доллара сегодня"}}}}
 - Запрос: "Нарисуй красивую девушку" -> {{"action": "call_tool", "tool": "internal__generate_image", "arguments": {{"prompt": "красивая девушка", "enhance_prompt": true}}}}
-- Запрос: "Сгенерируй изображение заката" -> {{"action": "call_tool", "tool": "internal__generate_image", "arguments": {{"prompt": "закат", "enhance_prompt": true}}}}
-- Запрос: "Покажи картинку кота" -> {{"action": "call_tool", "tool": "internal__generate_image", "arguments": {{"prompt": "кот", "enhance_prompt": true}}}}
+- Запрос: "Что ты умеешь?" -> {{"action": "call_tool", "tool": "internal__list_tools", "arguments": {{}}}}
+- Запрос: "Какие команды доступны?" -> {{"action": "call_tool", "tool": "internal__list_tools", "arguments": {{}}}}
 - Запрос: "Спасибо, понятно" -> {{"action": "answer_directly"}}
 - Запрос: "Как дела?" -> {{"action": "answer_directly"}}
+- Запрос: "Запомни, что я люблю пиццу, и расскажи погоду в Москве" -> 
+  {{"action": "call_tool", "tool": "internal__remember", "arguments": {{"fact": "я люблю пиццу"}}}}
+  (после получения результата, на следующем раунде вызови internal__web_search для погоды)
+- Запрос: "Вспомни мои цели и добавь новую: выучить испанский" ->
+  {{"action": "call_tool", "tool": "internal__recall", "arguments": {{"query": "цели"}}}}
+  (затем, в следующем раунде, вызови internal__add_goal)
 
 Последние реплики диалога:
 {history_tail}
@@ -353,21 +403,8 @@ class ToolRouter:
 
     async def _plan_subtasks(self, message: str) -> str:
         """
-        ПУНКТ №4 (планирование): раньше ReAct-цикл был полностью реактивным
-        — на каждом раунде модель заново решала, какой СЛЕДУЮЩИЙ инструмент
-        вызвать, не имея явного плана на составной запрос ("сравни X и Y,
-        потом посчитай Z"). Из-за этого сложные многочастные запросы часто
-        закрывались после первого/второго раунда неполным ответом — модель
-        решала одну подзадачу и не "помнила", что вопрос был из нескольких
-        частей. Для запросов, которые эвристически выглядят как составные
-        (_looks_compound), делаем ОДИН дешёвый предварительный вызов,
-        раскладывающий запрос на подзадачи, и дальше передаём этот список
-        как ориентир в промпт выбора инструмента на каждом раунде — как
-        native, так и fallback (см. run()).
-
-        Возвращает пустую строку при простом запросе, отключённой настройке
-        или сбое LLM — вызывающий код в этом случае просто не добавляет
-        блок плана и работает как раньше.
+        ПУНКТ №4 (планирование): для составных запросов разбивает на подзадачи.
+        Возвращает пустую строку, если план не нужен или не удался.
         """
         if not TOOL_PLANNING_ENABLED or not _looks_compound(message):
             return ""
@@ -381,11 +418,13 @@ class ToolRouter:
         )
         try:
             raw = await self.llm_text_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=200)
+            if not raw:  # пустой ответ или None
+                return ""
+            lines = [l.strip(" -•\t") for l in raw.split("\n") if l.strip()]
+            return "\n".join(lines[:MAX_SUBTASKS])
         except Exception as e:
             logger.debug(f"Planning step failed, continuing without a plan: {e}")
             return ""
-        lines = [l.strip(" -•\t") for l in (raw or "").split("\n") if l.strip()]
-        return "\n".join(lines[:MAX_SUBTASKS])
 
     async def _decide_fallback(self, message: str, history_tail: str,
                                 tool_results_so_far: str, temp: float) -> Optional[Dict]:
