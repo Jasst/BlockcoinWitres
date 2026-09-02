@@ -1402,6 +1402,103 @@ class GCNMemoryRouter:
         # Функция вызова LLM (будет установлена из контроллера)
         self._llm_caller = None
 
+    def _find_similar_concept(self, emb: List[float], scope: MemoryScope, threshold: float = CONCEPT_MERGE_THRESHOLD) -> \
+    Optional[KnowledgeObject]:
+        """
+        Ищет существующий концепт в указанном слое памяти, семантически близкий к данному вектору.
+        Возвращает объект концепта или None.
+        """
+        target = {
+            MemoryScope.GLOBAL: self.global_memory,
+            MemoryScope.SHARED: self.shared_memory,
+            MemoryScope.PRIVATE: self.private_memory,
+        }.get(scope)
+        if target is None:
+            return None
+
+        store = target.store
+        # Получаем все объекты типа CONCEPT в этом scope
+        concepts = [obj for obj in store._objects.values() if obj.type == KnowledgeType.CONCEPT and obj.scope == scope]
+        if not concepts:
+            return None
+
+        best_sim = threshold
+        best_obj = None
+        for c in concepts:
+            c_emb = store.get_embedding(c.id)
+            if c_emb is None:
+                continue
+            sim = MemoryStore._cosine(emb, c_emb)
+            if sim > best_sim:
+                best_sim = sim
+                best_obj = c
+        return best_obj
+
+    async def _update_existing_concept(self,
+                                       existing_obj: KnowledgeObject,
+                                       new_members: List[KnowledgeObject],
+                                       store: MemoryStore,
+                                       scope: MemoryScope) -> None:
+        """
+        Обновляет существующий концепт: добавляет рёбра к новым членам, обновляет метаданные,
+        пересчитывает центроид (эмбеддинг) и при необходимости перегенерирует текст через LLM.
+        """
+        # 1. Добавляем рёбра ABSTRACTS_FROM от концепта к новым членам
+        for member in new_members:
+            store._graph.add_relation(existing_obj.id, "ABSTRACTS_FROM", member.id, weight=1.0)
+
+        # 2. Обновляем метаданные (увеличиваем счётчик членов)
+        meta = existing_obj.object if isinstance(existing_obj.object, dict) else {}
+        old_count = meta.get("member_count", 0)
+        new_count = old_count + len(new_members)
+        meta["member_count"] = new_count
+        meta["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+        # 3. Пересчитываем центроид (средний вектор) всех членов (старых + новых)
+        #    Для этого находим все факты, на которые ссылается концепт (рёбра ABSTRACTS_FROM)
+        all_member_ids = [target for _, target in store._graph.get_neighbors(existing_obj.id, "ABSTRACTS_FROM")]
+        # Собираем векторы всех членов
+        vectors = []
+        for mid in all_member_ids:
+            vec = store.get_embedding(mid)
+            if vec is not None:
+                vectors.append(vec)
+        if vectors:
+            centroid = np.mean(vectors, axis=0).tolist()
+            store.set_embedding(existing_obj.id, centroid)
+            # Обновляем объект (поле object)
+            store.update(existing_obj.id, {"object": meta}, actor=f"concept_update:{scope.value}")
+
+        # 4. Если добавлено достаточно новых членов – перегенерируем текст концепта через LLM
+        if len(new_members) >= CONCEPT_REFRESH_MEMBERS_DELTA and self._llm_caller is not None:
+            # Собираем тексты всех членов (максимум 15 для краткости)
+            member_texts = []
+            for mid in all_member_ids[:15]:
+                obj = store.get(mid)
+                if obj:
+                    member_texts.append(obj.subject)
+            if member_texts:
+                facts_text = "\n".join(f"- {t}" for t in member_texts)
+                prompt = (
+                        "Ниже – набор связанных фактов, обобщённых в концепт. "
+                        "Сформулируй ОДНО краткое обобщающее утверждение (концепт), которое "
+                        "связывает их общий смысл. Не перечисляй факты, а обобщи их суть в "
+                        "одном предложении на русском языке. Ответь только этим предложением, "
+                        "без пояснений и без кавычек.\n\n" + facts_text
+                )
+                try:
+                    new_text = await self._llm_caller([{"role": "user", "content": prompt}],
+                                                      temp=0.3, max_tokens=120)
+                    new_text = (new_text or "").strip().strip('"').strip()
+                    if 10 < len(new_text) < 400:
+                        # Обновляем subject концепта
+                        store.update(existing_obj.id, {"subject": new_text}, actor=f"concept_refresh:{scope.value}")
+                        logger.info(f"[ConceptUpdate] Обновлён текст концепта: {new_text[:80]}...")
+                except Exception as e:
+                    logger.warning(f"Не удалось перегенерировать текст концепта: {e}")
+
+        store._faiss_dirty = True
+
     @classmethod
     def _get_global_memory(cls, base_dir: Path) -> CognitiveMemory:
         """Возвращает глобальную память как синглтон."""
@@ -1765,10 +1862,11 @@ class GCNMemoryRouter:
                             similarity_threshold: float = CONCEPT_SIMILARITY_THRESHOLD,
                             max_scan: int = CONCEPT_MAX_SCAN,
                             max_concepts_per_run: int = CONCEPT_MAX_PER_RUN) -> List[str]:
-        """Кластеризует семантически близкие CLAIM-объекты указанного слоя и
-        формулирует для каждого достаточно большого кластера обобщающий CONCEPT
-        через LLM. Вызывать из периодической глубокой консолидации (не на
-        каждый запрос — операция O(n^2) по эмбеддингам в пределах max_scan)."""
+        """
+        Кластеризует семантически близкие CLAIM-объекты указанного слоя и
+        для каждого кластера находит (или создаёт) обобщающий CONCEPT.
+        Если похожий концепт уже существует – обновляет его.
+        """
         target = {
             MemoryScope.GLOBAL: self.global_memory,
             MemoryScope.SHARED: self.shared_memory,
@@ -1779,7 +1877,7 @@ class GCNMemoryRouter:
 
         store = target.store
         candidates = [obj for obj in store._objects.values()
-                     if obj.type == KnowledgeType.CLAIM and obj.scope == scope][:max_scan]
+                      if obj.type == KnowledgeType.CLAIM and obj.scope == scope][:max_scan]
         vectors, objs = [], []
         for obj in candidates:
             vec = store.get_embedding(obj.id)
@@ -1794,8 +1892,7 @@ class GCNMemoryRouter:
         vectors_norm = vectors_np / (norms + 1e-8)
         sim_matrix = vectors_norm @ vectors_norm.T
 
-        # Простая union-find кластеризация по порогу косинусной близости —
-        # без внешних зависимостей (sklearn/hdbscan не гарантированы в окружении)
+        # Union-Find кластеризация
         parent = list(range(len(objs)))
 
         def find(x):
@@ -1819,33 +1916,26 @@ class GCNMemoryRouter:
         for i in range(n):
             clusters[find(i)].append(i)
 
-        # Уже абстрагированные факты (есть ABSTRACTS_FROM входящее ребро) не переобобщаем
-        already_abstracted = set()
-        for obj in objs:
-            if store._graph.get_incoming(obj.id, "ABSTRACTS_FROM"):
-                already_abstracted.add(obj.id)
-
         formed: List[str] = []
         for idxs in clusters.values():
             if len(formed) >= max_concepts_per_run:
                 break
             if len(idxs) < min_cluster_size:
                 continue
-            members = [objs[i] for i in idxs if objs[i].id not in already_abstracted]
-            if len(members) < min_cluster_size:
-                continue
 
+            members = [objs[i] for i in idxs]
+            # 1. Генерируем текст концепта через LLM
             facts_text = "\n".join(f"- {m.subject}" for m in members[:12])
             prompt = (
-                "Ниже — набор связанных фактов из памяти AI-ассистента. "
-                "Сформулируй ОДНО краткое обобщающее утверждение (концепт), которое "
-                "связывает их общий смысл. Не перечисляй факты, а обобщи их суть в "
-                "одном предложении на русском языке. Ответь только этим предложением, "
-                "без пояснений и без кавычек.\n\n" + facts_text
+                    "Ниже – набор связанных фактов из памяти AI-ассистента. "
+                    "Сформулируй ОДНО краткое обобщающее утверждение (концепт), которое "
+                    "связывает их общий смысл. Не перечисляй факты, а обобщи их суть в "
+                    "одном предложении на русском языке. Ответь только этим предложением, "
+                    "без пояснений и без кавычек.\n\n" + facts_text
             )
             try:
                 concept_text = await self._llm_caller([{"role": "user", "content": prompt}],
-                                                       temp=0.3, max_tokens=120)
+                                                      temp=0.3, max_tokens=120)
                 concept_text = (concept_text or "").strip().strip('"').strip()
             except Exception as e:
                 logger.warning(f"Concept formation LLM call failed: {e}")
@@ -1853,28 +1943,41 @@ class GCNMemoryRouter:
             if not (10 < len(concept_text) < 400):
                 continue
 
-            centroid = np.mean([vectors_norm[i] for i in idxs if objs[i].id not in already_abstracted], axis=0)
-            concept_id = f"concept_{uuid.uuid4()}"
-            concept_obj = KnowledgeObject(
-                id=concept_id,
-                type=KnowledgeType.CONCEPT,
-                subject=concept_text,
-                predicate="abstracts",
-                object={"member_count": len(members)},
-                author=f"consolidation:{scope.value}",
-                created=datetime.now(timezone.utc),
-                confidence=0.6,
-                scope=scope,
-                source_type="concept_formation",
-            )
-            store.create(concept_obj, actor="system:consolidation")
-            store.set_embedding(concept_id, centroid.tolist())
-            for m in members:
-                store._graph.add_relation(concept_id, "ABSTRACTS_FROM", m.id, weight=1.0)
-            formed.append(concept_id)
+            # 2. Вычисляем центроид кластера
+            centroid = np.mean([vectors_norm[i] for i in idxs], axis=0)
+
+            # 3. Ищем похожий существующий концепт
+            existing = self._find_similar_concept(centroid.tolist(), scope, CONCEPT_MERGE_THRESHOLD)
+            if existing is not None:
+                # Обновляем существующий концепт
+                await self._update_existing_concept(existing, members, store, scope)
+                formed.append(existing.id)
+                logger.info(f"[ConceptUpdate] Обновлён концепт {existing.id} ({len(members)} новых членов)")
+            else:
+                # Создаём новый концепт
+                concept_id = f"concept_{uuid.uuid4()}"
+                concept_obj = KnowledgeObject(
+                    id=concept_id,
+                    type=KnowledgeType.CONCEPT,
+                    subject=concept_text,
+                    predicate="abstracts",
+                    object={"member_count": len(members)},
+                    author=f"consolidation:{scope.value}",
+                    created=datetime.now(timezone.utc),
+                    confidence=0.6,
+                    scope=scope,
+                    source_type="concept_formation",
+                )
+                store.create(concept_obj, actor="system:consolidation")
+                store.set_embedding(concept_id, centroid.tolist())
+                for m in members:
+                    store._graph.add_relation(concept_id, "ABSTRACTS_FROM", m.id, weight=1.0)
+                formed.append(concept_id)
+                logger.info(f"[ConceptFormation] Создан новый концепт: {concept_text[:80]}...")
 
         if formed:
             store._faiss_dirty = True
             await target._schedule_save()
-            logger.info(f"[ConceptFormation] scope={scope.value}: сформировано {len(formed)} концептов")
+            logger.info(
+                f"[ConceptFormation] scope={scope.value}: обработано {len(formed)} концептов (создано/обновлено)")
         return formed
