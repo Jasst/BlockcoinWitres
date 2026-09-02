@@ -36,11 +36,32 @@ except ImportError:
     SSE_AVAILABLE = False
 
 try:
-    from GCN.config_ai import TOOL_CALL_TIMEOUT_SECONDS, MCP_RECONNECT_INTERVAL, MEMORY_BASE_DIR
+    from GCN.config_ai import (
+        TOOL_CALL_TIMEOUT_SECONDS,
+        MCP_RECONNECT_INTERVAL,
+        MEMORY_BASE_DIR,
+        MCP_TOOL_TIMEOUT_OVERRIDES,
+    )
 except ImportError:
     TOOL_CALL_TIMEOUT_SECONDS = 45
     MCP_RECONNECT_INTERVAL = 120
     MEMORY_BASE_DIR = Path(__file__).resolve().parent
+    MCP_TOOL_TIMEOUT_OVERRIDES = {}
+
+
+def _resolve_tool_timeout(tool_name: str) -> float:
+    """
+    Подбирает тайм-аут клиента под конкретный инструмент (см.
+    MCP_TOOL_TIMEOUT_OVERRIDES в config_ai.py) вместо единого
+    TOOL_CALL_TIMEOUT_SECONDS для всех вызовов подряд — иначе клиент
+    обрывал бы вызов тяжёлых инструментов (генерация изображения,
+    глубокое исследование) раньше, чем сервер сам успевает их выполнить.
+    """
+    name_lower = (tool_name or "").lower()
+    for marker, timeout in MCP_TOOL_TIMEOUT_OVERRIDES.items():
+        if marker in name_lower:
+            return timeout
+    return TOOL_CALL_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -170,14 +191,15 @@ class MCPToolManager:
         session = self.sessions.get(server_name)
         if not session:
             raise ValueError(f"Сервер '{server_name}' не найден")
+        timeout = _resolve_tool_timeout(tool_name)
         try:
             result = await asyncio.wait_for(
                 session.call_tool(tool_name, arguments=arguments),
-                timeout=TOOL_CALL_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
             raise TimeoutError(
-                f"MCP-инструмент '{server_name}.{tool_name}' не ответил за {TOOL_CALL_TIMEOUT_SECONDS}с"
+                f"MCP-инструмент '{server_name}.{tool_name}' не ответил за {timeout}с"
             )
         if result.content:
             return result.content[0].text

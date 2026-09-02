@@ -590,7 +590,26 @@ class CognitiveController:
             server="internal"
         )
 
+        # ---- Инструмент для перечисления доступных инструментов ----
+        async def _internal_list_tools(args: Dict) -> str:
+            """Возвращает список всех зарегистрированных инструментов с описаниями."""
+            lines = []
+            for name, spec in self.tool_registry._tools.items():
+                lines.append(f"- {name}: {spec.description[:200]}")
+            if not lines:
+                return "Инструменты не зарегистрированы."
+            return "Доступные инструменты:\n" + "\n".join(lines)
+
+        self.tool_registry.register(
+            name="list_tools",
+            description="Возвращает список всех доступных инструментов с краткими описаниями",
+            parameters={"type": "object", "properties": {}},
+            handler=_internal_list_tools,
+            server="internal"
+        )
+
         self._external_tools_registered = False
+
 
         # Для отслеживания бездействия
         self._last_activity_time = time.time()
@@ -626,7 +645,26 @@ class CognitiveController:
         self._external_tools_registered = True
 
     async def _handle_mcp_call(self, server: str, tool: str, args: Dict) -> str:
-        """Выполняет вызов внешнего MCP-инструмента (используется ToolRegistry как handler)."""
+        """
+        Выполняет вызов внешнего MCP-инструмента (используется ToolRegistry как handler).
+
+        ИСПРАВЛЕНИЕ (универсальный сервер памяти для чата и внешних MCP-клиентов —
+        так и было задумано, см. mcp_servers.json/blockcoin-memory): раньше сюда
+        приходили ровно те аргументы, что собрала LLM, и если инструмент на
+        внешнем сервере принимает user_id (recall/remember/forget/add_goal/
+        generate_image/... в mcp_server_blockcoin.py), а LLM его не указала
+        (few-shot примеры её этому не учили) — вызов уходил с user_id=None,
+        сервер подставлял DEFAULT_USER="default_user", и чат читал/писал
+        чужую, несвязанную с кошельком память. Это не повод отказываться от
+        общего сервера — наоборот, раз именно он должен быть единой точкой
+        истины для памяти, чат обязан сам, надёжно (не полагаясь на LLM)
+        подставлять СВОЙ user_id в каждый вызов к нему, если аргумент ещё не
+        задан явно. Явно переданный LLM user_id (например, если пользователь
+        сам просит выполнить что-то от имени другого известного ID) не
+        перезаписывается.
+        """
+        if "user_id" not in args or not args.get("user_id"):
+            args = {**args, "user_id": self.user_id}
         try:
             result = await self.mcp_manager.call_tool(server, tool, args)
             return result
@@ -943,7 +981,26 @@ class CognitiveController:
 
     # ===== НОВЫЙ МЕТОД: автоматическое извлечение фактов из сообщения =====
     async def _auto_extract_facts(self, message: str) -> List[str]:
-        """Извлекает факты из сообщения пользователя и сохраняет через сервис (глобально)."""
+        """
+        Извлекает факты из сообщения пользователя. ЧИСТЫЙ экстрактор — сохранение
+        через memory_service.remember() делает вызывающий код (см. _run_memory_intent_pipeline).
+
+        ИСПРАВЛЕНИЕ (баг задвоения сохранения): раньше этот метод САМ сохранял
+        первые 3 факта через memory_service.remember() и ВОЗВРАЩАЛ список фактов,
+        а вызывающий код в _run_memory_intent_pipeline заново сохранял ВЕСЬ
+        возвращённый список тем же remember(). Итог: каждый факт из первых
+        трёх сохранялся дважды — а submit_candidate() при почти полном текстовом
+        совпадении (similarity > 0.95) не создаёт дубль-объект, а "усиливает"
+        существующий (_reinforce: +evidence, рост confidence) — то есть один
+        и тот же факт из одного извлечения выглядел в памяти как дважды
+        подтверждённый. Это напрямую искажало HYBRID_WEIGHT_EVIDENCE и
+        GLOBAL_FACT_CONFIDENCE_THRESHOLD (факт казался надёжнее, чем есть на
+        самом деле), плюс впустую тратился второй embed_text+semantic_search на
+        каждое сообщение. Заодно старый код ограничивал внутреннее сохранение
+        facts[:3], а возвращал (и caller дальше сохранял) весь список без
+        среза — несогласованность лимитов. Теперь сохранение только одно,
+        унифицированный лимit задаёт caller.
+        """
         if not AUTO_EXTRACT_FACTS:
             return []
         # Пропускаем, если сообщение является командой (чтобы не дублировать)
@@ -974,14 +1031,10 @@ class CognitiveController:
             if not re.search(r'(является|составляет|равен|находится|имеет|был|стал|\d)', line):
                 continue
             facts.append(line[:300])
-        # Сохраняем через сервис в глобальную память
-        for fact in facts[:3]:
-            result = await self.memory_service.remember(fact, scope="global")
-            if result.get("id"):
-                self.memory.hierarchy.add_to_working(result["id"])
-        if facts:
-            await self.memory_service.global_memory._schedule_save()
-        return facts
+        # Сохранение НЕ выполняется здесь — см. docstring. Ограничиваем на
+        # выходе (тем же порогом, что раньше применялся к сохранению) —
+        # caller сохраняет ровно то, что вернул этот метод, без своего среза.
+        return facts[:3]
 
     # ===== ОСНОВНАЯ ЛОГИКА ПОДГОТОВКИ СООБЩЕНИЙ =====
     async def _prepare_messages(self, message: str, web_search: bool = False,
@@ -1350,14 +1403,27 @@ class CognitiveController:
             })
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
-            if error > 0.85:
-                self._spawn_background_task(self._quick_correction(message, predictions, response), name="quick-correction")
+            if error > 0.85 and len(response) > 50 and not response.strip().lower().startswith(
+                    ("привет", "здравствуйте", "hello")):
+                self._spawn_background_task(self._quick_correction(message, predictions, response),
+                                            name="quick-correction")
 
         return response, search_meta
 
     # ===== ИЗВЛЕЧЕНИЕ ФАКТОВ (без изменений) =====
     async def _extract_facts_llm(self, text: str) -> List[str]:
-        """Извлекает факты из текста и сохраняет их через сервис в глобальную память."""
+        """
+        Извлекает факты из текста. ЧИСТЫЙ экстрактор — не сохраняет сам.
+
+        ИСПРАВЛЕНИЕ (тот же баг задвоения, что и в _auto_extract_facts): раньше
+        этот метод сам сохранял первые 10 фактов через memory_service.remember(),
+        а все три вызывающих места (process_input, stream_response x2) заново
+        сохраняли ВЕСЬ возвращённый список — двойное сохранение = двойное
+        "усиление" (submit_candidate._reinforce) одного и того же факта из
+        одного извлечения, искусственно раздувающее evidence/confidence
+        глобальных фактов, извлечённых из веб-поиска. Сохранение теперь
+        выполняется один раз, только вызывающим кодом.
+        """
         prompt = (
             "Извлеки из текста только объективные, проверяемые факты. "
             "Факт должен быть кратким утверждением, содержащим конкретную информацию "
@@ -1391,12 +1457,10 @@ class CognitiveController:
                 continue
             facts.append(line[:300])
 
-        # Сохраняем через сервис
-        for fact in facts[:10]:
-            await self.memory_service.remember(fact, scope="global")
-        if facts:
-            await self.memory_service.global_memory._schedule_save()
-        return facts
+        # Сохранение НЕ выполняется здесь — см. docstring. Тот же лимит,
+        # что раньше применялся к сохранению, теперь применяется к возврату,
+        # чтобы вызывающий код не сохранял больше, чем было задумано.
+        return facts[:10]
 
     def _extract_facts_from_text(self, text: str) -> List[str]:
         sentences = re.split(r'[.!?]', text)
@@ -1619,6 +1683,9 @@ class CognitiveController:
                         memory_context: str, image_base64: Optional[str],
                         image_mime: Optional[str], reasoning: bool,
                         uncertainty: float, predictions: List[str], goal_hint: str) -> List[Dict]:
+        # Защита от None
+        memory_context = memory_context or ""
+        search_context = search_context or ""
         system_parts = [
             "Ты — когнитивный AI-ассистент с доступом к трём источникам знаний:",
             "1. ЛИЧНАЯ ПАМЯТЬ (факты, которые пользователь просил запомнить или извлечены из диалога) — самый надёжный источник.",
@@ -1762,7 +1829,7 @@ class CognitiveController:
         )
 
         # ===== ЗАЩИТА ОТ None =====
-        if search_meta is None:
+        if not search_meta or not isinstance(search_meta, dict):
             search_meta = {}
         elif not isinstance(search_meta, dict):
             search_meta = {}
@@ -1783,6 +1850,8 @@ class CognitiveController:
                     )
                 tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
                 tool_trace = tool_run.get("tool_trace", [])
+                logger.info(
+                    f"ToolRouter decisions for '{message[:50]}': used_native={tool_run.get('used_native')}, trace_len={len(tool_trace)}")
                 logger.info(f"Tool trace: {tool_trace}")
 
                 # ИСПРАВЛЕНИЕ (см. process_input): поиск теперь происходит
@@ -1946,8 +2015,9 @@ class CognitiveController:
             })
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
-            if error > 0.85:
-                self._spawn_background_task(self._quick_correction(message, predictions, full_response),
+            if error > 0.85 and len(response) > 50 and not response.strip().lower().startswith(
+                    ("привет", "здравствуйте", "hello")):
+                self._spawn_background_task(self._quick_correction(message, predictions, response),
                                             name="quick-correction")
 
         yield "data: [DONE]\n\n"
@@ -1959,6 +2029,9 @@ class CognitiveController:
                               sampler_name: Optional[str] = None) -> Optional[str]:
         return await generate_image(prompt, steps=steps, width=width, height=height,
                                      cfg_scale=cfg_scale, seed=seed, sampler_name=sampler_name)
+
+
+
 
     async def enhance_prompt(self, prompt: str) -> str:
         return await enhance_prompt(prompt)

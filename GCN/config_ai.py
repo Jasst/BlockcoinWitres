@@ -15,19 +15,19 @@ MEMORY_BASE_DIR.mkdir(exist_ok=True)
 # -------------------------------
 LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
 LM_STUDIO_API_KEY = "lm-studio"
-LM_STUDIO_TIMEOUT = 300
-LM_STUDIO_STREAM_TIMEOUT = 600
+LM_STUDIO_TIMEOUT = 600
+LM_STUDIO_STREAM_TIMEOUT = 900
 LM_STUDIO_USE_STREAM = True
 LM_STUDIO_VISION_SUPPORTED = True
 
 # -------------------------------
 # Параметры памяти (GCN)
 # -------------------------------
-WORKING_MEMORY_SIZE = 20
+WORKING_MEMORY_SIZE = 40
 SENSORY_BUFFER_SIZE = 5
-EPISODIC_MAX_SIZE = 500
-SEMANTIC_MAX_FACTS = 10000
-ASSOCIATIVE_GRAPH_MAX_NODES = 20000
+EPISODIC_MAX_SIZE = 1000
+SEMANTIC_MAX_FACTS = 100000
+ASSOCIATIVE_GRAPH_MAX_NODES = 200000
 DEFAULT_CONFIDENCE = 0.5
 DEFAULT_IMPORTANCE = 1.0
 
@@ -145,6 +145,24 @@ GENERATED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 TOOL_CALL_TIMEOUT_SECONDS = 45
 # Периодичность повторных попыток подключиться к упавшим при старте MCP-серверам.
 MCP_RECONNECT_INTERVAL = 120
+
+# ИСПРАВЛЕНИЕ (рассинхронизация клиентского и серверного таймаута MCP):
+# mcp_client_manager.MCPToolManager.call_tool раньше всегда ждал ровно
+# TOOL_CALL_TIMEOUT_SECONDS (45с) для ЛЮБОГО инструмента любого внешнего
+# MCP-сервера. При этом mcp_server_blockcoin.py сам себе на стороне сервера
+# даёт до 300с на generate_image и до 240с на research_topic
+# (_MCP_IMAGE_TOOL_TIMEOUT_SECONDS/_MCP_RESEARCH_TOOL_TIMEOUT_SECONDS) — то
+# есть клиент обрывал вызов и возвращал "не ответил за 45с" за много секунд
+# ДО того, как сервер вообще успевал закончить генерацию/исследование,
+# которые сами по себе не зависли и продолжали бы работать. Ключи — это
+# подстроки, которые ищутся в original_tool_name вызываемого инструмента
+# (без учёта регистра); используется первое совпадение, иначе — обычный
+# TOOL_CALL_TIMEOUT_SECONDS.
+MCP_TOOL_TIMEOUT_OVERRIDES = {
+    "generate_image": 300,
+    "research_topic": 240,
+    "web_search": 90,
+}
 
 # -------------------------------
 # Прочее
