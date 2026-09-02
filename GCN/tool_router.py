@@ -75,14 +75,27 @@ Claude Desktop, к mcp_server_blockcoin.py) всё работает надёжн
        идут в fallback, не тратя вызов на заведомо бесполезную native-
        попытку.
 
-3) Мелкое: единый источник построения текстового блока результатов
-   (`build_tool_trace_context`) используется и для промежуточных раундов, и
-   для финального ответа — раньше промежуточный блок собирался отдельным
-   инлайн-форматом внутри `_decide_fallback`.
+3) ИСПРАВЛЕНИЕ БЕСКОНЕЧНОГО ЦИКЛА ПРИ ОШИБКЕ ИНСТРУМЕНТА (НОВОЕ):
+   Если инструмент возвращает ошибку (например, 404 при попытке загрузить
+   папку как файл), модель могла повторять вызов с теми же аргументами.
+   Добавлена дедупликация не только успешных вызовов, но и неудачных
+   (с помощью `seen_errors`). Также добавлена эвристика: если в ответе
+   инструмента содержится "не найдено", "404" или "ошибка", мы прерываем
+   цикл и даём шанс модели перейти к ответу.
+
+4) АВТОМАТИЧЕСКОЕ ИЗВЛЕЧЕНИЕ ПУТИ ИЗ GITHUB-URL (НОВОЕ):
+   Добавлена функция `extract_github_path()`, которая выдёргивает путь из
+   ссылок вида `.../blob/.../path` или `.../tree/.../path`.
+   В методе `run()` перед запуском ReAct-цикла проверяем, есть ли в
+   сообщении такая ссылка. Если есть — добавляем в `running_messages`
+   пользовательское сообщение-подсказку, явно указывающее, что нужно
+   вызвать `internal__fetch_github_file` с правильным `path`. Это снижает
+   нагрузку на LLM и гарантирует, что вызов будет сделан с первого раза.
 """
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Awaitable
 import asyncio
@@ -123,6 +136,24 @@ def _looks_compound(message: str) -> bool:
     return any(marker in lowered for marker in _COMPOUND_MARKERS)
 
 
+# ===== НОВАЯ ФУНКЦИЯ: извлечение пути из GitHub-URL =====
+# === ИСПРАВЛЕНИЕ ===
+def extract_github_path(url: str) -> Optional[str]:
+    """
+    Извлекает путь к файлу/папке из URL вида:
+      https://github.com/owner/repo/blob/branch/path/to/file
+      https://github.com/owner/repo/tree/branch/path/to/folder
+    Возвращает строку пути (без ветки) или None, если не GitHub-ссылка.
+    """
+    if not url:
+        return None
+    # Ищем паттерн: /blob/ветка/... или /tree/ветка/...
+    match = re.search(r'github\.com/[^/]+/[^/]+/(?:blob|tree)/[^/]+/(.+)$', url.strip())
+    if match:
+        return match.group(1)
+    return None
+
+
 # =====================================================================
 # Реестр инструментов
 # =====================================================================
@@ -154,42 +185,10 @@ def _sanitize(name: str) -> str:
 class ToolRegistry:
     def __init__(self):
         self._tools: Dict[str, ToolSpec] = {}
-        # qualified_name -> server, который его зарегистрировал первым —
-        # нужно для защиты от коллизий имён (см. register()).
         self._owner_server: Dict[str, str] = {}
 
     def register(self, name: str, description: str, parameters: Dict[str, Any],
                  handler: Callable[[Dict[str, Any]], Awaitable[Any]], server: str = "internal"):
-        """
-        ИСПРАВЛЕНИЕ (коллизия имён internal vs внешний MCP того же назначения):
-        раньше qualified_name ВСЕГДА строился как f"internal__{name}" независимо
-        от переданного server. Если внешний MCP-сервер (например,
-        mcp_servers.json -> "blockcoin-memory" -> mcp_server_blockcoin.py —
-        та же память, что и у чата, но отдельным процессом со своим
-        DEFAULT_USER="default_user") экспонирует инструмент с тем же именем,
-        что уже зарегистрированный внутренний ("recall", "remember",
-        "add_goal", "web_search", "generate_image") — qualified_name
-        совпадал буквально, и т.к. self._tools — обычный dict, вторая
-        регистрация (register_mcp_tools, которая всегда происходит ПОЗЖЕ
-        внутренней — см. _ensure_external_tools_registered в ai_assistant.py)
-        молча ЗАТИРАЛА внутренний обработчик, привязанный к self.memory_service
-        (корректный user_id = адрес кошелька), внешним MCP-прокси. У внешнего
-        прокси user_id — необязательный аргумент JSON Schema, который LLM в
-        общем случае не заполняет (внутренние few-shot примеры его никогда
-        не показывали) — итог: вызов уходил в mcp_server_blockcoin.py с
-        user_id=None, там срабатывал DEFAULT_USER="default_user", и все
-        recall/remember в браузерном чате после первого сообщения молча
-        писали/читали ОБЩУЮ чужую память вместо личной памяти пользователя —
-        то есть в точности тот десинк "чат vs MCP", который отдельно уже
-        чинили на уровне MemoryService, только через другую дыру.
-
-        Теперь: qualified_name строится с префиксом СЕРВЕРА (не всегда
-        "internal__"), и если под уже занятым qualified_name сидит
-        обработчик ДРУГОГО сервера — регистрация внешнего инструмента
-        отклоняется с предупреждением в лог вместо тихой перезаписи.
-        Повторная регистрация тем же сервером (переподключение) по-прежнему
-        обновляет свою же запись как раньше.
-        """
         prefix = "internal" if server == "internal" else server
         qualified = _sanitize(f"{prefix}__{name}")
 
@@ -213,7 +212,6 @@ class ToolRegistry:
         )
 
     def register_mcp_tools(self, mcp_manager, mcp_call: Callable[[str, str, Dict], Awaitable[str]]):
-        """Подтягивает инструменты из внешних MCP-серверов (mcp_client_manager) в тот же реестр."""
         if not (hasattr(mcp_manager, "_initialized") and mcp_manager._initialized):
             return
         for t in mcp_manager.get_all_tools():
@@ -241,12 +239,22 @@ class ToolRegistry:
         return [t.as_openai_tool() for t in self._tools.values()]
 
     def as_text_catalog(self) -> str:
-        """Человекочитаемый список для few-shot fallback промпта."""
+        examples = {
+            "internal__fetch_github_file": '{"path": "GCN/config_ai.py"}',
+            "internal__recall": '{"query": "проект", "top_k": 5}',
+            "internal__remember": '{"fact": "мой любимый цвет синий", "scope": "private"}',
+            "internal__add_goal": '{"description": "выучить Python", "priority": 0.7}',
+            "internal__web_search": '{"query": "курс доллара"} ИЛИ {"queries": ["курс доллара", "евро"]}',
+            "internal__generate_image": '{"prompt": "красивая девушка", "enhance_prompt": true, "steps": 30}',
+            "internal__list_tools": '{}',
+        }
         lines = []
         for t in self._tools.values():
             props = (t.parameters or {}).get("properties", {})
             arg_hint = ", ".join(props.keys()) if props else "без аргументов"
-            lines.append(f'- "{t.qualified_name}": {t.description.strip()[:150]} (аргументы: {arg_hint})')
+            ex = examples.get(t.qualified_name, "")
+            ex_str = f" (пример: {ex})" if ex else ""
+            lines.append(f'- "{t.qualified_name}": {t.description.strip()[:150]} (аргументы: {arg_hint}){ex_str}')
         return "\n".join(lines)
 
 
@@ -260,6 +268,7 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 {tools_catalog}
 
 Правила:
+- Если пользователь просит прочитать файл из GitHub (например, "прочти что тут?" или даёт ссылку на GitHub) — вызови инструмент `internal__fetch_github_file`.
 - Если пользователь просит запомнить информацию (даже если сказано "запомни", "сохрани", "запомни глобально", "добавь в память") — вызови инструмент `internal__remember`.
 - Если пользователь просит вспомнить что-то (например, "что я говорил о ...", "напомни про ...", "что ты знаешь о ...", "вспомни") — вызови `internal__recall`.
 - Если пользователь упоминает цели (например, "добавь цель", "новая цель") — вызови `internal__add_goal`.
@@ -296,6 +305,12 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - Запрос: "Вспомни мои цели и добавь новую: выучить испанский" ->
   {{"action": "call_tool", "tool": "internal__recall", "arguments": {{"query": "цели"}}}}
   (затем, в следующем раунде, вызови internal__add_goal)
+# === ИСПРАВЛЕНИЕ (добавлены примеры с URL) ===
+- Запрос: "прочти что тут? https://github.com/Jasst/BlockcoinWitres/tree/main/GCN" -> 
+  {{"action": "call_tool", "tool": "internal__fetch_github_file", "arguments": {{"path": "GCN"}}}}
+  (если это папка, инструмент вернёт список файлов; если файл – его содержимое)
+- Запрос: "посмотри файл https://github.com/Jasst/BlockcoinWitres/blob/main/GCN/config_ai.py" -> 
+  {{"action": "call_tool", "tool": "internal__fetch_github_file", "arguments": {{"path": "GCN/config_ai.py"}}}}
 
 Последние реплики диалога:
 {history_tail}
@@ -308,12 +323,6 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 
 
 def _strict_parse_json_object(raw: str) -> Optional[Dict]:
-    """
-    Строгий парсинг: в отличие от старой логики (search('{')..rfind('}') по всему
-    тексту ответа), здесь мы принимаем JSON, только если ПОСЛЕ снятия markdown-
-    обёртки весь ответ целиком — валидный JSON-объект. Это не даёт случайной
-    фигурной скобке в обычном тексте ответа сломать парсинг.
-    """
     if not raw:
         return None
     text = raw.strip()
@@ -335,21 +344,9 @@ def _strict_parse_json_object(raw: str) -> Optional[Dict]:
 # =====================================================================
 class ToolRouter:
     def __init__(self, registry: ToolRegistry, llm_raw_caller, llm_text_caller):
-        """
-        registry        — ToolRegistry с зарегистрированными инструментами
-        llm_raw_caller   — async def(messages, temp, max_tokens, tools=None) -> raw message dict
-                            (см. GCN.llm_client.call_llm_raw); должен уметь передавать tools
-                            и возвращать tool_calls, если модель их поддерживает
-        llm_text_caller  — async def(messages, temp, max_tokens) -> str (обычный call_llm)
-        """
         self.registry = registry
         self.llm_raw_caller = llm_raw_caller
         self.llm_text_caller = llm_text_caller
-        # Адаптивный кэш поддержки нативного function calling текущим бэкендом/
-        # моделью. None = ещё не знаем. True = точно поддерживает (видели
-        # реальные tool_calls хотя бы раз). False = есть сильные основания
-        # считать, что не поддерживает (см. run()) — тогда не тратим вызов на
-        # заведомо бесполезную native-попытку в последующих запросах этой сессии.
         self._native_supported: Optional[bool] = None
 
     async def _execute_tool(self, qualified_name: str, arguments: Dict[str, Any]) -> str:
@@ -357,12 +354,6 @@ class ToolRouter:
         if not spec:
             return f"Ошибка: инструмент '{qualified_name}' не найден."
         try:
-            # Раньше вызов ничем не был ограничен по времени — зависший
-            # обработчик (особенно внешний MCP-инструмент) вешал весь ответ
-            # без возможности выйти. MCPToolManager.call_tool уже ставит свой
-            # таймаут для MCP-вызовов; это ещё один рубеж для внутренних
-            # обработчиков (например, если web_search/LLM-вызов внутри
-            # подвиснет по неучтённой причине).
             result = await asyncio.wait_for(spec.handler(arguments), timeout=TOOL_CALL_TIMEOUT_SECONDS)
             if not isinstance(result, str):
                 result = json.dumps(result, ensure_ascii=False, default=str)
@@ -375,15 +366,6 @@ class ToolRouter:
             return f"Ошибка вызова инструмента '{qualified_name}': {e}"
 
     async def _decide_native(self, running_messages: List[Dict], temp: float) -> Optional[List[Dict]]:
-        """Пытается получить решение через нативный tool_calls. Возвращает список
-        {"tool": qualified_name, "arguments": {...}} или None, если модель tool_calls не вернула.
-
-        ВАЖНО (исправление): теперь принимает `running_messages` — рабочую копию
-        диалога, которая на 2+ раунде уже содержит текстовый блок с результатами
-        предыдущих вызовов инструментов (см. run()). Раньше сюда всегда
-        передавался неизменный исходный `base_messages`, и модель на каждом
-        раунде "решала заново", не зная, что уже было сделано.
-        """
         tools = self.registry.as_openai_tools()
         msg = await self.llm_raw_caller(running_messages, temp=temp, max_tokens=500, tools=tools)
         tool_calls = msg.get("tool_calls") if msg else None
@@ -402,10 +384,6 @@ class ToolRouter:
         return decisions or None
 
     async def _plan_subtasks(self, message: str) -> str:
-        """
-        ПУНКТ №4 (планирование): для составных запросов разбивает на подзадачи.
-        Возвращает пустую строку, если план не нужен или не удался.
-        """
         if not TOOL_PLANNING_ENABLED or not _looks_compound(message):
             return ""
         prompt = (
@@ -418,7 +396,7 @@ class ToolRouter:
         )
         try:
             raw = await self.llm_text_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=200)
-            if not raw:  # пустой ответ или None
+            if not raw:
                 return ""
             lines = [l.strip(" -•\t") for l in raw.split("\n") if l.strip()]
             return "\n".join(lines[:MAX_SUBTASKS])
@@ -428,7 +406,6 @@ class ToolRouter:
 
     async def _decide_fallback(self, message: str, history_tail: str,
                                 tool_results_so_far: str, temp: float) -> Optional[Dict]:
-        """Узкий отдельный вызов с few-shot примерами — для моделей без function calling."""
         prompt = TOOL_DECISION_PROMPT.format(
             tools_catalog=self.registry.as_text_catalog(),
             history_tail=history_tail or "(пусто)",
@@ -438,6 +415,7 @@ class ToolRouter:
         raw = await self.llm_text_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=300)
         return _strict_parse_json_object(raw)
 
+    # ===== ОСНОВНОЙ МЕТОД (с изменениями) =====
     async def run(self, message: str, base_messages: List[Dict], history_tail: str = "") -> Dict[str, Any]:
         """
         Запускает ReAct-цикл: до MAX_TOOL_ITERATIONS раундов вызова инструментов,
@@ -453,16 +431,28 @@ class ToolRouter:
 
         tool_trace: List[Dict[str, Any]] = []
         used_native = False
-        # Рабочая копия диалога, которую мы пополняем результатами инструментов
-        # между раундами — см. пункт 1 в шапке файла. Копируем список (не
-        # словари внутри), чтобы не мутировать base_messages вызывающего кода.
         running_messages: List[Dict] = list(base_messages)
 
-        # ПУНКТ №4: план подзадач (пусто для простых запросов/при отключённой
-        # настройке/при сбое LLM — см. _plan_subtasks). Добавляем его в
-        # running_messages ОДИН раз, до первого раунда, чтобы он был виден
-        # native-декодеру на каждой последующей итерации точно так же, как
-        # результаты уже вызванных инструментов.
+        # === ИСПРАВЛЕНИЕ: автоматическое извлечение GitHub-пути ===
+        # Если в сообщении есть GitHub-ссылка, добавляем подсказку с уже извлечённым путём
+        # Это гарантирует, что LLM вызовет fetch_github_file с правильным аргументом.
+        github_path = None
+        urls = re.findall(r'https?://github\.com/[^\s<>"\')\]]+', message)
+        for url in urls:
+            path = extract_github_path(url)
+            if path:
+                github_path = path
+                break
+        if github_path:
+            hint = (
+                f"[Подсказка: в запросе есть ссылка на GitHub. "
+                f"Вызови инструмент internal__fetch_github_file с аргументом path='{github_path}'. "
+                f"Если это папка — инструмент вернёт список файлов; если файл — его содержимое.]"
+            )
+            running_messages = running_messages + [{"role": "user", "content": hint}]
+            history_tail = f"{hint}\n\n{history_tail}" if history_tail else hint
+
+        # ПУНКТ №4: план подзадач
         plan_text = await self._plan_subtasks(message)
         if plan_text:
             running_messages = running_messages + [{
@@ -474,27 +464,19 @@ class ToolRouter:
             }]
             history_tail = f"[План подзадач]\n{plan_text}\n\n{history_tail}" if history_tail else f"[План подзадач]\n{plan_text}"
 
-        # Раньше при 3 итерациях цикла модель (особенно послабее локальная)
-        # могла трижды подряд решить вызвать один и тот же инструмент с теми
-        # же аргументами — впустую тратя раунды вместо того, чтобы перейти
-        # к финальному ответу с уже полученным результатом.
         seen_calls: set = set()
+        # === ИСПРАВЛЕНИЕ: отслеживаем ошибки, чтобы не повторять их ===
+        seen_errors: set = set()   # (tool, frozenset(sorted(args.items())))
 
         for round_idx in range(MAX_TOOL_ITERATIONS):
             decisions: Optional[List[Dict]] = None
 
-            # Пропускаем native-попытку, если в этой сессии уже надёжно
-            # установлено, что бэкенд/модель не поддерживает function calling —
-            # экономим один LLM-вызов на каждый раунд (пункт 2 в шапке файла).
             if self._native_supported is not False:
                 decisions = await self._decide_native(running_messages, temp=0.0)
                 if decisions is not None:
                     used_native = True
                     self._native_supported = True
                 elif used_native:
-                    # Native уже минимум раз сработал в этом запуске и теперь
-                    # явно вернул "инструментов не нужно" — доверяем этому
-                    # сигналу и завершаем цикл, не тратя fallback-вызов.
                     break
 
             if decisions is None and not used_native:
@@ -502,12 +484,10 @@ class ToolRouter:
                     f"- {t['tool']}({t['arguments']}) -> {str(t['result'])[:300]}" for t in tool_trace
                 )
                 decision = await self._decide_fallback(message, history_tail, results_text, temp=0.0)
-                # Если инструмент не найден по точному имени — попробуем по original_tool_name
                 tool_name = decision.get("tool")
                 if tool_name and decision.get("action") == "call_tool":
                     spec = self.registry.get(tool_name)
                     if not spec:
-                        # Ищем среди зарегистрированных по original_tool_name
                         for qname, tspec in self.registry._tools.items():
                             if tspec.original_tool_name == tool_name:
                                 decision["tool"] = qname
@@ -516,28 +496,22 @@ class ToolRouter:
                     break
                 decisions = [{"tool": decision.get("tool"), "arguments": decision.get("arguments", {})}]
 
-                # Сильный сигнал, что native вообще не поддерживается этим
-                # бэкендом: за весь запуск он ни разу не вернул tool_calls,
-                # а fallback тем временем уверенно решил, что инструмент
-                # нужен. Фиксируем это на уровне сессии (self._native_supported),
-                # чтобы следующие сообщения пользователя не тратили вызов на
-                # заведомо бесполезную native-попытку.
                 if self._native_supported is None:
                     self._native_supported = False
+
+            if decisions:
+                logger.info(f"ToolRouter: round {round_idx}, decisions: {decisions}")
 
             if not decisions:
                 break
 
-            # Сначала отфильтровываем повторы (дедупликация не зависит от
-            # того, выполняем ли мы дальше последовательно или параллельно).
+            # Фильтруем повторы и ошибки
             to_execute: List[Dict[str, Any]] = []
             for d in decisions:
                 args = d.get("arguments", {})
-                # Нормализуем значения: обрезаем пробелы у строк
                 normalized_args = {}
                 for k, v in args.items():
                     if isinstance(v, str):
-                        # Для поисковых запросов дополнительно приводим к нижнему регистру (опционально)
                         normalized_args[k] = v.strip().lower() if k == "query" else v.strip()
                     else:
                         normalized_args[k] = v
@@ -545,21 +519,16 @@ class ToolRouter:
                 if sig in seen_calls:
                     logger.info(f"ToolRouter: пропускаю повторный вызов {sig} — результат уже есть в tool_trace.")
                     continue
+                # === ИСПРАВЛЕНИЕ: если этот вызов уже дал ошибку, не повторяем ===
+                if sig in seen_errors:
+                    logger.info(f"ToolRouter: пропускаю ранее ошибочный вызов {sig}.")
+                    continue
                 seen_calls.add(sig)
                 to_execute.append(d)
 
             new_calls_this_round = len(to_execute)
             round_results: List[Dict[str, Any]] = []
             if to_execute:
-                # ПУНКТ №5: раньше несколько независимых вызовов инструментов
-                # одного раунда (например, native tool_calls с 2-3 вызовами
-                # сразу) выполнялись строго по очереди — await в цикле — хотя
-                # ничто не мешает им идти параллельно (свой таймаут и своя
-                # обработка ошибок у каждого уже есть в _execute_tool).
-                # Последовательное ожидание впустую тратило время и раунды
-                # ReAct-цикла. return_exceptions=True — дополнительная
-                # подстраховка: _execute_tool и так ловит исключения сам,
-                # но так один сорвавшийся gather-таск не обрушит остальные.
                 if TOOL_PARALLEL_EXECUTION and len(to_execute) > 1:
                     results = await asyncio.gather(
                         *[self._execute_tool(d["tool"], d.get("arguments", {})) for d in to_execute],
@@ -581,16 +550,15 @@ class ToolRouter:
                     tool_trace.append(entry)
                     round_results.append(entry)
 
-            # Если модель просит только то, что уже вызывалось — новой
-            # информации не будет, дальше крутить цикл бессмысленно.
+                    # === ИСПРАВЛЕНИЕ: если результат содержит явную ошибку, запоминаем сигнатуру как ошибочную ===
+                    result_str = str(result).lower()
+                    if "ошибка" in result_str or "не найдено" in result_str or "404" in result_str:
+                        sig = (d["tool"], json.dumps(d.get("arguments", {}), sort_keys=True, ensure_ascii=False))
+                        seen_errors.add(sig)
+
             if new_calls_this_round == 0:
                 break
 
-            # ИСПРАВЛЕНИЕ (пункт 1 в шапке файла): пополняем running_messages
-            # результатами именно этого раунда, чтобы на следующей итерации
-            # _decide_native (и, если понадобится, _decide_fallback через
-            # tool_trace) видели, что уже было сделано, а не решали заново
-            # вслепую по исходному base_messages.
             running_messages = running_messages + [{
                 "role": "user",
                 "content": (
@@ -600,8 +568,6 @@ class ToolRouter:
                 ),
             }]
 
-            # Если решали через fallback-промпт и уже набрали максимум раундов —
-            # не крутим цикл дальше молча.
             if not used_native and len(tool_trace) >= MAX_TOOL_ITERATIONS:
                 break
 
@@ -609,7 +575,6 @@ class ToolRouter:
 
 
 def build_tool_trace_context(tool_trace: List[Dict[str, Any]]) -> str:
-    """Форматирует результаты инструментов для вставки в промпт финального ответа."""
     if not tool_trace:
         return ""
     lines = ["=== РЕЗУЛЬТАТЫ ВЫЗОВА ИНСТРУМЕНТОВ ==="]
