@@ -532,7 +532,16 @@ class ToolRouter:
             # того, выполняем ли мы дальше последовательно или параллельно).
             to_execute: List[Dict[str, Any]] = []
             for d in decisions:
-                sig = (d.get("tool"), json.dumps(d.get("arguments", {}), sort_keys=True, ensure_ascii=False))
+                args = d.get("arguments", {})
+                # Нормализуем значения: обрезаем пробелы у строк
+                normalized_args = {}
+                for k, v in args.items():
+                    if isinstance(v, str):
+                        # Для поисковых запросов дополнительно приводим к нижнему регистру (опционально)
+                        normalized_args[k] = v.strip().lower() if k == "query" else v.strip()
+                    else:
+                        normalized_args[k] = v
+                sig = (d.get("tool"), json.dumps(normalized_args, sort_keys=True, ensure_ascii=False))
                 if sig in seen_calls:
                     logger.info(f"ToolRouter: пропускаю повторный вызов {sig} — результат уже есть в tool_trace.")
                     continue
