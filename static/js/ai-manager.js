@@ -157,8 +157,29 @@ window.selectConversation = function(address, name, isGroup) {
         imageMaxWidth: 800,
         imageQuality: 0.7,
         apiEndpoint: '/ai/chat',
+        attachEndpoint: '/ai/chat/attach',
         searchEndpoint: '/ai/search',
     };
+
+    // ─── переподключение к генерации, которая продолжается на сервере ───
+    // Свернули вкладку / браузер придушил фоновую вкладку / коротко пропала
+    // сеть — соединение SSE могло оборваться, хотя сама генерация на
+    // сервере идёт независимо от него (см. backend: stream_response /
+    // _stream_response_worker) и всё равно досчитается и сохранится.
+    // Вместо того чтобы показывать ошибку и терять почти готовый ответ —
+    // при возврате на вкладку молча пробуем переподключиться и забрать
+    // то, что уже накопилось + доиграть остаток.
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && _isSending && !_currentStreamReader) {
+            _attachToActiveAiStream().then((recovered) => {
+                if (!recovered) {
+                    _isSending = false;
+                    if (_aiSendBtn) _aiSendBtn.style.display = 'inline-flex';
+                    if (_aiStopBtn) _aiStopBtn.style.display = 'none';
+                }
+            }).catch(() => {});
+        }
+    });
 
     // ─── работа с историей сессии ───
     function _getStoredHistory(sessionId) {
@@ -561,6 +582,108 @@ function _clearAiHistory() {
 
     // ─── основная отправка ───
     // ai-manager.js — функция _sendToAi (полностью, с исправлением)
+    // ─── попытка переподключения к уже идущей на сервере генерации ───
+    async function _attachToActiveAiStream() {
+        if (!_currentStreamingMessage) return false;
+        const markdownBody = _currentStreamingMessage.querySelector('.content .markdown-body');
+        if (!markdownBody) return false;
+
+        let response;
+        try {
+            response = await fetch(CONFIG.attachEndpoint, { method: 'GET' });
+        } catch (e) {
+            return false;
+        }
+        if (!response.ok) return false;
+
+        // Сервер реплеит генерацию с самого начала (весь накопленный буфер),
+        // поэтому локальный текст пересобираем заново, а не дописываем.
+        _currentStreamingText = '';
+        let firstTokenReceived = false, streamFinished = false, searchResults = null, noActiveGeneration = false;
+        const reader = response.body.getReader();
+        _currentStreamReader = reader;
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        try {
+            while (!streamFinished) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    const dataStr = line.slice(6).trim();
+                    if (dataStr === '[DONE]') { streamFinished = true; break; }
+
+                    try {
+                        const data = JSON.parse(dataStr);
+                        if (data.no_active_generation) { noActiveGeneration = true; continue; }
+                        if (data.token) {
+                            if (!firstTokenReceived) {
+                                _showAiTypingIndicator(false);
+                                firstTokenReceived = true;
+                            }
+                            _currentStreamingText += data.token;
+                            if (!window._aiUpdateTimer) {
+                                window._aiUpdateTimer = setTimeout(() => {
+                                    markdownBody.innerHTML = _renderMarkdown(_currentStreamingText);
+                                    _enhanceCodeBlocks(markdownBody);
+                                    _addImageDownloadButtons(markdownBody);
+                                    _attachReasoningToggle(markdownBody);
+                                    if (_aiMessagesContainer) _aiMessagesContainer.scrollTop = _aiMessagesContainer.scrollHeight;
+                                    window._aiUpdateTimer = null;
+                                }, 50);
+                            }
+                        } else if (data.image_url) {
+                            const imageMarkdown = `![generated](${data.image_url})`;
+                            const messageTextWithImage = `🎨 *Сгенерировано изображение:*\n\n${imageMarkdown}`;
+                            _displayAiMessage(messageTextWithImage, false, null, true);
+                            _saveAiMessage('assistant', messageTextWithImage, _currentAiSessionId);
+                            firstTokenReceived = true;
+                        } else if (data.error) {
+                            markdownBody.textContent = '❌ ' + data.error;
+                            firstTokenReceived = true;
+                            streamFinished = true;
+                            break;
+                        } else if (data.sources) {
+                            searchResults = data.sources;
+                        }
+                    } catch (e) {}
+                }
+            }
+        } finally {
+            if (_currentStreamReader === reader) _currentStreamReader = null;
+        }
+
+        if (window._aiUpdateTimer) {
+            clearTimeout(window._aiUpdateTimer);
+            window._aiUpdateTimer = null;
+        }
+
+        if (noActiveGeneration && !firstTokenReceived) {
+            // Нечего доигрывать: либо ответ уже досчитался и сохранился
+            // раньше, чем мы переподключились, либо генерации не было —
+            // в обоих случаях это не ошибка.
+            return false;
+        }
+
+        if (firstTokenReceived && _currentStreamingText) {
+            const finalHtml = _renderMarkdown(_currentStreamingText);
+            markdownBody.innerHTML = finalHtml;
+            _enhanceCodeBlocks(markdownBody);
+            _addImageDownloadButtons(markdownBody);
+            _attachReasoningToggle(markdownBody);
+            _saveAiMessage('assistant', _currentStreamingText, _currentAiSessionId);
+            if (searchResults && searchResults.length) {
+                _displaySearchSources(searchResults);
+            }
+        }
+        return true;
+    }
+
 async function _sendToAi(messageText, imageFile) {
     // Проверка контейнера
     if (!_aiMessagesContainer) {
@@ -806,12 +929,19 @@ async function _sendToAi(messageText, imageFile) {
             _showToast('Генерация остановлена', 'warning');
         } else {
             console.error('AI error:', err);
-            _showAiTypingIndicator(false);
-            if (_currentStreamingMessage?.parentNode) {
-                const errDiv = _currentStreamingMessage.querySelector('.content .markdown-body');
-                if (errDiv) errDiv.textContent = '❌ Ошибка связи с AI-сервером. Проверьте, запущен ли LM Studio.';
-            } else {
-                _displayAiMessage('❌ Ошибка связи с AI-сервером.', false, null, true);
+            // Обрыв соединения — не обязательно обрыв генерации: сервер
+            // (см. backend) продолжает считать ответ в фоне независимо от
+            // этого запроса. Пробуем один раз переподключиться и забрать
+            // то, что уже насчиталось, прежде чем показывать ошибку.
+            const recovered = await _attachToActiveAiStream().catch(() => false);
+            if (!recovered) {
+                _showAiTypingIndicator(false);
+                if (_currentStreamingMessage?.parentNode) {
+                    const errDiv = _currentStreamingMessage.querySelector('.content .markdown-body');
+                    if (errDiv) errDiv.textContent = '❌ Ошибка связи с AI-сервером. Проверьте, запущен ли LM Studio.';
+                } else {
+                    _displayAiMessage('❌ Ошибка связи с AI-сервером.', false, null, true);
+                }
             }
         }
     } finally {

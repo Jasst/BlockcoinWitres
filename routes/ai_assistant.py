@@ -326,6 +326,9 @@ class CognitiveController:
         # fire-and-forget задачи регистрируются в self._background_tasks и
         # снимаются оттуда по завершении через add_done_callback.
         self._background_tasks: set = set()
+        # Текущая фоновая генерация ответа (см. stream_response) — не привязана
+        # к конкретному HTTP-соединению, живёт пока не допишется целиком.
+        self._active_stream: Optional[Dict] = None
 
         self._consolidation_task = None
         self._planner_task = None
@@ -1884,223 +1887,347 @@ class CognitiveController:
     async def stream_response(self, message: str, web_search: bool = False,
                               image_base64: str = None, image_mime: str = None,
                               reasoning: bool = False, char_by_char: bool = None):
-        # Подтягиваем изменения, сделанные другими процессами (например, MCP)
-        self.memory_service.refresh()
+        """
+        Тонкая обёртка над StreamingResponse. Реальная генерация выполняется в
+        self._stream_response_worker, запущенном как отдельная asyncio.Task
+        через _spawn_background_task (сильная ссылка в self._background_tasks —
+        см. комментарий в __init__ про то, почему это важно само по себе).
 
-        self._last_activity_time = time.time()
+        Этот генератор — единственное, что "видит" обрыв HTTP-соединения. При
+        обрыве (клиент закрыл вкладку / потерял сеть / нажал "стоп") здесь
+        просто отписывается локальная очередь-подписчик — сама генерация в
+        фоновой Task продолжает работать и досчитывается до конца, сохраняет
+        историю и память независимо от того, слушает её кто-нибудь или нет.
+        Это то самое поведение "как у Claude" — генерация не зависит от того,
+        остался пользователь на странице или нет.
 
-        # ИСПРАВЛЕНИЕ (#3 из чат-ревью): используем общий пайплайн памяти
-        pipeline_result = await self._run_memory_intent_pipeline(message)
-        if pipeline_result:
-            yield f"data: {json.dumps({'token': pipeline_result[0]})}\n\n"
-            yield "data: [DONE]\n\n"
+        Если на момент вызова для этого пользователя уже идёт генерация
+        (например, пользователь обновил страницу/переподключился, пока ответ
+        ещё считался), новый вызов подключается к УЖЕ ИДУЩЕЙ задаче: сначала
+        реплеит то, что уже успело сгенерироваться (буфер), затем продолжает
+        live — а не запускает вторую параллельную генерацию поверх той же
+        self.history.
+        """
+        state = self._active_stream
+        if state is None or state.get("done"):
+            gen_id = f"{self.user_id}:{time.time_ns()}"
+            state = {"gen_id": gen_id, "buffer": [], "subscribers": set(), "done": False}
+            self._active_stream = state
+            push = self._make_push(gen_id)
+            task = self._spawn_background_task(
+                self._stream_response_worker(
+                    gen_id=gen_id, push=push, message=message, web_search=web_search,
+                    image_base64=image_base64, image_mime=image_mime,
+                    reasoning=reasoning, char_by_char=char_by_char,
+                ),
+                name=f"stream:{gen_id}",
+            )
+            state["task"] = task
+        else:
+            gen_id = state["gen_id"]
+            logger.info(f"stream_response: подключаюсь к уже идущей генерации {gen_id} вместо новой")
+
+        queue: asyncio.Queue = asyncio.Queue()
+        for chunk in list(state["buffer"]):
+            await queue.put(chunk)
+        if state["done"]:
+            await queue.put(None)
+        else:
+            state["subscribers"].add(queue)
+
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+        finally:
+            # Отписываемся от рассылки — фоновую задачу это НЕ останавливает.
+            state["subscribers"].discard(queue)
+
+    def _make_push(self, gen_id: str):
+        """
+        Возвращает push(chunk) — функцию, которую _stream_response_worker
+        зовёт вместо `yield`. Пишет чанк в буфер генерации (для реплея
+        подключившимся позже слушателям) и рассылает его всем текущим
+        подписчикам. Молча становится no-op, если генерация с этим gen_id
+        уже завершена/подменена — на случай гонок при повторном подключении.
+        """
+        async def push(chunk: str):
+            state = self._active_stream
+            if state is None or state.get("gen_id") != gen_id:
+                return
+            state["buffer"].append(chunk)
+            for q in list(state["subscribers"]):
+                await q.put(chunk)
+        return push
+
+    async def _finish_generation(self, gen_id: str):
+        """Помечает генерацию завершённой и будит всех подписчиков сентинелом None."""
+        state = self._active_stream
+        if state is None or state.get("gen_id") != gen_id:
             return
+        state["done"] = True
+        for q in list(state["subscribers"]):
+            await q.put(None)
+        state["subscribers"].clear()
+        if self._active_stream is state:
+            self._active_stream = None
 
-        await self._ensure_external_tools_registered()
+    async def _stream_response_worker(self, gen_id: str, push, message: str, web_search: bool = False,
+                                       image_base64: str = None, image_mime: str = None,
+                                       reasoning: bool = False, char_by_char: bool = None):
+        """
+        Фактическая генерация ответа. Запускается как ОТДЕЛЬНАЯ asyncio.Task
+        (см. stream_response ниже) — а не как тело async-генератора, который
+        напрямую потребляет StreamingResponse.
 
-        messages, search_meta = await self._prepare_messages(
-            message, web_search, image_base64, image_mime, reasoning
-        )
-        uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
+        Раньше это был один и тот же код: если клиент (браузер) обрывал
+        соединение — закрыл вкладку, потерял сеть, вызвал
+        AbortController.abort() — Starlette дожидается следующего чтения
+        из тела ответа, видит обрыв и вызывает generator.aclose(). Это
+        кидает GeneratorExit ровно в ту точку, где генератор был
+        приостановлен — чаще всего внутри `async for token in
+        call_llm_stream(...)`. GeneratorExit не ловится `except
+        Exception`, поэтому весь код ПОСЛЕ генерации (сохранение
+        self.history, memory_service.add_episode, обновление целей,
+        _verify_response) просто не выполнялся. В итоге ответ терялся и на
+        сервере, и в памяти, а следующий запрос получал рассинхронизированную
+        историю — это и проявлялось как «ошибка LLM»/пустой ответ.
 
-        # === НОВОЕ: активное уточнение ===
-        if uncertainty > 0.7 and not web_search and not reasoning:
-            clarification = await self._ask_clarification(message, uncertainty)
-            if clarification:
-                yield f"data: {json.dumps({'token': clarification})}\n\n"
-                yield "data: [DONE]\n\n"
-                self.history.append({"role": "assistant", "content": clarification})
-                self._save_history()
+        Теперь push() пишет каждый чанк в общий буфер генерации и рассылает
+        его текущим подписчикам (см. _make_push/_finish_generation) — эта
+        корутина как asyncio.Task не прерывается закрытием HTTP-соединения
+        и всегда дописывает историю/память до конца.
+        """
+        try:
+            # Подтягиваем изменения, сделанные другими процессами (например, MCP)
+            self.memory_service.refresh()
+
+            self._last_activity_time = time.time()
+
+            # ИСПРАВЛЕНИЕ (#3 из чат-ревью): используем общий пайплайн памяти
+            pipeline_result = await self._run_memory_intent_pipeline(message)
+            if pipeline_result:
+                await push(f"data: {json.dumps({'token': pipeline_result[0]})}\n\n")
+                await push("data: [DONE]\n\n")
                 return
 
-        full_response = ""
-        tool_trace: List[Dict[str, Any]] = []
-        already_verified = False
-        try:
-            if LM_STUDIO_USE_STREAM:
-                history_tail = "\n".join(
-                    f"{m.get('role')}: {str(m.get('content'))[:200]}" for m in self.history[-6:]
-                )
-                if search_meta.get("search_requested"):
-                    history_tail = (
-                        "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри "
-                        f"вызов internal__web_search]\n{history_tail}" if history_tail else
-                        "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри вызов internal__web_search]"
-                    )
-                tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
-                tool_trace = tool_run.get("tool_trace", [])
-                logger.info(
-                    f"ToolRouter decisions for '{message[:50]}': used_native={tool_run.get('used_native')}, trace_len={len(tool_trace)}")
-                logger.info(f"Tool trace: {tool_trace}")
+            await self._ensure_external_tools_registered()
 
-                # Обработка результатов поиска (из внутреннего web_search)
-                if self._web_search_results_this_turn:
-                    seen_urls = set()
-                    merged_sources: List[Dict] = []
-                    context_parts: List[str] = []
-                    for r in self._web_search_results_this_turn:
-                        for s in r.get("sources", []):
-                            url = s.get("url")
-                            if url and url not in seen_urls:
-                                seen_urls.add(url)
-                                merged_sources.append(s)
-                        if r.get("context"):
-                            context_parts.append(r["context"])
-                    search_meta["web_search_used"] = True
-                    search_meta["sources"] = merged_sources
-                    search_meta["context"] = "\n\n---\n\n".join(context_parts)
-
-                    if EXTRACT_FACTS_FROM_SEARCH and search_meta["context"]:
-                        try:
-                            if EXTRACT_FACTS_WITH_LLM:
-                                # Используем улучшенную версию _extract_facts_llm с метаданными
-                                facts = await self._extract_facts_llm(search_meta["context"], merged_sources)
-                            else:
-                                facts = self._extract_facts_from_text(search_meta["context"])
-                            for f in facts:
-                                # f может быть строкой или словарём – адаптируем
-                                text = f.get("text", f) if isinstance(f, dict) else f
-                                await self.memory_service.remember(text, scope="global")
-                            if facts:
-                                await self.memory_service.global_memory._schedule_save()
-                            logger.info(f"Extracted {len(facts)} facts from web search -> global memory")
-                        except Exception as e:
-                            logger.warning(f"Fact extraction error: {e}")
-
-                if search_meta.get("sources"):
-                    yield f"data: {json.dumps({'sources': search_meta['sources']})}\n\n"
-
-                for t in tool_trace:
-                    if t.get("tool") == "internal__generate_image":
-                        result = t.get("result")
-                        if isinstance(result, str):
-                            try:
-                                result = json.loads(result)
-                            except (json.JSONDecodeError, TypeError):
-                                logger.warning(
-                                    f"generate_image: не удалось распарсить результат инструмента как JSON: {result[:200]!r}"
-                                )
-                        logger.info(f"generate_image result: {result}")
-                        if isinstance(result, dict) and result.get("image_url"):
-                            image_url = result["image_url"]
-                            logger.info(f"Sending image_url event: {image_url}")
-                            yield f"data: {json.dumps({'image_url': image_url})}\n\n"
-                            break
-                        else:
-                            logger.warning("generate_image result does not contain image_url")
-
-                if tool_trace:
-                    for t in tool_trace:
-                        yield f"data: {json.dumps({'tool_call': t['tool'], 'result_preview': str(t['result'])[:200]})}\n\n"
-                        self.history.append({
-                            "role": "assistant",
-                            "content": f"[инструмент {t['tool']}] {str(t['result'])[:500]}"
-                        })
-                    messages = self._build_messages(
-                        message=message,
-                        web_search=web_search,
-                        search_context=search_meta.get("context", ""),
-                        memory_context=self._memory_context_for_rebuild(
-                            tool_trace, self._last_prepare_meta.get("memory_context", "")
-                        ),
-                        image_base64=image_base64,
-                        image_mime=image_mime,
-                        reasoning=reasoning,
-                        uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
-                        predictions=self._last_prepare_meta.get("predictions", []),
-                        goal_hint=self._last_prepare_meta.get("goal_hint", "")
-                    )
-                    messages.append({
-                        "role": "user",
-                        "content": build_tool_trace_context(tool_trace) + "\n\nТеперь дай финальный ответ пользователю."
-                    })
-
-                async for token in call_llm_stream(messages):
-                    full_response += token
-                    yield f"data: {json.dumps({'token': token})}\n\n"
-            else:
-                response, inner_meta = await self.process_input(message, web_search, image_base64, image_mime,
-                                                                reasoning)
-                full_response = response
-                already_verified = True
-                if isinstance(inner_meta, dict) and inner_meta.get("sources"):
-                    search_meta["sources"] = inner_meta["sources"]
-                    yield f"data: {json.dumps({'sources': inner_meta['sources']})}\n\n"
-                if char_by_char is None:
-                    char_by_char = STREAM_CHAR_BY_CHAR
-                if char_by_char:
-                    for ch in full_response:
-                        yield f"data: {json.dumps({'token': ch})}\n\n"
-                        await asyncio.sleep(STREAM_CHAR_DELAY)
-                else:
-                    for word in full_response.split():
-                        yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-        except Exception as e:
-            logger.error(f"Stream error: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            return
-
-        if full_response and not already_verified:
-            evidence_text = "\n".join(filter(None, [
-                self._last_prepare_meta.get("memory_context", ""),
-                search_meta.get("context", ""),
-                build_tool_trace_context(tool_trace) if tool_trace else "",
-            ]))
-            note = await self._verify_response(message, full_response, evidence_text)
-            if note:
-                caveat = f"\n\n⚠️ Уточнение: {note}"
-                yield f"data: {json.dumps({'token': caveat})}\n\n"
-                full_response += caveat
-
-        self.history.append({"role": "user", "content": message})
-        if full_response:
-            self.history.append({"role": "assistant", "content": full_response})
-            self._save_history()
+            messages, search_meta = await self._prepare_messages(
+                message, web_search, image_base64, image_mime, reasoning
+            )
             uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
-            salience = 1.0 - uncertainty
-            await self.memory_service.add_episode(message, full_response, salience=salience)
 
-            active_goals = self._last_prepare_meta.get("active_goals", [])
-            for goal_dict in active_goals:
-                if goal_dict["description"].lower() in full_response.lower():
-                    for g in self.memory.goals:
-                        if g.description == goal_dict["description"]:
-                            g.confidence = min(1.0, g.confidence + 0.1)
-                            if g.confidence >= 0.9:
-                                new_obj = g.object.copy() if isinstance(g.object, dict) else {}
-                                new_obj["status"] = "completed"
-                                self.memory.store.update(g.gcn_id, {"object": new_obj, "confidence": g.confidence},
-                                                         self.user_id)
+            # === НОВОЕ: активное уточнение ===
+            if uncertainty > 0.7 and not web_search and not reasoning:
+                clarification = await self._ask_clarification(message, uncertainty)
+                if clarification:
+                    await push(f"data: {json.dumps({'token': clarification})}\n\n")
+                    await push("data: [DONE]\n\n")
+                    self.history.append({"role": "assistant", "content": clarification})
+                    self._save_history()
+                    return
+
+            full_response = ""
+            tool_trace: List[Dict[str, Any]] = []
+            already_verified = False
+            try:
+                if LM_STUDIO_USE_STREAM:
+                    history_tail = "\n".join(
+                        f"{m.get('role')}: {str(m.get('content'))[:200]}" for m in self.history[-6:]
+                    )
+                    if search_meta.get("search_requested"):
+                        history_tail = (
+                            "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри "
+                            f"вызов internal__web_search]\n{history_tail}" if history_tail else
+                            "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри вызов internal__web_search]"
+                        )
+                    tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
+                    tool_trace = tool_run.get("tool_trace", [])
+                    logger.info(
+                        f"ToolRouter decisions for '{message[:50]}': used_native={tool_run.get('used_native')}, trace_len={len(tool_trace)}")
+                    logger.info(f"Tool trace: {tool_trace}")
+
+                    # Обработка результатов поиска (из внутреннего web_search)
+                    if self._web_search_results_this_turn:
+                        seen_urls = set()
+                        merged_sources: List[Dict] = []
+                        context_parts: List[str] = []
+                        for r in self._web_search_results_this_turn:
+                            for s in r.get("sources", []):
+                                url = s.get("url")
+                                if url and url not in seen_urls:
+                                    seen_urls.add(url)
+                                    merged_sources.append(s)
+                            if r.get("context"):
+                                context_parts.append(r["context"])
+                        search_meta["web_search_used"] = True
+                        search_meta["sources"] = merged_sources
+                        search_meta["context"] = "\n\n---\n\n".join(context_parts)
+
+                        if EXTRACT_FACTS_FROM_SEARCH and search_meta["context"]:
+                            try:
+                                if EXTRACT_FACTS_WITH_LLM:
+                                    # Используем улучшенную версию _extract_facts_llm с метаданными
+                                    facts = await self._extract_facts_llm(search_meta["context"], merged_sources)
+                                else:
+                                    facts = self._extract_facts_from_text(search_meta["context"])
+                                for f in facts:
+                                    # f может быть строкой или словарём – адаптируем
+                                    text = f.get("text", f) if isinstance(f, dict) else f
+                                    await self.memory_service.remember(text, scope="global")
+                                if facts:
+                                    await self.memory_service.global_memory._schedule_save()
+                                logger.info(f"Extracted {len(facts)} facts from web search -> global memory")
+                            except Exception as e:
+                                logger.warning(f"Fact extraction error: {e}")
+
+                    if search_meta.get("sources"):
+                        await push(f"data: {json.dumps({'sources': search_meta['sources']})}\n\n")
+
+                    for t in tool_trace:
+                        if t.get("tool") == "internal__generate_image":
+                            result = t.get("result")
+                            if isinstance(result, str):
+                                try:
+                                    result = json.loads(result)
+                                except (json.JSONDecodeError, TypeError):
+                                    logger.warning(
+                                        f"generate_image: не удалось распарсить результат инструмента как JSON: {result[:200]!r}"
+                                    )
+                            logger.info(f"generate_image result: {result}")
+                            if isinstance(result, dict) and result.get("image_url"):
+                                image_url = result["image_url"]
+                                logger.info(f"Sending image_url event: {image_url}")
+                                await push(f"data: {json.dumps({'image_url': image_url})}\n\n")
+                                break
                             else:
-                                self.memory.store.update(g.gcn_id, {"confidence": g.confidence}, self.user_id)
-                            self.memory._sync_goal_from_gcn(g.gcn_id)
-                            break
-            await self.memory_service.private_memory._schedule_save()
+                                logger.warning("generate_image result does not contain image_url")
 
-            relevant = self._last_prepare_meta.get("relevant", [])
-            for fact_dict in relevant[:3]:
-                gcn_id = fact_dict.get("gcn_id")
-                if gcn_id:
-                    self.memory.hierarchy.add_to_working(gcn_id)
+                    if tool_trace:
+                        for t in tool_trace:
+                            await push(f"data: {json.dumps({'tool_call': t['tool'], 'result_preview': str(t['result'])[:200]})}\n\n")
+                            self.history.append({
+                                "role": "assistant",
+                                "content": f"[инструмент {t['tool']}] {str(t['result'])[:500]}"
+                            })
+                        messages = self._build_messages(
+                            message=message,
+                            web_search=web_search,
+                            search_context=search_meta.get("context", ""),
+                            memory_context=self._memory_context_for_rebuild(
+                                tool_trace, self._last_prepare_meta.get("memory_context", "")
+                            ),
+                            image_base64=image_base64,
+                            image_mime=image_mime,
+                            reasoning=reasoning,
+                            uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
+                            predictions=self._last_prepare_meta.get("predictions", []),
+                            goal_hint=self._last_prepare_meta.get("goal_hint", "")
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": build_tool_trace_context(tool_trace) + "\n\nТеперь дай финальный ответ пользователю."
+                        })
 
-        predictions = self._last_prepare_meta.get("predictions", [])
-        if predictions and full_response:
-            error = self._compute_prediction_error(predictions, full_response)
-            self.prediction_history.append({
-                "query": message,
-                "predicted": predictions,
-                "actual": full_response,
-                "error": error,
-                "timestamp": time.time()
-            })
-            if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
-                self.prediction_history.pop(0)
-            if error > 0.85 and len(full_response) > 50 and not full_response.strip().lower().startswith(
-                    ("привет", "здравствуйте", "hello")):
-                self._spawn_background_task(self._quick_correction(message, predictions, full_response),
-                                            name="quick-correction")
+                    async for token in call_llm_stream(messages):
+                        full_response += token
+                        await push(f"data: {json.dumps({'token': token})}\n\n")
+                else:
+                    response, inner_meta = await self.process_input(message, web_search, image_base64, image_mime,
+                                                                    reasoning)
+                    full_response = response
+                    already_verified = True
+                    if isinstance(inner_meta, dict) and inner_meta.get("sources"):
+                        search_meta["sources"] = inner_meta["sources"]
+                        await push(f"data: {json.dumps({'sources': inner_meta['sources']})}\n\n")
+                    if char_by_char is None:
+                        char_by_char = STREAM_CHAR_BY_CHAR
+                    if char_by_char:
+                        for ch in full_response:
+                            await push(f"data: {json.dumps({'token': ch})}\n\n")
+                            await asyncio.sleep(STREAM_CHAR_DELAY)
+                    else:
+                        for word in full_response.split():
+                            await push(f"data: {json.dumps({'token': word + ' '})}\n\n")
+            except Exception as e:
+                logger.error(f"Stream error: {e}")
+                await push(f"data: {json.dumps({'error': str(e)})}\n\n")
+                return
 
-        yield "data: [DONE]\n\n"
+            if full_response and not already_verified:
+                evidence_text = "\n".join(filter(None, [
+                    self._last_prepare_meta.get("memory_context", ""),
+                    search_meta.get("context", ""),
+                    build_tool_trace_context(tool_trace) if tool_trace else "",
+                ]))
+                note = await self._verify_response(message, full_response, evidence_text)
+                if note:
+                    caveat = f"\n\n⚠️ Уточнение: {note}"
+                    await push(f"data: {json.dumps({'token': caveat})}\n\n")
+                    full_response += caveat
+
+            self.history.append({"role": "user", "content": message})
+            if full_response:
+                self.history.append({"role": "assistant", "content": full_response})
+                self._save_history()
+                uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
+                salience = 1.0 - uncertainty
+                await self.memory_service.add_episode(message, full_response, salience=salience)
+
+                active_goals = self._last_prepare_meta.get("active_goals", [])
+                for goal_dict in active_goals:
+                    if goal_dict["description"].lower() in full_response.lower():
+                        for g in self.memory.goals:
+                            if g.description == goal_dict["description"]:
+                                g.confidence = min(1.0, g.confidence + 0.1)
+                                if g.confidence >= 0.9:
+                                    new_obj = g.object.copy() if isinstance(g.object, dict) else {}
+                                    new_obj["status"] = "completed"
+                                    self.memory.store.update(g.gcn_id, {"object": new_obj, "confidence": g.confidence},
+                                                             self.user_id)
+                                else:
+                                    self.memory.store.update(g.gcn_id, {"confidence": g.confidence}, self.user_id)
+                                self.memory._sync_goal_from_gcn(g.gcn_id)
+                                break
+                await self.memory_service.private_memory._schedule_save()
+
+                relevant = self._last_prepare_meta.get("relevant", [])
+                for fact_dict in relevant[:3]:
+                    gcn_id = fact_dict.get("gcn_id")
+                    if gcn_id:
+                        self.memory.hierarchy.add_to_working(gcn_id)
+
+            predictions = self._last_prepare_meta.get("predictions", [])
+            if predictions and full_response:
+                error = self._compute_prediction_error(predictions, full_response)
+                self.prediction_history.append({
+                    "query": message,
+                    "predicted": predictions,
+                    "actual": full_response,
+                    "error": error,
+                    "timestamp": time.time()
+                })
+                if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
+                    self.prediction_history.pop(0)
+                if error > 0.85 and len(full_response) > 50 and not full_response.strip().lower().startswith(
+                        ("привет", "здравствуйте", "hello")):
+                    self._spawn_background_task(self._quick_correction(message, predictions, full_response),
+                                                name="quick-correction")
+
+            await push("data: [DONE]\n\n")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception(f"_stream_response_worker: необработанная ошибка: {e}")
+            try:
+                await push(f"data: {json.dumps({'error': str(e)})}\n\n")
+            except Exception:
+                pass
+        finally:
+            await self._finish_generation(gen_id)
 
     # ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====
     async def generate_image(self, prompt: str, steps: Optional[int] = None,
