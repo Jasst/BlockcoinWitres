@@ -596,7 +596,7 @@ body {
 .messages {
   flex: 1;
   overflow-y: auto;
-  padding: 16px 16px 20px 16px;
+  padding: 16px 16px 160px 16px;
   scroll-behavior: smooth;
   display: flex;
   flex-direction: column;
@@ -767,7 +767,7 @@ body {
 #aiChatContainer .messages {
   flex: 1;
   overflow-y: auto;
-  padding: 16px 16px 20px 16px;
+  padding: 16px 16px 160px 16px;
   display: flex;
   flex-direction: column;
   gap: 12px;
