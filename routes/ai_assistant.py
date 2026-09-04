@@ -349,6 +349,20 @@ class CognitiveController:
         self.last_prediction_error = 0.0
         self._last_prepare_meta: Dict = {}
 
+        # Антиспам для авто-коррекции: предсказания predict_next() строятся по темам
+        # рабочей памяти и почти всегда НЕ совпадают с разговорными/мета-сообщениями
+        # ("ты не показываешь рассуждения", "почему ты так ответил") — prediction_error
+        # для них заведомо ≈ 1, и раньше любая такая реплика запускала фоновый
+        # research() по смыслу жалобы, который ничего не исправлял, а жег бюджет
+        # LLM-вызовов. Поэтому: не чаще одного срабатывания в 10 минут, только для
+        # вопросов (с "?") и не для обращений/жалоб к самому ассистенту.
+        self._last_quick_correction: float = 0.0
+        self._quick_correction_cooldown: float = 600.0
+        self._quick_correction_skip_markers = (
+            "ты не", "вы не", "почему ты", "почему вы", "исправь", "почини",
+            "не работает", "не показываешь", "покажи", "сделай так",
+        )
+
         # ИСПРАВЛЕНИЕ (унификация поиска — устранение двойного поиска):
         # раньше _prepare_messages сам синхронно вызывал deep_search, а затем
         # ToolRouter.run() (ReAct-цикл) мог НЕЗАВИСИМО решить снова вызвать
@@ -711,6 +725,13 @@ class CognitiveController:
         # цикла ниже (см. _consume_autonomous_llm_budget).
         self._autonomous_llm_calls = 0
         self._autonomous_budget_reset_at = time.time()
+
+        # Последний завершённый обмен (см. /ai/chat/last_response): нужен, чтобы
+        # после перезагрузки страницы фронтенд мог забрать ответ, который LLM
+        # досчитала, пока пользователь был не в чате (генерация идёт в фоновой
+        # Task независимо от HTTP-соединения, но attach-буфер после завершения
+        # уничтожается — поэтому фиксируем обмен отдельно).
+        self._last_exchange: Optional[Dict] = None
 
         logger.info(f"CognitiveController (GCN) initialized for {user_id[:16]}")
 
@@ -1298,6 +1319,7 @@ class CognitiveController:
             "memory_context": memory_context,
             "predictions": predictions,
             "uncertainty": uncertainty,
+            "goal_hint": goal_hint,
             "active_goals": active_goals,
             "relevant": relevant,
             "message": message,
@@ -1511,13 +1533,18 @@ class CognitiveController:
 
         self.history.append({"role": "user", "content": message})
         if response:
-            self.history.append({"role": "assistant", "content": response})
+            # ИСПРАВЛЕНИЕ: блок 💭 РАССУЖДЕНИЕ: ... --- не сохраняем в историю и память —
+            # иначе он уходит в контекст КАЖДОГО следующего запроса (съедает токены)
+            # и смешивается с реальными ответами при извлечении фактов.
+            stored_response = re.sub(r'💭\s*РАССУЖДЕНИЕ:\s*[\s\S]*?---\s*', '', response).strip() or response
+            self.history.append({"role": "assistant", "content": stored_response})
         self._save_history()
 
         if response:
             uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
             salience = 1.0 - uncertainty
-            await self.memory_service.add_episode(message, response, salience=salience)
+            await self.memory_service.add_episode(message, stored_response, salience=salience)
+            self._last_exchange = {"user": message, "assistant": response, "timestamp": time.time()}
 
             relevant = self._last_prepare_meta.get("relevant", [])
             for fact_dict in relevant[:3]:
@@ -1537,8 +1564,13 @@ class CognitiveController:
             })
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
-            if error > 0.85 and len(response) > 50 and not response.strip().lower().startswith(
-                    ("привет", "здравствуйте", "hello")):
+            if (error > 0.85
+                    and len(response) > 50
+                    and not response.strip().lower().startswith(("привет", "здравствуйте", "hello"))
+                    and "?" in message
+                    and not any(m in message.lower() for m in self._quick_correction_skip_markers)
+                    and time.time() - self._last_quick_correction >= self._quick_correction_cooldown):
+                self._last_quick_correction = time.time()
                 self._spawn_background_task(self._quick_correction(message, predictions, response),
                                             name="quick-correction")
 
@@ -1735,6 +1767,13 @@ class CognitiveController:
                 logger.warning(f"Contradiction verify LLM call failed ({fact_a.id},{fact_b.id}): {e}")
                 continue
 
+            # ИСПРАВЛЕНИЕ: пустой ответ LLM (сбой/таймаут LM Studio — call_llm возвращает "")
+            # — это не "плохой JSON", и спамить warning каждый цикл консолидации из-за
+            # этого не нужно. Реально невалидный (непустой) ответ логируем как раньше.
+            if not raw or not raw.strip():
+                logger.debug(f"Contradiction verify: пустой ответ LLM для пары ({fact_a.id},{fact_b.id}) — пропуск.")
+                continue
+
             verdict = parse_llm_json(raw)
             if not verdict or "relation" not in verdict:
                 logger.warning(f"Contradiction verify: bad JSON from LLM: {raw[:200]!r}")
@@ -1858,8 +1897,17 @@ class CognitiveController:
         if goal_hint:
             system_parts.append(f"Учитывай активные цели: {goal_hint}.")
         if reasoning:
+            # ИСПРАВЛЕНИЕ: раньше инструкция была одной размытой строкой, и локальные
+            # модели часто игнорировали формат (писали "Рассуждение:" без эмодзи,
+            # без разделителя "---") — фронтенд такое не распознавал, и режим
+            # "рассуждения" выглядел сломанным. Теперь формат задан строго и по шагам.
             system_parts.append(
-                "Перед ответом покажи рассуждения: начни с 💭 РАССУЖДЕНИЕ: и заканчивая ---, затем финальный ответ."
+                "Включён режим рассуждений. Строго следуй формату (без изменений):\n"
+                "1. Первая строка ответа — ровно: 💭 РАССУЖДЕНИЕ:\n"
+                "2. Далее — твои рассуждения по делу (несколько предложений или пунктов).\n"
+                "3. Затем отдельная строка, ровно: ---\n"
+                "4. Затем — финальный ответ пользователю.\n"
+                "Если режим рассуждений не включён — не используй этот формат."
             )
         if search_context:
             system_parts.append(
@@ -2228,11 +2276,14 @@ class CognitiveController:
 
             self.history.append({"role": "user", "content": message})
             if full_response:
-                self.history.append({"role": "assistant", "content": full_response})
+                # См. process_input: рассуждения не попадают в историю/память.
+                stored_response = re.sub(r'💭\s*РАССУЖДЕНИЕ:\s*[\s\S]*?---\s*', '', full_response).strip() or full_response
+                self.history.append({"role": "assistant", "content": stored_response})
                 self._save_history()
                 uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
                 salience = 1.0 - uncertainty
-                await self.memory_service.add_episode(message, full_response, salience=salience)
+                await self.memory_service.add_episode(message, stored_response, salience=salience)
+                self._last_exchange = {"user": message, "assistant": full_response, "timestamp": time.time()}
 
                 active_goals = self._last_prepare_meta.get("active_goals", [])
                 for goal_dict in active_goals:
@@ -2269,8 +2320,13 @@ class CognitiveController:
                 })
                 if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                     self.prediction_history.pop(0)
-                if error > 0.85 and len(full_response) > 50 and not full_response.strip().lower().startswith(
-                        ("привет", "здравствуйте", "hello")):
+                if (error > 0.85
+                        and len(full_response) > 50
+                        and not full_response.strip().lower().startswith(("привет", "здравствуйте", "hello"))
+                        and "?" in message
+                        and not any(m in message.lower() for m in self._quick_correction_skip_markers)
+                        and time.time() - self._last_quick_correction >= self._quick_correction_cooldown):
+                    self._last_quick_correction = time.time()
                     self._spawn_background_task(self._quick_correction(message, predictions, full_response),
                                                 name="quick-correction")
 
@@ -2455,6 +2511,75 @@ async def chat_with_ai(body: AIRequest, address: str = Depends(require_auth)):
         reasoning=body.reasoning
     )
     return {"reply": response, "meta": meta}
+
+@router.get("/chat/attach")
+async def attach_to_active_stream(address: str = Depends(require_auth)):
+    """
+    Подключение к УЖЕ ИДУЩЕЙ генерации (см. CognitiveController._active_stream):
+    сначала реплеит накопленный буфер с самого начала, затем live-хвост до
+    завершения. Фронтенд (ai-manager.js) использует это для восстановления
+    ответа, если пользователь вышел из чата или перезагрузил страницу, пока
+    LLM ещё печатала. Если генерации нет/она закончилась — отдаёт
+    no_active_generation, и клиент забирает готовый ответ через
+    /ai/chat/last_response (attach-буфер после завершения уничтожается).
+    """
+    assistant = await get_assistant(address)
+    state = assistant._active_stream
+    if not state or state.get("done"):
+        async def _none():
+            yield "data: " + json.dumps({"no_active_generation": True}) + "\n\n"
+        return StreamingResponse(_none(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    async def _gen():
+        queue: asyncio.Queue = asyncio.Queue()
+        # ВАЖНО: сначала подписываемся, ПОТОМ реплеим буфер — тогда чанк,
+        # отправленный между этими действиями, попадёт ровно один раз
+        # (push() пишет в буфер и в очереди неделимо, без await между ними).
+        state["subscribers"].add(queue)
+        try:
+            for chunk in list(state["buffer"]):
+                yield chunk
+            if state.get("done"):
+                yield "data: [DONE]\n\n"
+                return
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=900)
+                except asyncio.TimeoutError:
+                    break
+                if chunk is None:
+                    break
+                yield chunk
+            yield "data: [DONE]\n\n"
+        finally:
+            state["subscribers"].discard(queue)
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache,no-store,must-revalidate", "X-Accel-Buffering": "no"})
+
+@router.get("/chat/last_response")
+async def get_last_response(address: str = Depends(require_auth)):
+    """
+    Возвращает последний завершённый обмен (user -> assistant), чтобы после
+    перезагрузки страницы фронтенд мог подтянуть ответ, который LLM досчитала,
+    пока пользователь был не в чате (attach на это не способен — его буфер
+    уничтожается по завершении генерации).
+    """
+    assistant = await get_assistant(address)
+    exchange = getattr(assistant, "_last_exchange", None)
+    if not exchange:
+        # Fallback после перезапуска процесса: восстанавливаем из history.json
+        user_msg = next((i.get("content") for i in reversed(assistant.history)
+                         if i.get("role") == "user"), None)
+        asst_msg = next((i.get("content") for i in reversed(assistant.history)
+                         if i.get("role") == "assistant"
+                         and not str(i.get("content", "")).startswith("[инструмент")), None)
+        if user_msg and asst_msg:
+            exchange = {"user": user_msg, "assistant": asst_msg, "timestamp": None}
+    if not exchange:
+        return {"user": None, "assistant": None}
+    return exchange
 
 @router.post("/search")
 async def direct_search(body: dict, address: str = Depends(require_auth)):

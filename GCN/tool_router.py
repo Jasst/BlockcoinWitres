@@ -484,6 +484,16 @@ class ToolRouter:
                     f"- {t['tool']}({t['arguments']}) -> {str(t['result'])[:300]}" for t in tool_trace
                 )
                 decision = await self._decide_fallback(message, history_tail, results_text, temp=0.0)
+                # ИСПРАВЛЕНИЕ (crash "Stream error: 'NoneType' object has no attribute 'get'"):
+                # _decide_fallback возвращает None, когда LLM выдала пустой ответ или
+                # не-JSON (сбой LM Studio, таймаут). Раньше decision.get(...) сразу падал
+                # с AttributeError, исключение вылетало из ToolRouter.run и гасило весь
+                # ответ чата (в стрим-режиме это ловилось как "Stream error"). None =
+                # "модель не смогла принять решение" — просто завершаем ReAct-цикл
+                # и отвечаем без инструментов.
+                if decision is None:
+                    logger.debug("ToolRouter: fallback-решение недоступно (пустой/невалидный ответ LLM) — завершаю цикл.")
+                    break
                 tool_name = decision.get("tool")
                 if tool_name and decision.get("action") == "call_tool":
                     spec = self.registry.get(tool_name)

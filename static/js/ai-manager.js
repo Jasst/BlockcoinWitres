@@ -151,6 +151,7 @@ window.selectConversation = function(address, name, isGroup) {
     let _currentAbortController = null;
     let _currentAiSessionId = null;
     let _aiNameSet = false;
+    let _partialSaveTimer = null;
 
     const CONFIG = {
         historyMaxLength: 200,
@@ -204,6 +205,56 @@ window.selectConversation = function(address, name, isGroup) {
         _aiMessagesContainer.innerHTML = '';
         history.forEach(msg => _displayAiMessage(msg.text, msg.role === 'user', null, false));
         if (history.length === 0) _displayWelcome();
+    }
+
+    // ─── восстановление ответа, если пользователь вышел из чата или перезагрузил
+    // страницу до завершения генерации ───
+    async function _recoverUnfinishedAiMessage() {
+        const sessionId = _currentAiSessionId || 'default';
+        const history = _getStoredHistory(sessionId);
+        const lastUserIdx = history.map(m => m.role).lastIndexOf('user');
+        if (lastUserIdx === -1) { localStorage.removeItem('ai_stream_partial_' + sessionId); return; }
+        const hasReply = history.slice(lastUserIdx + 1).some(m => m.role === 'assistant');
+        if (hasReply) { localStorage.removeItem('ai_stream_partial_' + sessionId); return; }
+        const lastUserText = history[lastUserIdx].text;
+
+        // 1) Генерация ещё идёт на сервере (worker досчитывает её независимо
+        //    от соединения) — подхватим поток и достроим сообщение.
+        try {
+            const attached = await _attachToActiveAiStream();
+            _isSending = false;
+            if (attached) {
+                _currentStreamingMessage = null;
+                localStorage.removeItem('ai_stream_partial_' + sessionId);
+                return;
+            }
+        } catch (e) { console.warn('attach recovery failed', e); _isSending = false; }
+
+        // 2) Генерация уже завершилась, пока пользователя не было —
+        //    заберём готовый ответ с сервера.
+        try {
+            const res = await fetch('/ai/chat/last_response');
+            if (res.ok) {
+                const data = await res.json();
+                if (data && data.assistant && data.user === lastUserText) {
+                    _displayAiMessage(data.assistant, false, null, true);
+                    localStorage.removeItem('ai_stream_partial_' + sessionId);
+                    return;
+                }
+            }
+        } catch (e) { console.warn('last_response recovery failed', e); }
+
+        // 3) Сервер ничего не знает — покажем последний сохранённый обрывок.
+        const raw = localStorage.getItem('ai_stream_partial_' + sessionId);
+        if (raw) {
+            try {
+                const partial = JSON.parse(raw);
+                if (partial.text && partial.text.trim()) {
+                    _displayAiMessage(partial.text + '\n\n_⏸ Ответ оборван (страница была перезагружена)_', false, null, true);
+                }
+            } catch (e) {}
+            localStorage.removeItem('ai_stream_partial_' + sessionId);
+        }
     }
     // В ai-manager.js добавить:
 function removeAiSession(sessionId) {
@@ -395,7 +446,11 @@ function _clearAiHistory() {
     function _renderMarkdown(text) {
         if (!text) return '';
         try {
-            const reasoningRegex = /💭\s*РАССУЖДЕНИЕ:\s*([\s\S]*?)\s*---/i;
+            // ИСПРАВЛЕНИЕ: старый регекс требовал точное "💭 РАССУЖДЕНИЕ:", поэтому
+            // рассуждения, которые модель написала как "Рассуждение:", "**Рассуждение:**"
+            // или без эмодзи, не сворачивались в блок — режим выглядел сломанным.
+            // Теперь эмодзи и markdown-жирность опциональны, регистр любой.
+            const reasoningRegex = /(?:💭\s*)?\**\s*РАССУЖДЕНИЯ?\s*:?\s*\**\s*([\s\S]*?)\s*---/i;
             let mainText = text;
             let reasoningHtml = '';
             const match = reasoningRegex.exec(text);
@@ -584,9 +639,20 @@ function _clearAiHistory() {
     // ai-manager.js — функция _sendToAi (полностью, с исправлением)
     // ─── попытка переподключения к уже идущей на сервере генерации ───
     async function _attachToActiveAiStream() {
-        if (!_currentStreamingMessage) return false;
+        // ИСПРАВЛЕНИЕ: раньше функция сразу возвращала false без активного
+        // _currentStreamingMessage, поэтому её нельзя было использовать для
+        // восстановления ответа после перезагрузки страницы. Теперь при
+        // отсутствии сообщения создаём новое и достраиваем ответ в него.
+        const createdMessage = !_currentStreamingMessage;
+        if (createdMessage) {
+            _currentStreamingMessage = _displayAiMessage('', false, null, false);
+            _currentStreamingText = '';
+        }
         const markdownBody = _currentStreamingMessage.querySelector('.content .markdown-body');
-        if (!markdownBody) return false;
+        if (!markdownBody) {
+            if (createdMessage) _currentStreamingMessage = null;
+            return false;
+        }
 
         let response;
         try {
@@ -666,7 +732,11 @@ function _clearAiHistory() {
         if (noActiveGeneration && !firstTokenReceived) {
             // Нечего доигрывать: либо ответ уже досчитался и сохранился
             // раньше, чем мы переподключились, либо генерации не было —
-            // в обоих случаях это не ошибка.
+            // в обоих случаях это не ошибка. Пустое созданное сообщение убираем.
+            if (createdMessage && _currentStreamingMessage) {
+                _currentStreamingMessage.remove();
+                _currentStreamingMessage = null;
+            }
             return false;
         }
 
@@ -677,6 +747,7 @@ function _clearAiHistory() {
             _addImageDownloadButtons(markdownBody);
             _attachReasoningToggle(markdownBody);
             _saveAiMessage('assistant', _currentStreamingText, _currentAiSessionId);
+            localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default'));
             if (searchResults && searchResults.length) {
                 _displaySearchSources(searchResults);
             }
@@ -700,6 +771,7 @@ async function _sendToAi(messageText, imageFile) {
 
     if (_isSending) { _showToast('Подождите, предыдущий запрос обрабатывается', 'warning'); return; }
     if (!messageText.trim() && !imageFile) { _showToast('Введите сообщение или выберите изображение', 'warning'); return; }
+    try { localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default')); } catch (e) {}
 
     // Авто-название
     if (_currentAiSessionId && !_aiNameSet) {
@@ -856,6 +928,19 @@ async function _sendToAi(messageText, imageFile) {
                         }
                         _currentStreamingText += data.token;
 
+                        // Персистентный обрывок: если пользователь перезагрузит
+                        // страницу посреди генерации, при входе покажем хотя бы
+                        // накопленное (см. _recoverUnfinishedAiMessage, шаг 3).
+                        if (!_partialSaveTimer) {
+                            _partialSaveTimer = setTimeout(() => {
+                                _partialSaveTimer = null;
+                                try {
+                                    localStorage.setItem('ai_stream_partial_' + (_currentAiSessionId || 'default'),
+                                        JSON.stringify({ text: _currentStreamingText, ts: Date.now() }));
+                                } catch (e) {}
+                            }, 400);
+                        }
+
                         // Обновляем DOM с debounce (не чаще 50 мс)
                         if (!window._aiUpdateTimer) {
                             window._aiUpdateTimer = setTimeout(() => {
@@ -910,6 +995,7 @@ async function _sendToAi(messageText, imageFile) {
             _addImageDownloadButtons(markdownBody);
             _attachReasoningToggle(markdownBody);
             _saveAiMessage('assistant', _currentStreamingText, _currentAiSessionId);
+            localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default'));
             if (searchResults && searchResults.length) {
                 _displaySearchSources(searchResults);
             } else if (useWebSearch && !searchResults) {
@@ -1323,6 +1409,10 @@ async function _sendToAi(messageText, imageFile) {
     _aiImageGenBtn = document.getElementById('aiImageGenBtn');
     if (!_aiMessagesContainer) return;
     _loadAiHistory(_currentAiSessionId);
+    // ИСПРАВЛЕНИЕ: если последний ответ LLM не был дописан (пользователь вышел
+    // из чата или перезагрузил страницу посреди генерации) — достраиваем его
+    // с сервера: attach к идущей генерации, либо готовый ответ, либо обрывок.
+    _recoverUnfinishedAiMessage().catch(() => {});
     _setupAiUI();
     if (_aiStopBtn) _aiStopBtn.style.display = 'none';
 
