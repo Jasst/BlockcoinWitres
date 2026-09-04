@@ -83,7 +83,21 @@ async def _with_timeout(coro, tool_name: str, timeout: Optional[float] = None) -
 # ============================================================
 
 # Добавить глобальный словарь для отслеживания последних вызовов
-_last_commands = {}
+_last_commands: Dict[str, float] = {}
+# ИСПРАВЛЕНИЕ: ключ — f"{user_id}:{command}", запись никогда не удалялась —
+# при разнообразных командах от разных пользователей словарь рос без
+# ограничений в течение всего времени жизни процесса. Записи старше окна
+# дедупликации бесполезны, поэтому чистим их по ходу дела (без отдельного
+# фонового таска — просто при каждом новом вызове, амортизированно дёшево).
+_DEDUP_WINDOW_SECONDS = 10
+_LAST_COMMANDS_MAX_SIZE = 2000
+
+def _prune_last_commands(now: float) -> None:
+    if len(_last_commands) <= _LAST_COMMANDS_MAX_SIZE:
+        return
+    stale = [k for k, ts in _last_commands.items() if now - ts >= _DEDUP_WINDOW_SECONDS]
+    for k in stale:
+        _last_commands.pop(k, None)
 
 @mcp.tool()
 async def execute_command(
@@ -95,7 +109,8 @@ async def execute_command(
     # === ИСПРАВЛЕНИЕ: дедупликация быстрых повторных вызовов ===
     key = f"{user_id or DEFAULT_USER}:{command}"
     now = time.time()
-    if key in _last_commands and now - _last_commands[key] < 10:
+    _prune_last_commands(now)
+    if key in _last_commands and now - _last_commands[key] < _DEDUP_WINDOW_SECONDS:
         return {
             "status": "error",
             "error": "duplicate",
@@ -235,9 +250,9 @@ async def web_search(
 @mcp.tool()
 async def generate_image(
     prompt: str = Field(..., description="Описание изображения"),
-    steps: int = Field(20, description="Количество шагов диффузии"),
-    width: int = Field(512, description="Ширина изображения"),
-    height: int = Field(512, description="Высота изображения"),
+    steps: int = Field(20, description="Количество шагов диффузии", ge=1, le=60),
+    width: int = Field(512, description="Ширина изображения (px, будет округлена до кратной 8)", ge=64, le=1536),
+    height: int = Field(512, description="Высота изображения (px, будет округлена до кратной 8)", ge=64, le=1536),
     cfg_scale: float = Field(7.0, description="Масштаб CFG (guidance scale)"),
     sampler: str = Field("dpmpp_2m", description="Сэмплер"),
     seed: int = Field(-1, description="Зерно (-1 для случайного)"),

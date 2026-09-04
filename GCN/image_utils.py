@@ -58,6 +58,14 @@ def _round_to_multiple(value: int, multiple: int = 8) -> int:
         return multiple
     return max(multiple, round(value / multiple) * multiple)
 
+# ИСПРАВЛЕНИЕ: mcp_server_blockcoin.generate_image объявляет width/height/steps
+# как открытые int-параметры Field без ge/le — ничто не мешало клиенту
+# запросить, скажем, 100000x100000 и надолго (или насмерть) занять локальный
+# EasyDiffusion-инстанс. Верхние границы здесь — последний рубеж защиты,
+# на стороне реальной отправки запроса, а не только у вызывающего кода.
+_MAX_IMAGE_DIMENSION = 1536
+_MAX_IMAGE_STEPS = 60
+
 async def set_easy_diffusion_model(model_name: str) -> bool:
     """
     Устанавливает модель через /v1/sdapi/v1/options.
@@ -119,11 +127,22 @@ async def generate_image(
         prompt = prompt[:500] + "..."
 
     # 2. Формируем payload для генерации (БЕЗ override_settings)
+    # ИСПРАВЛЕНИЕ: _round_to_multiple() была написана именно для этого места
+    # (см. её docstring), но никогда здесь не вызывалась — width/height шли в
+    # payload сырыми. mcp_server_blockcoin.generate_image передаёт их как
+    # открытые Field-параметры без ge/le, поэтому кратность 8 и верхняя
+    # граница нужны здесь, на стороне реальной отправки в EasyDiffusion, а не
+    # только понадеявшись на вызывающий код.
+    safe_width = min(_MAX_IMAGE_DIMENSION, _round_to_multiple(
+        width if width is not None else EASYDIFFUSION_DEFAULT_WIDTH))
+    safe_height = min(_MAX_IMAGE_DIMENSION, _round_to_multiple(
+        height if height is not None else EASYDIFFUSION_DEFAULT_HEIGHT))
+    safe_steps = max(1, min(_MAX_IMAGE_STEPS, steps if steps is not None else EASYDIFFUSION_DEFAULT_STEPS))
     payload = {
         "prompt": prompt,
-        "steps": steps if steps is not None else EASYDIFFUSION_DEFAULT_STEPS,
-        "width": width if width is not None else EASYDIFFUSION_DEFAULT_WIDTH,
-        "height": height if height is not None else EASYDIFFUSION_DEFAULT_HEIGHT,
+        "steps": safe_steps,
+        "width": safe_width,
+        "height": safe_height,
         # Не добавляем override_settings – модель уже установлена через options
     }
     if cfg_scale is not None:

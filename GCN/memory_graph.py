@@ -278,6 +278,11 @@ class CognitiveMemory:
         # ---- Прогностическая модель (локально) ----
         self.predictive_matrix: DefaultDict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
         self.concept_examples: Dict[str, str] = {}
+        # ИСПРАВЛЕНИЕ (см. predict_next): кэш эмбеддингов примеров-концептов —
+        # нужен, чтобы predict_next мог находить похожие (а не только
+        # текстуально идентичные) концепты через косинусную близость, не
+        # пересчитывая эмбеддинги всех concept_examples на каждый вызов.
+        self.concept_embeddings: Dict[str, np.ndarray] = {}
         self.prediction_cache: Dict[str, List[int]] = {}
 
         # ---- Динамические веса (для гибридного поиска) ----
@@ -472,11 +477,23 @@ class CognitiveMemory:
     # ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
     @staticmethod
     def _extract_keywords(text: str) -> Set[str]:
-        words = re.findall(r'\b[a-zA-Zа-яА-ЯёЁ]{3,}\b', text.lower())
+        """
+        ИСПРАВЛЕНИЕ: text приводился к нижнему регистру ДО извлечения слов —
+        то есть регистр, по которому можно было бы отличить аббревиатуру
+        (ИИ, США, AI, US, ОС, БД) от обычного слова, терялся ещё до того, как
+        применялся минимум в 3 буквы. В итоге все 2-буквенные аббревиатуры
+        отсекались без исключений — а это как раз частые в технических
+        диалогах короткие, но информативные токены. Извлекаем аббревиатуры
+        (2+ буквы, все заглавные) из ОРИГИНАЛЬНОГО текста отдельной веткой,
+        обычные слова — как раньше, от 3 букв после приведения к нижнему
+        регистру.
+        """
+        acronyms = {w.lower() for w in re.findall(r'\b[A-ZА-ЯЁ]{2,}\b', text)}
+        words = set(re.findall(r'\b[a-zA-Zа-яА-ЯёЁ]{3,}\b', text.lower()))
         stopwords = {'это', 'все', 'так', 'вот', 'да', 'нет', 'или', 'и', 'с', 'на', 'по', 'для', 'из', 'о', 'к', 'у',
                      'же', 'бы', 'то', 'не', 'что', 'как', 'за', 'от', 'до', 'при', 'через', 'без', 'между', 'тоже',
                      'также', 'очень', 'можно', 'нужно', 'будет', 'если', 'тогда', 'потом', 'который', 'какой'}
-        return {w for w in words if w not in stopwords}
+        return {w for w in (words | acronyms) if w not in stopwords}
 
     @staticmethod
     def _compute_similarity(text1: str, text2: str) -> float:
@@ -820,32 +837,79 @@ class CognitiveMemory:
                 self.predictive_matrix[src_key][k] /= total
         self.concept_examples[src_key] = source_text[:200]
         self.concept_examples[tgt_key] = target_text[:200]
+        # ИСПРАВЛЕНИЕ (см. predict_next): кэшируем эмбеддинг примера при
+        # первом появлении ключа концепта — используется для приблизительного
+        # (не только точного) сопоставления при предсказании.
+        if self.use_embeddings:
+            if src_key not in self.concept_embeddings:
+                self.concept_embeddings[src_key] = self._get_embedding(source_text)
+            if tgt_key not in self.concept_embeddings:
+                self.concept_embeddings[tgt_key] = self._get_embedding(target_text)
         if len(self.predictive_matrix) > PREDICTIVE_MATRIX_MAX_SIZE:
             weakest = min(self.predictive_matrix.items(), key=lambda kv: sum(kv[1].values()))[0]
             del self.predictive_matrix[weakest]
             self.concept_examples.pop(weakest, None)
+            self.concept_embeddings.pop(weakest, None)
 
     def _rebuild_predictive_from_episodes(self):
+        """
+        ИСПРАВЛЕНИЕ: раньше здесь дополнительно делался
+        self.gcn_store.get_all_episodes(self.user_id) + сортировка — результат
+        нигде не читался (комментарий "для простоты" честно признавал, что
+        функция всё равно строит матрицу из self.episodic_memory). Тот же
+        self.episodic_memory уже восстановлен из GCN в _rebuild_caches_from_gcn,
+        который вызывается прямо перед этим методом в __init__ — повторный
+        запрос к GCN был чистой тратой времени без какого-либо эффекта.
+        """
         self.predictive_matrix.clear()
         self.concept_examples.clear()
-        # Используем эпизоды из GCN (MEMORY_EVENT)
-        episodes = self.gcn_store.get_all_episodes(self.user_id)
-        # Сортируем по времени
-        episodes.sort(key=lambda obj: obj.created)
-        # Группируем по парам: пользователь -> ассистент
-        # Для простоты берём подряд идущие: user -> assistant
-        # Но структура GCN позволяет найти связи, здесь упростим
-        # Лучше строить на основе локальных эпизодов, которые мы обновляем
+        self.concept_embeddings.clear()
         for ep in sorted(self.episodic_memory, key=lambda e: e.timestamp):
             self._update_predictive(ep.user_msg, ep.assistant_msg)
 
     async def predict_next(self, current_texts: List[str], top_k: int = 5) -> List[str]:
+        """
+        ИСПРАВЛЕНИЕ: раньше это был чистый точный поиск по ключу —
+        _concept_key() берёт 5 самых длинных слов текста, сортирует и
+        склеивает в строку; малейший перефраз (другой порядок слов, синоним,
+        добавленное слово) даёт другой ключ и предсказание НЕ срабатывает
+        вообще. На реальных разговорах (не FAQ с повторяющимися формулировками)
+        это означало, что predictive_matrix почти никогда не давал совпадений
+        сверх дословных повторов — "предсказательная модель", которая ничего
+        не обобщала. Теперь: точное совпадение ключа остаётся первым и
+        приоритетным сигналом (он дешёвый и надёжный), а если он не сработал —
+        используем уже накопленный кэш эмбеддингов concept_embeddings, чтобы
+        найти ближайшие по смыслу известные концепты (косинусная близость
+        выше CONCEPT_SIMILARITY_THRESHOLD) и предсказать по ним.
+        """
         candidates = defaultdict(float)
+        exact_hit = False
         for text in current_texts:
             key = self._concept_key(text)
             if key and key in self.predictive_matrix:
+                exact_hit = True
                 for nxt_key, prob in self.predictive_matrix[key].items():
                     candidates[nxt_key] += prob
+
+        if not exact_hit and self.use_embeddings and self.concept_embeddings:
+            for text in current_texts:
+                query_vec = self._get_embedding(text, is_query=True)
+                if query_vec is None or not np.any(query_vec):
+                    continue
+                q_norm = np.linalg.norm(query_vec)
+                if q_norm == 0:
+                    continue
+                for src_key, src_vec in self.concept_embeddings.items():
+                    if src_key not in self.predictive_matrix:
+                        continue
+                    src_norm = np.linalg.norm(src_vec)
+                    if src_norm == 0:
+                        continue
+                    sim = float(np.dot(query_vec, src_vec) / (q_norm * src_norm))
+                    if sim >= CONCEPT_SIMILARITY_THRESHOLD:
+                        for nxt_key, prob in self.predictive_matrix[src_key].items():
+                            candidates[nxt_key] += prob * sim  # взвешиваем похожестью, не как точный сигнал
+
         sorted_candidates = sorted(candidates.items(), key=lambda x: -x[1])[:top_k]
         return [self.concept_examples.get(k, k) for k, _ in sorted_candidates]
 
@@ -1093,12 +1157,22 @@ class CognitiveMemory:
         return result
 
     def _is_time_sensitive(self, query: str) -> bool:
-        """Эвристика для запросов, требующих актуальных данных."""
+        """Эвристика для запросов, требующих актуальных данных.
+
+        ИСПРАВЛЕНИЕ: список маркеров раньше содержал явные литералы годов
+        ('2024','2025','2026') — рабочие ровно 3 года, после чего эвристика
+        молча переставала ловить упоминания текущего/следующего года без
+        каких-либо ошибок или логов. Заменено на regex \\b\\d{4}\\b — ловит
+        любой 4-значный год в запросе, а не только захардкоженные значения.
+        """
         time_markers = [
             'сегодня', 'сейчас', 'курс', 'погода', 'новости', 'свежие',
-            'завтра', 'вчера', 'актуальные', 'последние', '2024', '2025', '2026'
+            'завтра', 'вчера', 'актуальные', 'последние'
         ]
-        return any(m in query.lower() for m in time_markers)
+        q = query.lower()
+        if any(m in q for m in time_markers):
+            return True
+        return bool(re.search(r'\b(19|20)\d{2}\b', q))
 
     def _is_factual(self, query: str) -> bool:
         """Эвристика для фактических запросов с числами или единицами."""
@@ -1197,6 +1271,17 @@ class CognitiveMemory:
 
             removed = self._remove_facts(to_remove)
             self._apply_decay()
+            # ИСПРАВЛЕНИЕ: GCN.MemoryStore.apply_decay() (затухание salience у
+            # объектов, к которым давно не обращались) существовал в коде, но
+            # нигде не вызывался — только затухание веса синапсов (self._apply_decay
+            # выше) реально происходило. Теперь салиентность на уровне GCN-объектов
+            # тоже участвует в цикле консолидации; с фиксом _mark_accessed выше
+            # last_accessed наконец обновляется при реальном извлечении, так что
+            # decay корректно щадит то, что действительно вспоминают.
+            try:
+                self.gcn_store.apply_decay(self.user_id)
+            except Exception as e:
+                logger.debug(f"GCN apply_decay failed for {self.user_id[:16]}: {e}")
             await self._schedule_save()
             logger.info(f"Light consolidation done for {self.user_id[:16]}: removed {removed} duplicates")
 
@@ -1587,7 +1672,49 @@ class GCNMemoryRouter:
         # релевантные — при сбое/пустом ответе всегда безопасно
         # откатываемся на исходный порядок по _score.
         reranked = await self._llm_rerank(query, unique, top_k)
-        return reranked if reranked is not None else unique[:top_k]
+        final = reranked if reranked is not None else unique[:top_k]
+        self._mark_accessed(final)
+        return final
+
+    def _mark_accessed(self, results: List[Dict]) -> None:
+        """
+        ИСПРАВЛЕНИЕ (память не "запоминала", что её вспоминали): record_access()
+        на стороне GCN и Fact.access_count раньше выставлялись ровно один раз —
+        в момент СОЗДАНИЯ факта (_add_fact) — и больше никогда не обновлялись
+        при реальном извлечении через retrieve()/retrieve_hybrid(). Из-за этого
+        были фактически мертвы сразу три механизма, которые читают эти поля:
+        (1) freshness в GCN.hybrid_retrieve() использует last_accessed вместо
+        created, но last_accessed никогда не менялся после создания;
+        (2) f.importance в deep_consolidation() учитывает f.access_count/10,
+        но access_count всегда оставался 0; (3) GCN.MemoryStore.apply_decay()
+        затухает salience только у объектов, к которым не обращались >7 дней —
+        без обновления last_accessed ВСЕ объекты выглядели как "давно не
+        вспоминавшиеся" сразу после создания. В сумме: факт, который
+        вспоминают каждый день, и факт, к которому ни разу не обратились после
+        сохранения, были неотличимы друг от друга для всей системы важности/
+        забывания. Помечаем как использованные только то, что реально попало
+        в финальную выдачу (после LLM-реранка), а не весь пул кандидатов.
+        """
+        scope_map = {
+            MemoryScope.PRIVATE.value: self.private_memory,
+            MemoryScope.SHARED.value: self.shared_memory,
+            MemoryScope.GLOBAL.value: self.global_memory,
+        }
+        for item in results:
+            memory = scope_map.get(item.get("scope"))
+            if memory is None:
+                continue
+            gcn_id = item.get("gcn_id")
+            if gcn_id:
+                try:
+                    memory.gcn_store.record_access(gcn_id, self.user_id)
+                except Exception as e:
+                    logger.debug(f"record_access failed for {gcn_id}: {e}")
+            local_id = item.get("id")
+            if local_id is not None:
+                fact = memory.facts_by_id.get(local_id)
+                if fact is not None:
+                    fact.access_count += 1
 
     async def _llm_rerank(self, query: str, candidates: List[Dict], top_k: int) -> Optional[List[Dict]]:
         """

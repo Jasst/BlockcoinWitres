@@ -90,7 +90,7 @@ def _now() -> float:
 SEARCH_TRIGGER_KEYWORDS = [
     'сегодня', 'сейчас', 'новости', 'курс', 'погода', 'свежие',
     'последние', 'завтра', 'найди', 'поищи', 'актуальные',
-    '2024', '2025', '2026', 'сколько стоит', 'какой сейчас', 'последние данные',
+    'сколько стоит', 'какой сейчас', 'последние данные',
     'статистика', 'результаты', 'кто победил', 'когда выйдет',
 ]
 
@@ -99,6 +99,13 @@ def needs_search_heuristic(message: str) -> bool:
     if re.search(r'https?://\S+', msg_lower):
         return True
     if any(kw in msg_lower for kw in SEARCH_TRIGGER_KEYWORDS):
+        return True
+    # ИСПРАВЛЕНИЕ: раньше конкретные годы ('2024','2025','2026') лежали прямо
+    # в SEARCH_TRIGGER_KEYWORDS — эвристика молча переставала бы ловить
+    # упоминания текущего года после 2026-го. Тот же класс бага уже был
+    # исправлен в memory_graph.py::_is_time_sensitive; здесь то же самое —
+    # любой правдоподобный 4-значный год тоже должен триггерить поиск.
+    if re.search(r'\b(19|20)\d{2}\b', msg_lower):
         return True
     if re.search(r'\b(сейчас|сегодня|вчера|завтра|этот год|этот месяц)\b', msg_lower):
         return True
@@ -694,6 +701,17 @@ class CognitiveController:
         self._last_activity_time = time.time()
         self._idle_consolidation_done = False
 
+        # ИСПРАВЛЕНИЕ: RESOURCE_BUDGET_LLM_CALLS был объявлен в config_ai.py,
+        # но нигде не читался — фоновые автономные циклы (планирование целей,
+        # авто-исследование, рефлексия) могли звать LLM без какого-либо
+        # верхнего предела в сутки. На self-hosted железе с одной локальной
+        # LLM это реальный риск: несколько простаивающих пользователей с
+        # активными целями могут забить очередь LM Studio чисто фоновой
+        # автономной активностью. Простой суточный бюджет на 3 фоновых
+        # цикла ниже (см. _consume_autonomous_llm_budget).
+        self._autonomous_llm_calls = 0
+        self._autonomous_budget_reset_at = time.time()
+
         logger.info(f"CognitiveController (GCN) initialized for {user_id[:16]}")
 
     async def _ensure_external_tools_registered(self):
@@ -783,6 +801,30 @@ class CognitiveController:
             self._reflection_task = asyncio.create_task(self._periodic_reflection())
             self._idle_task = asyncio.create_task(self._idle_consolidation())
 
+    def _consume_autonomous_llm_budget(self, n: int = 1) -> bool:
+        """
+        Суточный бюджет LLM-вызовов для фоновой автономной активности
+        (планирование целей, авто-исследование, рефлексия) — см.
+        RESOURCE_BUDGET_LLM_CALLS в config_ai.py. Возвращает True и
+        расходует бюджет, если лимит на сутки ещё не исчерпан; False —
+        если исчерпан (вызывающий фоновый цикл должен пропустить этот
+        проход и попробовать в следующий раз). Не ограничивает обычные
+        ответы в чате — только фоновые циклы, инициированные не
+        пользователем напрямую.
+        """
+        now = time.time()
+        if now - self._autonomous_budget_reset_at > 86400:
+            self._autonomous_llm_calls = 0
+            self._autonomous_budget_reset_at = now
+        if self._autonomous_llm_calls + n > RESOURCE_BUDGET_LLM_CALLS:
+            logger.info(
+                f"[Budget] Автономный LLM-бюджет исчерпан для {self.user_id[:16]} "
+                f"({self._autonomous_llm_calls}/{RESOURCE_BUDGET_LLM_CALLS} за сутки), пропуск фонового цикла"
+            )
+            return False
+        self._autonomous_llm_calls += n
+        return True
+
     # ----- Фоновые задачи (добавлена консолидация по бездействию) -----
     async def _periodic_consolidation(self):
         while True:
@@ -820,6 +862,8 @@ class CognitiveController:
     async def _periodic_planning(self):
         while True:
             await asyncio.sleep(LONG_TERM_PLANNER_INTERVAL)
+            if not self._consume_autonomous_llm_budget():
+                continue
             try:
                 await self._plan_goals()
             except Exception as e:
@@ -828,6 +872,13 @@ class CognitiveController:
     async def _periodic_research(self):
         while True:
             await asyncio.sleep(CURIOSITY_RESEARCH_INTERVAL)
+            # ИСПРАВЛЕНИЕ: AUTO_RESEARCH_ENABLED был объявлен в config_ai.py,
+            # но нигде не читался — цикл авто-исследования крутился
+            # безусловно, флаг фактически не давал его отключить.
+            if not AUTO_RESEARCH_ENABLED:
+                continue
+            if not self._consume_autonomous_llm_budget():
+                continue
             try:
                 await self._auto_research()
             except Exception as e:
@@ -889,8 +940,12 @@ class CognitiveController:
     async def _auto_research(self):
         # ИЗМЕНЕНИЕ: получение целей через сервис
         active_goals = await self.memory_service.get_goals()
+        # ИСПРАВЛЕНИЕ: порог был захардкожен как 0.5 прямо здесь, а
+        # CURIOSITY_UNCERTAINTY_THRESHOLD = 0.7 из config_ai.py, объявленный
+        # именно для этой цели, нигде не читался — то есть реальный порог
+        # запуска авто-исследования расходился с задокументированным.
         for goal_dict in active_goals:
-            if goal_dict["confidence"] < 0.5:
+            if goal_dict["confidence"] < CURIOSITY_UNCERTAINTY_THRESHOLD:
                 logger.info(f"Auto-research triggered for goal: {goal_dict['description']}")
                 await self.research(goal_dict["description"])
                 # Обновляем уверенность через сервис (пока нет метода update_goal, можно через private_memory)
@@ -950,6 +1005,8 @@ class CognitiveController:
     async def _periodic_reflection(self):
         while True:
             await asyncio.sleep(self.reflection_interval)
+            if not self._consume_autonomous_llm_budget():
+                continue
             try:
                 await self._run_reflection()
             except Exception as e:
@@ -2531,6 +2588,18 @@ async def shutdown_all():
             await assistant.shutdown()
         except Exception:
             pass
+    # ИСПРАВЛЕНИЕ: CognitiveController.shutdown() -> MemoryService.shutdown()
+    # теперь закрывает только приватную память вызвавшего пользователя (см.
+    # комментарий в memory_service.MemoryService.shutdown) — раньше это было
+    # не так, и shared/global сохранялись "бесплатно" как побочный эффект
+    # выгрузки любого пользователя, включая рутинную выгрузку простаивающих
+    # ассистентов, а не только остановку процесса. Здесь, при реальной
+    # остановке всего приложения, сохраняем их явно и ровно один раз.
+    try:
+        from GCN.memory_service import MemoryService
+        await MemoryService.shutdown_shared_global()
+    except Exception as e:
+        logger.error(f"Ошибка при закрытии общей/глобальной памяти: {e}")
 
 import atexit
 

@@ -301,9 +301,39 @@ class MemoryService:
         await self.private_memory.add_episode(user_msg, assistant_msg, salience)
 
     async def shutdown(self):
+        """
+        ИСПРАВЛЕНИЕ: раньше shutdown() одного пользователя закрывал private_memory
+        И shared_memory И global_memory. Но shared/global — это ПРОЦЕСС-ШИРОКИЕ
+        синглтоны (GCNMemoryRouter._get_shared_memory/_get_global_memory), общие
+        для всех пользователей, а не что-то принадлежащее этому MemoryService.
+        ai_assistant.py вызывает CognitiveController.shutdown() (который вызывает
+        этот метод) при обычной выгрузке простаивающего пользователя из LRU-кэша
+        (_evict_stale_assistants, по умолчанию раз в час простоя, или при
+        превышении лимита одновременных пользователей) — то есть в штатном
+        режиме, а не только при остановке процесса. Каждая такая выгрузка
+        отменяла фоновую _save_task и форсировала полное пересохранение
+        (включая перестройку FAISS-индекса) ОБЩЕЙ памяти для ВСЕХ пользователей
+        — просто потому, что один конкретный пользователь давно не писал в чат.
+        Теперь per-user shutdown трогает только private_memory. shared/global
+        должны закрываться ровно один раз, при остановке всего процесса — см.
+        shutdown_shared_global().
+        """
         await self.private_memory.shutdown()
-        await self.shared_memory.shutdown()
-        await self.global_memory.shutdown()
+
+    @staticmethod
+    async def shutdown_shared_global():
+        """
+        Закрывает общую (shared) и глобальную (global) память — процесс-широкие
+        синглтоны. Вызывать один раз при остановке всего приложения, а НЕ при
+        выгрузке отдельного простаивающего пользователя (см. комментарий в
+        shutdown() выше).
+        """
+        from GCN.memory_graph import GCNMemoryRouter
+        from GCN.config_ai import MEMORY_BASE_DIR
+        shared = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
+        glob = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
+        await shared.shutdown()
+        await glob.shutdown()
 
 
 # ===== Фабрика сервисов с LRU-кэшированием (аналогично CognitiveController) =====
@@ -314,9 +344,47 @@ _SERVICE_MAX_COUNT = 50
 
 async def get_memory_service(user_id: str) -> MemoryService:
     """Возвращает экземпляр MemoryService для пользователя, с выгрузкой неактивных."""
-    # При необходимости можно добавить логику выгрузки, как в ai_assistant
     if user_id not in _services:
         _services[user_id] = MemoryService(user_id)
         logger.info(f"MemoryService создан для {user_id[:16]}")
+        # ИСПРАВЛЕНИЕ: _SERVICE_MAX_IDLE/_SERVICE_MAX_COUNT были объявлены, но
+        # нигде не читались — MemoryService (со своим приватным
+        # CognitiveMemory: эмбеддинги, FAISS-индекс, факты) накапливался в
+        # словаре _services без ограничений для каждого нового user_id, в
+        # отличие от параллельного кэша _assistants в ai_assistant.py и кэша
+        # роутеров в mcp_server_blockcoin.py, у которых выгрузка уже была.
+        # Любой код, обращающийся к памяти через get_memory_service() напрямую
+        # (а не через CognitiveController), тёк по памяти процесса.
+        await _evict_stale_services(exclude_uid=user_id)
     _services_last_used[user_id] = time.time()
     return _services[user_id]
+
+
+async def _evict_stale_services(exclude_uid: Optional[str] = None) -> None:
+    now = time.time()
+    stale = [
+        uid for uid, ts in _services_last_used.items()
+        if uid != exclude_uid and now - ts > _SERVICE_MAX_IDLE
+    ]
+    for uid in stale:
+        service = _services.pop(uid, None)
+        _services_last_used.pop(uid, None)
+        if service is not None:
+            try:
+                await service.shutdown()  # только private_memory — см. MemoryService.shutdown()
+            except Exception as e:
+                logger.error(f"Ошибка при выгрузке MemoryService {uid[:16]}: {e}")
+            logger.info(f"MemoryService {uid[:16]} выгружен (простой > {_SERVICE_MAX_IDLE}с)")
+
+    while len(_services) > _SERVICE_MAX_COUNT:
+        oldest_uid = min(_services_last_used, key=_services_last_used.get, default=None)
+        if oldest_uid is None or oldest_uid == exclude_uid:
+            break
+        service = _services.pop(oldest_uid, None)
+        _services_last_used.pop(oldest_uid, None)
+        if service is not None:
+            try:
+                await service.shutdown()
+            except Exception as e:
+                logger.error(f"Ошибка при выгрузке MemoryService {oldest_uid[:16]}: {e}")
+        logger.info(f"MemoryService {oldest_uid[:16]} выгружен по лимиту количества (LRU, max={_SERVICE_MAX_COUNT})")
