@@ -68,6 +68,18 @@ _USER_ID_DESC = (
 
 # --- Вспомогательные функции ---
 async def _with_timeout(coro, tool_name: str, timeout: Optional[float] = None) -> Any:
+    """
+    ИСПРАВЛЕНИЕ: раньше ловился только asyncio.TimeoutError. Эта обёртка
+    используется 4 разными инструментами (execute_command, web_search,
+    generate_image, research_topic) как единая точка "безопасного" вызова —
+    но любое другое исключение внутри (сетевая ошибка, KeyError, что угодно
+    в глубине process_input/deep_search/gen_image) вылетало из тула
+    необработанным, вместо структурированного {"status": "error", ...},
+    которым отвечают все остальные инструменты в этом файле. Для клиента
+    MCP разница ощутимая: сырой traceback/протокольная ошибка вместо
+    предсказуемого JSON, который можно показать пользователю или обработать
+    программно.
+    """
     try:
         return await asyncio.wait_for(coro, timeout=timeout or _MCP_TOOL_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
@@ -76,6 +88,13 @@ async def _with_timeout(coro, tool_name: str, timeout: Optional[float] = None) -
             "status": "error",
             "error": "timeout",
             "message": f"'{tool_name}' не ответил за {timeout or _MCP_TOOL_TIMEOUT_SECONDS}с — операция прервана.",
+        }
+    except Exception as e:
+        logger.exception(f"Тул '{tool_name}' упал с исключением: {e}")
+        return {
+            "status": "error",
+            "error": "exception",
+            "message": f"'{tool_name}' завершился с ошибкой: {e}",
         }
 
 # ============================================================
@@ -122,9 +141,27 @@ async def execute_command(
     async def _run():
         return await assistant.process_input(command, web_search=allow_web_search)
     result = await _with_timeout(_run(), "execute_command")
-    if isinstance(result, dict) and result.get("error") == "timeout":
+    # ИСПРАВЛЕНИЕ: раньше проверялось только result.get("error") == "timeout" —
+    # теперь _with_timeout может вернуть структурированную ошибку и для любого
+    # другого исключения (см. _with_timeout), поэтому проверяем общий признак.
+    if isinstance(result, dict) and result.get("status") == "error":
         return result
     response, meta = result
+
+    # ИСПРАВЛЕНИЕ: если LLM вернула пустой ответ (сбой call_llm, см.
+    # llm_client.call_llm — при ошибке возвращает ""), пустая строка не
+    # содержит ни "ошибка", ни "не удалось", ни "404" — раньше это тихо
+    # проваливалось в ветку "status": "ok" с пустым result, то есть реальный
+    # сбой LLM выглядел для вызывающего MCP-клиента как успешное выполнение.
+    if not response or not response.strip():
+        return {
+            "status": "error",
+            "error": "empty_response",
+            "message": "Модель не вернула ответ (возможно, сбой локальной LLM).",
+            "meta": meta,
+            "user_id": user_id or DEFAULT_USER,
+            "timestamp": time.time()
+        }
 
     # === ИСПРАВЛЕНИЕ: если ответ содержит ошибку, возвращаем чёткий статус ===
     if "ошибка" in response.lower() or "не удалось" in response.lower() or "404" in response:
@@ -222,10 +259,11 @@ async def web_search(
         if isinstance(data, Exception):
             logger.warning(f"web_search: запрос '{q}' упал с ошибкой: {data}")
             continue
-        if isinstance(data, dict) and data.get("error") == "timeout":
-            # Таймаут одного из подзапросов не должен обрушивать остальные —
-            # возвращаем то, что успело собраться по другим запросам.
-            logger.warning(f"web_search: запрос '{q}' не уложился в таймаут")
+        if isinstance(data, dict) and data.get("status") == "error":
+            # Ошибка (таймаут или исключение) одного из подзапросов не должна
+            # обрушивать остальные — возвращаем то, что успело собраться по
+            # другим запросам.
+            logger.warning(f"web_search: запрос '{q}' завершился с ошибкой: {data.get('message')}")
             continue
         if not data.get("search_performed"):
             continue
@@ -275,7 +313,7 @@ async def generate_image(
         return fp, img
 
     run_result = await _with_timeout(_run(), "generate_image", timeout=_MCP_IMAGE_TOOL_TIMEOUT_SECONDS)
-    if isinstance(run_result, dict) and run_result.get("error") == "timeout":
+    if isinstance(run_result, dict) and run_result.get("status") == "error":
         return run_result
     final_prompt, image_b64 = run_result
     if not image_b64:
@@ -350,7 +388,7 @@ async def research_topic(
         "research_topic",
         timeout=_MCP_RESEARCH_TOOL_TIMEOUT_SECONDS
     )
-    if isinstance(result, dict) and result.get("error") == "timeout":
+    if isinstance(result, dict) and result.get("status") == "error":
         return result
     return {
         "topic": topic,
