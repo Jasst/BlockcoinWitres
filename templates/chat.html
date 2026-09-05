@@ -569,6 +569,9 @@
     border-radius: 24px;
     overflow: hidden;
   }
+  /* ИСПРАВЛЕНО: правило выше перекрывало класс .hidden (ID > class),
+     из-за чего AI-чат нельзя было скрыть */
+  #aiChatContainer.hidden { display: none !important; }
 
   #aiChatContainer .messages {
     background: transparent;
@@ -585,6 +588,12 @@
       height: calc(100vh - 70px);
       max-height: none;
       gap: 10px;
+    }
+    /* ИСПРАВЛЕНО: когда чат открыт на мобильном, навигация скрыта —
+       чат должен занимать весь экран, иначе снизу пустая полоса */
+    body.chat-open .chat-layout {
+      height: 100vh;
+      height: 100dvh;
     }
     .conversations-panel {
       width: 100%;

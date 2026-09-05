@@ -129,9 +129,12 @@ class KnowledgeIngestion:
     - слияние канонических утверждений
     """
     def __init__(self, store: MemoryStore, similarity_threshold: float = 0.85,
-                 scope: Optional["MemoryScope"] = None):
+                 scope: Optional["MemoryScope"] = None,
+                 contradiction_llm_verify: bool = True):
         self.store = store
         self.similarity_threshold = similarity_threshold
+        # ИНТЕЛЛЕКТ-ПАКЕТ (D): LLM-подтверждение эвристических противоречий
+        self.contradiction_llm_verify = contradiction_llm_verify
         # УЛУЧШЕНИЕ: раньше _find_similar/_keyword_search были жёстко зашиты на
         # MemoryScope.GLOBAL, поэтому дедуп/усиление/обнаружение противоречий
         # работали ТОЛЬКО для глобальной памяти — PRIVATE и SHARED росли без
@@ -205,6 +208,14 @@ class KnowledgeIngestion:
         elif similarity > 0.7:
             # Похожи, но есть различия — проверяем противоречие
             if self._is_contradictory(candidate, best):
+                # ИНТЕЛЛЕКТ-ПАКЕТ (D): эвристика по отрицаниям даёт много
+                # ложных срабатываний; подтверждаем вторым LLM-проходом.
+                # verdict=False (не противоречат) -> усиливаем существующий;
+                # verdict=True/None (противоречат/проверить не удалось) ->
+                # прежнее поведение: регистрируем противоречие.
+                verdict = self._verify_contradiction_llm(candidate.subject, best.subject)
+                if verdict is False:
+                    return self._reinforce(best, candidate, actor)
                 # Регистрируем противоречие
                 self.store.register_contradiction(candidate.id, best.id, actor)
                 # Понижаем уверенность обоих (уже есть в register_contradiction)
@@ -267,6 +278,24 @@ class KnowledgeIngestion:
         # -------------------------------------------------
 
         return existing.id
+
+    def _verify_contradiction_llm(self, text_a: str, text_b: str) -> Optional[bool]:
+        """
+        ИНТЕЛЛЕКТ-ПАКЕТ (D): LLM-подтверждение эвристического противоречия.
+        True — противоречат; False — не противоречат (ложное срабатывание
+        эвристики, знания усиливаются); None — проверить не удалось, звать
+        повторно не пытаемся, вызывающий код доверяет эвристике.
+        Синхронный, т.к. submit_candidate() синхронный; LLM-запрос уходит
+        через ThreadPoolExecutor с жёстким таймаутом (см. GCN/intellect.py).
+        """
+        if not self.contradiction_llm_verify:
+            return None
+        try:
+            from GCN.intellect import verify_contradiction_sync
+            return verify_contradiction_sync(text_a, text_b)
+        except Exception as e:
+            logger.debug(f"LLM-верификация противоречия недоступна: {e}")
+            return None
 
     def _is_contradictory(self, a: KnowledgeObject, b: KnowledgeObject) -> bool:
         # Простая эвристика: если одно содержит отрицание, а другое нет, и они о схожем предмете

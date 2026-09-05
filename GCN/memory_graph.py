@@ -105,6 +105,7 @@ except ImportError:
     RERANK_ENABLED = True
     RERANK_CANDIDATE_MULTIPLIER = 3
     RERANK_MAX_CANDIDATES = 20
+    MAX_RETRIEVE_SUBQUERIES = 3
 
 
 # =====================================================================
@@ -1612,10 +1613,16 @@ class GCNMemoryRouter:
         self.shared_memory.reload_if_stale()
         self.global_memory.reload_if_stale()
 
-    async def retrieve(self, query: str, top_k: int = 7, include_private: bool = True) -> List[Dict]:
+    async def retrieve(self, query: str, top_k: int = 7, include_private: bool = True,
+                       subqueries: Optional[List[str]] = None) -> List[Dict]:
         """
         Объединённый поиск по всем доступным слоям с ранжированием.
+        ИНТЕЛЛЕКТ-ПАКЕТ (C): если переданы subqueries — каждый подзапрос ищется
+        отдельно, результаты сливаются с бустом мультихитов (см.
+        _retrieve_subqueries). Если subqueries=None — прежнее поведение.
         """
+        if subqueries:
+            return await self._retrieve_subqueries(query, subqueries, top_k, include_private)
         self.refresh(include_private=include_private)
         private_results = []
         shared_results = []
@@ -1671,6 +1678,43 @@ class GCNMemoryRouter:
         # pool целиком (с запасом) и выбрать + упорядочить только реально
         # релевантные — при сбое/пустом ответе всегда безопасно
         # откатываемся на исходный порядок по _score.
+        reranked = await self._llm_rerank(query, unique, top_k)
+        final = reranked if reranked is not None else unique[:top_k]
+        self._mark_accessed(final)
+        return final
+
+    async def _retrieve_subqueries(self, query: str, subqueries: List[str],
+                                   top_k: int, include_private: bool) -> List[Dict]:
+        """
+        ИНТЕЛЛЕКТ-ПАКЕТ (C): retrieval по подзапросам. Каждый подзапрос идёт
+        через обычный multi-scope retrieve() (private+shared+global, rerank,
+        grounded-концепты — весь существующий пайплайн), затем результаты
+        сливаются по gcn_id: факт, найденный по нескольким подзапросам,
+        получает буст _score (+0.07 за каждый доп. хит) — это устраняет
+        главный недостаток single-embedding поиска по составным вопросам,
+        когда релевантный факт "размазан" между несколькими смысловыми
+        частями запроса. Финальный порядок — один общий LLM-реранк уже по
+        исходному запросу; при его сбое — по _score.
+        """
+        merged: Dict[str, Dict] = {}
+        for sub in [s for s in subqueries if s][:MAX_RETRIEVE_SUBQUERIES]:
+            try:
+                part = await self.retrieve(sub, top_k=top_k, include_private=include_private)
+            except Exception as e:
+                logger.debug(f"subquery retrieve failed for '{sub[:60]}': {e}")
+                continue
+            for item in part:
+                key = item.get("gcn_id") or item.get("text", "")
+                if not key:
+                    continue
+                if key in merged:
+                    merged[key]["_score"] = min(1.0, merged[key].get("_score", 0.0) + 0.07)
+                    merged[key]["_hits"] = merged[key].get("_hits", 1) + 1
+                else:
+                    item["_hits"] = 1
+                    merged[key] = item
+
+        unique = sorted(merged.values(), key=lambda x: x.get("_score", 0.0), reverse=True)
         reranked = await self._llm_rerank(query, unique, top_k)
         final = reranked if reranked is not None else unique[:top_k]
         self._mark_accessed(final)

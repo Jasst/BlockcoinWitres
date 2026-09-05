@@ -35,6 +35,10 @@ from GCN.llm_client import call_llm, call_llm_raw, call_llm_stream
 from GCN.web_search import deep_search, fetch_url
 from GCN.image_utils import enhance_prompt, generate_image
 from GCN.tool_router import ToolRegistry, ToolRouter, build_tool_trace_context
+# ИНТЕЛЛЕКТ-ПАКЕТ: заземлённые ответы, санитайзер фактов, подзапросный retrieval,
+# критик по плану (см. GCN/intellect.py)
+from GCN import intellect as intellect_mod
+from GCN.config_ai import GROUNDED_ANSWER_ENABLED, PLAN_CRITIC_ENABLED
 
 # ИЗМЕНЕНИЕ: импорт MemoryService и фабрики
 from GCN.memory_service import MemoryService, get_memory_service
@@ -125,9 +129,14 @@ def is_factual_query(message: str) -> bool:
 async def rewrite_query(llm_caller, original: str) -> str:
     if not ENABLE_QUERY_REWRITE:
         return original
+    today = datetime.now(timezone.utc).strftime("%d.%m.%Y")
     prompt = (
+        f"Сегодня {today}. "
         f"Перепиши вопрос в виде ОДНОГО короткого поискового запроса (3-10 слов), "
-        f"оптимизированного для DuckDuckGo. Убери лишнее. Ответь ТОЛЬКО запросом, без пояснений.\n\n"
+        f"оптимизированного для DuckDuckGo. Убери лишнее, но ОБЯЗАТЕЛЬНО сохрани "
+        f"указания на актуальность (сегодня/сейчас/курс/погода/новости): если вопрос "
+        f"чувствителен ко времени — подставь сегодняшнюю дату {today} прямо в запрос. "
+        f"Ответь ТОЛЬКО запросом, без пояснений.\n\n"
         f"Вопрос: {original}"
     )
     try:
@@ -427,6 +436,14 @@ class CognitiveController:
             return f"Цель добавлена: {description} (приоритет: {priority})"
 
         async def _internal_web_search(args: Dict) -> str:
+            # Единый поиск за ход: если детерминированный поиск уже выполнен
+            # (см. _force_search_if_requested), не дёргаем DDG повторно, а
+            # отдаём накопленный контекст — модель получает те же источники.
+            if self._web_search_results_this_turn:
+                acc = self._web_search_results_this_turn[-1]
+                acc_ctx = acc.get("context", "")
+                return (f"Поиск уже выполнен в этом ходе. Найдено "
+                        f"{len(acc.get('sources', []))} источников.\n{acc_ctx[:2500]}")
             # ПУНКТ №2 (многошаговый/параллельный поиск): раньше инструмент
             # принимал ровно один query. Для составных запросов ("сравни курс
             # доллара и евро", разложенных _plan_subtasks на несколько
@@ -735,6 +752,53 @@ class CognitiveController:
 
         logger.info(f"CognitiveController (GCN) initialized for {user_id[:16]}")
 
+    async def _force_search_if_requested(self, message: str, search_meta: Dict) -> None:
+        """
+        Детерминированный веб-поиск (фикс «веб-поиск не всегда работает»).
+
+        Раньше даже при web_search=True (кнопка «Интернет» во фронтенде) решение
+        «искать или нет» принимала локальная LLM внутри ToolRouter: если модель
+        не смогла сформировать tool_call (или невалидный JSON в fallback-режиме),
+        поиск молча не выполнялся, а ответ генерировался из памяти — при этом
+        выглядело всё так, будто поиск сработал.
+
+        Теперь при явном запросе (web_search=True или прямая ссылка в сообщении)
+        поиск выполняется сразу и безусловно, ДО ReAct-цикла. Результаты копятся
+        в self._web_search_results_this_turn и подхватываются существующим кодом
+        слияния (process_input / _stream_response_worker), а повторный вызов
+        internal__web_search самой моделью отдаёт уже накопленный контекст без
+        второго DDG-запроса (см. _internal_web_search).
+
+        Дополнительно оживлён мёртвый код: rewrite_query() и MAX_SEARCH_ATTEMPTS
+        раньше объявлялись, но нигде не вызывались. Если DDG вернул пусто,
+        делаем до MAX_SEARCH_ATTEMPTS повторов с переписанной формулировкой.
+        """
+        if self._web_search_results_this_turn:
+            return
+        has_url = bool(re.search(r'https?://\S+', message))
+        if not (search_meta.get("search_requested") or has_url):
+            return
+
+        # Для прямой ссылки повторы бессмысленны (deep_search читает URL напрямую)
+        attempts = 1 if has_url else max(1, MAX_SEARCH_ATTEMPTS)
+        for attempt in range(attempts):
+            query = message if has_url else await rewrite_query(call_llm, message)
+            try:
+                data = await deep_search(query, max_results=5)
+            except Exception as e:
+                logger.warning(f"[ForcedSearch] попытка {attempt + 1}/{attempts}: исключение {e}")
+                continue
+            if data.get("search_performed") and data.get("context"):
+                self._web_search_results_this_turn.append({
+                    "queries": [query],
+                    "sources": data.get("sources", []),
+                    "context": data["context"],
+                })
+                logger.info(f"[ForcedSearch] поиск выполнен с {attempt + 1}-й попытки: '{query[:80]}'")
+                return
+            logger.info(f"[ForcedSearch] попытка {attempt + 1}/{attempts}: пусто для '{query[:80]}'")
+        logger.warning(f"[ForcedSearch] поиск не дал результатов за {attempts} попыток")
+
     async def _ensure_external_tools_registered(self):
         """Регистрирует внешние MCP-инструменты в ToolRegistry, если они ещё не зарегистрированы."""
         if self._external_tools_registered:
@@ -981,6 +1045,45 @@ class CognitiveController:
         await self.memory_service.private_memory._schedule_save()
 
     # ===== РЕФЛЕКСИЯ =====
+    async def _run_plan_critic(self, message: str, response: str) -> str:
+        """
+        ИНТЕЛЛЕКТ-ПАКЕТ (E): сверяет готовый ответ с планом подзадач
+        (ToolRouter._last_plan). Если критик нашёл пропущенные пункты —
+        один дополнительный проход генерации с просьбой дополнить ответ.
+        При любом сбое возвращает исходный ответ без изменений.
+        """
+        if not PLAN_CRITIC_ENABLED or not response:
+            return response
+        plan = getattr(self.tool_router, "_last_plan", "") or ""
+        if not plan:
+            return response
+        try:
+            missed = await intellect_mod.plan_critic(message, plan, response)
+        except Exception as e:
+            logger.debug(f"plan_critic failed: {e}")
+            return response
+        if not missed:
+            return response
+        logger.info(f"[PlanCritic] Пропущены пункты плана: {missed}")
+        try:
+            extra = await call_llm(
+                [{"role": "user", "content": (
+                    f"Твой предыдущий ответ пользователю не раскрыл части его запроса.\n"
+                    f"Запрос: {message}\nПлан подзадач: {plan}\n"
+                    f"Пропущено: {missed}\n\n"
+                    "Дополни ответ, закрыв пропущенные пункты. Пиши ТОЛЬКО "
+                    "дополнение, не повторяй уже сказанное. Если для пункта нет "
+                    "данных — прямо скажи об этом."
+                )}],
+                temp=0.5, max_tokens=700
+            )
+        except Exception as e:
+            logger.debug(f"PlanCritic добор не удался: {e}")
+            return response
+        if extra and extra.strip():
+            response = f"{response}\n\n{extra.strip()}"
+        return response
+
     async def _verify_response(self, message: str, response: str, evidence_text: str) -> Optional[str]:
         """
         ПУНКТ №3 (верификация/критик): дешёвый второй проход LLM после
@@ -1225,7 +1328,11 @@ class CognitiveController:
         sources = []
 
         # ИЗМЕНЕНИЕ: поиск через сервис
-        relevant = await self.memory_service.recall(message, top_k=7)
+        # ИНТЕЛЛЕКТ-ПАКЕТ (C): составной запрос разбиваем на подзапросы и
+        # ищем каждый отдельно (слияние с бустом мультихитов — в
+        # GCNMemoryRouter._retrieve_subqueries).
+        subqueries = await intellect_mod.make_subqueries(message)
+        relevant = await self.memory_service.recall(message, top_k=7, subqueries=subqueries or None)
         memory_context = ""
         # ИСПРАВЛЕНИЕ (причина №2 — "путаница" памяти в браузерном чате, которой
         # нет в MCP-режиме): отсекаем низкорелевантные результаты по порогу.
@@ -1308,7 +1415,8 @@ class CognitiveController:
             reasoning=reasoning,
             uncertainty=uncertainty,
             predictions=predictions,
-            goal_hint=goal_hint
+            goal_hint=goal_hint,
+            sources=sources
         )
 
         search_meta["context"] = search_context
@@ -1436,6 +1544,11 @@ class CognitiveController:
         )
         uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
 
+        # Детерминированный поиск: если пользователь явно запросил интернет
+        # (web_search=True) или дал прямую ссылку — ищем сразу, не полагаясь
+        # на решение локальной LLM вызвать internal__web_search.
+        await self._force_search_if_requested(message, search_meta)
+
         # === НОВОЕ: активное уточнение ===
         if uncertainty > 0.7 and not web_search and not reasoning:
             clarification = await self._ask_clarification(message, uncertainty)
@@ -1483,10 +1596,12 @@ class CognitiveController:
                         facts = await self._extract_facts_llm(search_context, sources)
                     else:
                         facts = self._extract_facts_from_text(search_context)
-                    for f in facts:
-                        # f может быть строкой или словарём – адаптируем
-                        text = f.get("text", f) if isinstance(f, dict) else f
-                        await self.memory_service.remember(text, scope="global")
+                    # ИНТЕЛЛЕКТ-ПАКЕТ (B): санитайзер — факты из поиска больше
+                    # не летят в global с фиксированным 0.9. Градация
+                    # scope/confidence по фактологичности и доверию домена.
+                    sanitized = intellect_mod.sanitize_search_facts(facts, merged_sources)
+                    for text, scope, conf in sanitized:
+                        await self.memory_service.remember(text, scope=scope, confidence=conf)
                     if facts:
                         await self.memory_service.global_memory._schedule_save()
                     logger.info(f"Extracted {len(facts)} facts from web search -> global memory")
@@ -1503,6 +1618,7 @@ class CognitiveController:
                 message=message,
                 web_search=web_search,
                 search_context=search_meta.get("context", ""),
+                sources=search_meta.get("sources"),
                 memory_context=self._memory_context_for_rebuild(
                     tool_trace, self._last_prepare_meta.get("memory_context", "")
                 ),
@@ -1530,6 +1646,9 @@ class CognitiveController:
             note = await self._verify_response(message, response, evidence_text)
             if note:
                 response = f"{response}\n\n⚠️ Уточнение: {note}"
+            # ИНТЕЛЛЕКТ-ПАКЕТ (E): критик по плану подзадач + (A) гарантия ссылок
+            response = await self._run_plan_critic(message, response)
+            response = intellect_mod.ensure_citations(response, search_meta.get("sources") or [])
 
         self.history.append({"role": "user", "content": message})
         if response:
@@ -1852,7 +1971,8 @@ class CognitiveController:
     def _build_messages(self, message: str, web_search: bool, search_context: str,
                         memory_context: str, image_base64: Optional[str],
                         image_mime: Optional[str], reasoning: bool,
-                        uncertainty: float, predictions: List[str], goal_hint: str) -> List[Dict]:
+                        uncertainty: float, predictions: List[str], goal_hint: str,
+                        sources: Optional[List[Dict]] = None) -> List[Dict]:
         """Строит сообщения для LLM с разделением концептов и фактов."""
         # Защита от None
         memory_context = memory_context or ""
@@ -1912,6 +2032,11 @@ class CognitiveController:
         if search_context:
             system_parts.append(
                 "Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
+        # ИНТЕЛЛЕКТ-ПАКЕТ (A): заземлённый синтез — только контекст + ссылки [N]
+        if (search_context or memory_context) and GROUNDED_ANSWER_ENABLED:
+            gb = intellect_mod.grounded_system_block()
+            if gb:
+                system_parts.append(gb)
         elif web_search:
             system_parts.append(
                 "Пользователю нужны актуальные данные из интернета (курсы, цены, новости, свежие "
@@ -1936,6 +2061,11 @@ class CognitiveController:
                 f"=== ДАННЫЕ ИЗ ИНТЕРНЕТА (актуальны на {datetime.now(timezone.utc).strftime('%Y-%m-%d')}) ===\n\n"
                 f"{search_context}\n\n=== КОНЕЦ ДАННЫХ ==="
             )
+        # ИНТЕЛЛЕКТ-ПАКЕТ (A): явный пронумерованный список источников для ссылок [N]
+        if sources and (search_context or memory_context) and GROUNDED_ANSWER_ENABLED:
+            sb = intellect_mod.sources_block(sources)
+            if sb:
+                user_blocks.append(sb)
         user_blocks.append(f"Вопрос пользователя: {message}")
         user_text = "\n\n".join(user_blocks)
 
@@ -2125,6 +2255,9 @@ class CognitiveController:
             )
             uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
 
+            # См. process_input: детерминированный поиск до ReAct-цикла.
+            await self._force_search_if_requested(message, search_meta)
+
             # === НОВОЕ: активное уточнение ===
             if uncertainty > 0.7 and not web_search and not reasoning:
                 clarification = await self._ask_clarification(message, uncertainty)
@@ -2179,10 +2312,10 @@ class CognitiveController:
                                     facts = await self._extract_facts_llm(search_meta["context"], merged_sources)
                                 else:
                                     facts = self._extract_facts_from_text(search_meta["context"])
-                                for f in facts:
-                                    # f может быть строкой или словарём – адаптируем
-                                    text = f.get("text", f) if isinstance(f, dict) else f
-                                    await self.memory_service.remember(text, scope="global")
+                                # ИНТЕЛЛЕКТ-ПАКЕТ (B): санитайзер фактов из поиска
+                                sanitized = intellect_mod.sanitize_search_facts(facts, merged_sources)
+                                for text, scope, conf in sanitized:
+                                    await self.memory_service.remember(text, scope=scope, confidence=conf)
                                 if facts:
                                     await self.memory_service.global_memory._schedule_save()
                                 logger.info(f"Extracted {len(facts)} facts from web search -> global memory")
@@ -2222,6 +2355,7 @@ class CognitiveController:
                             message=message,
                             web_search=web_search,
                             search_context=search_meta.get("context", ""),
+                            sources=search_meta.get("sources"),
                             memory_context=self._memory_context_for_rebuild(
                                 tool_trace, self._last_prepare_meta.get("memory_context", "")
                             ),
@@ -2273,6 +2407,15 @@ class CognitiveController:
                     caveat = f"\n\n⚠️ Уточнение: {note}"
                     await push(f"data: {json.dumps({'token': caveat})}\n\n")
                     full_response += caveat
+                # ИНТЕЛЛЕКТ-ПАКЕТ (E/A): критик по плану + гарантия ссылок [N]
+                updated_resp = await self._run_plan_critic(message, full_response)
+                if updated_resp != full_response:
+                    await push(f"data: {json.dumps({'token': updated_resp[len(full_response):]})}\n\n")
+                    full_response = updated_resp
+                cited_resp = intellect_mod.ensure_citations(full_response, search_meta.get("sources") or [])
+                if cited_resp != full_response:
+                    await push(f"data: {json.dumps({'token': cited_resp[len(full_response):]})}\n\n")
+                    full_response = cited_resp
 
             self.history.append({"role": "user", "content": message})
             if full_response:
@@ -2476,6 +2619,10 @@ class AIRequest(BaseModel):
     image_mime: Optional[str] = None
     reasoning: bool = False
     char_by_char: Optional[bool] = None
+    # Прямая ссылка от фронтенда (JS отправляет url_to_fetch при URL в сообщении).
+    # Раньше поля не было в модели — FastAPI/pydantic отбрасывали его молча,
+    # и ссылка оставалась только в тексте сообщения на усмотрение LLM.
+    url_to_fetch: Optional[str] = Field(None, max_length=2000)
 
 class ResearchRequest(BaseModel):
     goal: str = Field(..., min_length=1, max_length=2000)
@@ -2489,6 +2636,10 @@ class EnhanceRequest(BaseModel):
 @router.post("/chat")
 async def chat_with_ai(body: AIRequest, address: str = Depends(require_auth)):
     logger.info(f"Запрос от {address[:16]}, web={body.web_search}, reasoning={body.reasoning}")
+    # url_to_fetch гарантированно попадает в текст сообщения, чтобы его увидел
+    # детерминированный поиск (см. CognitiveController._force_search_if_requested)
+    if body.url_to_fetch and body.url_to_fetch not in (body.message or ""):
+        body.message = f"{body.message}\n{body.url_to_fetch}".strip()
     assistant = await get_assistant(address)
     if body.stream:
         return StreamingResponse(

@@ -348,6 +348,9 @@ class ToolRouter:
         self.llm_raw_caller = llm_raw_caller
         self.llm_text_caller = llm_text_caller
         self._native_supported: Optional[bool] = None
+        # ИНТЕЛЛЕКТ-ПАКЕТ (E): план подзадач текущего запуска — читает
+        # PlanCritic из ai_assistant через этот атрибут или run()["plan"].
+        self._last_plan: str = ""
 
     async def _execute_tool(self, qualified_name: str, arguments: Dict[str, Any]) -> str:
         spec = self.registry.get(qualified_name)
@@ -454,6 +457,7 @@ class ToolRouter:
 
         # ПУНКТ №4: план подзадач
         plan_text = await self._plan_subtasks(message)
+        self._last_plan = plan_text or ""
         if plan_text:
             running_messages = running_messages + [{
                 "role": "user",
@@ -581,7 +585,7 @@ class ToolRouter:
             if not used_native and len(tool_trace) >= MAX_TOOL_ITERATIONS:
                 break
 
-        return {"tool_trace": tool_trace, "used_native": used_native}
+        return {"tool_trace": tool_trace, "used_native": used_native, "plan": getattr(self, "_last_plan", "")}
 
 
 def build_tool_trace_context(tool_trace: List[Dict[str, Any]]) -> str:

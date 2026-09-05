@@ -411,6 +411,48 @@ def domain_trust(url: str) -> Tuple[str, float]:
 
 
 # ---------- Утилиты ----------
+_DATE_SENSITIVE_MARKERS = (
+    "сегодня", "сейчас", "завтра", "вчера", "погода", "температур",
+    "курс", "цена", "стоимость", "сколько стоит", "котировк",
+    "новост", "актуальн", "последн", "свеж", "результат",
+    "расписан", "во сколько", "кто победил",
+)
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+_MONTHS_RU = (
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+
+
+def inject_query_date(query: str) -> str:
+    """
+    Подставляет РЕАЛЬНУЮ текущую дату в чувствительные ко времени запросы.
+
+    Зачем: для запросов вроде «курс доллара», «погода сегодня», «новости»
+    слова «сегодня/сейчас» бесполезны — ни одна проиндексированная страница
+    их не содержит, и DDG отдаёт произвольно старые результаты. Если же в
+    запросе стоит конкретная свежая дата («курс доллара 5 сентября 2026»),
+    поисковик смещает выдачу к свежим страницам. Дата берётся из системных
+    часов сервера (datetime.now), а не из текста запроса — это и есть
+    «сначала узнать актуальную дату, потом формировать запрос».
+
+    Не срабатывает, если:
+      - в запросе уже есть год (4-значный) — не дублируем;
+      - запрос не выглядит чувствительным ко времени (нет маркеров).
+    """
+    q = (query or "").strip()
+    if not q:
+        return q
+    low = q.lower()
+    if not any(m in low for m in _DATE_SENSITIVE_MARKERS):
+        return q
+    if _YEAR_RE.search(q):
+        return q
+    now = time.localtime()
+    date_str = f"{now.tm_mday} {_MONTHS_RU[now.tm_mon - 1]} {now.tm_year}"
+    return f"{q} {date_str}"
+
+
 def hash_query(q: str) -> str:
     return hashlib.sha256(q.lower().strip().encode()).hexdigest()[:32]
 
@@ -531,6 +573,14 @@ async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict
         if remainder:
             query = remainder
 
+    # Подстановка реальной текущей даты для чувствительных ко времени запросов
+    # (см. inject_query_date). Делается здесь, в единой точке входа, чтобы
+    # охватить ВСЕ пути: браузерный чат (в т.ч. детерминированный ForcedSearch),
+    # MCP-инструмент web_search и research(). До вычисления кэш-ключа, чтобы
+    # запрос «курс доллара» и «курс доллара 5 сентября 2026» не делили кэш
+    # с устаревшим сырым вариантом.
+    query = inject_query_date(query)
+
     cache_key = hash_query(query)
     skip_cache = content_has_currency_numbers(query)
 
@@ -625,7 +675,10 @@ async def deep_search(query: str, max_results: int = MAX_PAGES_TO_FETCH) -> Dict
         "search_performed": True,
         "chunks_found": len(context_parts)
     }
-    if not skip_cache:
+    # Пустой результат не кэшируем: иначе одна неудачная попытка (лимит DDG,
+    # сетевая ошибка) блокирует повторный поиск того же запроса на SEARCH_CACHE_TTL
+    # секунд, что и создавало ощущение «поиск работает через раз».
+    if not skip_cache and context_parts:
         await _search_cache.set(cache_key, result)
     return result
 

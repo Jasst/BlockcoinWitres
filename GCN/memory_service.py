@@ -40,19 +40,24 @@ class MemoryService:
         """Подтягивает изменения, сделанные другими процессами."""
         self.router.refresh(include_private=True)
 
-    async def recall(self, query: str, top_k: int = 5, scope: Optional[str] = None) -> List[Dict]:
+    async def recall(self, query: str, top_k: int = 5, scope: Optional[str] = None,
+                     subqueries: Optional[List[str]] = None) -> List[Dict]:
         """
         Поиск по всем слоям с опциональным фильтром по скоупу.
+        ИНТЕЛЛЕКТ-ПАКЕТ (C): subqueries — декомпозиция составного запроса,
+        пробрасывается в router.retrieve.
         Возвращает список фактов с метаданными.
         """
         self.refresh()
-        results = await self.router.retrieve(query, top_k=top_k * 2, include_private=True)
+        results = await self.router.retrieve(query, top_k=top_k * 2, include_private=True,
+                                             subqueries=subqueries)
         if scope:
             scope_lower = scope.lower()
             results = [r for r in results if r.get('scope') == scope_lower]
         return results[:top_k]
 
-    async def remember(self, fact: str, scope: Optional[str] = None) -> Dict[str, Any]:
+    async def remember(self, fact: str, scope: Optional[str] = None,
+                       confidence: float = 0.9) -> Dict[str, Any]:
         """
         Сохраняет факт в указанный скоуп (автоопределение, если scope не задан).
         Возвращает id и скоуп.
@@ -74,7 +79,7 @@ class MemoryService:
             predicate="is_fact",
             obj="true",
             scope=scope_enum,
-            confidence=0.9,
+            confidence=confidence,
             author=self.user_id,
             source_type="memory_service"
         )

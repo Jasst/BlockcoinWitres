@@ -998,7 +998,11 @@ async function _sendToAi(messageText, imageFile) {
             localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default'));
             if (searchResults && searchResults.length) {
                 _displaySearchSources(searchResults);
-            } else if (useWebSearch && !searchResults) {
+            } else if (useWebSearch) {
+                // Поиск явно запрашивался кнопкой «Интернет», но источники не
+                // пришли — предупреждаем, чтобы «тихий ответ из памяти» не
+                // выглядел как результат веб-поиска.
+                _showToast('Веб-поиск не дал источников — ответ сформирован из памяти', 'warning');
                 _tryFetchSearchSources(messageText);
             }
         }

@@ -372,3 +372,21 @@ MEMORY_CONTEXT_MIN_SCORE = 0.15
 # -------------------------------
 CONCEPT_MERGE_THRESHOLD = 0.80          # порог для объединения с существующим концептом
 CONCEPT_REFRESH_MEMBERS_DELTA = 3       # минимальное число новых членов для перегенерации текста
+# ------------------------------- Интеллект-пакет (GCN/intellect.py) -------------------------------
+# A. Заземлённый синтез ответа: модель обязана цитировать источники [N] и
+#    не выдумывать факты вне переданного контекста.
+GROUNDED_ANSWER_ENABLED = True
+GROUNDED_MAX_SOURCES = 8
+# B. Санитайзер фактов из поиска: градация scope/confidence по доверию домена
+#    (см. intellect.sanitize_search_facts). Отключение вернёт старое поведение
+#    "всё в global с confidence 0.9".
+SEARCH_FACT_SANITIZER_ENABLED = True
+# C. Подзапросный retrieval для составных вопросов (retrieve по subqueries).
+SUBQUERY_RETRIEVAL_ENABLED = True
+MAX_RETRIEVE_SUBQUERIES = 3
+# D. LLM-подтверждение эвристических противоречий в KnowledgeIngestion.
+#    При сбое/таймауте верификатора система откатывается на эвристику.
+CONTRADICTION_LLM_VERIFY_ENABLED = True
+# E. Финальный критик: сверка ответа с планом подзадач и добор пропущенного.
+PLAN_CRITIC_ENABLED = True
+PLAN_CRITIC_MAX_MISSED = 3
