@@ -456,12 +456,17 @@ async def add_goal(
 async def semantic_search(
     query: str = Field(..., description="Поисковый запрос"),
     top_k: int = Field(5, description="Число результатов", ge=1, le=20),
+    scope: Optional[str] = Field(
+        None,
+        description="Фильтр по слою памяти: 'private', 'shared' или 'global'. "
+                    "Если не указан — поиск по всем трём слоям (личная, общая и глобальная память)."
+    ),
     user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
 ) -> Dict[str, Any]:
-    """Векторный поиск по смыслу (использует эмбеддинги)."""
+    """Векторный поиск по смыслу по личной, общей и глобальной памяти (эмбеддинги)."""
     service = await get_memory_service(user_id or DEFAULT_USER)
-    results = await service.semantic_search(query, top_k)
-    return {"results": results}
+    results = await service.semantic_search(query, top_k, scope=scope)
+    return {"results": results, "count": len(results)}
 
 @mcp.tool()
 async def graph_explore(

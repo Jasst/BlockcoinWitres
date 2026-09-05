@@ -262,8 +262,6 @@ FAISS_MIN_TRAIN_VECTORS = 500
 # -------------------------------
 HYBRID_WEIGHT_BM25 = 0.25
 HYBRID_WEIGHT_COSINE = 0.40
-FACTUAL_WEIGHTS = (0.35, 0.30, 0.15, 0.20)
-GENERAL_WEIGHTS = (HYBRID_WEIGHT_BM25, HYBRID_WEIGHT_COSINE, HYBRID_WEIGHT_FRESHNESS, HYBRID_WEIGHT_GRAPH)
 
 # -------------------------------
 # FAISS адаптивные пороги
@@ -386,7 +384,10 @@ SUBQUERY_RETRIEVAL_ENABLED = True
 MAX_RETRIEVE_SUBQUERIES = 3
 # D. LLM-подтверждение эвристических противоречий в KnowledgeIngestion.
 #    При сбое/таймауте верификатора система откатывается на эвристику.
-CONTRADICTION_LLM_VERIFY_ENABLED = True
+# False: один механизм LLM-проверки противоречий — периодический
+# _verify_pending_contradictions в ai_assistant. Включение сюда
+# дублировало проверку двумя разными промптами (ingestion + controller).
+CONTRADICTION_LLM_VERIFY_ENABLED = False
 # E. Финальный критик: сверка ответа с планом подзадач и добор пропущенного.
 PLAN_CRITIC_ENABLED = True
 PLAN_CRITIC_MAX_MISSED = 3

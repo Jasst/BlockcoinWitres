@@ -1,43 +1,72 @@
 """
-web_search.py v2 — улучшенный веб-поиск для BlockcoinWitres.
+web_search.py v3 — улучшенный веб-поиск для BlockcoinWitres.
 
-Что добавлено по сравнению с исходной версией:
-  1. CROSS-ENCODER РЕРАНКЕР (BAAI/bge-reranker-v2-m3, мультиязычный).
-     После скачивания страниц top-N кандидатов переранжируются моделью,
-     которая смотрит запрос и текст ВМЕСТЕ — заметно точнее, чем
-     токенный overlap ChunkRanker. Ленивая загрузка, отключение через
-     RERANK_ENABLED=false, безопасный откат на ChunkRanker при сбое.
-  2. FALLBACK-БЭКЕНДЫ: DDG -> SearXNG (self-hosted) -> Brave API.
-     Поиск перестаёт "работать через раз", когда DDG отдаёт капчу.
-     Настройка: env SEARXNG_URL / BRAVE_API_KEY (ничего менять в
-     config_ai.py не нужно, но можно и там).
-  3. СТРУКТУРИРОВАННОЕ ИЗВЛЕЧЕНИЕ: JSON-LD микроразметка (цены, рейтинги,
-     даты событий), HTML-таблицы (курсы валют), дата публикации
-     страницы. Для time-sensitive запросов свежие страницы получают
-     буст в ранжировании.
-  4. ДЕДУПЛИКАЦИЯ ПО СОДЕРЖИМОМУ (simhash): агрегаторы и копипаст
-     больше не засоряют контекст LLM.
-  5. ИТЕРАТИВНОЕ УТОЧНЕНИЕ: если лучшие найденные страницы слабо
-     релевантны, выполняется до max_refinements дополнительных проходов
-     с переформулированным запросом (эвристически или через LLM —
-     параметр query_refiner).
+Обратная совместимость: публичный API v2 полностью сохранён
+(deep_search, fetch_url, search_ddg, best_excerpt, domain_trust, и т.д.).
 
-Публичный API полностью совместим с прежней версией:
-  deep_search, fetch_url, search_ddg, best_excerpt, domain_trust,
-  extract_urls, normalize_raw_url, content_has_currency_numbers,
-  SearchCache, WebPageFetcher, ChunkRanker, close_search_resources.
+Что нового в v3 (см. ИЗМЕНЕНИЯ ниже):
+
+  1. BM25-скоринг вместо голого токенного overlap.
+     ChunkRanker.score_text раньше делал (overlap*2 + tf) / (len+1) —
+     длинные страницы систематически занижались, короткие сниппеты
+     завышались, и ранжирование сниппетов/страниц/чанков было
+     несопоставимо между собой. Теперь везде, где документы сравниваются
+     между собой, используется классический BM25 (k1=1.5, b=0.75) с
+     корпусной IDF. score_text оставлен для совместимости, но тоже
+     улучшен (BM25-стиль TF-сатурация + бонус за точную фразу).
+
+  2. Порядок бэкендов настраивается (env SEARCH_BACKENDS_ORDER,
+     по умолчанию "ddg,searxng,brave"). Если поднят self-hosted SearXNG,
+     имеет смысл поставить его первым — DDG часто отдаёт капчу, и логично
+     сначала пробовать собственный стабильный бэкенд.
+
+  3. Сниппеты как fallback. Раньше если страница не скачалась (таймаут,
+     JS-рендер, 403) — источник терялся полностью, хотя поисковик уже
+     дал релевантный сниппет. Теперь при недоступности страницы контекст
+     строится из сниппета (с явной пометкой "[сниппет поисковика]").
+
+  4. Общий бюджет времени (env SEARCH_TIME_BUDGET, по умолчанию 30с).
+     deep_search раньше мог растягиваться непредсказуемо: DDG-ретраи с
+     экспоненциальными паузами + до 7 страниц × 15с + хопы + refinement.
+     Теперь между стадиями проверяется дедлайн; при нехватке времени
+     возвращается лучший из накопленного (вплоть до контекста только из
+     сниппетов), а не пустой результат.
+
+  5. Частичные результаты при дедлайне. fetch_many* принимает deadline
+     и возвращает успевшие загрузиться страницы вместо потери всей
+     пачки из-за отмены gather.
+
+  6. Хук параллельного расширения запроса — query_expander
+     (async def(query) -> List[str], например через LLM: синонимы,
+     английский вариант, декомпозиция). Несколько запросов уходят в
+     бэкенды параллельно, результаты сливаются с приоритетом базового
+     запроса и дедупликацией по URL. Без expander поведение прежнее.
+
+  7. Чистка URL (utm_*/fbclid/gclid/фрагменты/www) — меньше мусорных
+     дублей в кэше, seen-сетах и источниках.
+
+  8. Ссылки на папки GitHub (/tree/...) теперь читаются через GitHub
+     Contents API и возвращаются аккуратным листингом (blob-ссылки
+     по-прежнему конвертируются в raw).
+
+  9. Заголовок страницы (<title>) используется как название источника,
+     если поисковик не дал своего.
+
+ 10. simhash-дедупликация переписана без хрупкого счётчика индексов
+     (было: ручной инкремент k, легко рассинхронизировать при правках).
 """
 
 import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -76,41 +105,53 @@ except ImportError:
     DDGS_AVAILABLE = False
 
 try:
-    import pypdf
+    import pypdf  # noqa: F401
     PDF_AVAILABLE = True
 except ImportError:
     try:
-        import pdfplumber
+        import pdfplumber  # noqa: F401
         PDF_AVAILABLE = True
     except ImportError:
         PDF_AVAILABLE = False
         logger.info("Для чтения PDF установите pypdf или pdfplumber")
 
 # =====================================================================
-# НОВЫЕ НАСТРОЙКИ (env-переменные, чтобы не трогать config_ai.py)
+# НАСТРОЙКИ (env-переменные, чтобы не трогать config_ai.py)
 # =====================================================================
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "true").lower() in ("1", "true", "yes")
 RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
-RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "10"))          # сколько скачанных страниц переранжировать
-RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "2048"))  # обрезка документа для реранкера
+RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "10"))
+RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "2048"))
 
-SEARXNG_URL = os.getenv("SEARXNG_URL", "").rstrip("/")        # например http://localhost:8080
+SEARXNG_URL = os.getenv("SEARXNG_URL", "").rstrip("/")
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 
-# Ниже этого скора (после реранка) результат считается слабым и
-# запускается уточняющий проход поиска.
 REFINEMENT_SCORE_THRESHOLD = float(os.getenv("REFINEMENT_SCORE_THRESHOLD", "0.30"))
 MAX_REFINEMENTS = int(os.getenv("MAX_REFINEMENTS", "1"))
-# Близость simhash (в битах): меньше => строже дедупликация.
 SIMHASH_DEDUP_BITS = int(os.getenv("SIMHASH_DEDUP_BITS", "8"))
 
-# Тип опциональной LLM-функции уточнения запроса:
-#   async def refiner(original_query: str, found_titles: List[str]) -> str
+# v3: порядок бэкендов. Если SearXNG поднят — разумно поставить его первым:
+# SEARCH_BACKENDS_ORDER="searxng,ddg,brave"
+SEARCH_BACKENDS_ORDER = [
+    s.strip() for s in os.getenv("SEARCH_BACKENDS_ORDER", "ddg,searxng,brave").split(",")
+    if s.strip()
+]
+# v3: общий бюджет времени на deep_search (секунды)
+SEARCH_TIME_BUDGET = float(os.getenv("SEARCH_TIME_BUDGET", "30"))
+# v3: максимум запросов при расширении (1 базовый + N дополнительных)
+MAX_EXPANDED_QUERIES = int(os.getenv("MAX_EXPANDED_QUERIES", "3"))
+
 QueryRefiner = Callable[[str, List[str]], Awaitable[str]]
+# v3: расширитель запроса — async def(query: str) -> List[str]
+QueryExpander = Callable[[str], Awaitable[List[str]]]
+
+
+def _loop_time() -> float:
+    return asyncio.get_event_loop().time()
 
 
 # =====================================================================
-# Кэш (без изменений)
+# Кэш
 # =====================================================================
 class SearchCache:
     def __init__(self, ttl: int = SEARCH_CACHE_TTL, maxsize: int = SEARCH_CACHE_MAX_SIZE):
@@ -143,14 +184,50 @@ URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
 _GITHUB_BLOB_RE = re.compile(
     r'^https?://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)$'
 )
+# v3: ссылки на папки GitHub читаем через Contents API
+_GITHUB_TREE_RE = re.compile(
+    r'^https?://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/?(.*)$'
+)
+
+# v3: трекинговые параметры, портящие дедупликацию и кэш
+_TRACKING_PARAMS = {
+    "fbclid", "gclid", "yclid", "dclid", "gclsrc", "mc_cid", "mc_eid",
+    "spm", "msclkid", "ref", "ref_src",
+}
+_TRACKING_PREFIXES = ("utm_",)
+
+
+def clean_url(url: str) -> str:
+    """
+    v3: нормализует URL — убирает трекинговые параметры, фрагмент, www,
+    хвостовой слэш. Канонический вид URL используется в seen-сетах, кэше
+    и source-списках, чтобы одна страница не мельтешила в выдаче как
+    несколько разных источников.
+    """
+    try:
+        p = urlparse(url.strip())
+    except Exception:
+        return url
+    host = (p.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    qs = [
+        (k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+        if k.lower() not in _TRACKING_PARAMS
+        and not any(k.lower().startswith(pref) for pref in _TRACKING_PREFIXES)
+    ]
+    path = p.path or "/"
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    return urlunparse((p.scheme.lower() or "https", host, path, "", urlencode(qs), ""))
 
 
 def normalize_raw_url(url: str) -> str:
     m = _GITHUB_BLOB_RE.match(url.strip())
     if m:
         user, repo, branch, path = m.groups()
-        return f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}"
-    return url
+        url = f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}"
+    return clean_url(url)
 
 
 def extract_urls(text: str) -> List[str]:
@@ -181,11 +258,73 @@ def _extract_pdf_text(raw_bytes: bytes) -> str:
 
 
 # =====================================================================
-# Simhash — дедупликация страниц по содержимому
+# BM25 (v3) — корпусный скоринг вместо голого overlap
+# =====================================================================
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r'\b\w+\b', (text or "").lower())
+
+
+class _BM25:
+    """Классический BM25 (Robertson). Потокобезопасен после fit()."""
+
+    def __init__(self, docs_tokens: List[List[str]], k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.dl = [len(d) for d in docs_tokens]
+        self.avgdl = (sum(self.dl) / len(self.dl)) if docs_tokens else 0.0
+        df: Counter = Counter()
+        for d in docs_tokens:
+            for t in set(d):
+                df[t] += 1
+        n = len(docs_tokens)
+        self.idf = {
+            t: math.log(1.0 + (n - freq + 0.5) / (freq + 0.5))
+            for t, freq in df.items()
+        }
+
+    def score(self, query_tokens: List[str], doc_idx: int) -> float:
+        doc = self._docs[doc_idx]
+        if not doc:
+            return 0.0
+        dl = self.dl[doc_idx]
+        score = 0.0
+        freqs = Counter(doc)
+        for qt in set(query_tokens):
+            idf = self.idf.get(qt)
+            if not idf or idf <= 0:
+                continue
+            tf = freqs.get(qt, 0)
+            if tf == 0:
+                continue
+            denom = tf + self.k1 * (1 - self.b + self.b * dl / (self.avgdl or 1.0))
+            score += idf * (tf * (self.k1 + 1)) / denom
+        return score
+
+    # docs запоминаем отдельно, чтобы score() не требовал передачи токенов
+    _docs: List[List[str]] = []
+
+    @classmethod
+    def fit(cls, docs_tokens: List[List[str]], **kwargs) -> "_BM25":
+        bm = cls(docs_tokens, **kwargs)
+        bm._docs = docs_tokens  # instance attr shadows class attr
+        return bm
+
+
+def bm25_scores(query: str, docs: List[str]) -> List[float]:
+    """v3: BM25-скоры документов относительно друг друга (с IDF по корпусу)."""
+    if not docs:
+        return []
+    query_tokens = _tokenize(query)
+    docs_tokens = [_tokenize(d) for d in docs]
+    bm = _BM25.fit(docs_tokens)
+    return [bm.score(query_tokens, i) for i in range(len(docs))]
+
+
+# =====================================================================
+# Simhash — дедупликация страниц по содержимому (v3: без счётчика индексов)
 # =====================================================================
 def _simhash(text: str, bits: int = 64) -> int:
-    """Классический simhash: взвешенная сумма хэшей токенов."""
-    tokens = ChunkRanker._tokenize(text)
+    tokens = _tokenize(text)
     if not tokens:
         return 0
     vec = [0] * bits
@@ -205,10 +344,7 @@ def _hamming(a: int, b: int) -> int:
 
 
 def dedup_by_simhash(texts: List[str], min_bits: int = SIMHASH_DEDUP_BITS) -> List[int]:
-    """
-    Возвращает индексы texts без почти-дубликатов (simhash-близость
-    >= min_bits считается разным содержимым).
-    """
+    """Возвращает индексы texts без почти-дубликатов (API v2 сохранён)."""
     keep: List[int] = []
     hashes: List[int] = []
     for i, t in enumerate(texts):
@@ -216,13 +352,35 @@ def dedup_by_simhash(texts: List[str], min_bits: int = SIMHASH_DEDUP_BITS) -> Li
         if h and any(_hamming(h, kh) < min_bits for kh in hashes):
             logger.debug(f"simhash: дубликат содержимого отброшен (idx {i})")
             continue
-        hashes.append(h)
+        if h:
+            hashes.append(h)
         keep.append(i)
     return keep
 
 
+def dedup_pages(
+    fetched: List[Tuple[str, str, List[Tuple[str, str]]]],
+    min_bits: int = SIMHASH_DEDUP_BITS,
+) -> List[Tuple[str, str, List[Tuple[str, str]]]]:
+    """v3: та же дедупликация, но сразу над списком (url, text, links)."""
+    keep: List[Tuple[str, str, List[Tuple[str, str]]]] = []
+    hashes: List[int] = []
+    for item in fetched:
+        text = item[1]
+        if not text:
+            keep.append(item)
+            continue
+        h = _simhash(text)
+        if h and any(_hamming(h, kh) < min_bits for kh in hashes):
+            continue
+        if h:
+            hashes.append(h)
+        keep.append(item)
+    return keep
+
+
 # =====================================================================
-# Cross-encoder реранкер (ленивая загрузка, откат при сбое)
+# Cross-encoder реранкер (без изменений)
 # =====================================================================
 def _default_device() -> str:
     try:
@@ -251,7 +409,7 @@ class Reranker:
                 logger.info("Реранкер загружен.")
             except Exception as e:
                 logger.warning(
-                    f"Реранкер недоступен ({e}) — откат на токенный скоринг ChunkRanker. "
+                    f"Реранкер недоступен ({e}) — откат на BM25-скоринг. "
                     "Установите: pip install sentence-transformers"
                 )
                 cls._failed = True
@@ -260,11 +418,6 @@ class Reranker:
 
     @classmethod
     def rerank(cls, query: str, docs: List[str]) -> List[int]:
-        """
-        Возвращает индексы docs, отсортированные по убыванию релевантности
-        запросу. При недоступности модели — исходный порядок (вызывающий
-        код должен отдельно отсортировать по ChunkRanker, как раньше).
-        """
         model = cls._get()
         if model is None or not docs:
             return list(range(len(docs)))
@@ -314,7 +467,7 @@ def _extract_tables(soup: BeautifulSoup, max_tables: int = 5) -> str:
             cells = [c for c in cells if c]
             if cells:
                 rows.append(" | ".join(cells))
-        if len(rows) >= 2:  # таблица из одной строки — это навигация, не данные
+        if len(rows) >= 2:
             parts.append("[table]\n" + "\n".join(rows))
     return "\n\n".join(parts)
 
@@ -339,7 +492,6 @@ def _extract_published_date(soup: BeautifulSoup, text: str = "") -> Optional[str
 
 
 def _recency_boost(published: Optional[str], time_sensitive: bool) -> float:
-    """Свежие страницы бустятся только для чувствительных ко времени запросов."""
     if not time_sensitive or not published:
         return 0.0
     try:
@@ -359,7 +511,7 @@ def _recency_boost(published: Optional[str], time_sensitive: bool) -> float:
 
 
 # =====================================================================
-# Загрузчик страниц (API совместим: fetch / fetch_with_links / fetch_many*)
+# Загрузчик страниц
 # =====================================================================
 class WebPageFetcher:
     def __init__(self, timeout: int = 15):
@@ -387,19 +539,67 @@ class WebPageFetcher:
     )
 
     async def fetch(self, url: str) -> str:
-        text, _ = await self._fetch_impl(url, with_links=False)
+        text, _, _ = await self._fetch_impl(url, with_links=False)
         return text
 
     async def fetch_with_links(self, url: str) -> Tuple[str, List[Tuple[str, str]]]:
-        return await self._fetch_impl(url, with_links=True)
+        text, links, _ = await self._fetch_impl(url, with_links=True)
+        return text, links
 
-    async def _fetch_impl(self, url: str, with_links: bool):
+    async def _fetch_github_tree(
+        self, session: aiohttp.ClientSession, owner: str, repo: str, branch: str, path: str
+    ) -> Optional[Tuple[str, List[Tuple[str, str]], str]]:
+        """v3: листинг папки GitHub через Contents API (публичные репозитории)."""
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path.strip('/')}?ref={branch}"
+        try:
+            async with session.get(
+                api_url,
+                headers={"Accept": "application/vnd.github+json"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+                if isinstance(data, dict):
+                    data = [data]
+                shown = path.strip("/") or "/"
+                lines = [
+                    f"[github] Содержимое папки {shown} "
+                    f"(репозиторий {owner}/{repo}, ветка {branch}):"
+                ]
+                for it in data:
+                    if it.get("type") == "dir":
+                        lines.append(f"  📁 {it.get('name', '?')}/")
+                    else:
+                        lines.append(f"  📄 {it.get('name', '?')} ({it.get('size', 0)} байт)")
+                lines.append(
+                    "\nДля чтения файла передай ссылку на файл (blob) или используй "
+                    "инструмент fetch_github_file."
+                )
+                return "\n".join(lines), [], api_url
+        except Exception as e:
+            logger.debug(f"GitHub tree fetch failed: {e}")
+            return None
+
+    async def _fetch_impl(self, url: str, with_links: bool) -> Tuple[str, List[Tuple[str, str]], str]:
+        """Возвращает (text, links, title). title может быть пустым."""
         url = normalize_raw_url(url)
+
+        # v3: ссылка на папку GitHub — отдаём листинг через API
+        tree = _GITHUB_TREE_RE.match(url)
+        if tree:
+            session = await self._get_session()
+            owner, repo, branch, path = tree.groups()
+            result = await self._fetch_github_tree(session, owner, repo, branch, path)
+            if result is not None:
+                return result
+
         try:
             session = await self._get_session()
             async with session.get(url, allow_redirects=True, max_redirects=5) as resp:
                 if resp.status != 200:
-                    return "", []
+                    return "", [], ""
+
                 content_type = resp.headers.get("Content-Type", "").lower()
                 is_textual = any(t in content_type for t in self.TEXTUAL_CONTENT_TYPES)
 
@@ -407,20 +607,20 @@ class WebPageFetcher:
                     raw_bytes = await resp.read()
                     text = _extract_pdf_text(raw_bytes)
                     if text:
-                        return self._clean_plain_text(text), []
-                    return "", []
+                        return self._clean_plain_text(text), [], ""
+                    return "", [], ""
 
                 if content_type and not is_textual:
-                    return "", []
+                    return "", [], ""
 
                 raw = await resp.text(errors="replace")
                 if "text/html" in content_type or "application/xhtml" in content_type:
                     final_url = str(resp.url)
                     return self._extract_html(raw, final_url, with_links)
-                return self._clean_plain_text(raw), []
+                return self._clean_plain_text(raw), [], ""
         except Exception as e:
             logger.debug(f"Fetch error for {url}: {e}")
-            return "", []
+            return "", [], ""
 
     @staticmethod
     def _clean_plain_text(text: str) -> str:
@@ -441,9 +641,12 @@ class WebPageFetcher:
         return text
 
     def _extract_html(self, html: str, base_url: str, with_links: bool):
-        """Единая точка извлечения: текст + JSON-LD + таблицы + дата + ссылки."""
+        """Единая точка извлечения: текст + JSON-LD + таблицы + дата + ссылки + <title>."""
         try:
             soup = BeautifulSoup(html, "lxml")
+            title = ""
+            if soup.title and soup.title.string:
+                title = soup.title.string.strip()[:200]
             for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript"]):
                 tag.decompose()
             main = (soup.find("main") or soup.find("article")
@@ -454,7 +657,6 @@ class WebPageFetcher:
             lines = [line.strip() for line in text.splitlines() if line.strip()]
             text = "\n".join(lines)
 
-            # === НОВОЕ: структурированные данные (цены, курсы, даты) ===
             structured = "\n".join(filter(None, [
                 _extract_jsonld(soup),
                 _extract_tables(soup),
@@ -465,14 +667,11 @@ class WebPageFetcher:
             if len(text) > PAGE_CONTENT_MAX_CHARS:
                 text = text[:PAGE_CONTENT_MAX_CHARS] + "\n...[truncated]"
 
-            if not with_links:
-                return text, []
-
-            links = self._collect_links(container, base_url)
-            return text, links
+            links = self._collect_links(container, base_url) if with_links else []
+            return text, links, title
         except Exception as e:
             logger.debug(f"Parse error: {e}")
-            return "", []
+            return "", [], ""
 
     @staticmethod
     def _collect_links(container, base_url: str) -> List[Tuple[str, str]]:
@@ -499,28 +698,56 @@ class WebPageFetcher:
                 break
         return links
 
-    # fetch_many / fetch_many_with_links — без изменений
-    async def fetch_many(self, urls: List[str], limit: int = PARALLEL_FETCH_LIMIT) -> List[Tuple[str, str]]:
+    async def fetch_many(self, urls: List[str], limit: int = PARALLEL_FETCH_LIMIT,
+                         deadline: Optional[float] = None) -> List[Tuple[str, str]]:
         semaphore = asyncio.Semaphore(limit)
 
         async def fetch_one(url):
             async with semaphore:
-                text = await self.fetch(url)
-                return url, text
+                try:
+                    if deadline is not None:
+                        remaining = deadline - _loop_time()
+                        if remaining <= 0:
+                            return url, ""
+                        text = await asyncio.wait_for(
+                            self.fetch(url), timeout=min(self.timeout + 5, remaining)
+                        )
+                    else:
+                        text = await self.fetch(url)
+                    return url, text
+                except Exception:
+                    return url, ""
 
-        results = await asyncio.gather(*[fetch_one(u) for u in urls], return_exceptions=True)
+        results = await asyncio.gather(*[fetch_one(u) for u in urls])
         return [r for r in results if isinstance(r, tuple)]
 
-    async def fetch_many_with_links(self, urls: List[str],
-                                    limit: int = PARALLEL_FETCH_LIMIT) -> List[Tuple[str, str, List[Tuple[str, str]]]]:
+    async def fetch_many_with_links(
+        self, urls: List[str],
+        limit: int = PARALLEL_FETCH_LIMIT,
+        deadline: Optional[float] = None,
+    ) -> List[Tuple[str, str, List[Tuple[str, str]]]]:
+        """v3: deadline — общий дедлайн (loop.time()); при его наступлении
+        возвращаются успевшие загрузиться страницы, а не пустой список."""
         semaphore = asyncio.Semaphore(limit)
 
         async def fetch_one(url):
             async with semaphore:
-                text, links = await self.fetch_with_links(url)
-                return url, text, links
+                try:
+                    if deadline is not None:
+                        remaining = deadline - _loop_time()
+                        if remaining <= 0:
+                            return url, "", []
+                        text, links, _ = await asyncio.wait_for(
+                            self._fetch_impl(url, with_links=True),
+                            timeout=min(self.timeout + 5, remaining),
+                        )
+                    else:
+                        text, links, _ = await self._fetch_impl(url, with_links=True)
+                    return url, text, links
+                except Exception:
+                    return url, "", []
 
-        results = await asyncio.gather(*[fetch_one(u) for u in urls], return_exceptions=True)
+        results = await asyncio.gather(*[fetch_one(u) for u in urls])
         return [r for r in results if isinstance(r, tuple)]
 
     async def close(self):
@@ -529,42 +756,44 @@ class WebPageFetcher:
 
 
 # =====================================================================
-# ChunkRanker (токенный fallback — оставлен для обратной совместимости)
+# ChunkRanker (API v2 сохранён; скоринг улучшен)
 # =====================================================================
 class ChunkRanker:
     @staticmethod
     def _tokenize(text: str) -> List[str]:
-        return re.findall(r'\b\w+\b', text.lower())
+        return _tokenize(text)
 
     @staticmethod
     def score_chunks(query: str, chunks: List[str]) -> List[Tuple[float, str]]:
-        q_tokens = set(ChunkRanker._tokenize(query))
-        if not q_tokens:
-            return [(0.0, c) for c in chunks]
-        scored = []
-        for chunk in chunks:
-            c_tokens = ChunkRanker._tokenize(chunk)
-            if not c_tokens:
-                scored.append((0.0, chunk))
-                continue
-            overlap = len(q_tokens & set(c_tokens))
-            tf = sum(c_tokens.count(qt) for qt in q_tokens)
-            score = (overlap * 2 + tf) / (len(c_tokens) + 1)
-            scored.append((score, chunk))
-        scored.sort(reverse=True)
+        """v3: BM25 по корпусу чанков вместо попарного overlap."""
+        if not chunks:
+            return []
+        scores = bm25_scores(query, chunks)
+        scored = list(zip(scores, chunks))
+        scored.sort(key=lambda x: -x[0])
         return scored
 
     @staticmethod
     def score_text(query: str, text: str) -> float:
-        q_tokens = set(ChunkRanker._tokenize(query))
+        """Скоринг одиночного текста (BM25-стиль TF + бонус за фразу).
+
+        Используется там, где документ не сравнивается с корпусом
+        (например, anchor-тексты ссылок). Нормализация по длине мягкая
+        (sqrt), чтобы не занижать длинные релевантные тексты так сильно,
+        как это делало старое деление на len+1.
+        """
+        q_tokens = set(_tokenize(query))
         if not q_tokens:
             return 0.0
-        t_tokens = ChunkRanker._tokenize(text)
+        t_tokens = _tokenize(text)
         if not t_tokens:
             return 0.0
-        overlap = len(q_tokens & set(t_tokens))
-        tf = sum(t_tokens.count(qt) for qt in q_tokens)
-        return (overlap * 2 + tf) / (len(t_tokens) + 1)
+        freqs = Counter(t_tokens)
+        tf_sat = sum(math.log1p(freqs.get(qt, 0)) for qt in q_tokens)
+        overlap = len(q_tokens & set(t_tokens)) / len(q_tokens)
+        phrase = 1.0 if (query or "").strip().lower() in (text or "").lower() else 0.0
+        score = (overlap * 2.0 + tf_sat + phrase * 3.0) / (math.sqrt(len(t_tokens)) + 1.0)
+        return score
 
     @staticmethod
     def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
@@ -678,7 +907,7 @@ def content_has_currency_numbers(text: str) -> bool:
 
 
 # =====================================================================
-# Поисковые бэкенды: DDG -> SearXNG -> Brave
+# Поисковые бэкенды: DDG / SearXNG / Brave
 # =====================================================================
 _search_cache = SearchCache()
 _fetcher = WebPageFetcher()
@@ -716,7 +945,6 @@ async def search_ddg(query: str, max_results: int = 5) -> List[Dict]:
 
 
 async def search_searxng(query: str, max_results: int = 5) -> List[Dict]:
-    """SearXNG (self-hosted метапоиск). Нужен env SEARXNG_URL, например http://localhost:8080."""
     if not SEARXNG_URL:
         return []
     try:
@@ -739,7 +967,7 @@ async def search_searxng(query: str, max_results: int = 5) -> List[Dict]:
                     "title": r.get("title", ""),
                     "url": url,
                     "snippet": r.get("content", "") or "",
-                    "published": r.get("publishedDate", "")[:10] or None,
+                    "published": (r.get("publishedDate") or "")[:10] or None,
                 })
             return out[:max_results]
     except Exception as e:
@@ -748,7 +976,6 @@ async def search_searxng(query: str, max_results: int = 5) -> List[Dict]:
 
 
 async def search_brave(query: str, max_results: int = 5) -> List[Dict]:
-    """Brave Search API. Нужен env BRAVE_API_KEY."""
     if not BRAVE_API_KEY:
         return []
     try:
@@ -780,24 +1007,30 @@ async def search_brave(query: str, max_results: int = 5) -> List[Dict]:
         return []
 
 
+_BACKENDS = {
+    "ddg": search_ddg,
+    "searxng": search_searxng,
+    "brave": search_brave,
+}
+
+
 async def search_backends(query: str, max_results: int) -> Tuple[List[Dict], str]:
     """
-    Пробует бэкенды по цепочке, пока кто-то не вернёт непустую выдачу.
-    Возвращает (results, backend_name) — backend попадает в логи/метаданные.
+    v3: порядок бэкендов берётся из SEARCH_BACKENDS_ORDER (env).
+    Первый непустой результат побеждает; исключения бэкенда не роняют
+    цепочку. Если бэкенд не сконфигурирован — его функция сама вернёт [].
     """
-    ddg = await search_ddg(query, max_results)
-    if ddg:
-        return ddg, "ddg"
-    if SEARXNG_URL:
-        sx = await search_searxng(query, max_results)
-        if sx:
-            logger.info(f"[Search] DDG пуст, использован SearXNG для '{query[:60]}'")
-            return sx, "searxng"
-    if BRAVE_API_KEY:
-        br = await search_brave(query, max_results)
-        if br:
-            logger.info(f"[Search] использован Brave API для '{query[:60]}'")
-            return br, "brave"
+    for name in SEARCH_BACKENDS_ORDER:
+        fn = _BACKENDS.get(name)
+        if fn is None:
+            continue
+        try:
+            results = await fn(query, max_results)
+        except Exception as e:
+            logger.warning(f"Backend '{name}' failed for '{query[:60]}': {e}")
+            continue
+        if results:
+            return results, name
     return [], "none"
 
 
@@ -814,23 +1047,29 @@ async def fetch_url(url: str, max_chars: int = PAGE_CONTENT_MAX_CHARS) -> Dict[s
 
 
 def best_excerpt(query: str, text: str, max_chars: int = 3000) -> str:
+    """v3: выбор чанков — через BM25 по корпусу чанков (раньше попарный
+    overlap, что давало нестабильный порядок на длинных текстах)."""
     if len(text) <= max_chars:
         return text
     chunks = ChunkRanker.chunk_text(text)
     if len(chunks) <= 1:
         return text[:max_chars]
-    scored = ChunkRanker.score_chunks(query, chunks)
-    if all(score <= 0 for score, _ in scored):
+    scores = bm25_scores(query, chunks)
+    if all(s <= 0 for s in scores):
         return text[:max_chars]
-    chunk_index = {c: i for i, c in enumerate(chunks)}
-    picked = []
+    ranked = sorted(zip(scores, range(len(chunks))), key=lambda x: -x[0])
+    picked_idx = set()
     total = 0
-    for score, chunk in scored:
+    for score, idx in ranked:
         if total >= max_chars:
             break
-        picked.append(chunk)
-        total += len(chunk)
-    picked.sort(key=lambda c: chunk_index[c])
+        if score <= 0:
+            break
+        picked_idx.add(idx)
+        total += len(chunks[idx])
+    if not picked_idx:
+        return text[:max_chars]
+    picked = [chunks[i] for i in sorted(picked_idx)]
     excerpt = "\n[...]\n".join(picked)
     if len(excerpt) > max_chars:
         excerpt = excerpt[:max_chars] + "\n...[truncated]"
@@ -838,19 +1077,25 @@ def best_excerpt(query: str, text: str, max_chars: int = 3000) -> str:
 
 
 # =====================================================================
-# Обработка набора страниц: дедуп -> реранк -> хопы -> контекст
+# Обработка набора страниц: дедуп -> BM25 -> реранк -> хопы -> контекст
 # =====================================================================
 async def _process_pages(
     query: str,
     fetched: List[Tuple[str, str, List[Tuple[str, str]]]],
     url_to_title: Dict[str, str],
+    url_to_snippet: Dict[str, str],
     url_to_published: Dict[str, Optional[str]],
     time_sensitive: bool,
     extra_hops_budget: int,
+    deadline: Optional[float] = None,
 ) -> Tuple[List[Dict], List[str], float, int]:
     """
     Возвращает (sources, context_parts, best_score, hops_used).
-    Используется и для основного прохода, и для уточняющего.
+    v3:
+      - BM25-скоры по корпусу страниц (сопоставимо между страницами);
+      - fallback на сниппет поисковика, если страница не прочитана;
+      - <title> страницы как название источника при отсутствии своего;
+      - дедлайн: хопы по ссылкам прекращаются, когда время вышло.
     """
     sources: List[Dict] = []
     context_parts: List[str] = []
@@ -858,72 +1103,84 @@ async def _process_pages(
     extra_hops_used = 0
     seen_urls: set = set()
 
-    # === 1. Дедупликация по содержимому (simhash) ===
-    texts = [t for _, t, _ in fetched if t]
-    keep_idx = set(dedup_by_simhash(texts))
-    deduped = []
-    k = 0
-    for item in fetched:
-        text = item[1]
-        if text:
-            if k not in keep_idx:
-                k += 1
-                continue
-            k += 1
-        deduped.append(item)
+    deduped = dedup_pages(fetched)
+    if not deduped:
+        return sources, context_parts, best_score, extra_hops_used
 
-    # === 2. Cross-encoder реранк (по убыванию релевантности) ===
-    if deduped and Reranker._get() is not None:
-        top = deduped[:RERANK_TOP_N]
-        order = Reranker.rerank(query, [t for _, t, _ in top])
-        rest = deduped[RERANK_TOP_N:]
-        deduped = [top[i] for i in order] + rest
+    texts = [t for _, t, _ in deduped]
+    bm_scores = bm25_scores(query, texts)
 
-    # === 3. Построение контекста с хопами по ссылкам ===
-    for url, text, links in deduped:
+    items = list(zip(deduped, bm_scores))
+
+    # Cross-encoder реранк топ-N (по убыванию релевантности)
+    if Reranker._get() is not None and len(items) > 1:
+        top_n = min(RERANK_TOP_N, len(items))
+        order = Reranker.rerank(query, texts[:top_n])
+        items = [items[i] for i in order] + items[top_n:]
+
+    for (url, text, links), base_score in items:
+        # --- v3: сниппет как fallback, если страница не прочитана ---
         if not text:
-            continue
-        page_score = ChunkRanker.score_text(query, text)
-
-        # Нерелевантная страница с хорошими ссылками — пробуем перейти (как раньше)
-        if page_score <= 0 and links and extra_hops_used < extra_hops_budget:
-            scored_links = []
-            for anchor_text, href in links:
-                s = ChunkRanker.score_text(query, anchor_text)
-                if s > 0:
-                    scored_links.append((s, href))
-            scored_links.sort(key=lambda x: x[0], reverse=True)
-            take = min(3, extra_hops_budget - extra_hops_used, len(scored_links))
-            if take > 0:
-                best_hrefs = [href for _, href in scored_links[:take]]
-                results = await asyncio.gather(
-                    *[_fetcher.fetch_with_links(h) for h in best_hrefs],
-                    return_exceptions=True,
+            snippet = (url_to_snippet.get(url) or "").strip()
+            if snippet and url not in seen_urls:
+                seen_urls.add(url)
+                src = {"title": url_to_title.get(url, url), "url": url}
+                trust_label, _ = domain_trust(url)
+                if trust_label:
+                    src["reliability"] = trust_label
+                sources.append(src)
+                context_parts.append(
+                    f"Источник: {url_to_title.get(url, url)}\nURL: {url}\n"
+                    f"[сниппет поисковика — страница не прочитана]\n{snippet[:1200]}"
                 )
-                for href, res in zip(best_hrefs, results):
-                    if isinstance(res, Exception):
-                        continue
-                    deep_text, _ = res
-                    if deep_text and ChunkRanker.score_text(query, deep_text) > page_score:
-                        extra_hops_used += 1
-                        hop_trust_label, _ = domain_trust(href)
-                        hop_source = {"title": f"{url_to_title.get(url, url)} → подробнее", "url": href}
-                        if hop_trust_label:
-                            hop_source["reliability"] = hop_trust_label
-                        sources.append(hop_source)
-                        excerpt = best_excerpt(query, deep_text, max_chars=3000)
-                        hop_suffix = f" [надёжность источника: {hop_trust_label}]" if hop_trust_label else ""
-                        context_parts.append(
-                            f"Источник: {url_to_title.get(url, url)} (подробности по ссылке со страницы){hop_suffix}\n"
-                            f"URL: {href}\n{excerpt}"
-                        )
-                continue
+                best_score = max(best_score, ChunkRanker.score_text(query, snippet))
+            continue
+
+        page_score = base_score
+
+        # Нерелевантная страница с хорошими ссылками — пробуем перейти
+        if page_score <= 0 and links and extra_hops_used < extra_hops_budget:
+            if deadline is not None and _loop_time() > deadline:
+                pass  # время вышло — хопы не делаем
+            else:
+                scored_links = []
+                for anchor_text, href in links:
+                    s = ChunkRanker.score_text(query, anchor_text)
+                    if s > 0:
+                        scored_links.append((s, href))
+                scored_links.sort(key=lambda x: x[0], reverse=True)
+                take = min(3, extra_hops_budget - extra_hops_used, len(scored_links))
+                if take > 0:
+                    hop_deadline = (deadline - 3.0) if deadline is not None else None
+                    results = await asyncio.gather(
+                        *[_fetcher.fetch_with_links(h) for h in [h for _, h in scored_links[:take]]],
+                        return_exceptions=True,
+                    )
+                    for href, res in zip([h for _, h in scored_links[:take]], results):
+                        if hop_deadline is not None and _loop_time() > hop_deadline:
+                            break
+                        if isinstance(res, Exception):
+                            continue
+                        deep_text, _ = res
+                        if deep_text and ChunkRanker.score_text(query, deep_text) > page_score:
+                            extra_hops_used += 1
+                            hop_trust_label, _ = domain_trust(href)
+                            hop_source = {"title": f"{url_to_title.get(url, url)} → подробнее", "url": href}
+                            if hop_trust_label:
+                                hop_source["reliability"] = hop_trust_label
+                            sources.append(hop_source)
+                            excerpt = best_excerpt(query, deep_text, max_chars=3000)
+                            hop_suffix = f" [надёжность источника: {hop_trust_label}]" if hop_trust_label else ""
+                            context_parts.append(
+                                f"Источник: {url_to_title.get(url, url)} (подробности по ссылке со страницы){hop_suffix}\n"
+                                f"URL: {href}\n{excerpt}"
+                            )
+                    continue
 
         if url in seen_urls:
             continue
         seen_urls.add(url)
 
-        # === 4. Рекенси-буст для time-sensitive запросов ===
         published = url_to_published.get(url)
         page_score += _recency_boost(published, time_sensitive)
         best_score = max(best_score, page_score)
@@ -954,20 +1211,34 @@ async def deep_search(
     max_results: int = MAX_PAGES_TO_FETCH,
     max_refinements: int = MAX_REFINEMENTS,
     query_refiner: Optional[QueryRefiner] = None,
+    query_expander: Optional[QueryExpander] = None,
+    time_budget: float = SEARCH_TIME_BUDGET,
 ) -> Dict[str, Any]:
     """
-    query_refiner — опциональная async-функция (original_query, found_titles) -> new_query.
-    Если не передана, уточнение выполняется эвристически (добавление года/даты).
+    v3:
+      - time_budget — общий дедлайн на всю операцию (loop-time, секунды).
+        При его исчерпании возвращается лучший накопленный контекст
+        (вплоть до сниппетов), а не пустой результат;
+      - query_expander — опциональный async hook(query) -> List[str]:
+        дополнительные формулировки, ищутся параллельно с базовым запросом
+        и сливаются с приоритетом базового (например, LLM-варианты:
+        синонимы, английская формулировка, декомпозиция);
+      - query_refiner — прежний хук итеративного уточнения (без изменений).
     """
+    deadline = _loop_time() + max(5.0, float(time_budget))
+
     # --- Прямые ссылки ---
-    direct_urls = extract_urls(query)
+    direct_urls = [clean_url(u) for u in extract_urls(query)]
     if direct_urls:
-        fetched = await asyncio.gather(*[fetch_url(u) for u in direct_urls[:max_results]])
-        sources = [{"title": r["title"], "url": r["url"]} for r in fetched if r["ok"]]
-        context_parts = [
-            f"Источник: {r['url']}\nURL: {r['url']}\n{r['text']}"
-            for r in fetched if r["ok"]
-        ]
+        fetch_deadline = min(deadline, _loop_time() + 20.0)
+        fetched = await _fetcher.fetch_many(direct_urls[:max_results], deadline=fetch_deadline)
+        sources = []
+        context_parts = []
+        for url, text in fetched:
+            if not text:
+                continue
+            sources.append({"title": url, "url": url})
+            context_parts.append(f"Источник: {url}\nURL: {url}\n{text}")
         if context_parts:
             return {
                 "sources": sources,
@@ -990,14 +1261,55 @@ async def deep_search(
             return cached
 
     time_sensitive = is_time_sensitive_query(query)
-    ddg_results, backend = await search_backends(query, max_results + 2)
-    if not ddg_results:
+
+    # --- v3: расширение запроса (параллельные формулировки) ---
+    queries = [query]
+    if query_expander is not None:
+        try:
+            extra = await asyncio.wait_for(query_expander(query), timeout=8.0)
+            if extra:
+                for q in extra:
+                    q = (q or "").strip()
+                    if q and q.lower() != query.lower() and q not in queries:
+                        queries.append(q)
+                    if len(queries) >= MAX_EXPANDED_QUERIES:
+                        break
+        except Exception as e:
+            logger.debug(f"query_expander failed: {e}")
+
+    # --- Поиск по всем формулировкам параллельно ---
+    per_query = max(3, max_results // len(queries) + 1)
+    search_results = await asyncio.gather(
+        *[search_backends(q, per_query + 2) for q in queries],
+        return_exceptions=True,
+    )
+
+    merged_results: List[Dict] = []
+    seen: set = set()
+    backend_used = "none"
+    for q, res in zip(queries, search_results):
+        if isinstance(res, Exception):
+            logger.warning(f"deep_search: запрос '{q[:60]}' упал: {res}")
+            continue
+        items, backend = res
+        if items and backend_used == "none":
+            backend_used = backend
+        for r in items:
+            url = clean_url(r.get("url", ""))
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            r["url"] = url
+            merged_results.append(r)
+
+    if not merged_results:
         return {"sources": [], "context": "Поиск не дал результатов.", "search_performed": False}
 
-    # --- Ранжирование сниппетов: скор + доверие домена + свежесть ---
+    # --- Ранжирование сниппетов: BM25 + доверие домена + свежесть ---
+    snippet_texts = [f"{r.get('title', '')} {r.get('snippet', '')}" for r in merged_results]
+    bm = bm25_scores(query, snippet_texts)
     scored = []
-    for r in ddg_results:
-        base = ChunkRanker.score_text(query, f"{r.get('title', '')} {r.get('snippet', '')}")
+    for r, base in zip(merged_results, bm):
         base += domain_trust(r.get("url", ""))[1]
         base += _recency_boost(r.get("published"), time_sensitive)
         scored.append((base, r))
@@ -1006,26 +1318,36 @@ async def deep_search(
     ordered_results = above_threshold if above_threshold else [r for _, r in scored]
 
     urls = [r["url"] for r in ordered_results if r.get("url")][:max_results]
-    url_to_title = {r["url"]: r["title"] for r in ddg_results}
-    url_to_published = {r["url"]: r.get("published") for r in ddg_results}
+    url_to_title = {r["url"]: r["title"] for r in merged_results}
+    url_to_snippet = {r["url"]: (r.get("snippet") or "") for r in merged_results}
+    url_to_published = {r["url"]: r.get("published") for r in merged_results}
 
-    fetched = await _fetcher.fetch_many_with_links(urls, limit=PARALLEL_FETCH_LIMIT)
-    # Если реранкер есть — он живёт внутри _process_pages.
-
+    # --- Чтение страниц с учётом оставшегося бюджета ---
+    remaining = deadline - _loop_time()
     MAX_EXTRA_HOPS = 3
-    sources, context_parts, best_score, _ = await _process_pages(
-        query, fetched, url_to_title, url_to_published,
-        time_sensitive, MAX_EXTRA_HOPS,
-    )
+    if remaining <= 2.0:
+        # Времени на чтение страниц нет — контекст из сниппетов
+        sources, context_parts, best_score, _ = await _process_pages(
+            query, [(u, "", []) for u in urls], url_to_title, url_to_snippet,
+            url_to_published, time_sensitive, 0, deadline=deadline,
+        )
+    else:
+        fetch_deadline = deadline - 2.0  # резерв на хопы/сборку
+        fetched = await _fetcher.fetch_many_with_links(
+            urls, limit=PARALLEL_FETCH_LIMIT, deadline=fetch_deadline
+        )
+        sources, context_parts, best_score, _ = await _process_pages(
+            query, fetched, url_to_title, url_to_snippet, url_to_published,
+            time_sensitive, MAX_EXTRA_HOPS, deadline=fetch_deadline,
+        )
 
     # === ИТЕРАТИВНОЕ УТОЧНЕНИЕ ===
-    # Лучший скор низкий -> переформулируем запрос и ищем ещё раз,
-    # добавляя новые уникальные источники (как делают агентные системы).
     refinements_done = 0
     current_query = query
     while (
         best_score < REFINEMENT_SCORE_THRESHOLD
         and refinements_done < max_refinements
+        and (deadline - _loop_time()) > 8.0  # v3: только если есть время на полный круг
     ):
         found_titles = [s.get("title", "") for s in sources]
         if query_refiner is not None:
@@ -1035,7 +1357,6 @@ async def deep_search(
                 logger.debug(f"query_refiner failed: {e}")
                 refined = ""
         else:
-            # Эвристический фолбэк: добавить текущий год, если его нет
             refined = current_query if _YEAR_RE.search(current_query) else f"{current_query} {time.localtime().tm_year}"
 
         if not refined or refined == current_query:
@@ -1054,16 +1375,23 @@ async def deep_search(
                           + _recency_boost(r.get("published"), time_sensitive),
             reverse=True,
         )
-        new_urls = [r["url"] for r in r_scored if r.get("url") and r["url"] not in {s.get("url") for s in sources}][:max_results]
+        new_urls = [clean_url(r["url"]) for r in r_scored
+                    if r.get("url") and clean_url(r["url"]) not in {s.get("url") for s in sources}][:max_results]
         if not new_urls:
             break
         for r in refined_results:
-            url_to_title.setdefault(r["url"], r["title"])
-            url_to_published.setdefault(r["url"], r.get("published"))
-        new_fetched = await _fetcher.fetch_many_with_links(new_urls, limit=PARALLEL_FETCH_LIMIT)
+            u = clean_url(r.get("url", ""))
+            if not u:
+                continue
+            url_to_title.setdefault(u, r["title"])
+            url_to_snippet.setdefault(u, r.get("snippet") or "")
+            url_to_published.setdefault(u, r.get("published"))
+        new_fetched = await _fetcher.fetch_many_with_links(
+            new_urls, limit=PARALLEL_FETCH_LIMIT, deadline=deadline - 1.0
+        )
         new_sources, new_parts, new_best, _ = await _process_pages(
-            refined, new_fetched, url_to_title, url_to_published,
-            time_sensitive, 0,  # хопы только в первом проходе
+            refined, new_fetched, url_to_title, url_to_snippet, url_to_published,
+            time_sensitive, 0, deadline=deadline - 1.0,
         )
         sources.extend(new_sources)
         context_parts.extend(new_parts)
@@ -1075,8 +1403,10 @@ async def deep_search(
         "context": context,
         "search_performed": True,
         "chunks_found": len(context_parts),
-        "backend": backend,
+        "backend": backend_used if len(queries) == 1 else f"{backend_used}+expand",
         "refinements": refinements_done,
+        "expanded_queries": queries[1:] if len(queries) > 1 else [],
+        "elapsed_seconds": round(_loop_time() - (deadline - max(5.0, float(time_budget))), 2),
     }
     if not skip_cache and context_parts:
         await _search_cache.set(cache_key, result)
@@ -1092,7 +1422,10 @@ __all__ = [
     'WebPageFetcher',
     'ChunkRanker',
     'Reranker',
+    'bm25_scores',
+    'clean_url',
     'dedup_by_simhash',
+    'dedup_pages',
     'hash_query',
     'content_has_currency_numbers',
     'search_ddg',

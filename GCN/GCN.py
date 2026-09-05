@@ -386,14 +386,25 @@ class KnowledgeGraph:
         return None
 
     def get_neighbors(self, node_id: str, relation: Optional[str] = None) -> List[Tuple[str, str]]:
+        # ИСПРАВЛЕНИЕ: self._edges/_reverse — defaultdict(list). Индексация
+        # `self._edges[node_id]` на ЧТЕНИЕ для узла, у которого ещё нет рёбер,
+        # молча создаёт в словаре пустую запись (побочный эффект defaultdict).
+        # get_neighbors/get_incoming/traverse вызываются очень часто именно
+        # для узлов БЕЗ нужного отношения (explain_fact дергает CONTRADICTS/
+        # GROUNDS_IN/ABSTRACTS_FROM для каждого факта, _pull_grounded_concepts
+        # — GROUNDS_IN для каждого кандидата) — то есть каждый такой вызов
+        # навсегда добавлял в граф мусорный узел с пустым списком рёбер.
+        # save() сериализует dict(self._graph._edges) целиком, так что этот
+        # мусор ещё и копился в файле состояния на диске. Заменено на .get(),
+        # который не мутирует словарь при отсутствии ключа.
         if relation is None:
-            return self._edges[node_id][:]
-        return [(r, t) for r, t in self._edges[node_id] if r == relation]
+            return self._edges.get(node_id, [])[:]
+        return [(r, t) for r, t in self._edges.get(node_id, []) if r == relation]
 
     def get_incoming(self, node_id: str, relation: Optional[str] = None) -> List[Tuple[str, str]]:
         if relation is None:
-            return self._reverse[node_id][:]
-        return [(r, s) for r, s in self._reverse[node_id] if r == relation]
+            return self._reverse.get(node_id, [])[:]
+        return [(r, s) for r, s in self._reverse.get(node_id, []) if r == relation]
 
     def traverse(self, start_id: str, max_depth: int = 2) -> List[str]:
         visited = set()
@@ -407,7 +418,7 @@ class KnowledgeGraph:
                     continue
                 visited.add(node)
                 result.append(node)
-                for _, neighbor in self._edges[node]:
+                for _, neighbor in self._edges.get(node, []):
                     if neighbor not in visited:
                         next_frontier.append(neighbor)
             frontier = next_frontier

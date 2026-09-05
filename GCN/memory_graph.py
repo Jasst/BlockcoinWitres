@@ -12,7 +12,6 @@ import time
 import re
 import asyncio
 import math
-import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Set, Optional, Any, Tuple, DefaultDict
@@ -20,7 +19,6 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 import faiss
 import uuid
@@ -35,77 +33,7 @@ from GCN.GCN import (
 
 logger = logging.getLogger(__name__)
 
-try:
-    from GCN.config_ai import *
-except ImportError:
-    # fallback значения (критические)
-    WORKING_MEMORY_SIZE = 20
-    SENSORY_BUFFER_SIZE = 5
-    EPISODIC_MAX_SIZE = 500
-    SEMANTIC_MAX_FACTS = 10000
-    ASSOCIATIVE_GRAPH_MAX_NODES = 20000
-    DEFAULT_IMPORTANCE = 1.0
-    DEFAULT_CONFIDENCE = 0.5
-    DEFAULT_NOVELTY = 0.0
-    DEFAULT_SALIENCE = 0.0
-    DEFAULT_STABILITY = 0.5
-    DEFAULT_PLASTICITY = 0.5
-    DEFAULT_PREDICTION_ERROR = 0.0
-    SYNAPSE_INITIAL_WEIGHT = 0.1
-    SYNAPSE_MAX_WEIGHT = 1.0
-    SYNAPSE_MIN_WEIGHT = 0.01
-    SYNAPSE_DECAY_RATE = 0.001
-    SYNAPSE_PLASTICITY_RATE = 0.01
-    SYNAPSE_COACTIVATION_THRESHOLD = 0.3
-    HEBBIAN_LEARNING_RATE = 0.02
-    STDP_LEARNING_RATE = 0.03
-    STDP_TIME_WINDOW = 5.0
-    STDP_LONG_TERM_POTENTIATION = 0.01
-    STDP_LONG_TERM_DEPRESSION = 0.005
-    SPREADING_MAX_DEPTH = 3
-    SPREADING_MAX_NODES = 50
-    SPREADING_DECAY = 0.5
-    SPREADING_THRESHOLD = 0.05
-    PREDICTIVE_MATRIX_MAX_SIZE = 5000
-    PREDICTIVE_LEARNING_RATE = 0.1
-    PREDICTION_ERROR_THRESHOLD = 0.3
-    CONSOLIDATION_INTERVAL = 7200
-    DEEP_CONSOLIDATION_INTERVAL = 28800
-    REPLAY_BATCH_SIZE = 20
-    REPLAY_MIX_RATIO = (0.4, 0.3, 0.2, 0.1)
-    MEMORY_USE_EMBEDDINGS = True
-    EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-    EMBEDDING_QUERY_PREFIX = "query: "
-    EMBEDDING_PASSAGE_PREFIX = "passage: "
-    FAISS_NLIST = 200
-    FAISS_NPROBE = 30
-    FAISS_REBUILD_THRESHOLD = 300
-    FAISS_MIN_TRAIN_VECTORS = 500
-    HYBRID_WEIGHT_BM25 = 0.25
-    HYBRID_WEIGHT_COSINE = 0.40
-    HYBRID_WEIGHT_FRESHNESS = 0.15
-    HYBRID_WEIGHT_GRAPH = 0.20
-    DYNAMIC_WEIGHTS_ENABLED = True
-    FACTUAL_WEIGHTS = (0.35, 0.30, 0.15, 0.20)
-    GENERAL_WEIGHTS = (HYBRID_WEIGHT_BM25, HYBRID_WEIGHT_COSINE, HYBRID_WEIGHT_FRESHNESS, HYBRID_WEIGHT_GRAPH)
-    MEMORY_CACHE_TTL = 60
-    MEMORY_CACHE_MAX_SIZE = 1000
-    DUPLICATE_SIMILARITY_THRESHOLD = 0.92
-    GCN_STATE_FILENAME = "gcn_state.json"
-    GCN_AUTO_VERIFY = True
-    GCN_EVIDENCE_THRESHOLD = 0.6
-    HYBRID_WEIGHT_SEMANTIC = 0.40
-    HYBRID_WEIGHT_CONFIDENCE = 0.05
-    HYBRID_WEIGHT_EVIDENCE = 0.10
-    CONCEPT_MIN_CLUSTER_SIZE = 3
-    CONCEPT_SIMILARITY_THRESHOLD = 0.6
-    CONCEPT_MAX_SCAN = 2000
-    CONCEPT_MAX_PER_RUN = 5
-    CROSS_LAYER_GROUNDING_THRESHOLD = 0.75
-    RERANK_ENABLED = True
-    RERANK_CANDIDATE_MULTIPLIER = 3
-    RERANK_MAX_CANDIDATES = 20
-    MAX_RETRIEVE_SUBQUERIES = 3
+from GCN.config_ai import *  # единственный источник конфигурации (fallback-дубль констант удалён)
 
 
 # =====================================================================
@@ -999,7 +927,24 @@ class CognitiveMemory:
     # ==================== SPREADING ACTIVATION ====================
     async def spread_activation(self, seed_ids: List[int], max_depth: int = SPREADING_MAX_DEPTH,
                                max_nodes: int = SPREADING_MAX_NODES) -> Dict[int, float]:
-        """Распространение активации по графу синапсов (локально)."""
+        """Распространение активации по графу синапсов (локально).
+
+        ИСПРАВЛЕНИЕ (потеря конвергентной активации): раньше сосед помечался
+        `visited` сразу при первом обнаружении из ЛЮБОГО узла текущего фронта,
+        и все остальные пути к тому же соседу на том же уровне BFS отсеивались
+        через `if neighbor in visited: continue` ДО строчки
+        `activation_map[neighbor] = ... + new_act` — то есть эта строка
+        физически никогда не могла накопить вклад больше чем от одного пути.
+        Для "нейронного" графа это принципиальная ошибка: узел, в который
+        ведут сильные синапсы сразу от нескольких активных узлов, обязан
+        получать БОЛЬШЕ суммарной активации, чем узел с одной слабой связью —
+        именно это свойство spreading activation и должен моделировать.
+        Теперь на каждом уровне BFS сначала суммируются ВСЕ входящие вклады
+        от всех узлов текущего фронта в каждого ещё не посещённого соседа, и
+        только после этого сосед помечается visited и передаётся дальше —
+        конвергентные пути в графе синапсов складываются, а не затирают друг
+        друга.
+        """
         now = time.time()
         # Обнуляем активации
         for f in self.semantic_facts:
@@ -1010,33 +955,71 @@ class CognitiveMemory:
             self.facts_by_id[sid].activation = 1.0
 
         visited = set(valid_seeds)
-        frontier = [(sid, 1.0, 0) for sid in valid_seeds]
+        frontier: List[Tuple[int, float]] = [(sid, 1.0) for sid in valid_seeds]
         activation_map = {sid: 1.0 for sid in valid_seeds}
 
-        while frontier and len(activation_map) < max_nodes:
-            new_frontier = []
-            for fid, act, depth in frontier:
-                if depth >= max_depth:
-                    continue
+        depth = 0
+        while frontier and len(activation_map) < max_nodes and depth < max_depth:
+            level_contrib: Dict[int, float] = defaultdict(float)
+            for fid, act in frontier:
                 for neighbor in self.graph.get(fid, set()):
-                    if neighbor in visited:
-                        continue
-                    if neighbor not in self.facts_by_id:
+                    if neighbor in visited or neighbor not in self.facts_by_id:
                         continue
                     syn = self.synapses.get((fid, neighbor))
                     weight = self._get_effective_weight(syn, now) if syn else 0.5
-                    new_act = act * weight * SPREADING_DECAY
-                    if new_act < SPREADING_THRESHOLD:
-                        continue
-                    visited.add(neighbor)
-                    activation_map[neighbor] = activation_map.get(neighbor, 0.0) + new_act
-                    new_frontier.append((neighbor, new_act, depth + 1))
+                    level_contrib[neighbor] += act * weight * SPREADING_DECAY
+
+            new_frontier = []
+            for neighbor, total_act in level_contrib.items():
+                if total_act < SPREADING_THRESHOLD:
+                    continue
+                visited.add(neighbor)
+                activation_map[neighbor] = total_act
+                new_frontier.append((neighbor, total_act))
+                if len(activation_map) >= max_nodes:
+                    break
             frontier = new_frontier
+            depth += 1
 
         for fid, act in activation_map.items():
             if fid in self.facts_by_id:
                 self.facts_by_id[fid].activation = act
         return activation_map
+
+    def _prune_weak_synapses(self, min_age: float = 3 * 86400) -> int:
+        """
+        Синаптический прунинг: удаляет связи, угасшие почти до нуля (вес у
+        пола SYNAPSE_MIN_WEIGHT после _apply_decay) и давно не подкреплявшиеся
+        коактивацией. Без этого self.synapses/self.graph только растут —
+        _apply_decay прижимает вес мёртвой связи к полу, но саму связь никогда
+        не убирает, поэтому spread_activation с каждым месяцем работы обходит
+        всё больше практически нулевых рёбер впустую, а граф размывается
+        шумом из давно неактуальных ассоциаций. Двойное условие (и вес, и
+        возраст) защищает свежую, но пока слабую связь от преждевременного
+        удаления — стирается только то, что и слабое, и давно не срабатывало.
+        """
+        now = time.time()
+        dead = [
+            key for key, syn in self.synapses.items()
+            if syn.weight <= SYNAPSE_MIN_WEIGHT * 1.5
+            and (now - syn.last_activation) > min_age
+        ]
+        for src, tgt in dead:
+            del self.synapses[(src, tgt)]
+            self.graph[src].discard(tgt)
+            if not self.graph[src]:
+                del self.graph[src]
+            fact_src = self.facts_by_id.get(src)
+            fact_tgt = self.facts_by_id.get(tgt)
+            if fact_src and fact_tgt and fact_src.gcn_id and fact_tgt.gcn_id:
+                try:
+                    self.gcn_store.unlink(fact_src.gcn_id, fact_tgt.gcn_id, "synapse", self.user_id)
+                except Exception as e:
+                    logger.debug(f"GCN synapse unlink failed during pruning: {e}")
+        if dead:
+            self._dirty = True
+            logger.info(f"[Prune] Removed {len(dead)} dead synapses for {self.user_id[:16]}")
+        return len(dead)
 
     # ==================== ГИБРИДНЫЙ ПОИСК ====================
     async def retrieve_hybrid(self, query: str, top_k: int = 5, use_graph: bool = True) -> List[Dict]:
@@ -1158,22 +1141,13 @@ class CognitiveMemory:
         return result
 
     def _is_time_sensitive(self, query: str) -> bool:
-        """Эвристика для запросов, требующих актуальных данных.
-
-        ИСПРАВЛЕНИЕ: список маркеров раньше содержал явные литералы годов
-        ('2024','2025','2026') — рабочие ровно 3 года, после чего эвристика
-        молча переставала ловить упоминания текущего/следующего года без
-        каких-либо ошибок или логов. Заменено на regex \\b\\d{4}\\b — ловит
-        любой 4-значный год в запросе, а не только захардкоженные значения.
         """
-        time_markers = [
-            'сегодня', 'сейчас', 'курс', 'погода', 'новости', 'свежие',
-            'завтра', 'вчера', 'актуальные', 'последние'
-        ]
-        q = query.lower()
-        if any(m in q for m in time_markers):
-            return True
-        return bool(re.search(r'\b(19|20)\d{2}\b', q))
+        Делегирует в единую эвристику web_search.is_time_sensitive_query —
+        раньше здесь лежала вторая копия списка маркеров, расходившаяся
+        с оригиналом (и уже один раз ломавшаяся на захардкоженных годах).
+        """
+        from GCN.web_search import is_time_sensitive_query
+        return is_time_sensitive_query(query)
 
     def _is_factual(self, query: str) -> bool:
         """Эвристика для фактических запросов с числами или единицами."""
@@ -1272,6 +1246,7 @@ class CognitiveMemory:
 
             removed = self._remove_facts(to_remove)
             self._apply_decay()
+            pruned = self._prune_weak_synapses()
             # ИСПРАВЛЕНИЕ: GCN.MemoryStore.apply_decay() (затухание salience у
             # объектов, к которым давно не обращались) существовал в коде, но
             # нигде не вызывался — только затухание веса синапсов (self._apply_decay
@@ -1284,7 +1259,10 @@ class CognitiveMemory:
             except Exception as e:
                 logger.debug(f"GCN apply_decay failed for {self.user_id[:16]}: {e}")
             await self._schedule_save()
-            logger.info(f"Light consolidation done for {self.user_id[:16]}: removed {removed} duplicates")
+            logger.info(
+                f"Light consolidation done for {self.user_id[:16]}: "
+                f"removed {removed} duplicates, pruned {pruned} dead synapses"
+            )
 
     async def deep_consolidation(self):
         async with self._lock:

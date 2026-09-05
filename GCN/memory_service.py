@@ -2,6 +2,17 @@
 """
 Сервисный слой для работы с когнитивной памятью.
 Используется как MCP-инструментами, так и чат-контроллером.
+
+ИЗМЕНЕНИЕ (semantic_search по трём слоям): раньше semantic_search искал
+ТОЛЬКО по приватной памяти пользователя — общие (shared) и глобальные
+(global) знания были недостижимы для векторного поиска, хотя recall()
+через router.retrieve() их видел. Это давало рассинхрон: один и тот же
+запрос через recall возвращал глобальные факты, а через semantic_search
+— нет. Теперь поиск идёт по всем трём слоям с теми же scope-весами, что
+и в GCNMemoryRouter.retrieve (private ×1.2, shared ×1.0, global ×0.9),
+с дедупликацией по тексту и пометкой record_access для найденного.
+Параметр scope (опционально) позволяет сузить поиск до одного слоя —
+обратная совместимость сохранена (по умолчанию ищем везде).
 """
 
 import logging
@@ -14,6 +25,9 @@ from GCN.llm_client import call_llm
 from GCN.config_ai import MEMORY_BASE_DIR
 
 logger = logging.getLogger(__name__)
+
+# Веса слоёв для semantic_search — зеркалят логику GCNMemoryRouter.retrieve
+_SCOPE_WEIGHTS = {"private": 1.2, "shared": 1.0, "global": 0.9}
 
 
 class MemoryService:
@@ -163,17 +177,90 @@ class MemoryService:
             for g in goals
         ]
 
-    async def semantic_search(self, query: str, top_k: int = 5) -> List[Dict]:
+    async def semantic_search(self, query: str, top_k: int = 5,
+                              scope: Optional[str] = None) -> List[Dict]:
+        """
+        Векторный поиск по смыслу.
+
+        ИЗМЕНЕНИЕ: раньше искал только по приватному слою. Теперь — по всем
+        трём (private/shared/global) с scope-весами как в retrieve():
+          private ×1.2, shared ×1.0, global ×0.9
+        Результаты дедуплицируются по тексту, сортируются по взвешенному
+        скору, найденное помечается record_access (как в router.retrieve).
+
+        Аргументы:
+            query — поисковый запрос;
+            top_k — число результатов после слияния слоёв;
+            scope — опциональный фильтр 'private'|'shared'|'global'
+                    (по умолчанию None — поиск по всем слоям).
+
+        Возвращает список dict: text, score, raw_score, scope, gcn_id,
+        confidence.
+        """
         self.refresh()
-        emb = self.private_memory.embed_text(query, is_query=True)
+        memory = self.private_memory
+        if not memory.use_embeddings or memory.embedder is None:
+            return []
+        emb = memory.embed_text(query, is_query=True)
         if emb is None:
             return []
-        results = self.private_memory.store.semantic_search(emb, top_k=top_k * 2)
-        return [
-            {"text": self.private_memory.store.get(gcn_id).subject if self.private_memory.store.get(gcn_id) else "",
-             "score": score}
-            for gcn_id, score in results[:top_k]
+
+        # Какие слои сканируем
+        layers = [
+            ("private", self.private_memory),
+            ("shared", self.shared_memory),
+            ("global", self.global_memory),
         ]
+        if scope:
+            scope_l = scope.lower()
+            layers = [(s, m) for s, m in layers if s == scope_l]
+            if not layers:
+                return []
+
+        merged: List[Dict] = []
+        seen_texts: set = set()
+        for scope_name, mem in layers:
+            try:
+                results = mem.store.semantic_search(emb, top_k=top_k * 2)
+            except Exception as e:
+                logger.debug(f"semantic_search: слой {scope_name} недоступен: {e}")
+                continue
+            for gcn_id, raw_score in results:
+                obj = mem.store.get(gcn_id)
+                if obj is None or not getattr(obj, "subject", ""):
+                    continue
+                text = obj.subject
+                key = text.strip().lower()
+                if key in seen_texts:
+                    continue
+                seen_texts.add(key)
+                weight = _SCOPE_WEIGHTS.get(scope_name, 1.0)
+                merged.append({
+                    "text": text,
+                    "score": min(1.0, max(0.0, raw_score) * weight),
+                    "raw_score": raw_score,
+                    "scope": scope_name,
+                    "gcn_id": gcn_id,
+                    "confidence": obj.confidence,
+                })
+
+        merged.sort(key=lambda x: x["score"], reverse=True)
+        final = merged[:top_k]
+
+        # Помечаем как использованные (свежесть/затухание работают корректно)
+        scope_map = {
+            "private": self.private_memory,
+            "shared": self.shared_memory,
+            "global": self.global_memory,
+        }
+        for item in final:
+            mem = scope_map.get(item["scope"])
+            if mem is not None and item.get("gcn_id"):
+                try:
+                    mem.store.record_access(item["gcn_id"], self.user_id)
+                except Exception as e:
+                    logger.debug(f"record_access failed for {item['gcn_id']}: {e}")
+        return final
 
     async def graph_explore(self, seed_text: str, depth: int = 2) -> Dict[str, Any]:
         self.refresh()

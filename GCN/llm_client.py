@@ -4,21 +4,18 @@ import logging
 from typing import List, Dict, Optional
 from GCN.config_ai import LM_STUDIO_URL, LM_STUDIO_API_KEY, LM_STUDIO_TIMEOUT, LM_STUDIO_STREAM_TIMEOUT
 import json
+
 logger = logging.getLogger(__name__)
 
-# УЛУЧШЕНИЕ: раньше каждый вызов (call_llm_raw, call_llm_stream) открывал
-# новый aiohttp.ClientSession и закрывал его сразу после ответа — то есть
-# новое TCP-соединение (и его закрытие) на КАЖДЫЙ запрос к одному и тому же
-# локальному LM Studio, при том что это самый горячий путь во всём проекте
-# (каждое сообщение чата, каждый tool-call реранкинг, verify_response и т.д.
-# идут через него). Теперь используется один переиспользуемый session с пулом
-# соединений (keep-alive), лениво создаваемый при первом обращении.
+# Переиспользуемая сессия с пулом соединений (keep-alive) к локальному LM
+# Studio вместо нового TCP-хендшейка на каждый вызов — это самый горячий
+# путь в проекте (каждое сообщение чата, каждый tool-call реранкинг,
+# verify_response). Закрывается через close_session() при остановке процесса.
 _session: Optional[aiohttp.ClientSession] = None
 _session_lock = asyncio.Lock()
 
 # Статусы, при которых имеет смысл повторить попытку (временная перегрузка/
-# рейт-лимит бэкенда), а не только 5xx — раньше 429 просто "проваливался"
-# в общий return {} без единой попытки повтора.
+# рейт-лимит бэкенда), а не только 5xx.
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 
 
@@ -49,14 +46,9 @@ async def call_llm_raw(
     retries: int = 3
 ) -> Dict:
     """
-    Возвращает СЫРОЙ объект message от LLM целиком (а не только текст content).
-    Нужно, чтобы вызывающий код (GCN.tool_router) мог прочитать tool_calls,
-    если модель поддерживает нативный function calling — это тот же механизм,
-    которым пользуется внешний MCP-клиент (например Claude Desktop) при работе
-    с mcp_server_blockcoin.py. Раньше в этом модуле возвращался только текст
-    content, и решение "звать ли инструмент" приходилось угадывать по фигурным
-    скобкам внутри обычного текстового ответа — это и было главной причиной,
-    почему браузерный чат вёл себя менее осмысленно, чем MCP-клиент.
+    Возвращает сырой объект message от LLM целиком (не только content), чтобы
+    вызывающий код (GCN.tool_router) мог прочитать tool_calls при нативном
+    function calling — тем же механизмом, что использует внешний MCP-клиент.
     """
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
     payload = {
@@ -76,18 +68,18 @@ async def call_llm_raw(
                 if resp.status == 200:
                     data = await resp.json()
                     return data.get("choices", [{}])[0].get("message", {}) or {}
-                else:
-                    error_text = await resp.text()
-                    logger.error(f"LLM error {resp.status}: {error_text[:200]}")
-                    # tools может быть не поддержан бэкендом (400) — пробуем без tools один раз
-                    if tools and resp.status == 400 and attempt == 0:
-                        payload.pop("tools", None)
-                        payload.pop("tool_choice", None)
-                        continue
-                    if resp.status in _RETRYABLE_STATUSES and attempt < retries - 1:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    return {}
+
+                error_text = await resp.text()
+                logger.error(f"LLM error {resp.status}: {error_text[:200]}")
+                # tools может быть не поддержан бэкендом (400) — пробуем без tools один раз
+                if tools and resp.status == 400 and attempt == 0:
+                    payload.pop("tools", None)
+                    payload.pop("tool_choice", None)
+                    continue
+                if resp.status in _RETRYABLE_STATUSES and attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return {}
         except Exception as e:
             logger.error(f"LLM call failed: {e}")
             if attempt < retries - 1:
@@ -103,12 +95,10 @@ async def call_llm(
     max_tokens: int = 2048,
     retries: int = 3
 ) -> str:
-    """
-    Универсальная функция вызова локальной LLM (LM Studio) — только текст ответа.
-    Используется и в ai_assistant, и в MCP-сервере, везде, где tool_calls не нужны.
-    """
+    """Универсальная функция вызова локальной LLM (LM Studio) — только текст ответа."""
     msg = await call_llm_raw(messages, temp=temp, max_tokens=max_tokens, tools=None, retries=retries)
     return msg.get("content", "") or ""
+
 
 async def call_llm_stream(
     messages: List[Dict[str, str]],
@@ -135,22 +125,18 @@ async def call_llm_stream(
                 return
             async for line in resp.content:
                 line = line.decode('utf-8').strip()
-                if not line:
+                if not line or not line.startswith('data: '):
                     continue
-                if line.startswith('data: '):
-                    data = line[6:]
-                    if data == '[DONE]':
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk.get('choices', [{}])[0].get('delta', {})
-                        content = delta.get('content', '')
-                        if content:
-                            yield content
-                    except json.JSONDecodeError:
-                        continue
-            # Если ничего не было выдано, отправляем пустую строку (не None)
-            yield ""
+                data = line[6:]
+                if data == '[DONE]':
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                content = chunk.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                if content:
+                    yield content
     except asyncio.CancelledError:
         logger.debug("Stream cancelled")
         raise

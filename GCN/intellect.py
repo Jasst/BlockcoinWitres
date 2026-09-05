@@ -69,6 +69,7 @@ except ImportError:
     GROUNDED_MAX_SOURCES = 8
 
 from GCN.llm_client import call_llm
+from GCN.tool_router import _looks_compound  # единая эвристика составного запроса (была третьей копией)
 from GCN.web_search import domain_trust
 
 logger = logging.getLogger(__name__)
@@ -206,22 +207,6 @@ def sanitize_search_facts(
 _SUBQUERY_SPLIT_RE = re.compile(
     r"\s+а также\s+|\s+затем\s+|\s+потом\s+|\s+после этого\s+|;\s*|\.\s+(?=[А-ЯA-Z])"
 )
-_COMPOUND_MARKERS_C = (" и ", " а также ", " затем ", " потом ", ";", " или ")
-_LEADING_CONNECTOR_RE = re.compile(
-    r"^(?:затем|потом|а также|также|и|а|после этого|далее|еще|ещё)\s+",
-    re.IGNORECASE,
-)
-
-
-def _looks_compound(message: str) -> bool:
-    if len(message) >= 120:
-        return True
-    if message.count("?") >= 2:
-        return True
-    lowered = f" {message.lower()} "
-    return any(m in lowered for m in _COMPOUND_MARKERS_C)
-
-
 def _heuristic_subqueries(message: str, max_n: int = None) -> List[str]:
     max_n = max_n or MAX_RETRIEVE_SUBQUERIES
     parts = [p.strip(" .,—-") for p in _SUBQUERY_SPLIT_RE.split(message)]
