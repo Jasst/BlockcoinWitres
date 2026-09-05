@@ -152,6 +152,10 @@ window.selectConversation = function(address, name, isGroup) {
     let _currentAiSessionId = null;
     let _aiNameSet = false;
     let _partialSaveTimer = null;
+    // ИСПРАВЛЕНИЕ (дубли картинок): URL уже показанных изображений — чтобы
+    // событие image_url не обрабатывалось повторно (attach-реплей, сетевой
+    // обрыв и повторное подключение к тому же потоку).
+    let _displayedImageUrls = new Set();
 
     const CONFIG = {
         historyMaxLength: 200,
@@ -467,6 +471,14 @@ function _clearAiHistory() {
                 mainText = text.replace(match[0], '').trim();
             }
             let html = marked.parse(mainText);
+            // ИСПРАВЛЕНИЕ: marked оборачивает голые URL в <a href="URL">URL</a>.
+            // Ссылки на сгенерированные изображения (не-stream ответы, текст
+            // результатов инструментов) превращаем в <img>, иначе картинка
+            // приходила только текстовой ссылкой и не отображалась.
+            html = html.replace(
+                /<a href="(https?:\/\/.+?\/generated_images\/.+?\.png)"[^>]*>[^<]*<\/a>/g,
+                '<img src="$1" alt="generated image" style="max-width:100%;border-radius:8px;">'
+            );
             if (reasoningHtml) html = reasoningHtml + html;
             return DOMPurify.sanitize(html);
         } catch (e) {
@@ -585,6 +597,25 @@ function _clearAiHistory() {
             _displayAiMessage(`❌ Ошибка исследования: ${err.message}`, false, null, true);
         }
     }
+    // ─── показ сгенерированного изображения с защитой от дублей ───
+    // Раньше картинка показывалась 2-3 раза: событие image_url обрабатывалось
+    // и в _sendToAi, и в _attachToActiveAiStream (attach после обрыва сети
+    // реплеит буфер), плюс сообщение сохранялось дважды (_displayAiMessage с
+    // saveToStorage=true + явный _saveAiMessage) — после перезахода в сессию
+    // дубль вылезал из localStorage. Теперь: дедуп по URL в рамках страницы +
+    // проверка, что URL ещё нет в сохранённой истории (защита от реплея
+    // после перезагрузки) + сохранение только через _displayAiMessage.
+    function _handleImageUrlEvent(imageUrl) {
+        if (!imageUrl) return;
+        if (_displayedImageUrls.has(imageUrl)) return;
+        _displayedImageUrls.add(imageUrl);
+        const hist = _getStoredHistory(_currentAiSessionId);
+        if (hist.some(m => m.role === 'assistant' && (m.text || '').includes(imageUrl))) return;
+        const imageMarkdown = `![generated](${imageUrl})`;
+        const messageTextWithImage = `🎨 *Сгенерировано изображение:*\n\n${imageMarkdown}`;
+        _displayAiMessage(messageTextWithImage, false, null, true); // сохраняет в историю сама
+    }
+
     function _displayAiMessage(text, isUser, imagePreview = null, saveToStorage = true) {
     if (!_aiMessagesContainer) {
         _aiMessagesContainer = document.getElementById('aiMessagesContainer');
@@ -704,10 +735,7 @@ function _clearAiHistory() {
                                 }, 50);
                             }
                         } else if (data.image_url) {
-                            const imageMarkdown = `![generated](${data.image_url})`;
-                            const messageTextWithImage = `🎨 *Сгенерировано изображение:*\n\n${imageMarkdown}`;
-                            _displayAiMessage(messageTextWithImage, false, null, true);
-                            _saveAiMessage('assistant', messageTextWithImage, _currentAiSessionId);
+                            _handleImageUrlEvent(data.image_url);
                             firstTokenReceived = true;
                         } else if (data.error) {
                             markdownBody.textContent = '❌ ' + data.error;
@@ -772,6 +800,7 @@ async function _sendToAi(messageText, imageFile) {
     if (_isSending) { _showToast('Подождите, предыдущий запрос обрабатывается', 'warning'); return; }
     if (!messageText.trim() && !imageFile) { _showToast('Введите сообщение или выберите изображение', 'warning'); return; }
     try { localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default')); } catch (e) {}
+    _displayedImageUrls = new Set(); // новый запрос — сброс дедупликации картинок
 
     // Авто-название
     if (_currentAiSessionId && !_aiNameSet) {
@@ -953,20 +982,16 @@ async function _sendToAi(messageText, imageFile) {
                             }, 50);
                         }
                     }
-                    // ======= НОВАЯ ОБРАБОТКА image_url =======
+                    // ======= ОБРАБОТКА image_url (с защитой от дублей) =======
                     else if (data.image_url) {
-    console.log('📸 image_url received:', data.image_url);  // <-- ДОБАВЛЕНО
-    const imageMarkdown = `![generated](${data.image_url})`;
-    const messageTextWithImage = `🎨 *Сгенерировано изображение:*\n\n${imageMarkdown}`;
-    _displayAiMessage(messageTextWithImage, false, null, true);
-    _saveAiMessage('assistant', messageTextWithImage, _currentAiSessionId);
-    if (!firstTokenReceived) {
-        _showAiTypingIndicator(false);
-        firstTokenReceived = true;
-    }
-    continue;
-}
-                    // ==============================================
+                        _handleImageUrlEvent(data.image_url);
+                        if (!firstTokenReceived) {
+                            _showAiTypingIndicator(false);
+                            firstTokenReceived = true;
+                        }
+                        continue;
+                    }
+                    // ========================================================
                     else if (data.error) {
                         markdownBody.textContent = '❌ ' + data.error;
                         firstTokenReceived = true;

@@ -508,7 +508,13 @@ class CognitiveController:
                         f"{len(query_list)} запрос(ам).\n{merged_context[:2500]}")
             return "Ничего не найдено."
 
-        async def _internal_generate_image(args: Dict) -> str:
+        # ИСПРАВЛЕНИЕ (картинки "иногда не показывались"): возвращаем dict с
+        # ключом image_url. Стрим-обработчик в _stream_response_worker делает
+        # json.loads(result) и ждёт именно {"image_url": ...} — со старой
+        # строкой "Изображение сгенерировано: <url>" парсинг падал, событие
+        # image_url в SSE не отправлялось, и фронтенд картинку не рендерил
+        # (файл при этом молча сохранялся на диск).
+        async def _internal_generate_image(args: Dict) -> Dict:
             prompt = args.get("prompt", "")
             enhance = args.get("enhance_prompt", True)
             steps = args.get("steps", 20)
@@ -523,20 +529,20 @@ class CognitiveController:
                                                   height=height, cfg_scale=cfg_scale,
                                                   seed=seed, sampler_name=sampler)
             if image_b64:
-                # Сохраняем и возвращаем ссылку (как в MCP-инструменте)
                 from GCN.config_ai import GENERATED_IMAGES_DIR
                 import base64
                 from datetime import datetime
                 output_dir = GENERATED_IMAGES_DIR
                 output_dir.mkdir(exist_ok=True)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                # %f — защита от коллизий имён при двух генерациях в одну секунду
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 filename = output_dir / f"image_{timestamp}.png"
                 with open(filename, "wb") as f:
                     f.write(base64.b64decode(image_b64))
                 BASE_URL = os.getenv("SERVER_BASE_URL", "http://localhost:8000")
                 image_url = f"{BASE_URL}/generated_images/{filename.name}"
-                return f"Изображение сгенерировано: {image_url}"
-            return "Не удалось сгенерировать изображение."
+                return {"status": "ok", "image_url": image_url, "prompt": prompt}
+            return {"status": "error", "message": "Не удалось сгенерировать изображение."}
 
         # Регистрируем в tool_registry
         self.tool_registry.register(
@@ -608,7 +614,10 @@ class CognitiveController:
                 "required": []
             },
             handler=_internal_web_search,
-            server="internal"
+            server="internal",
+            # DDG-интервал + параллельное чтение до 7 страниц регулярно
+            # превышают 45с — как в MCP_TOOL_TIMEOUT_OVERRIDES.
+            timeout_seconds=90
         )
         self.tool_registry.register(
             name="generate_image",
@@ -628,7 +637,12 @@ class CognitiveController:
                 "required": ["prompt"]
             },
             handler=_internal_generate_image,
-            server="internal"
+            server="internal",
+            # Тяжёлый инструмент: enhance-промпт (LLM) + переключение модели +
+            # генерация до EASYDIFFUSION_TIMEOUT (140с). Было: единый 45с
+            # таймаут ToolRouter обрывал генерацию под нагрузкой — отсюда
+            # "иногда работает". 300с — как в MCP_TOOL_TIMEOUT_OVERRIDES.
+            timeout_seconds=300
         )
 
         # ---- Инструмент для перечисления доступных инструментов ----
@@ -2340,6 +2354,13 @@ class CognitiveController:
                                 image_url = result["image_url"]
                                 logger.info(f"Sending image_url event: {image_url}")
                                 await push(f"data: {json.dumps({'image_url': image_url})}\n\n")
+                                # ИСПРАВЛЕНИЕ (картинка по 2-3 раза в чате): URL уходит
+                                # во фронтенд отдельным SSE-событием. Если оставить его
+                                # в tool_trace, финальный ответ LLM тоже содержит этот
+                                # URL, фронтендский рендер markdown превращает его во
+                                # вторую картинку в том же сообщении. Заменяем
+                                # результат коротким текстом без URL.
+                                t["result"] = "Изображение сгенерировано и показано пользователю выше."
                                 break
                             else:
                                 logger.warning("generate_image result does not contain image_url")
