@@ -2,19 +2,17 @@
 MCP Client Manager — управление подключениями к MCP-серверам.
 Загружает инструменты из конфига и предоставляет единый интерфейс для вызова.
 
-Изменения по сравнению с исходной версией:
-- config_path больше не резолвится от текущей рабочей директории процесса
-  (ломалось при запуске из другого cwd, например под systemd) — теперь по
-  умолчанию ищется рядом с этим модулем / GCN.config_ai.MEMORY_BASE_DIR,
-  с возможностью переопределить через переменную окружения MCP_SERVERS_CONFIG.
-- Поддержаны не только локальные stdio-серверы, но и удалённые MCP по SSE
-  (cfg с полем "url" и опциональным "headers") — раньше был захардкожен
-  только StdioServerParameters/stdio_client.
-- Каждый вызов инструмента ограничен по времени (TOOL_CALL_TIMEOUT_SECONDS) —
-  раньше зависший внешний сервер вешал весь ответ чата без возможности выйти.
-- Серверы, которые не удалось поднять при старте, не остаются "мёртвыми"
-  до перезапуска процесса: initialize() помнит их конфиг и позволяет
-  периодически повторять попытку через ensure_connected().
+- Конфиг ищется рядом с этим модулем / GCN.config_ai.MEMORY_BASE_DIR (не от
+  cwd процесса — важно при запуске под systemd), с переопределением через
+  переменную окружения MCP_SERVERS_CONFIG.
+- Поддержаны локальные stdio-серверы и удалённые MCP по SSE (cfg с полем
+  "url" и опциональным "headers").
+- Каждый вызов инструмента ограничен по времени (TOOL_CALL_TIMEOUT_SECONDS,
+  с точечными переопределениями per-tool), чтобы зависший внешний сервер не
+  вешал весь ответ чата.
+- Серверы, которые не удалось поднять при старте, не остаются "мёртвыми" до
+  перезапуска процесса: initialize() помнит их конфиг, ensure_connected()
+  периодически повторяет попытку.
 """
 
 import json
@@ -48,34 +46,37 @@ except ImportError:
     MEMORY_BASE_DIR = Path(__file__).resolve().parent
     MCP_TOOL_TIMEOUT_OVERRIDES = {}
 
+logger = logging.getLogger(__name__)
+
 
 def _resolve_tool_timeout(tool_name: str) -> float:
-    """
-    Подбирает тайм-аут клиента под конкретный инструмент (см.
-    MCP_TOOL_TIMEOUT_OVERRIDES в config_ai.py) вместо единого
-    TOOL_CALL_TIMEOUT_SECONDS для всех вызовов подряд — иначе клиент
-    обрывал бы вызов тяжёлых инструментов (генерация изображения,
-    глубокое исследование) раньше, чем сервер сам успевает их выполнить.
-    """
+    """Подбирает тайм-аут под конкретный инструмент (MCP_TOOL_TIMEOUT_OVERRIDES)
+    вместо единого TOOL_CALL_TIMEOUT_SECONDS для всех вызовов подряд — иначе
+    тяжёлые инструменты (генерация изображения, глубокое исследование)
+    обрывались бы клиентом раньше, чем сервер успевает их выполнить."""
     name_lower = (tool_name or "").lower()
     for marker, timeout in MCP_TOOL_TIMEOUT_OVERRIDES.items():
         if marker in name_lower:
             return timeout
     return TOOL_CALL_TIMEOUT_SECONDS
 
-logger = logging.getLogger(__name__)
-
 
 def _default_config_path() -> Path:
     env_path = os.environ.get("MCP_SERVERS_CONFIG")
     if env_path:
         return Path(env_path)
-    # Раньше: Path("mcp_servers.json") — зависело от cwd процесса.
     candidate = MEMORY_BASE_DIR.parent / "mcp_servers.json"
     if candidate.exists():
         return candidate
-    # запасной вариант — рядом с текущим файлом
     return Path(__file__).resolve().parent / "mcp_servers.json"
+
+
+def _redact_cfg(cfg: Dict) -> Dict:
+    """Конфиг сервера для лога — без значений env (могут содержать секреты)."""
+    safe = {k: v for k, v in cfg.items() if k != "env"}
+    if "env" in cfg:
+        safe["env"] = list(cfg["env"].keys())
+    return safe
 
 
 class MCPToolManager:
@@ -92,7 +93,7 @@ class MCPToolManager:
         """Подключиться ко всем серверам из конфига."""
         if self._initialized:
             return
-        logger.info(f"Загрузка MCP конфига из: {self.config_path}")  # <-- ДОБАВЛЕНО
+        logger.info(f"Загрузка MCP конфига из: {self.config_path}")
         if not self.config_path.exists():
             logger.warning(f"Файл конфигурации MCP не найден: {self.config_path}")
             self._initialized = True
@@ -109,7 +110,7 @@ class MCPToolManager:
         self._initialized = True
 
     async def _connect_one(self, name: str, cfg: Dict) -> bool:
-        logger.info(f"Connecting to MCP server '{name}' with config: {cfg}")
+        logger.info(f"Connecting to MCP server '{name}': {_redact_cfg(cfg)}")
         stack = AsyncExitStack()
         try:
             if cfg.get("url"):
@@ -119,26 +120,21 @@ class MCPToolManager:
                         "в этой версии — обновите пакет 'mcp' для поддержки удалённых серверов."
                     )
                 url = cfg["url"]
-                headers = cfg.get("headers") or {}
-                headers = {**headers, "Accept": "text/event-stream"}
-                logger.info(f"Connecting via SSE to {url}")
+                headers = {**(cfg.get("headers") or {}), "Accept": "text/event-stream"}
+                logger.debug(f"'{name}': SSE connect to {url}")
                 read, write = await stack.enter_async_context(sse_client(url, headers=headers))
             else:
                 command = cfg.get("command")
                 args = cfg.get("args", [])
                 env = cfg.get("env", {})
-                logger.info(f"Connecting via stdio: command={command}, args={args}")
+                logger.debug(f"'{name}': stdio connect, command={command}, args={args}")
                 server_params = StdioServerParameters(command=command, args=args, env=env)
                 read, write = await stack.enter_async_context(stdio_client(server_params))
 
-            logger.info(f"Creating session for '{name}'")
             session = await stack.enter_async_context(ClientSession(read, write))
-            logger.info(f"Initializing session for '{name}'")
             await session.initialize()
-            logger.info(f"Listing tools for '{name}'")
             response = await session.list_tools()
             tools = [tool.model_dump() for tool in response.tools]
-            logger.info(f"Received {len(tools)} tools for '{name}'")
 
             self.sessions[name] = session
             self.tools[name] = tools
@@ -156,13 +152,9 @@ class MCPToolManager:
             return False
 
     async def ensure_connected(self):
-        """
-        Повторяет попытку подключения к серверам, которые не удалось поднять
+        """Повторяет попытку подключения к серверам, которые не удалось поднять
         при старте (или отвалились позже) — не чаще MCP_RECONNECT_INTERVAL на
-        сервер. Раньше сервер, недоступный в момент старта процесса, оставался
-        недоступен до перезапуска, даже если поднимался через минуту после старта.
-        Безопасно вызывать часто — сама решает, нужна ли попытка.
-        """
+        сервер. Безопасно вызывать часто — сама решает, нужна ли попытка."""
         if not self._failed_servers:
             return
         now = time.time()

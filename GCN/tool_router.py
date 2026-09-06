@@ -107,6 +107,7 @@ try:
         TOOL_PLANNING_ENABLED,
         TOOL_PLANNING_MIN_LEN,
         MAX_SUBTASKS,
+        MCP_TOOL_TIMEOUT_OVERRIDES,
     )
 except ImportError:
     TOOL_CALL_TIMEOUT_SECONDS = 45
@@ -114,6 +115,20 @@ except ImportError:
     TOOL_PLANNING_ENABLED = True
     TOOL_PLANNING_MIN_LEN = 140
     MAX_SUBTASKS = 4
+    MCP_TOOL_TIMEOUT_OVERRIDES = {}
+
+# ИСПРАВЛЕНИЕ (генерация изображений в чате "не всегда работает"): тяжёлые
+# инструменты убивались единым TOOL_CALL_TIMEOUT_SECONDS=45 ещё ДО того, как
+# EasyDiffusion успевал сгенерировать картинку (только enhance-промпт через
+# LLM + генерация до 140с). Теперь таймаут берётся из ToolSpec, а для
+# MCP-инструментов — из того же MCP_TOOL_TIMEOUT_OVERRIDES, что и в
+# mcp_client_manager (generate_image 300с, research_topic 240с, web_search 90с).
+def _resolve_timeout(tool_name: str):
+    low = (tool_name or "").lower()
+    for marker, t in MCP_TOOL_TIMEOUT_OVERRIDES.items():
+        if marker in low:
+            return t
+    return None
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +181,7 @@ class ToolSpec:
     handler: Callable[[Dict[str, Any]], Awaitable[Any]]  # async def(arguments) -> результат
     server: str = "internal"
     original_tool_name: str = ""
+    timeout_seconds: Optional[float] = None  # None = дефолт TOOL_CALL_TIMEOUT_SECONDS
 
     def as_openai_tool(self) -> Dict[str, Any]:
         return {
@@ -188,7 +204,8 @@ class ToolRegistry:
         self._owner_server: Dict[str, str] = {}
 
     def register(self, name: str, description: str, parameters: Dict[str, Any],
-                 handler: Callable[[Dict[str, Any]], Awaitable[Any]], server: str = "internal"):
+                 handler: Callable[[Dict[str, Any]], Awaitable[Any]], server: str = "internal",
+                 timeout_seconds: Optional[float] = None):
         prefix = "internal" if server == "internal" else server
         qualified = _sanitize(f"{prefix}__{name}")
 
@@ -209,6 +226,7 @@ class ToolRegistry:
             handler=handler,
             server=server,
             original_tool_name=name,
+            timeout_seconds=timeout_seconds,
         )
 
     def register_mcp_tools(self, mcp_manager, mcp_call: Callable[[str, str, Dict], Awaitable[str]]):
@@ -227,6 +245,7 @@ class ToolRegistry:
                 parameters=t.get("inputSchema") or {"type": "object", "properties": {}},
                 handler=_handler,
                 server=server,
+                timeout_seconds=_resolve_timeout(name),
             )
 
     def is_empty(self) -> bool:
@@ -348,19 +367,23 @@ class ToolRouter:
         self.llm_raw_caller = llm_raw_caller
         self.llm_text_caller = llm_text_caller
         self._native_supported: Optional[bool] = None
+        # ИНТЕЛЛЕКТ-ПАКЕТ (E): план подзадач текущего запуска — читает
+        # PlanCritic из ai_assistant через этот атрибут или run()["plan"].
+        self._last_plan: str = ""
 
     async def _execute_tool(self, qualified_name: str, arguments: Dict[str, Any]) -> str:
         spec = self.registry.get(qualified_name)
         if not spec:
             return f"Ошибка: инструмент '{qualified_name}' не найден."
+        timeout = spec.timeout_seconds or TOOL_CALL_TIMEOUT_SECONDS
         try:
-            result = await asyncio.wait_for(spec.handler(arguments), timeout=TOOL_CALL_TIMEOUT_SECONDS)
+            result = await asyncio.wait_for(spec.handler(arguments), timeout=timeout)
             if not isinstance(result, str):
                 result = json.dumps(result, ensure_ascii=False, default=str)
             return result
         except asyncio.TimeoutError:
-            logger.error(f"Tool '{qualified_name}' timed out after {TOOL_CALL_TIMEOUT_SECONDS}s")
-            return f"Ошибка: инструмент '{qualified_name}' не ответил за {TOOL_CALL_TIMEOUT_SECONDS}с."
+            logger.error(f"Tool '{qualified_name}' timed out after {timeout}s")
+            return f"Ошибка: инструмент '{qualified_name}' не ответил за {timeout}с."
         except Exception as e:
             logger.error(f"Tool '{qualified_name}' failed: {e}", exc_info=True)
             return f"Ошибка вызова инструмента '{qualified_name}': {e}"
@@ -454,6 +477,7 @@ class ToolRouter:
 
         # ПУНКТ №4: план подзадач
         plan_text = await self._plan_subtasks(message)
+        self._last_plan = plan_text or ""
         if plan_text:
             running_messages = running_messages + [{
                 "role": "user",
@@ -484,6 +508,16 @@ class ToolRouter:
                     f"- {t['tool']}({t['arguments']}) -> {str(t['result'])[:300]}" for t in tool_trace
                 )
                 decision = await self._decide_fallback(message, history_tail, results_text, temp=0.0)
+                # ИСПРАВЛЕНИЕ (crash "Stream error: 'NoneType' object has no attribute 'get'"):
+                # _decide_fallback возвращает None, когда LLM выдала пустой ответ или
+                # не-JSON (сбой LM Studio, таймаут). Раньше decision.get(...) сразу падал
+                # с AttributeError, исключение вылетало из ToolRouter.run и гасило весь
+                # ответ чата (в стрим-режиме это ловилось как "Stream error"). None =
+                # "модель не смогла принять решение" — просто завершаем ReAct-цикл
+                # и отвечаем без инструментов.
+                if decision is None:
+                    logger.debug("ToolRouter: fallback-решение недоступно (пустой/невалидный ответ LLM) — завершаю цикл.")
+                    break
                 tool_name = decision.get("tool")
                 if tool_name and decision.get("action") == "call_tool":
                     spec = self.registry.get(tool_name)
@@ -571,7 +605,7 @@ class ToolRouter:
             if not used_native and len(tool_trace) >= MAX_TOOL_ITERATIONS:
                 break
 
-        return {"tool_trace": tool_trace, "used_native": used_native}
+        return {"tool_trace": tool_trace, "used_native": used_native, "plan": getattr(self, "_last_plan", "")}
 
 
 def build_tool_trace_context(tool_trace: List[Dict[str, Any]]) -> str:

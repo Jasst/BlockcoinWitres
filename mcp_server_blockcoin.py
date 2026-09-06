@@ -68,6 +68,18 @@ _USER_ID_DESC = (
 
 # --- Вспомогательные функции ---
 async def _with_timeout(coro, tool_name: str, timeout: Optional[float] = None) -> Any:
+    """
+    ИСПРАВЛЕНИЕ: раньше ловился только asyncio.TimeoutError. Эта обёртка
+    используется 4 разными инструментами (execute_command, web_search,
+    generate_image, research_topic) как единая точка "безопасного" вызова —
+    но любое другое исключение внутри (сетевая ошибка, KeyError, что угодно
+    в глубине process_input/deep_search/gen_image) вылетало из тула
+    необработанным, вместо структурированного {"status": "error", ...},
+    которым отвечают все остальные инструменты в этом файле. Для клиента
+    MCP разница ощутимая: сырой traceback/протокольная ошибка вместо
+    предсказуемого JSON, который можно показать пользователю или обработать
+    программно.
+    """
     try:
         return await asyncio.wait_for(coro, timeout=timeout or _MCP_TOOL_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
@@ -77,13 +89,34 @@ async def _with_timeout(coro, tool_name: str, timeout: Optional[float] = None) -
             "error": "timeout",
             "message": f"'{tool_name}' не ответил за {timeout or _MCP_TOOL_TIMEOUT_SECONDS}с — операция прервана.",
         }
+    except Exception as e:
+        logger.exception(f"Тул '{tool_name}' упал с исключением: {e}")
+        return {
+            "status": "error",
+            "error": "exception",
+            "message": f"'{tool_name}' завершился с ошибкой: {e}",
+        }
 
 # ============================================================
 # ИНСТРУМЕНТЫ
 # ============================================================
 
 # Добавить глобальный словарь для отслеживания последних вызовов
-_last_commands = {}
+_last_commands: Dict[str, float] = {}
+# ИСПРАВЛЕНИЕ: ключ — f"{user_id}:{command}", запись никогда не удалялась —
+# при разнообразных командах от разных пользователей словарь рос без
+# ограничений в течение всего времени жизни процесса. Записи старше окна
+# дедупликации бесполезны, поэтому чистим их по ходу дела (без отдельного
+# фонового таска — просто при каждом новом вызове, амортизированно дёшево).
+_DEDUP_WINDOW_SECONDS = 10
+_LAST_COMMANDS_MAX_SIZE = 2000
+
+def _prune_last_commands(now: float) -> None:
+    if len(_last_commands) <= _LAST_COMMANDS_MAX_SIZE:
+        return
+    stale = [k for k, ts in _last_commands.items() if now - ts >= _DEDUP_WINDOW_SECONDS]
+    for k in stale:
+        _last_commands.pop(k, None)
 
 @mcp.tool()
 async def execute_command(
@@ -95,7 +128,8 @@ async def execute_command(
     # === ИСПРАВЛЕНИЕ: дедупликация быстрых повторных вызовов ===
     key = f"{user_id or DEFAULT_USER}:{command}"
     now = time.time()
-    if key in _last_commands and now - _last_commands[key] < 10:
+    _prune_last_commands(now)
+    if key in _last_commands and now - _last_commands[key] < _DEDUP_WINDOW_SECONDS:
         return {
             "status": "error",
             "error": "duplicate",
@@ -107,9 +141,27 @@ async def execute_command(
     async def _run():
         return await assistant.process_input(command, web_search=allow_web_search)
     result = await _with_timeout(_run(), "execute_command")
-    if isinstance(result, dict) and result.get("error") == "timeout":
+    # ИСПРАВЛЕНИЕ: раньше проверялось только result.get("error") == "timeout" —
+    # теперь _with_timeout может вернуть структурированную ошибку и для любого
+    # другого исключения (см. _with_timeout), поэтому проверяем общий признак.
+    if isinstance(result, dict) and result.get("status") == "error":
         return result
     response, meta = result
+
+    # ИСПРАВЛЕНИЕ: если LLM вернула пустой ответ (сбой call_llm, см.
+    # llm_client.call_llm — при ошибке возвращает ""), пустая строка не
+    # содержит ни "ошибка", ни "не удалось", ни "404" — раньше это тихо
+    # проваливалось в ветку "status": "ok" с пустым result, то есть реальный
+    # сбой LLM выглядел для вызывающего MCP-клиента как успешное выполнение.
+    if not response or not response.strip():
+        return {
+            "status": "error",
+            "error": "empty_response",
+            "message": "Модель не вернула ответ (возможно, сбой локальной LLM).",
+            "meta": meta,
+            "user_id": user_id or DEFAULT_USER,
+            "timestamp": time.time()
+        }
 
     # === ИСПРАВЛЕНИЕ: если ответ содержит ошибку, возвращаем чёткий статус ===
     if "ошибка" in response.lower() or "не удалось" in response.lower() or "404" in response:
@@ -207,10 +259,11 @@ async def web_search(
         if isinstance(data, Exception):
             logger.warning(f"web_search: запрос '{q}' упал с ошибкой: {data}")
             continue
-        if isinstance(data, dict) and data.get("error") == "timeout":
-            # Таймаут одного из подзапросов не должен обрушивать остальные —
-            # возвращаем то, что успело собраться по другим запросам.
-            logger.warning(f"web_search: запрос '{q}' не уложился в таймаут")
+        if isinstance(data, dict) and data.get("status") == "error":
+            # Ошибка (таймаут или исключение) одного из подзапросов не должна
+            # обрушивать остальные — возвращаем то, что успело собраться по
+            # другим запросам.
+            logger.warning(f"web_search: запрос '{q}' завершился с ошибкой: {data.get('message')}")
             continue
         if not data.get("search_performed"):
             continue
@@ -235,9 +288,9 @@ async def web_search(
 @mcp.tool()
 async def generate_image(
     prompt: str = Field(..., description="Описание изображения"),
-    steps: int = Field(20, description="Количество шагов диффузии"),
-    width: int = Field(512, description="Ширина изображения"),
-    height: int = Field(512, description="Высота изображения"),
+    steps: int = Field(20, description="Количество шагов диффузии", ge=1, le=60),
+    width: int = Field(512, description="Ширина изображения (px, будет округлена до кратной 8)", ge=64, le=1536),
+    height: int = Field(512, description="Высота изображения (px, будет округлена до кратной 8)", ge=64, le=1536),
     cfg_scale: float = Field(7.0, description="Масштаб CFG (guidance scale)"),
     sampler: str = Field("dpmpp_2m", description="Сэмплер"),
     seed: int = Field(-1, description="Зерно (-1 для случайного)"),
@@ -260,7 +313,7 @@ async def generate_image(
         return fp, img
 
     run_result = await _with_timeout(_run(), "generate_image", timeout=_MCP_IMAGE_TOOL_TIMEOUT_SECONDS)
-    if isinstance(run_result, dict) and run_result.get("error") == "timeout":
+    if isinstance(run_result, dict) and run_result.get("status") == "error":
         return run_result
     final_prompt, image_b64 = run_result
     if not image_b64:
@@ -335,7 +388,7 @@ async def research_topic(
         "research_topic",
         timeout=_MCP_RESEARCH_TOOL_TIMEOUT_SECONDS
     )
-    if isinstance(result, dict) and result.get("error") == "timeout":
+    if isinstance(result, dict) and result.get("status") == "error":
         return result
     return {
         "topic": topic,
@@ -403,12 +456,17 @@ async def add_goal(
 async def semantic_search(
     query: str = Field(..., description="Поисковый запрос"),
     top_k: int = Field(5, description="Число результатов", ge=1, le=20),
+    scope: Optional[str] = Field(
+        None,
+        description="Фильтр по слою памяти: 'private', 'shared' или 'global'. "
+                    "Если не указан — поиск по всем трём слоям (личная, общая и глобальная память)."
+    ),
     user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
 ) -> Dict[str, Any]:
-    """Векторный поиск по смыслу (использует эмбеддинги)."""
+    """Векторный поиск по смыслу по личной, общей и глобальной памяти (эмбеддинги)."""
     service = await get_memory_service(user_id or DEFAULT_USER)
-    results = await service.semantic_search(query, top_k)
-    return {"results": results}
+    results = await service.semantic_search(query, top_k, scope=scope)
+    return {"results": results, "count": len(results)}
 
 @mcp.tool()
 async def graph_explore(

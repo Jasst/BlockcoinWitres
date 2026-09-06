@@ -37,78 +37,7 @@
       to { opacity: 1; transform: translateY(0); }
     }
 
-    /* ---------- НАВИГАЦИЯ (bottom-nav) ---------- */
-    .bottom-nav {
-      background: var(--glass-bg);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border-top: 1px solid var(--glass-border);
-      box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.3);
-      display: flex;
-      justify-content: space-around;
-      padding: 8px 0 env(safe-area-inset-bottom);
-      position: fixed;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      z-index: 1000;
-      transition: transform 0.3s ease;
-    }
-
-    .bottom-nav-item {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 2px;
-      padding: 6px 12px;
-      border-radius: 50px;
-      color: var(--text-muted);
-      text-decoration: none;
-      font-size: 11px;
-      font-weight: 500;
-      transition: color 0.2s, background 0.2s, transform 0.2s;
-      min-width: 56px;
-      background: transparent;
-      border: none;
-      cursor: pointer;
-    }
-
-    .bottom-nav-item .nav-icon {
-      width: 24px;
-      height: 24px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .bottom-nav-item .nav-icon svg {
-      stroke: currentColor;
-      fill: none;
-    }
-
-    .bottom-nav-item .nav-label {
-      font-size: 10px;
-      line-height: 1.2;
-      letter-spacing: 0.3px;
-    }
-
-    .bottom-nav-item:hover {
-      color: var(--text-main);
-      background: rgba(255, 255, 255, 0.05);
-      transform: translateY(-2px);
-    }
-
-    .bottom-nav-item.active {
-      color: var(--accent-color);
-      background: rgba(108, 92, 231, 0.15);
-      box-shadow: 0 0 20px var(--accent-glow);
-    }
-
-    .bottom-nav-item.active .nav-icon svg {
-      stroke: var(--accent-color);
-      fill: var(--accent-color);
-    }
-
+    /* Навигация вынесена в style.css (единый плавающий pill) */
     /* ---------- МОДАЛЬНЫЕ ОКНА ЗВОНКОВ ---------- */
     .modal-overlay {
       background: rgba(0, 0, 0, 0.7);
@@ -379,6 +308,7 @@
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="{{ url_for('static', path='js/qr-manager.js') }}" defer></script>
+<base target="_blank">
 </head>
 
 <body>
@@ -610,6 +540,7 @@
 })();
 </script>
   
+  <script src="{{ url_for('static', path='js/spa-nav.js') }}" defer></script>
   {% block scripts %}{% endblock %}
 </body>
 

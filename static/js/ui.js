@@ -64,13 +64,17 @@
         const badge = document.createElement('button');
         badge.id = 'newMessagesBadge';
         badge.innerHTML = t('new_messages_badge');
-        badge.style.cssText = 'position:absolute;bottom:90px;right:20px;background:var(--accent);color:var(--text-inverse);border:none;padding:8px 16px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;box-shadow:var(--shadow-md);z-index:100;display:flex;align-items:center;gap:6px;';
+        badge.style.cssText = 'position:absolute;bottom:110px;right:20px;background:var(--accent);color:var(--text-inverse);border:none;padding:8px 16px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;box-shadow:var(--shadow-md);z-index:100;display:flex;align-items:center;gap:6px;';
         badge.onclick = () => {
             const c = document.getElementById('messagesContainer');
             if (c) { c.scrollTo({ top: c.scrollHeight, behavior: 'smooth' }); badge.remove(); }
         };
-        const main = document.querySelector('.main-content');
-        if (main) { main.style.position = 'relative'; main.appendChild(badge); }
+        // ИСПРАВЛЕНО: раньше искали .main-content, которого нет в вёрстке — бейдж никогда не показывался
+        const anchor = document.querySelector('.chat-panel') || document.querySelector('.chat-layout') || document.body;
+        if (anchor) {
+            if (getComputedStyle(anchor).position === 'static') anchor.style.position = 'relative';
+            anchor.appendChild(badge);
+        }
         setTimeout(() => badge?.remove(), 15000);
     }
 

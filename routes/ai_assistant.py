@@ -15,14 +15,10 @@ import logging
 import json
 import asyncio
 import time
-import hashlib
 import re
 from typing import Dict, Optional, Any, List, Tuple
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
-import numpy as np
-import aiohttp
-from bs4 import BeautifulSoup
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -32,9 +28,13 @@ from GCN.GCN import AIAdapter, KnowledgeObject, KnowledgeType, MemoryScope
 from GCN.memory_graph import CognitiveMemory, Fact, Episode, Goal, GCNMemoryRouter
 
 from GCN.llm_client import call_llm, call_llm_raw, call_llm_stream
-from GCN.web_search import deep_search, fetch_url
+from GCN.web_search import deep_search, is_time_sensitive_query
 from GCN.image_utils import enhance_prompt, generate_image
 from GCN.tool_router import ToolRegistry, ToolRouter, build_tool_trace_context
+# ИНТЕЛЛЕКТ-ПАКЕТ: заземлённые ответы, санитайзер фактов, подзапросный retrieval,
+# критик по плану (см. GCN/intellect.py)
+from GCN import intellect as intellect_mod
+from GCN.config_ai import GROUNDED_ANSWER_ENABLED, PLAN_CRITIC_ENABLED
 
 # ИЗМЕНЕНИЕ: импорт MemoryService и фабрики
 from GCN.memory_service import MemoryService, get_memory_service
@@ -67,13 +67,6 @@ def get_global_mcp_manager() -> Optional[MCPToolManager]:
     return _global_mcp_manager
 
 try:
-    from ddgs import DDGS
-    DDGS_AVAILABLE = True
-except ImportError:
-    DDGS_AVAILABLE = False
-    logger.warning("⚠️ ddgs not installed")
-
-try:
     from dependencies import require_auth
 except ImportError:
     async def require_auth():
@@ -90,19 +83,21 @@ def _now() -> float:
 SEARCH_TRIGGER_KEYWORDS = [
     'сегодня', 'сейчас', 'новости', 'курс', 'погода', 'свежие',
     'последние', 'завтра', 'найди', 'поищи', 'актуальные',
-    '2024', '2025', '2026', 'сколько стоит', 'какой сейчас', 'последние данные',
+    'сколько стоит', 'какой сейчас', 'последние данные',
     'статистика', 'результаты', 'кто победил', 'когда выйдет',
 ]
 
 def needs_search_heuristic(message: str) -> bool:
+    # Единая эвристика временной чувствительности живёт в web_search
+    # (is_time_sensitive_query) — раньше её копии расходились в трёх файлах
+    # (ai_assistant, memory_graph, web_search) и путали друг друга.
     msg_lower = message.lower()
     if re.search(r'https?://\S+', msg_lower):
         return True
     if any(kw in msg_lower for kw in SEARCH_TRIGGER_KEYWORDS):
         return True
-    if re.search(r'\b(сейчас|сегодня|вчера|завтра|этот год|этот месяц)\b', msg_lower):
-        return True
-    return False
+    return is_time_sensitive_query(message)
+
 
 def is_factual_query(message: str) -> bool:
     patterns = [
@@ -115,12 +110,48 @@ def is_factual_query(message: str) -> bool:
             return True
     return False
 
+async def _search_query_expander(query: str) -> List[str]:
+    """
+    LLM-расширитель поискового запроса для deep_search (web_search v3):
+    синонимы / английский вариант / более точная формулировка. Возвращает
+    до 2 дополнительных запросов, которые ищутся параллельно с базовым.
+    При любом сбое — []: expander опционален и не должен ломать поиск.
+    """
+    prompt = (
+        "Дай 2 альтернативные формулировки поискового запроса: синонимы, "
+        "английский вариант или более точную формулировку для поисковика. "
+        "Ответь ТОЛЬКО JSON-массивом строк, без пояснений и без markdown.\n"
+        f"Запрос: {query}"
+    )
+    try:
+        raw = await call_llm([{"role": "user", "content": prompt}], temp=0.2, max_tokens=80)
+    except Exception as e:
+        logger.debug(f"search query expander failed: {e}")
+        return []
+    m = re.search(r"\[[^\[\]]*\]", raw or "")
+    if not m:
+        return []
+    try:
+        arr = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(arr, list):
+        return []
+    return [str(x).strip() for x in arr
+            if isinstance(x, str) and len(str(x).strip()) >= 5][:2]
+
+
 async def rewrite_query(llm_caller, original: str) -> str:
     if not ENABLE_QUERY_REWRITE:
         return original
+    today = datetime.now(timezone.utc).strftime("%d.%m.%Y")
     prompt = (
+        f"Сегодня {today}. "
         f"Перепиши вопрос в виде ОДНОГО короткого поискового запроса (3-10 слов), "
-        f"оптимизированного для DuckDuckGo. Убери лишнее. Ответь ТОЛЬКО запросом, без пояснений.\n\n"
+        f"оптимизированного для DuckDuckGo. Убери лишнее, но ОБЯЗАТЕЛЬНО сохрани "
+        f"указания на актуальность (сегодня/сейчас/курс/погода/новости): если вопрос "
+        f"чувствителен ко времени — подставь сегодняшнюю дату {today} прямо в запрос. "
+        f"Ответь ТОЛЬКО запросом, без пояснений.\n\n"
         f"Вопрос: {original}"
     )
     try:
@@ -219,47 +250,6 @@ def parse_llm_json(raw: str) -> Optional[Dict]:
             return None
     return None
 
-# ========== НОВЫЙ МОДУЛЬ: классификация намерений ==========
-INTENT_CLASSIFICATION_PROMPT = """Проанализируй сообщение пользователя и определи, относится ли оно к управлению памятью.
-Если да, укажи команду и извлеки сущности.
-
-Возможные команды:
-- "store" — запомнить факт (пользователь хочет, чтобы ты запомнил информацию). Может быть уточнение "глобально" -> scope="global".
-- "forget" — забыть факт (удалить информацию).
-- "recall" — вспомнить информацию по теме.
-- "none" — обычный вопрос, не связанный с управлением памятью.
-
-Также извлеки "content" — текст, который нужно запомнить/забыть/или тему для поиска.
-Если в сообщении есть "глобально" или "global" и команда "store", установи scope="global".
-
-Ответь ТОЛЬКО валидным JSON:
-{{"intent": "store|forget|recall|none", "content": "извлечённый текст или пустая строка", "scope": "private|shared|global", "confidence": 0.0-1.0}}
-
-Примеры:
-- "Запомни, что мой любимый цвет синий" -> {{"intent": "store", "content": "мой любимый цвет синий", "scope": "private", "confidence": 0.95}}
-- "Запомни глобально, что Земля круглая" -> {{"intent": "store", "content": "Земля круглая", "scope": "global", "confidence": 0.95}}
-- "Забудь всё о погоде" -> {{"intent": "forget", "content": "погода", "scope": "private", "confidence": 0.9}}
-- "Что ты знаешь о Питоне?" -> {{"intent": "recall", "content": "Питон", "scope": "private", "confidence": 0.95}}
-- "Как дела?" -> {{"intent": "none", "content": "", "scope": "private", "confidence": 1.0}}
-
-Сообщение: {message}
-"""
-
-async def classify_intent(message: str) -> Dict:
-    """Определяет намерение пользователя с помощью LLM."""
-    if not ENABLE_INTENT_CLASSIFICATION:
-        # fallback на старую логику
-        return {"intent": "none", "content": "", "confidence": 1.0}
-    try:
-        prompt = INTENT_CLASSIFICATION_PROMPT.format(message=message)
-        raw = await call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=150)
-        result = parse_llm_json(raw)
-        if result and "intent" in result:
-            return result
-    except Exception as e:
-        logger.debug(f"Intent classification failed: {e}")
-    return {"intent": "none", "content": "", "confidence": 0.0}
-
 # ПУНКТ №3 (верификация/критик): промпт для дешёвого второго прохода после
 # генерации финального ответа.
 VERIFICATION_PROMPT = """Ты — проверяющий модуль когнитивного ассистента.
@@ -277,6 +267,13 @@ VERIFICATION_PROMPT = """Ты — проверяющий модуль когни
 Если ответ корректен и ничего существенного не выдумано — ответь ровно одним словом: OK
 Если есть подозрительные непроверяемые утверждения — кратко, 1-2 предложения на русском, перечисли, что именно вызывает сомнение. Не переписывай сам ответ, не добавляй ничего лишнего.
 """
+
+# Параметры извлечения фактов из поисковой выдачи (см. _extract_facts_llm):
+# контекст нарезается на чанки и обрабатывается параллельно, чтобы факты
+# из ВСЕХ источников доходили до памяти, а не только из первых 4000 символов.
+FACT_EXTRACT_CHUNK_CHARS = 3500
+FACT_EXTRACT_MAX_CHUNKS = 4
+FACT_EXTRACT_CHUNK_OVERLAP = 200
 
 # =====================================================================
 # 3. КОГНИТИВНЫЙ КОНТРОЛЛЕР (изменён)
@@ -313,8 +310,6 @@ class CognitiveController:
         self.max_history = 20
         self._load_history()
 
-        self._searcher = None
-        self._last_ddg_call = 0.0
 
         # УЛУЧШЕНИЕ: asyncio.create_task(...), вызванный без сохранения
         # ссылки на Task, — известная ловушка: цикл событий хранит на него
@@ -326,6 +321,9 @@ class CognitiveController:
         # fire-and-forget задачи регистрируются в self._background_tasks и
         # снимаются оттуда по завершении через add_done_callback.
         self._background_tasks: set = set()
+        # Текущая фоновая генерация ответа (см. stream_response) — не привязана
+        # к конкретному HTTP-соединению, живёт пока не допишется целиком.
+        self._active_stream: Optional[Dict] = None
 
         self._consolidation_task = None
         self._planner_task = None
@@ -338,6 +336,20 @@ class CognitiveController:
         self.current_goals: List[Goal] = []
         self.last_prediction_error = 0.0
         self._last_prepare_meta: Dict = {}
+
+        # Антиспам для авто-коррекции: предсказания predict_next() строятся по темам
+        # рабочей памяти и почти всегда НЕ совпадают с разговорными/мета-сообщениями
+        # ("ты не показываешь рассуждения", "почему ты так ответил") — prediction_error
+        # для них заведомо ≈ 1, и раньше любая такая реплика запускала фоновый
+        # research() по смыслу жалобы, который ничего не исправлял, а жег бюджет
+        # LLM-вызовов. Поэтому: не чаще одного срабатывания в 10 минут, только для
+        # вопросов (с "?") и не для обращений/жалоб к самому ассистенту.
+        self._last_quick_correction: float = 0.0
+        self._quick_correction_cooldown: float = 600.0
+        self._quick_correction_skip_markers = (
+            "ты не", "вы не", "почему ты", "почему вы", "исправь", "почини",
+            "не работает", "не показываешь", "покажи", "сделай так",
+        )
 
         # ИСПРАВЛЕНИЕ (унификация поиска — устранение двойного поиска):
         # раньше _prepare_messages сам синхронно вызывал deep_search, а затем
@@ -403,6 +415,14 @@ class CognitiveController:
             return f"Цель добавлена: {description} (приоритет: {priority})"
 
         async def _internal_web_search(args: Dict) -> str:
+            # Единый поиск за ход: если детерминированный поиск уже выполнен
+            # (см. _force_search_if_requested), не дёргаем DDG повторно, а
+            # отдаём накопленный контекст — модель получает те же источники.
+            if self._web_search_results_this_turn:
+                acc = self._web_search_results_this_turn[-1]
+                acc_ctx = acc.get("context", "")
+                return (f"Поиск уже выполнен в этом ходе. Найдено "
+                        f"{len(acc.get('sources', []))} источников.\n{acc_ctx[:2500]}")
             # ПУНКТ №2 (многошаговый/параллельный поиск): раньше инструмент
             # принимал ровно один query. Для составных запросов ("сравни курс
             # доллара и евро", разложенных _plan_subtasks на несколько
@@ -422,7 +442,8 @@ class CognitiveController:
 
             max_results = args.get("max_results", 5)
             results = await asyncio.gather(
-                *[deep_search(q, max_results=max_results) for q in query_list],
+                *[deep_search(q, max_results=max_results,
+                              query_expander=_search_query_expander) for q in query_list],
                 return_exceptions=True
             )
 
@@ -467,7 +488,13 @@ class CognitiveController:
                         f"{len(query_list)} запрос(ам).\n{merged_context[:2500]}")
             return "Ничего не найдено."
 
-        async def _internal_generate_image(args: Dict) -> str:
+        # ИСПРАВЛЕНИЕ (картинки "иногда не показывались"): возвращаем dict с
+        # ключом image_url. Стрим-обработчик в _stream_response_worker делает
+        # json.loads(result) и ждёт именно {"image_url": ...} — со старой
+        # строкой "Изображение сгенерировано: <url>" парсинг падал, событие
+        # image_url в SSE не отправлялось, и фронтенд картинку не рендерил
+        # (файл при этом молча сохранялся на диск).
+        async def _internal_generate_image(args: Dict) -> Dict:
             prompt = args.get("prompt", "")
             enhance = args.get("enhance_prompt", True)
             steps = args.get("steps", 20)
@@ -482,20 +509,20 @@ class CognitiveController:
                                                   height=height, cfg_scale=cfg_scale,
                                                   seed=seed, sampler_name=sampler)
             if image_b64:
-                # Сохраняем и возвращаем ссылку (как в MCP-инструменте)
                 from GCN.config_ai import GENERATED_IMAGES_DIR
                 import base64
                 from datetime import datetime
                 output_dir = GENERATED_IMAGES_DIR
                 output_dir.mkdir(exist_ok=True)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                # %f — защита от коллизий имён при двух генерациях в одну секунду
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 filename = output_dir / f"image_{timestamp}.png"
                 with open(filename, "wb") as f:
                     f.write(base64.b64decode(image_b64))
                 BASE_URL = os.getenv("SERVER_BASE_URL", "http://localhost:8000")
                 image_url = f"{BASE_URL}/generated_images/{filename.name}"
-                return f"Изображение сгенерировано: {image_url}"
-            return "Не удалось сгенерировать изображение."
+                return {"status": "ok", "image_url": image_url, "prompt": prompt}
+            return {"status": "error", "message": "Не удалось сгенерировать изображение."}
 
         # Регистрируем в tool_registry
         self.tool_registry.register(
@@ -567,7 +594,10 @@ class CognitiveController:
                 "required": []
             },
             handler=_internal_web_search,
-            server="internal"
+            server="internal",
+            # DDG-интервал + параллельное чтение до 7 страниц регулярно
+            # превышают 45с — как в MCP_TOOL_TIMEOUT_OVERRIDES.
+            timeout_seconds=90
         )
         self.tool_registry.register(
             name="generate_image",
@@ -587,7 +617,12 @@ class CognitiveController:
                 "required": ["prompt"]
             },
             handler=_internal_generate_image,
-            server="internal"
+            server="internal",
+            # Тяжёлый инструмент: enhance-промпт (LLM) + переключение модели +
+            # генерация до EASYDIFFUSION_TIMEOUT (140с). Было: единый 45с
+            # таймаут ToolRouter обрывал генерацию под нагрузкой — отсюда
+            # "иногда работает". 300с — как в MCP_TOOL_TIMEOUT_OVERRIDES.
+            timeout_seconds=300
         )
 
         # ---- Инструмент для перечисления доступных инструментов ----
@@ -691,7 +726,73 @@ class CognitiveController:
         self._last_activity_time = time.time()
         self._idle_consolidation_done = False
 
+        # ИСПРАВЛЕНИЕ: RESOURCE_BUDGET_LLM_CALLS был объявлен в config_ai.py,
+        # но нигде не читался — фоновые автономные циклы (планирование целей,
+        # авто-исследование, рефлексия) могли звать LLM без какого-либо
+        # верхнего предела в сутки. На self-hosted железе с одной локальной
+        # LLM это реальный риск: несколько простаивающих пользователей с
+        # активными целями могут забить очередь LM Studio чисто фоновой
+        # автономной активностью. Простой суточный бюджет на 3 фоновых
+        # цикла ниже (см. _consume_autonomous_llm_budget).
+        self._autonomous_llm_calls = 0
+        self._autonomous_budget_reset_at = time.time()
+
+        # Последний завершённый обмен (см. /ai/chat/last_response): нужен, чтобы
+        # после перезагрузки страницы фронтенд мог забрать ответ, который LLM
+        # досчитала, пока пользователь был не в чате (генерация идёт в фоновой
+        # Task независимо от HTTP-соединения, но attach-буфер после завершения
+        # уничтожается — поэтому фиксируем обмен отдельно).
+        self._last_exchange: Optional[Dict] = None
+
         logger.info(f"CognitiveController (GCN) initialized for {user_id[:16]}")
+
+    async def _force_search_if_requested(self, message: str, search_meta: Dict) -> None:
+        """
+        Детерминированный веб-поиск (фикс «веб-поиск не всегда работает»).
+
+        Раньше даже при web_search=True (кнопка «Интернет» во фронтенде) решение
+        «искать или нет» принимала локальная LLM внутри ToolRouter: если модель
+        не смогла сформировать tool_call (или невалидный JSON в fallback-режиме),
+        поиск молча не выполнялся, а ответ генерировался из памяти — при этом
+        выглядело всё так, будто поиск сработал.
+
+        Теперь при явном запросе (web_search=True или прямая ссылка в сообщении)
+        поиск выполняется сразу и безусловно, ДО ReAct-цикла. Результаты копятся
+        в self._web_search_results_this_turn и подхватываются существующим кодом
+        слияния (process_input / _stream_response_worker), а повторный вызов
+        internal__web_search самой моделью отдаёт уже накопленный контекст без
+        второго DDG-запроса (см. _internal_web_search).
+
+        Дополнительно оживлён мёртвый код: rewrite_query() и MAX_SEARCH_ATTEMPTS
+        раньше объявлялись, но нигде не вызывались. Если DDG вернул пусто,
+        делаем до MAX_SEARCH_ATTEMPTS повторов с переписанной формулировкой.
+        """
+        if self._web_search_results_this_turn:
+            return
+        has_url = bool(re.search(r'https?://\S+', message))
+        if not (search_meta.get("search_requested") or has_url):
+            return
+
+        # Для прямой ссылки повторы бессмысленны (deep_search читает URL напрямую)
+        attempts = 1 if has_url else max(1, MAX_SEARCH_ATTEMPTS)
+        for attempt in range(attempts):
+            query = message if has_url else await rewrite_query(call_llm, message)
+            try:
+                data = await deep_search(query, max_results=5,
+                                         query_expander=_search_query_expander)
+            except Exception as e:
+                logger.warning(f"[ForcedSearch] попытка {attempt + 1}/{attempts}: исключение {e}")
+                continue
+            if data.get("search_performed") and data.get("context"):
+                self._web_search_results_this_turn.append({
+                    "queries": [query],
+                    "sources": data.get("sources", []),
+                    "context": data["context"],
+                })
+                logger.info(f"[ForcedSearch] поиск выполнен с {attempt + 1}-й попытки: '{query[:80]}'")
+                return
+            logger.info(f"[ForcedSearch] попытка {attempt + 1}/{attempts}: пусто для '{query[:80]}'")
+        logger.warning(f"[ForcedSearch] поиск не дал результатов за {attempts} попыток")
 
     async def _ensure_external_tools_registered(self):
         """Регистрирует внешние MCP-инструменты в ToolRegistry, если они ещё не зарегистрированы."""
@@ -748,12 +849,6 @@ class CognitiveController:
             logger.error(f"MCP call error: {e}", exc_info=True)
             return f"Ошибка вызова MCP: {str(e)}"
 
-    @property
-    def searcher(self):
-        if self._searcher is None and DDGS_AVAILABLE:
-            self._searcher = DDGS()
-        return self._searcher
-
     def _load_history(self):
         history_path = self.user_dir / "history.json"
         if history_path.exists():
@@ -779,6 +874,30 @@ class CognitiveController:
             self._research_task = asyncio.create_task(self._periodic_research())
             self._reflection_task = asyncio.create_task(self._periodic_reflection())
             self._idle_task = asyncio.create_task(self._idle_consolidation())
+
+    def _consume_autonomous_llm_budget(self, n: int = 1) -> bool:
+        """
+        Суточный бюджет LLM-вызовов для фоновой автономной активности
+        (планирование целей, авто-исследование, рефлексия) — см.
+        RESOURCE_BUDGET_LLM_CALLS в config_ai.py. Возвращает True и
+        расходует бюджет, если лимит на сутки ещё не исчерпан; False —
+        если исчерпан (вызывающий фоновый цикл должен пропустить этот
+        проход и попробовать в следующий раз). Не ограничивает обычные
+        ответы в чате — только фоновые циклы, инициированные не
+        пользователем напрямую.
+        """
+        now = time.time()
+        if now - self._autonomous_budget_reset_at > 86400:
+            self._autonomous_llm_calls = 0
+            self._autonomous_budget_reset_at = now
+        if self._autonomous_llm_calls + n > RESOURCE_BUDGET_LLM_CALLS:
+            logger.info(
+                f"[Budget] Автономный LLM-бюджет исчерпан для {self.user_id[:16]} "
+                f"({self._autonomous_llm_calls}/{RESOURCE_BUDGET_LLM_CALLS} за сутки), пропуск фонового цикла"
+            )
+            return False
+        self._autonomous_llm_calls += n
+        return True
 
     # ----- Фоновые задачи (добавлена консолидация по бездействию) -----
     async def _periodic_consolidation(self):
@@ -817,6 +936,8 @@ class CognitiveController:
     async def _periodic_planning(self):
         while True:
             await asyncio.sleep(LONG_TERM_PLANNER_INTERVAL)
+            if not self._consume_autonomous_llm_budget():
+                continue
             try:
                 await self._plan_goals()
             except Exception as e:
@@ -825,42 +946,17 @@ class CognitiveController:
     async def _periodic_research(self):
         while True:
             await asyncio.sleep(CURIOSITY_RESEARCH_INTERVAL)
+            # ИСПРАВЛЕНИЕ: AUTO_RESEARCH_ENABLED был объявлен в config_ai.py,
+            # но нигде не читался — цикл авто-исследования крутился
+            # безусловно, флаг фактически не давал его отключить.
+            if not AUTO_RESEARCH_ENABLED:
+                continue
+            if not self._consume_autonomous_llm_budget():
+                continue
             try:
                 await self._auto_research()
             except Exception as e:
                 logger.error(f"Auto research error: {e}")
-
-    async def _route(self, message: str) -> Dict:
-        # ПРИМЕЧАНИЕ: после унификации поиска (см. _prepare_messages) больше не
-        # вызывается для решения "искать ли и с каким query" — эта роль теперь
-        # у ToolRouter/internal__web_search. Метод оставлен как есть — на
-        # случай, если понадобится его LLM-классификация needs_web_search/
-        # answer_strategy для чего-то ещё, не трогаем.
-        history_tail = "\n".join(
-            f"{item['role'].capitalize()}: {item['content'][:200]}"
-            for item in self.history[-4:]
-        ) if self.history else "(диалог только начался)"
-
-        # ИЗМЕНЕНИЕ: получение активных целей через сервис
-        active_goals = await self.memory_service.get_goals()
-        goals_str = "; ".join(g["description"] for g in active_goals[:3]) or "нет"
-
-        prompt = ROUTER_PROMPT.format(history_tail=history_tail, goals=goals_str, message=message)
-        try:
-            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=200)
-            result = parse_llm_json(raw)
-            if result and "search_query" in result:
-                return result
-            logger.warning(f"Router: bad/incomplete JSON, falling back to heuristics: {raw[:200]!r}")
-        except Exception as e:
-            logger.warning(f"Router LLM call failed, falling back to heuristics: {e}")
-
-        return {
-            "needs_web_search": True,
-            "search_query": None,
-            "is_factual_time_sensitive": is_factual_query(message),
-            "answer_strategy": "search_then_answer",
-        }
 
     async def _plan_goals(self):
         if len(self.history) < 5:
@@ -886,8 +982,12 @@ class CognitiveController:
     async def _auto_research(self):
         # ИЗМЕНЕНИЕ: получение целей через сервис
         active_goals = await self.memory_service.get_goals()
+        # ИСПРАВЛЕНИЕ: порог был захардкожен как 0.5 прямо здесь, а
+        # CURIOSITY_UNCERTAINTY_THRESHOLD = 0.7 из config_ai.py, объявленный
+        # именно для этой цели, нигде не читался — то есть реальный порог
+        # запуска авто-исследования расходился с задокументированным.
         for goal_dict in active_goals:
-            if goal_dict["confidence"] < 0.5:
+            if goal_dict["confidence"] < CURIOSITY_UNCERTAINTY_THRESHOLD:
                 logger.info(f"Auto-research triggered for goal: {goal_dict['description']}")
                 await self.research(goal_dict["description"])
                 # Обновляем уверенность через сервис (пока нет метода update_goal, можно через private_memory)
@@ -902,6 +1002,86 @@ class CognitiveController:
         await self.memory_service.private_memory._schedule_save()
 
     # ===== РЕФЛЕКСИЯ =====
+    async def _run_plan_critic(self, message: str, response: str) -> str:
+        """
+        ИНТЕЛЛЕКТ-ПАКЕТ (E): сверяет готовый ответ с планом подзадач
+        (ToolRouter._last_plan). Если критик нашёл пропущенные пункты —
+        один дополнительный проход генерации с просьбой дополнить ответ.
+        При любом сбое возвращает исходный ответ без изменений.
+        """
+        if not PLAN_CRITIC_ENABLED or not response:
+            return response
+        plan = getattr(self.tool_router, "_last_plan", "") or ""
+        if not plan:
+            return response
+        try:
+            missed = await intellect_mod.plan_critic(message, plan, response)
+        except Exception as e:
+            logger.debug(f"plan_critic failed: {e}")
+            return response
+        if not missed:
+            return response
+        logger.info(f"[PlanCritic] Пропущены пункты плана: {missed}")
+        try:
+            extra = await call_llm(
+                [{"role": "user", "content": (
+                    f"Твой предыдущий ответ пользователю не раскрыл части его запроса.\n"
+                    f"Запрос: {message}\nПлан подзадач: {plan}\n"
+                    f"Пропущено: {missed}\n\n"
+                    "Дополни ответ, закрыв пропущенные пункты. Пиши ТОЛЬКО "
+                    "дополнение, не повторяй уже сказанное. Если для пункта нет "
+                    "данных — прямо скажи об этом."
+                )}],
+                temp=0.5, max_tokens=700
+            )
+        except Exception as e:
+            logger.debug(f"PlanCritic добор не удался: {e}")
+            return response
+        if extra and extra.strip():
+            response = f"{response}\n\n{extra.strip()}"
+        return response
+
+    async def _save_sanitized_facts(self, sanitized: List[Tuple[str, str, float]]) -> None:
+        """
+        Сохраняет факты, прошедшие санитайзер (ИНТЕЛЛЕКТ-ПАКЕТ B), и
+        ставит на сохранение на диск только те слои памяти, в которые
+        реально что-то записано.
+
+        ИСПРАВЛЕНИЕ: раньше оба места вызова sanitize_search_facts делали
+        `if facts: await self.memory_service.global_memory._schedule_save()`
+        безусловно для global_memory — но sanitize_search_facts специально
+        градуирует факты по доверию источника (высокое → global, среднее →
+        shared, остальное → private/0.55), то есть в общем случае в
+        global_memory ничего не попадает вообще. private/shared-факты,
+        которые реально были записаны через remember(), не ставились на
+        сохранение никаким явным вызовом — персистентность зависела от
+        случайных сторонних триггеров (idle-эвикшн, shutdown). Теперь
+        схема сохранения не привязана к global(), а строится по фактическому
+        набору scope из sanitized.
+        """
+        if not sanitized:
+            return
+        scope_to_memory = {
+            "global": self.memory_service.global_memory,
+            "shared": self.memory_service.shared_memory,
+            "private": self.memory_service.private_memory,
+        }
+        touched_scopes = set()
+        for text, scope, conf in sanitized:
+            await self.memory_service.remember(text, scope=scope, confidence=conf)
+            touched_scopes.add(scope)
+        for scope in touched_scopes:
+            mem = scope_to_memory.get(scope)
+            if mem is not None:
+                try:
+                    await mem._schedule_save()
+                except Exception as e:
+                    logger.debug(f"_schedule_save failed for scope={scope}: {e}")
+        logger.info(
+            f"Extracted {len(sanitized)} sanitized facts from web search -> "
+            f"scopes: {sorted(touched_scopes)}"
+        )
+
     async def _verify_response(self, message: str, response: str, evidence_text: str) -> Optional[str]:
         """
         ПУНКТ №3 (верификация/критик): дешёвый второй проход LLM после
@@ -947,6 +1127,8 @@ class CognitiveController:
     async def _periodic_reflection(self):
         while True:
             await asyncio.sleep(self.reflection_interval)
+            if not self._consume_autonomous_llm_budget():
+                continue
             try:
                 await self._run_reflection()
             except Exception as e:
@@ -1044,17 +1226,6 @@ class CognitiveController:
         logger.info(f"[QuickCorrection] High error detected for: {query[:50]}...")
         await self.research(query)
 
-    def _generate_alternative_queries(self, original: str, attempt: int) -> str:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if attempt == 1:
-            return f"{original} {today}"
-        elif attempt == 2:
-            return f"курс {original} покупка продажа сегодня"
-        elif attempt == 3:
-            return f"{original} сайт банки.ру"
-        else:
-            return f"{original} котировка"
-
     # ===== НОВЫЙ МЕТОД: автоматическое извлечение фактов из сообщения =====
     async def _auto_extract_facts(self, message: str) -> List[str]:
         """
@@ -1144,7 +1315,11 @@ class CognitiveController:
         sources = []
 
         # ИЗМЕНЕНИЕ: поиск через сервис
-        relevant = await self.memory_service.recall(message, top_k=7)
+        # ИНТЕЛЛЕКТ-ПАКЕТ (C): составной запрос разбиваем на подзапросы и
+        # ищем каждый отдельно (слияние с бустом мультихитов — в
+        # GCNMemoryRouter._retrieve_subqueries).
+        subqueries = await intellect_mod.make_subqueries(message)
+        relevant = await self.memory_service.recall(message, top_k=7, subqueries=subqueries or None)
         memory_context = ""
         # ИСПРАВЛЕНИЕ (причина №2 — "путаница" памяти в браузерном чате, которой
         # нет в MCP-режиме): отсекаем низкорелевантные результаты по порогу.
@@ -1227,7 +1402,8 @@ class CognitiveController:
             reasoning=reasoning,
             uncertainty=uncertainty,
             predictions=predictions,
-            goal_hint=goal_hint
+            goal_hint=goal_hint,
+            sources=sources
         )
 
         search_meta["context"] = search_context
@@ -1238,6 +1414,7 @@ class CognitiveController:
             "memory_context": memory_context,
             "predictions": predictions,
             "uncertainty": uncertainty,
+            "goal_hint": goal_hint,
             "active_goals": active_goals,
             "relevant": relevant,
             "message": message,
@@ -1252,86 +1429,130 @@ class CognitiveController:
     # ===== ОБЩИЙ ПРЕ-ПАЙПЛАЙН ПАМЯТИ =====
     async def _run_memory_intent_pipeline(self, message: str) -> Optional[Tuple[str, Dict]]:
         """
-        Общий первый этап обработки сообщения: явные команды памяти (regex),
-        классификация намерений store/forget/recall (LLM) и автоматическое
-        извлечение фактов.
-
-        ИСПРАВЛЕНИЕ: временно отключаем предварительную обработку, чтобы все запросы
-        шли через ToolRouter. Это позволяет использовать MCP-инструменты для команд
-        памяти (запомни/вспомни/забудь) так же, как в MCP-режиме.
+        Явные команды памяти обрабатываются через ToolRouter / internal-инструменты
+        (тот же путь, что и в MCP-режиме) — прямой обработки здесь больше нет.
+        Раньше под этим методом лежало ~150 строк отключённого кода после
+        `return None` (команды, classify_intent, автоизвлечение), который
+        дублировал логику инструментов и только расходился с ней.
         """
-        # ===== ВРЕМЕННОЕ ОТКЛЮЧЕНИЕ =====
-        # Возвращаем None, чтобы основной пайплайн продолжил обработку
-        # без перехвата команд памяти.
         return None
 
-        # Весь код ниже (команды, классификация, автоизвлечение) временно не выполняется.
-        # При необходимости его можно будет вернуть, убрав return None.
+    # ===== ПОСТ-ОБРАБОТКА ОТВЕТА (единая для process_input и стрима) =====
+    async def _postprocess_response(self, message: str, response: str,
+                                    evidence_text: str,
+                                    sources: Optional[List[Dict]]) -> str:
+        """
+        Три дешёвых пост-прохода над готовым ответом (пункт №3 и
+        ИНТЕЛЛЕКТ-ПАКЕТ A/E): критик по плану подзадач, верификация фактов,
+        гарантия ссылок [N]. Каждый откатывается к исходному ответу при сбое.
+        Раньше эти вызовы были размазаны по двум копиям пайплайна.
 
-        # 1. Сначала проверяем команды памяти (старый способ для совместимости)
-        cmd_response = await self._handle_memory_command(message)
-        if cmd_response:
-            return cmd_response[0], cmd_response[1]
+        ИСПРАВЛЕНИЕ ПОРЯДКА: раньше _verify_response вызывалась ДО
+        _run_plan_critic. _run_plan_critic при обнаружении пропущенных
+        пунктов плана делает отдельный сырой LLM-вызов ("дополни ответ") и
+        дописывает результат в конец — то есть ровно тот текст, который
+        _verify_response должна была проверить на выдуманные факты, в
+        момент проверки ещё не существовал. Добавка проходила мимо всей
+        системы заземления (пакет A) и верификации (пункт №3). Теперь план-
+        критик работает первым, а верификация и гарантия цитат применяются
+        уже к полному финальному тексту, включая добавленный кусок.
+        """
+        if not response:
+            return response
+        response = await self._run_plan_critic(message, response)
+        note = await self._verify_response(message, response, evidence_text)
+        if note:
+            response = f"{response}\n\n⚠️ Уточнение: {note}"
+        response = intellect_mod.ensure_citations(response, sources or [])
+        return response
 
-        # 2. Новая классификация намерений (использует улучшенный промпт)
-        if ENABLE_INTENT_CLASSIFICATION:
-            intent_data = await classify_intent(message)
-            intent = intent_data.get("intent", "none")
-            content = intent_data.get("content", "")
-            confidence = intent_data.get("confidence", 0.0)
-            scope_str = intent_data.get("scope", "private")
-            scope_enum = {"private": MemoryScope.PRIVATE, "shared": MemoryScope.SHARED,
-                          "global": MemoryScope.GLOBAL}.get(scope_str, MemoryScope.PRIVATE)
+    async def _finalize_answer(self, message: str, response: str,
+                               search_meta: Dict,
+                               tool_trace: List[Dict[str, Any]],
+                               push=None) -> str:
+        """
+        Единый «хвост» обработки ответа: верификация/критик/цитаты, история,
+        эпизод в памяти, прогресс целей, prediction error и быстрая коррекция.
 
-            if intent == "store" and content and confidence > 0.6:
-                result = await self.memory_service.remember(content, scope=scope_str)
-                if result.get("id"):
-                    self.memory.hierarchy.add_to_working(result["id"])
-                await self.memory_service._save_scope(scope_enum)
-                return f"✅ Запомнил ({scope_enum.value}): {content}", {"memory": "auto_stored", "id": result.get("id")}
+        Раньше этот блок (~100 строк) был скопирован в process_input и
+        _stream_response_worker и РАСХОДИЛСЯ между ними: обновление прогресса
+        целей было только в стрим-версии, а в ней же был скрытый баг —
+        обращение к g.object у dataclass Goal, у которого такого поля нет
+        (AttributeError при достижении confidence >= 0.9). Здесь мета цели
+        читается из GCN-объекта.
+        """
+        if response:
+            evidence_text = "\n".join(filter(None, [
+                self._last_prepare_meta.get("memory_context", ""),
+                search_meta.get("context", ""),
+                build_tool_trace_context(tool_trace) if tool_trace else "",
+            ]))
+            updated = await self._postprocess_response(
+                message, response, evidence_text, search_meta.get("sources"))
+            if updated != response and push is not None:
+                await push(f"data: {json.dumps({'token': updated[len(response):]})}\n\n")
+            response = updated
 
-            elif intent == "forget" and content and confidence > 0.6:
-                result = await self.memory_service.forget(content, scope="private", dry_run=False)
-                if result.get("removed", 0) > 0:
-                    return f"✅ Удалено {result['removed']} фактов по запросу '{content}'", {"memory": "auto_forgot"}
-                else:
-                    return f"Ничего не найдено для удаления по '{content}'", {"memory": "no_match"}
+        self.history.append({"role": "user", "content": message})
+        stored_response = response
+        if response:
+            # Блок 💭 РАССУЖДЕНИЕ: ... --- не сохраняем в историю и память —
+            # иначе он уходит в контекст КАЖДОГО следующего запроса (съедает
+            # токены) и смешивается с реальными ответами при извлечении фактов.
+            stored_response = re.sub(r'💭\s*РАССУЖДЕНИЕ:\s*[\s\S]*?---\s*', '', response).strip() or response
+            self.history.append({"role": "assistant", "content": stored_response})
+        self._save_history()
 
-            elif intent == "recall" and content and confidence > 0.6:
-                facts = await self.memory_service.recall(content, top_k=7)
-                if not facts:
-                    return "Ничего не найдено.", {"memory": "no_recall"}
+        if response:
+            uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
+            salience = 1.0 - uncertainty
+            await self.memory_service.add_episode(message, stored_response, salience=salience)
+            self._last_exchange = {"user": message, "assistant": response, "timestamp": time.time()}
 
-                scope_labels = {"private": "личный", "shared": "общий", "global": "глобальный"}
-                context_lines = []
-                for f in facts[:5]:
-                    scope = f.get("scope", "private")
-                    scope_label = scope_labels.get(scope, scope)
-                    context_lines.append(f"- [{scope_label}] {f['text']}")
-                context = "\n".join(context_lines)
+            # Прогресс активных целей, упомянутых в ответе (теперь и в non-stream).
+            for goal_dict in self._last_prepare_meta.get("active_goals", []):
+                if goal_dict["description"].lower() in response.lower():
+                    for g in self.memory.goals:
+                        if g.description == goal_dict["description"] and g.gcn_id:
+                            g.confidence = min(1.0, g.confidence + 0.1)
+                            g_obj = self.memory.store.get(g.gcn_id)
+                            new_obj = dict(g_obj.object) if g_obj and isinstance(g_obj.object, dict) else {}
+                            if g.confidence >= 0.9:
+                                new_obj["status"] = "completed"
+                            self.memory.store.update(
+                                g.gcn_id, {"object": new_obj, "confidence": g.confidence}, self.user_id)
+                            self.memory._sync_goal_from_gcn(g.gcn_id)
+                            break
+            await self.memory_service.private_memory._schedule_save()
 
-                messages = [
-                    {"role": "system", "content": "Ты — ассистент. На основе фактов дай связный ответ."},
-                    {"role": "user", "content": f"Вопрос: {content}\n\nФакты:\n{context}"}
-                ]
-                response = await call_llm(messages, temp=0.6, max_tokens=500)
-                if not response:
-                    response = "Вот что я знаю:\n" + context
-                return response, {"memory": "recalled"}
+            relevant = self._last_prepare_meta.get("relevant", [])
+            for fact_dict in relevant[:3]:
+                gcn_id = fact_dict.get("gcn_id")
+                if gcn_id:
+                    self.memory.hierarchy.add_to_working(gcn_id)
 
-        # 3. Автоматическое извлечение фактов (даже без команды) — побочный
-        # эффект, не прерывает обработку сообщения.
-        if AUTO_EXTRACT_FACTS and not any(cmd in message.lower() for cmd in MEMORY_CONTROL_COMMANDS.keys()):
-            extracted = await self._auto_extract_facts(message)
-            if extracted:
-                for fact in extracted:
-                    result = await self.memory_service.remember(fact, scope="global")
-                    if result.get("id"):
-                        self.memory.hierarchy.add_to_working(result["id"])
-                await self.memory_service.global_memory._schedule_save()
-                logger.info(f"Auto-extracted {len(extracted)} facts from message")
-
-        return None
+        predictions = self._last_prepare_meta.get("predictions", [])
+        if predictions and response:
+            error = self._compute_prediction_error(predictions, response)
+            self.prediction_history.append({
+                "query": message,
+                "predicted": predictions,
+                "actual": response,
+                "error": error,
+                "timestamp": time.time()
+            })
+            if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
+                self.prediction_history.pop(0)
+            if (error > 0.85
+                    and len(response) > 50
+                    and not response.strip().lower().startswith(("привет", "здравствуйте", "hello"))
+                    and "?" in message
+                    and not any(m in message.lower() for m in self._quick_correction_skip_markers)
+                    and time.time() - self._last_quick_correction >= self._quick_correction_cooldown):
+                self._last_quick_correction = time.time()
+                self._spawn_background_task(self._quick_correction(message, predictions, response),
+                                            name="quick-correction")
+        return response
 
     # ===== ПРОЦЕССИНГ ВХОДА (изменён: добавлена классификация и автоизвлечение) =====
     async def process_input(self, message: str, web_search: bool = False,
@@ -1353,6 +1574,11 @@ class CognitiveController:
             message, web_search, image_base64, image_mime, reasoning
         )
         uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
+
+        # Детерминированный поиск: если пользователь явно запросил интернет
+        # (web_search=True) или дал прямую ссылку — ищем сразу, не полагаясь
+        # на решение локальной LLM вызвать internal__web_search.
+        await self._force_search_if_requested(message, search_meta)
 
         # === НОВОЕ: активное уточнение ===
         if uncertainty > 0.7 and not web_search and not reasoning:
@@ -1401,13 +1627,14 @@ class CognitiveController:
                         facts = await self._extract_facts_llm(search_context, sources)
                     else:
                         facts = self._extract_facts_from_text(search_context)
-                    for f in facts:
-                        # f может быть строкой или словарём – адаптируем
-                        text = f.get("text", f) if isinstance(f, dict) else f
-                        await self.memory_service.remember(text, scope="global")
-                    if facts:
-                        await self.memory_service.global_memory._schedule_save()
-                    logger.info(f"Extracted {len(facts)} facts from web search -> global memory")
+                    # ИНТЕЛЛЕКТ-ПАКЕТ (B): санитайзер — факты из поиска больше
+                    # не летят в global с фиксированным 0.9. Градация
+                    # scope/confidence по фактологичности и доверию домена.
+                    # ИСПРАВЛЕНИЕ: сохранение на диск теперь идёт по
+                    # фактическому scope каждого факта, а не всегда в global
+                    # (см. _save_sanitized_facts).
+                    sanitized = intellect_mod.sanitize_search_facts(facts, merged_sources)
+                    await self._save_sanitized_facts(sanitized)
                 except Exception as e:
                     logger.warning(f"Fact extraction error: {e}")
 
@@ -1421,6 +1648,7 @@ class CognitiveController:
                 message=message,
                 web_search=web_search,
                 search_context=search_meta.get("context", ""),
+                sources=search_meta.get("sources"),
                 memory_context=self._memory_context_for_rebuild(
                     tool_trace, self._last_prepare_meta.get("memory_context", "")
                 ),
@@ -1437,51 +1665,7 @@ class CognitiveController:
             })
 
         response = await call_llm(messages)
-
-        # Верификация ответа (пункт №3)
-        if response:
-            evidence_text = "\n".join(filter(None, [
-                self._last_prepare_meta.get("memory_context", ""),
-                search_meta.get("context", ""),
-                build_tool_trace_context(tool_trace) if tool_trace else "",
-            ]))
-            note = await self._verify_response(message, response, evidence_text)
-            if note:
-                response = f"{response}\n\n⚠️ Уточнение: {note}"
-
-        self.history.append({"role": "user", "content": message})
-        if response:
-            self.history.append({"role": "assistant", "content": response})
-        self._save_history()
-
-        if response:
-            uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
-            salience = 1.0 - uncertainty
-            await self.memory_service.add_episode(message, response, salience=salience)
-
-            relevant = self._last_prepare_meta.get("relevant", [])
-            for fact_dict in relevant[:3]:
-                gcn_id = fact_dict.get("gcn_id")
-                if gcn_id:
-                    self.memory.hierarchy.add_to_working(gcn_id)
-
-        predictions = self._last_prepare_meta.get("predictions", [])
-        if predictions and response:
-            error = self._compute_prediction_error(predictions, response)
-            self.prediction_history.append({
-                "query": message,
-                "predicted": predictions,
-                "actual": response,
-                "error": error,
-                "timestamp": time.time()
-            })
-            if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
-                self.prediction_history.pop(0)
-            if error > 0.85 and len(response) > 50 and not response.strip().lower().startswith(
-                    ("привет", "здравствуйте", "hello")):
-                self._spawn_background_task(self._quick_correction(message, predictions, response),
-                                            name="quick-correction")
-
+        response = await self._finalize_answer(message, response, search_meta, tool_trace)
         return response, search_meta
 
     # ===== ИЗВЛЕЧЕНИЕ ФАКТОВ (без изменений) =====
@@ -1489,49 +1673,123 @@ class CognitiveController:
         """
         Извлекает факты с метаданными (источник, дата) из текста.
         Возвращает список словарей с полями: text, source, date.
+
+        ИСПРАВЛЕНИЕ: раньше весь search-контекст резался до context[:4000],
+        и при типовой выдаче (5-7 страниц × ~3000 символов excerpt) до LLM
+        доходили факты только из первых 1-2 источников — остальные молча
+        терялись и не попадали в память. Теперь контекст нарезается на
+        чанки (FACT_EXTRACT_CHUNK_CHARS × FACT_EXTRACT_MAX_CHUNKS, с overlap,
+        чтобы факты на границе не портились), чанки обрабатываются
+        ПАРАЛЛЕЛЬНО одним gather, результаты склеиваются и дедуплицируются.
+        При сбое LLM/пустом результате — прежний откат на regex-эвристику
+        _extract_facts_from_text.
         """
         if not context:
             return []
 
-        # Формируем аннотации источников
-        source_annotations = ""
-        if sources:
-            for s in sources[:5]:
-                url = s.get('url', '')
-                reliability = s.get('reliability', 'неизвестна')
-                source_annotations += f"- {url} (надёжность: {reliability})\n"
+        sources = sources or []
 
-        prompt = (
-                "Извлеки из текста только объективные, проверяемые факты. Для каждого факта укажи:"
-                "   текст факта (кратко, предложением),"
-                "   возможный источник (URL из списка, если он упоминается в тексте или очевидно связан),"
-                "   ориентировочную дату (если указана в тексте или актуальна на текущую дату)."
-                "Факты должны быть краткими утверждениями, содержащими конкретную информацию (числа, даты, имена)."
-                "НЕ включай: мнения, прогнозы, инструкции, общие фразы."
-                "Верни ответ в виде JSON-списка объектов с полями: text, source, date."
-                "Если источник неясен, укажи 'неизвестен'. Если дата не указана, укажи 'неизвестна'."
-                "\n\nСписок источников (URL и надёжность):\n" + source_annotations +
-                "\n\nТЕКСТ:\n" + context[:4000]
+        # Формируем аннотации источников (общие для всех чанков)
+        source_annotations = ""
+        for s in sources[:5]:
+            url = s.get('url', '')
+            reliability = s.get('reliability', 'неизвестна')
+            source_annotations += f"- {url} (надёжность: {reliability})\n"
+
+        base_prompt = (
+            "Извлеки из текста только объективные, проверяемые факты. Для каждого факта укажи:"
+            "   текст факта (кратко, предложением),"
+            "   возможный источник (URL из списка, если он упоминается в тексте или очевидно связан),"
+            "   ориентировочную дату (если указана в тексте или актуальна на текущую дату)."
+            "Факты должны быть краткими утверждениями, содержащими конкретную информацию (числа, даты, имена)."
+            "НЕ включай: мнения, прогнозы, инструкции, общие фразы."
+            "Верни ответ в виде JSON-списка объектов с полями: text, source, date."
+            "Если источник неясен, укажи 'неизвестен'. Если дата не указана, укажи 'неизвестна'."
+            "\n\nСписок источников (URL и надёжность):\n" + source_annotations
         )
 
-        try:
-            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.2, max_tokens=500)
-            # Очистка от маркдауна и извлечение JSON
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.strip("`")
-                if raw.lower().startswith("json"):
-                    raw = raw[4:]
-            raw = raw.strip()
-            facts = json.loads(raw)
-            if isinstance(facts, list):
-                return facts[:10]
-        except Exception as e:
-            logger.warning(f"LLM fact extraction failed: {e}")
-            # fallback: извлекаем простые предложения
+        # --- Нарезка контекста на чанки ---
+        total = len(context)
+        if total <= FACT_EXTRACT_CHUNK_CHARS + 1000:
+            chunks = [context]
+        else:
+            chunks = []
+            start = 0
+            while start < total and len(chunks) < FACT_EXTRACT_MAX_CHUNKS:
+                end = min(total, start + FACT_EXTRACT_CHUNK_CHARS)
+                chunks.append(context[start:end])
+                if end >= total:
+                    break
+                start = end - FACT_EXTRACT_CHUNK_OVERLAP
+
+        # --- Параллельное извлечение из всех чанков ---
+        tasks = [
+            call_llm(
+                [{"role": "user", "content":
+                  base_prompt +
+                  f"\n\nТЕКСТ (часть {i + 1}/{len(chunks)}):\n{chunk}"}],
+                temp=0.2, max_tokens=450,
+            )
+            for i, chunk in enumerate(chunks)
+        ]
+        raws = await asyncio.gather(*tasks, return_exceptions=True)
+
+        facts: List[Dict] = []
+        seen: set = set()
+        for raw in raws:
+            if isinstance(raw, Exception):
+                logger.debug(f"_extract_facts_llm: чанк упал с исключением: {raw}")
+                continue
+            for fact in self._parse_extracted_facts_json(raw):
+                key = fact["text"].strip().lower()[:150]
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                facts.append(fact)
+
+        # --- Откат на эвристику, если LLM ничего не дала ---
+        if not facts and context:
             simple = self._extract_facts_from_text(context)
             return [{"text": s, "source": "unknown", "date": "unknown"} for s in simple[:5]]
-        return []
+        return facts[:15]
+
+    @staticmethod
+    def _parse_extracted_facts_json(raw: str) -> List[Dict]:
+        """
+        Разбор JSON-ответа LLM-экстрактора. Ожидает список объектов
+        {text, source, date}. Терпимо к markdown-обёртке; валидными считаются
+        только пункты с непустым text (длина >= 15).
+        """
+        if not raw:
+            return []
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        m = re.search(r"\[[\s\S]*\]", text)
+        if not m:
+            return []
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(data, list):
+            return []
+        out: List[Dict] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            fact_text = str(item.get("text", "") or "").strip()
+            if len(fact_text) < 15:
+                continue
+            out.append({
+                "text": fact_text[:400],
+                "source": str(item.get("source", "unknown") or "unknown")[:300],
+                "date": str(item.get("date", "unknown") or "unknown")[:50],
+            })
+        return out
 
     def _extract_facts_from_text(self, text: str) -> List[str]:
         sentences = re.split(r'[.!?]', text)
@@ -1675,6 +1933,13 @@ class CognitiveController:
                 logger.warning(f"Contradiction verify LLM call failed ({fact_a.id},{fact_b.id}): {e}")
                 continue
 
+            # ИСПРАВЛЕНИЕ: пустой ответ LLM (сбой/таймаут LM Studio — call_llm возвращает "")
+            # — это не "плохой JSON", и спамить warning каждый цикл консолидации из-за
+            # этого не нужно. Реально невалидный (непустой) ответ логируем как раньше.
+            if not raw or not raw.strip():
+                logger.debug(f"Contradiction verify: пустой ответ LLM для пары ({fact_a.id},{fact_b.id}) — пропуск.")
+                continue
+
             verdict = parse_llm_json(raw)
             if not verdict or "relation" not in verdict:
                 logger.warning(f"Contradiction verify: bad JSON from LLM: {raw[:200]!r}")
@@ -1753,7 +2018,8 @@ class CognitiveController:
     def _build_messages(self, message: str, web_search: bool, search_context: str,
                         memory_context: str, image_base64: Optional[str],
                         image_mime: Optional[str], reasoning: bool,
-                        uncertainty: float, predictions: List[str], goal_hint: str) -> List[Dict]:
+                        uncertainty: float, predictions: List[str], goal_hint: str,
+                        sources: Optional[List[Dict]] = None) -> List[Dict]:
         """Строит сообщения для LLM с разделением концептов и фактов."""
         # Защита от None
         memory_context = memory_context or ""
@@ -1798,12 +2064,26 @@ class CognitiveController:
         if goal_hint:
             system_parts.append(f"Учитывай активные цели: {goal_hint}.")
         if reasoning:
+            # ИСПРАВЛЕНИЕ: раньше инструкция была одной размытой строкой, и локальные
+            # модели часто игнорировали формат (писали "Рассуждение:" без эмодзи,
+            # без разделителя "---") — фронтенд такое не распознавал, и режим
+            # "рассуждения" выглядел сломанным. Теперь формат задан строго и по шагам.
             system_parts.append(
-                "Перед ответом покажи рассуждения: начни с 💭 РАССУЖДЕНИЕ: и заканчивая ---, затем финальный ответ."
+                "Включён режим рассуждений. Строго следуй формату (без изменений):\n"
+                "1. Первая строка ответа — ровно: 💭 РАССУЖДЕНИЕ:\n"
+                "2. Далее — твои рассуждения по делу (несколько предложений или пунктов).\n"
+                "3. Затем отдельная строка, ровно: ---\n"
+                "4. Затем — финальный ответ пользователю.\n"
+                "Если режим рассуждений не включён — не используй этот формат."
             )
         if search_context:
             system_parts.append(
                 "Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
+        # ИНТЕЛЛЕКТ-ПАКЕТ (A): заземлённый синтез — только контекст + ссылки [N]
+        if (search_context or memory_context) and GROUNDED_ANSWER_ENABLED:
+            gb = intellect_mod.grounded_system_block()
+            if gb:
+                system_parts.append(gb)
         elif web_search:
             system_parts.append(
                 "Пользователю нужны актуальные данные из интернета (курсы, цены, новости, свежие "
@@ -1828,6 +2108,11 @@ class CognitiveController:
                 f"=== ДАННЫЕ ИЗ ИНТЕРНЕТА (актуальны на {datetime.now(timezone.utc).strftime('%Y-%m-%d')}) ===\n\n"
                 f"{search_context}\n\n=== КОНЕЦ ДАННЫХ ==="
             )
+        # ИНТЕЛЛЕКТ-ПАКЕТ (A): явный пронумерованный список источников для ссылок [N]
+        if sources and (search_context or memory_context) and GROUNDED_ANSWER_ENABLED:
+            sb = intellect_mod.sources_block(sources)
+            if sb:
+                user_blocks.append(sb)
         user_blocks.append(f"Вопрос пользователя: {message}")
         user_text = "\n\n".join(user_blocks)
 
@@ -1884,223 +2169,302 @@ class CognitiveController:
     async def stream_response(self, message: str, web_search: bool = False,
                               image_base64: str = None, image_mime: str = None,
                               reasoning: bool = False, char_by_char: bool = None):
-        # Подтягиваем изменения, сделанные другими процессами (например, MCP)
-        self.memory_service.refresh()
+        """
+        Тонкая обёртка над StreamingResponse. Реальная генерация выполняется в
+        self._stream_response_worker, запущенном как отдельная asyncio.Task
+        через _spawn_background_task (сильная ссылка в self._background_tasks —
+        см. комментарий в __init__ про то, почему это важно само по себе).
 
-        self._last_activity_time = time.time()
+        Этот генератор — единственное, что "видит" обрыв HTTP-соединения. При
+        обрыве (клиент закрыл вкладку / потерял сеть / нажал "стоп") здесь
+        просто отписывается локальная очередь-подписчик — сама генерация в
+        фоновой Task продолжает работать и досчитывается до конца, сохраняет
+        историю и память независимо от того, слушает её кто-нибудь или нет.
+        Это то самое поведение "как у Claude" — генерация не зависит от того,
+        остался пользователь на странице или нет.
 
-        # ИСПРАВЛЕНИЕ (#3 из чат-ревью): используем общий пайплайн памяти
-        pipeline_result = await self._run_memory_intent_pipeline(message)
-        if pipeline_result:
-            yield f"data: {json.dumps({'token': pipeline_result[0]})}\n\n"
-            yield "data: [DONE]\n\n"
+        Если на момент вызова для этого пользователя уже идёт генерация
+        (например, пользователь обновил страницу/переподключился, пока ответ
+        ещё считался), новый вызов подключается к УЖЕ ИДУЩЕЙ задаче: сначала
+        реплеит то, что уже успело сгенерироваться (буфер), затем продолжает
+        live — а не запускает вторую параллельную генерацию поверх той же
+        self.history.
+        """
+        state = self._active_stream
+        if state is None or state.get("done"):
+            gen_id = f"{self.user_id}:{time.time_ns()}"
+            state = {"gen_id": gen_id, "buffer": [], "subscribers": set(), "done": False}
+            self._active_stream = state
+            push = self._make_push(gen_id)
+            task = self._spawn_background_task(
+                self._stream_response_worker(
+                    gen_id=gen_id, push=push, message=message, web_search=web_search,
+                    image_base64=image_base64, image_mime=image_mime,
+                    reasoning=reasoning, char_by_char=char_by_char,
+                ),
+                name=f"stream:{gen_id}",
+            )
+            state["task"] = task
+        else:
+            gen_id = state["gen_id"]
+            logger.info(f"stream_response: подключаюсь к уже идущей генерации {gen_id} вместо новой")
+
+        queue: asyncio.Queue = asyncio.Queue()
+        for chunk in list(state["buffer"]):
+            await queue.put(chunk)
+        if state["done"]:
+            await queue.put(None)
+        else:
+            state["subscribers"].add(queue)
+
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+        finally:
+            # Отписываемся от рассылки — фоновую задачу это НЕ останавливает.
+            state["subscribers"].discard(queue)
+
+    def _make_push(self, gen_id: str):
+        """
+        Возвращает push(chunk) — функцию, которую _stream_response_worker
+        зовёт вместо `yield`. Пишет чанк в буфер генерации (для реплея
+        подключившимся позже слушателям) и рассылает его всем текущим
+        подписчикам. Молча становится no-op, если генерация с этим gen_id
+        уже завершена/подменена — на случай гонок при повторном подключении.
+        """
+        async def push(chunk: str):
+            state = self._active_stream
+            if state is None or state.get("gen_id") != gen_id:
+                return
+            state["buffer"].append(chunk)
+            for q in list(state["subscribers"]):
+                await q.put(chunk)
+        return push
+
+    async def _finish_generation(self, gen_id: str):
+        """Помечает генерацию завершённой и будит всех подписчиков сентинелом None."""
+        state = self._active_stream
+        if state is None or state.get("gen_id") != gen_id:
             return
+        state["done"] = True
+        for q in list(state["subscribers"]):
+            await q.put(None)
+        state["subscribers"].clear()
+        if self._active_stream is state:
+            self._active_stream = None
 
-        await self._ensure_external_tools_registered()
+    async def _stream_response_worker(self, gen_id: str, push, message: str, web_search: bool = False,
+                                       image_base64: str = None, image_mime: str = None,
+                                       reasoning: bool = False, char_by_char: bool = None):
+        """
+        Фактическая генерация ответа. Запускается как ОТДЕЛЬНАЯ asyncio.Task
+        (см. stream_response ниже) — а не как тело async-генератора, который
+        напрямую потребляет StreamingResponse.
 
-        messages, search_meta = await self._prepare_messages(
-            message, web_search, image_base64, image_mime, reasoning
-        )
-        uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
+        Раньше это был один и тот же код: если клиент (браузер) обрывал
+        соединение — закрыл вкладку, потерял сеть, вызвал
+        AbortController.abort() — Starlette дожидается следующего чтения
+        из тела ответа, видит обрыв и вызывает generator.aclose(). Это
+        кидает GeneratorExit ровно в ту точку, где генератор был
+        приостановлен — чаще всего внутри `async for token in
+        call_llm_stream(...)`. GeneratorExit не ловится `except
+        Exception`, поэтому весь код ПОСЛЕ генерации (сохранение
+        self.history, memory_service.add_episode, обновление целей,
+        _verify_response) просто не выполнялся. В итоге ответ терялся и на
+        сервере, и в памяти, а следующий запрос получал рассинхронизированную
+        историю — это и проявлялось как «ошибка LLM»/пустой ответ.
 
-        # === НОВОЕ: активное уточнение ===
-        if uncertainty > 0.7 and not web_search and not reasoning:
-            clarification = await self._ask_clarification(message, uncertainty)
-            if clarification:
-                yield f"data: {json.dumps({'token': clarification})}\n\n"
-                yield "data: [DONE]\n\n"
-                self.history.append({"role": "assistant", "content": clarification})
-                self._save_history()
+        Теперь push() пишет каждый чанк в общий буфер генерации и рассылает
+        его текущим подписчикам (см. _make_push/_finish_generation) — эта
+        корутина как asyncio.Task не прерывается закрытием HTTP-соединения
+        и всегда дописывает историю/память до конца.
+        """
+        try:
+            # Подтягиваем изменения, сделанные другими процессами (например, MCP)
+            self.memory_service.refresh()
+
+            self._last_activity_time = time.time()
+
+            # ИСПРАВЛЕНИЕ (#3 из чат-ревью): используем общий пайплайн памяти
+            pipeline_result = await self._run_memory_intent_pipeline(message)
+            if pipeline_result:
+                await push(f"data: {json.dumps({'token': pipeline_result[0]})}\n\n")
+                await push("data: [DONE]\n\n")
                 return
 
-        full_response = ""
-        tool_trace: List[Dict[str, Any]] = []
-        already_verified = False
-        try:
-            if LM_STUDIO_USE_STREAM:
-                history_tail = "\n".join(
-                    f"{m.get('role')}: {str(m.get('content'))[:200]}" for m in self.history[-6:]
-                )
-                if search_meta.get("search_requested"):
-                    history_tail = (
-                        "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри "
-                        f"вызов internal__web_search]\n{history_tail}" if history_tail else
-                        "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри вызов internal__web_search]"
-                    )
-                tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
-                tool_trace = tool_run.get("tool_trace", [])
-                logger.info(
-                    f"ToolRouter decisions for '{message[:50]}': used_native={tool_run.get('used_native')}, trace_len={len(tool_trace)}")
-                logger.info(f"Tool trace: {tool_trace}")
+            await self._ensure_external_tools_registered()
 
-                # Обработка результатов поиска (из внутреннего web_search)
-                if self._web_search_results_this_turn:
-                    seen_urls = set()
-                    merged_sources: List[Dict] = []
-                    context_parts: List[str] = []
-                    for r in self._web_search_results_this_turn:
-                        for s in r.get("sources", []):
-                            url = s.get("url")
-                            if url and url not in seen_urls:
-                                seen_urls.add(url)
-                                merged_sources.append(s)
-                        if r.get("context"):
-                            context_parts.append(r["context"])
-                    search_meta["web_search_used"] = True
-                    search_meta["sources"] = merged_sources
-                    search_meta["context"] = "\n\n---\n\n".join(context_parts)
-
-                    if EXTRACT_FACTS_FROM_SEARCH and search_meta["context"]:
-                        try:
-                            if EXTRACT_FACTS_WITH_LLM:
-                                # Используем улучшенную версию _extract_facts_llm с метаданными
-                                facts = await self._extract_facts_llm(search_meta["context"], merged_sources)
-                            else:
-                                facts = self._extract_facts_from_text(search_meta["context"])
-                            for f in facts:
-                                # f может быть строкой или словарём – адаптируем
-                                text = f.get("text", f) if isinstance(f, dict) else f
-                                await self.memory_service.remember(text, scope="global")
-                            if facts:
-                                await self.memory_service.global_memory._schedule_save()
-                            logger.info(f"Extracted {len(facts)} facts from web search -> global memory")
-                        except Exception as e:
-                            logger.warning(f"Fact extraction error: {e}")
-
-                if search_meta.get("sources"):
-                    yield f"data: {json.dumps({'sources': search_meta['sources']})}\n\n"
-
-                for t in tool_trace:
-                    if t.get("tool") == "internal__generate_image":
-                        result = t.get("result")
-                        if isinstance(result, str):
-                            try:
-                                result = json.loads(result)
-                            except (json.JSONDecodeError, TypeError):
-                                logger.warning(
-                                    f"generate_image: не удалось распарсить результат инструмента как JSON: {result[:200]!r}"
-                                )
-                        logger.info(f"generate_image result: {result}")
-                        if isinstance(result, dict) and result.get("image_url"):
-                            image_url = result["image_url"]
-                            logger.info(f"Sending image_url event: {image_url}")
-                            yield f"data: {json.dumps({'image_url': image_url})}\n\n"
-                            break
-                        else:
-                            logger.warning("generate_image result does not contain image_url")
-
-                if tool_trace:
-                    for t in tool_trace:
-                        yield f"data: {json.dumps({'tool_call': t['tool'], 'result_preview': str(t['result'])[:200]})}\n\n"
-                        self.history.append({
-                            "role": "assistant",
-                            "content": f"[инструмент {t['tool']}] {str(t['result'])[:500]}"
-                        })
-                    messages = self._build_messages(
-                        message=message,
-                        web_search=web_search,
-                        search_context=search_meta.get("context", ""),
-                        memory_context=self._memory_context_for_rebuild(
-                            tool_trace, self._last_prepare_meta.get("memory_context", "")
-                        ),
-                        image_base64=image_base64,
-                        image_mime=image_mime,
-                        reasoning=reasoning,
-                        uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
-                        predictions=self._last_prepare_meta.get("predictions", []),
-                        goal_hint=self._last_prepare_meta.get("goal_hint", "")
-                    )
-                    messages.append({
-                        "role": "user",
-                        "content": build_tool_trace_context(tool_trace) + "\n\nТеперь дай финальный ответ пользователю."
-                    })
-
-                async for token in call_llm_stream(messages):
-                    full_response += token
-                    yield f"data: {json.dumps({'token': token})}\n\n"
-            else:
-                response, inner_meta = await self.process_input(message, web_search, image_base64, image_mime,
-                                                                reasoning)
-                full_response = response
-                already_verified = True
-                if isinstance(inner_meta, dict) and inner_meta.get("sources"):
-                    search_meta["sources"] = inner_meta["sources"]
-                    yield f"data: {json.dumps({'sources': inner_meta['sources']})}\n\n"
-                if char_by_char is None:
-                    char_by_char = STREAM_CHAR_BY_CHAR
-                if char_by_char:
-                    for ch in full_response:
-                        yield f"data: {json.dumps({'token': ch})}\n\n"
-                        await asyncio.sleep(STREAM_CHAR_DELAY)
-                else:
-                    for word in full_response.split():
-                        yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-        except Exception as e:
-            logger.error(f"Stream error: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            return
-
-        if full_response and not already_verified:
-            evidence_text = "\n".join(filter(None, [
-                self._last_prepare_meta.get("memory_context", ""),
-                search_meta.get("context", ""),
-                build_tool_trace_context(tool_trace) if tool_trace else "",
-            ]))
-            note = await self._verify_response(message, full_response, evidence_text)
-            if note:
-                caveat = f"\n\n⚠️ Уточнение: {note}"
-                yield f"data: {json.dumps({'token': caveat})}\n\n"
-                full_response += caveat
-
-        self.history.append({"role": "user", "content": message})
-        if full_response:
-            self.history.append({"role": "assistant", "content": full_response})
-            self._save_history()
+            messages, search_meta = await self._prepare_messages(
+                message, web_search, image_base64, image_mime, reasoning
+            )
             uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
-            salience = 1.0 - uncertainty
-            await self.memory_service.add_episode(message, full_response, salience=salience)
 
-            active_goals = self._last_prepare_meta.get("active_goals", [])
-            for goal_dict in active_goals:
-                if goal_dict["description"].lower() in full_response.lower():
-                    for g in self.memory.goals:
-                        if g.description == goal_dict["description"]:
-                            g.confidence = min(1.0, g.confidence + 0.1)
-                            if g.confidence >= 0.9:
-                                new_obj = g.object.copy() if isinstance(g.object, dict) else {}
-                                new_obj["status"] = "completed"
-                                self.memory.store.update(g.gcn_id, {"object": new_obj, "confidence": g.confidence},
-                                                         self.user_id)
+            # См. process_input: детерминированный поиск до ReAct-цикла.
+            await self._force_search_if_requested(message, search_meta)
+
+            # === НОВОЕ: активное уточнение ===
+            if uncertainty > 0.7 and not web_search and not reasoning:
+                clarification = await self._ask_clarification(message, uncertainty)
+                if clarification:
+                    await push(f"data: {json.dumps({'token': clarification})}\n\n")
+                    await push("data: [DONE]\n\n")
+                    self.history.append({"role": "assistant", "content": clarification})
+                    self._save_history()
+                    return
+
+            full_response = ""
+            tool_trace: List[Dict[str, Any]] = []
+            already_verified = False
+            try:
+                if LM_STUDIO_USE_STREAM:
+                    history_tail = "\n".join(
+                        f"{m.get('role')}: {str(m.get('content'))[:200]}" for m in self.history[-6:]
+                    )
+                    if search_meta.get("search_requested"):
+                        history_tail = (
+                            "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри "
+                            f"вызов internal__web_search]\n{history_tail}" if history_tail else
+                            "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри вызов internal__web_search]"
+                        )
+                    tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
+                    tool_trace = tool_run.get("tool_trace", [])
+                    logger.info(
+                        f"ToolRouter decisions for '{message[:50]}': used_native={tool_run.get('used_native')}, trace_len={len(tool_trace)}")
+                    logger.info(f"Tool trace: {tool_trace}")
+
+                    # Обработка результатов поиска (из внутреннего web_search)
+                    if self._web_search_results_this_turn:
+                        seen_urls = set()
+                        merged_sources: List[Dict] = []
+                        context_parts: List[str] = []
+                        for r in self._web_search_results_this_turn:
+                            for s in r.get("sources", []):
+                                url = s.get("url")
+                                if url and url not in seen_urls:
+                                    seen_urls.add(url)
+                                    merged_sources.append(s)
+                            if r.get("context"):
+                                context_parts.append(r["context"])
+                        search_meta["web_search_used"] = True
+                        search_meta["sources"] = merged_sources
+                        search_meta["context"] = "\n\n---\n\n".join(context_parts)
+
+                        if EXTRACT_FACTS_FROM_SEARCH and search_meta["context"]:
+                            try:
+                                if EXTRACT_FACTS_WITH_LLM:
+                                    # Используем улучшенную версию _extract_facts_llm с метаданными
+                                    facts = await self._extract_facts_llm(search_meta["context"], merged_sources)
+                                else:
+                                    facts = self._extract_facts_from_text(search_meta["context"])
+                                # ИНТЕЛЛЕКТ-ПАКЕТ (B): санитайзер фактов из поиска.
+                                # ИСПРАВЛЕНИЕ: сохранение по фактическому scope,
+                                # не всегда в global (см. _save_sanitized_facts).
+                                sanitized = intellect_mod.sanitize_search_facts(facts, merged_sources)
+                                await self._save_sanitized_facts(sanitized)
+                            except Exception as e:
+                                logger.warning(f"Fact extraction error: {e}")
+
+                    if search_meta.get("sources"):
+                        await push(f"data: {json.dumps({'sources': search_meta['sources']})}\n\n")
+
+                    for t in tool_trace:
+                        if t.get("tool") == "internal__generate_image":
+                            result = t.get("result")
+                            if isinstance(result, str):
+                                try:
+                                    result = json.loads(result)
+                                except (json.JSONDecodeError, TypeError):
+                                    logger.warning(
+                                        f"generate_image: не удалось распарсить результат инструмента как JSON: {result[:200]!r}"
+                                    )
+                            logger.info(f"generate_image result: {result}")
+                            if isinstance(result, dict) and result.get("image_url"):
+                                image_url = result["image_url"]
+                                logger.info(f"Sending image_url event: {image_url}")
+                                await push(f"data: {json.dumps({'image_url': image_url})}\n\n")
+                                # ИСПРАВЛЕНИЕ (картинка по 2-3 раза в чате): URL уходит
+                                # во фронтенд отдельным SSE-событием. Если оставить его
+                                # в tool_trace, финальный ответ LLM тоже содержит этот
+                                # URL, фронтендский рендер markdown превращает его во
+                                # вторую картинку в том же сообщении. Заменяем
+                                # результат коротким текстом без URL.
+                                t["result"] = "Изображение сгенерировано и показано пользователю выше."
+                                break
                             else:
-                                self.memory.store.update(g.gcn_id, {"confidence": g.confidence}, self.user_id)
-                            self.memory._sync_goal_from_gcn(g.gcn_id)
-                            break
-            await self.memory_service.private_memory._schedule_save()
+                                logger.warning("generate_image result does not contain image_url")
 
-            relevant = self._last_prepare_meta.get("relevant", [])
-            for fact_dict in relevant[:3]:
-                gcn_id = fact_dict.get("gcn_id")
-                if gcn_id:
-                    self.memory.hierarchy.add_to_working(gcn_id)
+                    if tool_trace:
+                        for t in tool_trace:
+                            await push(f"data: {json.dumps({'tool_call': t['tool'], 'result_preview': str(t['result'])[:200]})}\n\n")
+                            self.history.append({
+                                "role": "assistant",
+                                "content": f"[инструмент {t['tool']}] {str(t['result'])[:500]}"
+                            })
+                        messages = self._build_messages(
+                            message=message,
+                            web_search=web_search,
+                            search_context=search_meta.get("context", ""),
+                            sources=search_meta.get("sources"),
+                            memory_context=self._memory_context_for_rebuild(
+                                tool_trace, self._last_prepare_meta.get("memory_context", "")
+                            ),
+                            image_base64=image_base64,
+                            image_mime=image_mime,
+                            reasoning=reasoning,
+                            uncertainty=self._last_prepare_meta.get("uncertainty", 0.5),
+                            predictions=self._last_prepare_meta.get("predictions", []),
+                            goal_hint=self._last_prepare_meta.get("goal_hint", "")
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": build_tool_trace_context(tool_trace) + "\n\nТеперь дай финальный ответ пользователю."
+                        })
 
-        predictions = self._last_prepare_meta.get("predictions", [])
-        if predictions and full_response:
-            error = self._compute_prediction_error(predictions, full_response)
-            self.prediction_history.append({
-                "query": message,
-                "predicted": predictions,
-                "actual": full_response,
-                "error": error,
-                "timestamp": time.time()
-            })
-            if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
-                self.prediction_history.pop(0)
-            if error > 0.85 and len(full_response) > 50 and not full_response.strip().lower().startswith(
-                    ("привет", "здравствуйте", "hello")):
-                self._spawn_background_task(self._quick_correction(message, predictions, full_response),
-                                            name="quick-correction")
+                    async for token in call_llm_stream(messages):
+                        full_response += token
+                        await push(f"data: {json.dumps({'token': token})}\n\n")
+                else:
+                    response, inner_meta = await self.process_input(message, web_search, image_base64, image_mime,
+                                                                    reasoning)
+                    full_response = response
+                    already_verified = True
+                    if isinstance(inner_meta, dict) and inner_meta.get("sources"):
+                        search_meta["sources"] = inner_meta["sources"]
+                        await push(f"data: {json.dumps({'sources': inner_meta['sources']})}\n\n")
+                    if char_by_char is None:
+                        char_by_char = STREAM_CHAR_BY_CHAR
+                    if char_by_char:
+                        for ch in full_response:
+                            await push(f"data: {json.dumps({'token': ch})}\n\n")
+                            await asyncio.sleep(STREAM_CHAR_DELAY)
+                    else:
+                        for word in full_response.split():
+                            await push(f"data: {json.dumps({'token': word + ' '})}\n\n")
+            except Exception as e:
+                logger.error(f"Stream error: {e}")
+                await push(f"data: {json.dumps({'error': str(e)})}\n\n")
+                return
 
-        yield "data: [DONE]\n\n"
+            if full_response and not already_verified:
+                # Единый хвост обработки (история, память, верификация,
+                # цели, prediction error) — см. _finalize_answer.
+                full_response = await self._finalize_answer(
+                    message, full_response, search_meta, tool_trace, push=push)
+
+            await push("data: [DONE]\n\n")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception(f"_stream_response_worker: необработанная ошибка: {e}")
+            try:
+                await push(f"data: {json.dumps({'error': str(e)})}\n\n")
+            except Exception:
+                pass
+        finally:
+            await self._finish_generation(gen_id)
 
     # ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====
     async def generate_image(self, prompt: str, steps: Optional[int] = None,
@@ -2236,6 +2600,10 @@ class AIRequest(BaseModel):
     image_mime: Optional[str] = None
     reasoning: bool = False
     char_by_char: Optional[bool] = None
+    # Прямая ссылка от фронтенда (JS отправляет url_to_fetch при URL в сообщении).
+    # Раньше поля не было в модели — FastAPI/pydantic отбрасывали его молча,
+    # и ссылка оставалась только в тексте сообщения на усмотрение LLM.
+    url_to_fetch: Optional[str] = Field(None, max_length=2000)
 
 class ResearchRequest(BaseModel):
     goal: str = Field(..., min_length=1, max_length=2000)
@@ -2249,6 +2617,10 @@ class EnhanceRequest(BaseModel):
 @router.post("/chat")
 async def chat_with_ai(body: AIRequest, address: str = Depends(require_auth)):
     logger.info(f"Запрос от {address[:16]}, web={body.web_search}, reasoning={body.reasoning}")
+    # url_to_fetch гарантированно попадает в текст сообщения, чтобы его увидел
+    # детерминированный поиск (см. CognitiveController._force_search_if_requested)
+    if body.url_to_fetch and body.url_to_fetch not in (body.message or ""):
+        body.message = f"{body.message}\n{body.url_to_fetch}".strip()
     assistant = await get_assistant(address)
     if body.stream:
         return StreamingResponse(
@@ -2271,6 +2643,75 @@ async def chat_with_ai(body: AIRequest, address: str = Depends(require_auth)):
         reasoning=body.reasoning
     )
     return {"reply": response, "meta": meta}
+
+@router.get("/chat/attach")
+async def attach_to_active_stream(address: str = Depends(require_auth)):
+    """
+    Подключение к УЖЕ ИДУЩЕЙ генерации (см. CognitiveController._active_stream):
+    сначала реплеит накопленный буфер с самого начала, затем live-хвост до
+    завершения. Фронтенд (ai-manager.js) использует это для восстановления
+    ответа, если пользователь вышел из чата или перезагрузил страницу, пока
+    LLM ещё печатала. Если генерации нет/она закончилась — отдаёт
+    no_active_generation, и клиент забирает готовый ответ через
+    /ai/chat/last_response (attach-буфер после завершения уничтожается).
+    """
+    assistant = await get_assistant(address)
+    state = assistant._active_stream
+    if not state or state.get("done"):
+        async def _none():
+            yield "data: " + json.dumps({"no_active_generation": True}) + "\n\n"
+        return StreamingResponse(_none(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    async def _gen():
+        queue: asyncio.Queue = asyncio.Queue()
+        # ВАЖНО: сначала подписываемся, ПОТОМ реплеим буфер — тогда чанк,
+        # отправленный между этими действиями, попадёт ровно один раз
+        # (push() пишет в буфер и в очереди неделимо, без await между ними).
+        state["subscribers"].add(queue)
+        try:
+            for chunk in list(state["buffer"]):
+                yield chunk
+            if state.get("done"):
+                yield "data: [DONE]\n\n"
+                return
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=900)
+                except asyncio.TimeoutError:
+                    break
+                if chunk is None:
+                    break
+                yield chunk
+            yield "data: [DONE]\n\n"
+        finally:
+            state["subscribers"].discard(queue)
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache,no-store,must-revalidate", "X-Accel-Buffering": "no"})
+
+@router.get("/chat/last_response")
+async def get_last_response(address: str = Depends(require_auth)):
+    """
+    Возвращает последний завершённый обмен (user -> assistant), чтобы после
+    перезагрузки страницы фронтенд мог подтянуть ответ, который LLM досчитала,
+    пока пользователь был не в чате (attach на это не способен — его буфер
+    уничтожается по завершении генерации).
+    """
+    assistant = await get_assistant(address)
+    exchange = getattr(assistant, "_last_exchange", None)
+    if not exchange:
+        # Fallback после перезапуска процесса: восстанавливаем из history.json
+        user_msg = next((i.get("content") for i in reversed(assistant.history)
+                         if i.get("role") == "user"), None)
+        asst_msg = next((i.get("content") for i in reversed(assistant.history)
+                         if i.get("role") == "assistant"
+                         and not str(i.get("content", "")).startswith("[инструмент")), None)
+        if user_msg and asst_msg:
+            exchange = {"user": user_msg, "assistant": asst_msg, "timestamp": None}
+    if not exchange:
+        return {"user": None, "assistant": None}
+    return exchange
 
 @router.post("/search")
 async def direct_search(body: dict, address: str = Depends(require_auth)):
@@ -2404,6 +2845,18 @@ async def shutdown_all():
             await assistant.shutdown()
         except Exception:
             pass
+    # ИСПРАВЛЕНИЕ: CognitiveController.shutdown() -> MemoryService.shutdown()
+    # теперь закрывает только приватную память вызвавшего пользователя (см.
+    # комментарий в memory_service.MemoryService.shutdown) — раньше это было
+    # не так, и shared/global сохранялись "бесплатно" как побочный эффект
+    # выгрузки любого пользователя, включая рутинную выгрузку простаивающих
+    # ассистентов, а не только остановку процесса. Здесь, при реальной
+    # остановке всего приложения, сохраняем их явно и ровно один раз.
+    try:
+        from GCN.memory_service import MemoryService
+        await MemoryService.shutdown_shared_global()
+    except Exception as e:
+        logger.error(f"Ошибка при закрытии общей/глобальной памяти: {e}")
 
 import atexit
 

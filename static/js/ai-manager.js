@@ -151,14 +151,40 @@ window.selectConversation = function(address, name, isGroup) {
     let _currentAbortController = null;
     let _currentAiSessionId = null;
     let _aiNameSet = false;
+    let _partialSaveTimer = null;
+    // ИСПРАВЛЕНИЕ (дубли картинок): URL уже показанных изображений — чтобы
+    // событие image_url не обрабатывалось повторно (attach-реплей, сетевой
+    // обрыв и повторное подключение к тому же потоку).
+    let _displayedImageUrls = new Set();
 
     const CONFIG = {
         historyMaxLength: 200,
         imageMaxWidth: 800,
         imageQuality: 0.7,
         apiEndpoint: '/ai/chat',
+        attachEndpoint: '/ai/chat/attach',
         searchEndpoint: '/ai/search',
     };
+
+    // ─── переподключение к генерации, которая продолжается на сервере ───
+    // Свернули вкладку / браузер придушил фоновую вкладку / коротко пропала
+    // сеть — соединение SSE могло оборваться, хотя сама генерация на
+    // сервере идёт независимо от него (см. backend: stream_response /
+    // _stream_response_worker) и всё равно досчитается и сохранится.
+    // Вместо того чтобы показывать ошибку и терять почти готовый ответ —
+    // при возврате на вкладку молча пробуем переподключиться и забрать
+    // то, что уже накопилось + доиграть остаток.
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && _isSending && !_currentStreamReader) {
+            _attachToActiveAiStream().then((recovered) => {
+                if (!recovered) {
+                    _isSending = false;
+                    if (_aiSendBtn) _aiSendBtn.style.display = 'inline-flex';
+                    if (_aiStopBtn) _aiStopBtn.style.display = 'none';
+                }
+            }).catch(() => {});
+        }
+    });
 
     // ─── работа с историей сессии ───
     function _getStoredHistory(sessionId) {
@@ -183,6 +209,56 @@ window.selectConversation = function(address, name, isGroup) {
         _aiMessagesContainer.innerHTML = '';
         history.forEach(msg => _displayAiMessage(msg.text, msg.role === 'user', null, false));
         if (history.length === 0) _displayWelcome();
+    }
+
+    // ─── восстановление ответа, если пользователь вышел из чата или перезагрузил
+    // страницу до завершения генерации ───
+    async function _recoverUnfinishedAiMessage() {
+        const sessionId = _currentAiSessionId || 'default';
+        const history = _getStoredHistory(sessionId);
+        const lastUserIdx = history.map(m => m.role).lastIndexOf('user');
+        if (lastUserIdx === -1) { localStorage.removeItem('ai_stream_partial_' + sessionId); return; }
+        const hasReply = history.slice(lastUserIdx + 1).some(m => m.role === 'assistant');
+        if (hasReply) { localStorage.removeItem('ai_stream_partial_' + sessionId); return; }
+        const lastUserText = history[lastUserIdx].text;
+
+        // 1) Генерация ещё идёт на сервере (worker досчитывает её независимо
+        //    от соединения) — подхватим поток и достроим сообщение.
+        try {
+            const attached = await _attachToActiveAiStream();
+            _isSending = false;
+            if (attached) {
+                _currentStreamingMessage = null;
+                localStorage.removeItem('ai_stream_partial_' + sessionId);
+                return;
+            }
+        } catch (e) { console.warn('attach recovery failed', e); _isSending = false; }
+
+        // 2) Генерация уже завершилась, пока пользователя не было —
+        //    заберём готовый ответ с сервера.
+        try {
+            const res = await fetch('/ai/chat/last_response');
+            if (res.ok) {
+                const data = await res.json();
+                if (data && data.assistant && data.user === lastUserText) {
+                    _displayAiMessage(data.assistant, false, null, true);
+                    localStorage.removeItem('ai_stream_partial_' + sessionId);
+                    return;
+                }
+            }
+        } catch (e) { console.warn('last_response recovery failed', e); }
+
+        // 3) Сервер ничего не знает — покажем последний сохранённый обрывок.
+        const raw = localStorage.getItem('ai_stream_partial_' + sessionId);
+        if (raw) {
+            try {
+                const partial = JSON.parse(raw);
+                if (partial.text && partial.text.trim()) {
+                    _displayAiMessage(partial.text + '\n\n_⏸ Ответ оборван (страница была перезагружена)_', false, null, true);
+                }
+            } catch (e) {}
+            localStorage.removeItem('ai_stream_partial_' + sessionId);
+        }
     }
     // В ai-manager.js добавить:
 function removeAiSession(sessionId) {
@@ -374,7 +450,11 @@ function _clearAiHistory() {
     function _renderMarkdown(text) {
         if (!text) return '';
         try {
-            const reasoningRegex = /💭\s*РАССУЖДЕНИЕ:\s*([\s\S]*?)\s*---/i;
+            // ИСПРАВЛЕНИЕ: старый регекс требовал точное "💭 РАССУЖДЕНИЕ:", поэтому
+            // рассуждения, которые модель написала как "Рассуждение:", "**Рассуждение:**"
+            // или без эмодзи, не сворачивались в блок — режим выглядел сломанным.
+            // Теперь эмодзи и markdown-жирность опциональны, регистр любой.
+            const reasoningRegex = /(?:💭\s*)?\**\s*РАССУЖДЕНИЯ?\s*:?\s*\**\s*([\s\S]*?)\s*---/i;
             let mainText = text;
             let reasoningHtml = '';
             const match = reasoningRegex.exec(text);
@@ -391,6 +471,14 @@ function _clearAiHistory() {
                 mainText = text.replace(match[0], '').trim();
             }
             let html = marked.parse(mainText);
+            // ИСПРАВЛЕНИЕ: marked оборачивает голые URL в <a href="URL">URL</a>.
+            // Ссылки на сгенерированные изображения (не-stream ответы, текст
+            // результатов инструментов) превращаем в <img>, иначе картинка
+            // приходила только текстовой ссылкой и не отображалась.
+            html = html.replace(
+                /<a href="(https?:\/\/.+?\/generated_images\/.+?\.png)"[^>]*>[^<]*<\/a>/g,
+                '<img src="$1" alt="generated image" style="max-width:100%;border-radius:8px;">'
+            );
             if (reasoningHtml) html = reasoningHtml + html;
             return DOMPurify.sanitize(html);
         } catch (e) {
@@ -509,6 +597,25 @@ function _clearAiHistory() {
             _displayAiMessage(`❌ Ошибка исследования: ${err.message}`, false, null, true);
         }
     }
+    // ─── показ сгенерированного изображения с защитой от дублей ───
+    // Раньше картинка показывалась 2-3 раза: событие image_url обрабатывалось
+    // и в _sendToAi, и в _attachToActiveAiStream (attach после обрыва сети
+    // реплеит буфер), плюс сообщение сохранялось дважды (_displayAiMessage с
+    // saveToStorage=true + явный _saveAiMessage) — после перезахода в сессию
+    // дубль вылезал из localStorage. Теперь: дедуп по URL в рамках страницы +
+    // проверка, что URL ещё нет в сохранённой истории (защита от реплея
+    // после перезагрузки) + сохранение только через _displayAiMessage.
+    function _handleImageUrlEvent(imageUrl) {
+        if (!imageUrl) return;
+        if (_displayedImageUrls.has(imageUrl)) return;
+        _displayedImageUrls.add(imageUrl);
+        const hist = _getStoredHistory(_currentAiSessionId);
+        if (hist.some(m => m.role === 'assistant' && (m.text || '').includes(imageUrl))) return;
+        const imageMarkdown = `![generated](${imageUrl})`;
+        const messageTextWithImage = `🎨 *Сгенерировано изображение:*\n\n${imageMarkdown}`;
+        _displayAiMessage(messageTextWithImage, false, null, true); // сохраняет в историю сама
+    }
+
     function _displayAiMessage(text, isUser, imagePreview = null, saveToStorage = true) {
     if (!_aiMessagesContainer) {
         _aiMessagesContainer = document.getElementById('aiMessagesContainer');
@@ -561,6 +668,121 @@ function _clearAiHistory() {
 
     // ─── основная отправка ───
     // ai-manager.js — функция _sendToAi (полностью, с исправлением)
+    // ─── попытка переподключения к уже идущей на сервере генерации ───
+    async function _attachToActiveAiStream() {
+        // ИСПРАВЛЕНИЕ: раньше функция сразу возвращала false без активного
+        // _currentStreamingMessage, поэтому её нельзя было использовать для
+        // восстановления ответа после перезагрузки страницы. Теперь при
+        // отсутствии сообщения создаём новое и достраиваем ответ в него.
+        const createdMessage = !_currentStreamingMessage;
+        if (createdMessage) {
+            _currentStreamingMessage = _displayAiMessage('', false, null, false);
+            _currentStreamingText = '';
+        }
+        const markdownBody = _currentStreamingMessage.querySelector('.content .markdown-body');
+        if (!markdownBody) {
+            if (createdMessage) _currentStreamingMessage = null;
+            return false;
+        }
+
+        let response;
+        try {
+            response = await fetch(CONFIG.attachEndpoint, { method: 'GET' });
+        } catch (e) {
+            return false;
+        }
+        if (!response.ok) return false;
+
+        // Сервер реплеит генерацию с самого начала (весь накопленный буфер),
+        // поэтому локальный текст пересобираем заново, а не дописываем.
+        _currentStreamingText = '';
+        let firstTokenReceived = false, streamFinished = false, searchResults = null, noActiveGeneration = false;
+        const reader = response.body.getReader();
+        _currentStreamReader = reader;
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        try {
+            while (!streamFinished) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    const dataStr = line.slice(6).trim();
+                    if (dataStr === '[DONE]') { streamFinished = true; break; }
+
+                    try {
+                        const data = JSON.parse(dataStr);
+                        if (data.no_active_generation) { noActiveGeneration = true; continue; }
+                        if (data.token) {
+                            if (!firstTokenReceived) {
+                                _showAiTypingIndicator(false);
+                                firstTokenReceived = true;
+                            }
+                            _currentStreamingText += data.token;
+                            if (!window._aiUpdateTimer) {
+                                window._aiUpdateTimer = setTimeout(() => {
+                                    markdownBody.innerHTML = _renderMarkdown(_currentStreamingText);
+                                    _enhanceCodeBlocks(markdownBody);
+                                    _addImageDownloadButtons(markdownBody);
+                                    _attachReasoningToggle(markdownBody);
+                                    if (_aiMessagesContainer) _aiMessagesContainer.scrollTop = _aiMessagesContainer.scrollHeight;
+                                    window._aiUpdateTimer = null;
+                                }, 50);
+                            }
+                        } else if (data.image_url) {
+                            _handleImageUrlEvent(data.image_url);
+                            firstTokenReceived = true;
+                        } else if (data.error) {
+                            markdownBody.textContent = '❌ ' + data.error;
+                            firstTokenReceived = true;
+                            streamFinished = true;
+                            break;
+                        } else if (data.sources) {
+                            searchResults = data.sources;
+                        }
+                    } catch (e) {}
+                }
+            }
+        } finally {
+            if (_currentStreamReader === reader) _currentStreamReader = null;
+        }
+
+        if (window._aiUpdateTimer) {
+            clearTimeout(window._aiUpdateTimer);
+            window._aiUpdateTimer = null;
+        }
+
+        if (noActiveGeneration && !firstTokenReceived) {
+            // Нечего доигрывать: либо ответ уже досчитался и сохранился
+            // раньше, чем мы переподключились, либо генерации не было —
+            // в обоих случаях это не ошибка. Пустое созданное сообщение убираем.
+            if (createdMessage && _currentStreamingMessage) {
+                _currentStreamingMessage.remove();
+                _currentStreamingMessage = null;
+            }
+            return false;
+        }
+
+        if (firstTokenReceived && _currentStreamingText) {
+            const finalHtml = _renderMarkdown(_currentStreamingText);
+            markdownBody.innerHTML = finalHtml;
+            _enhanceCodeBlocks(markdownBody);
+            _addImageDownloadButtons(markdownBody);
+            _attachReasoningToggle(markdownBody);
+            _saveAiMessage('assistant', _currentStreamingText, _currentAiSessionId);
+            localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default'));
+            if (searchResults && searchResults.length) {
+                _displaySearchSources(searchResults);
+            }
+        }
+        return true;
+    }
+
 async function _sendToAi(messageText, imageFile) {
     // Проверка контейнера
     if (!_aiMessagesContainer) {
@@ -577,6 +799,8 @@ async function _sendToAi(messageText, imageFile) {
 
     if (_isSending) { _showToast('Подождите, предыдущий запрос обрабатывается', 'warning'); return; }
     if (!messageText.trim() && !imageFile) { _showToast('Введите сообщение или выберите изображение', 'warning'); return; }
+    try { localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default')); } catch (e) {}
+    _displayedImageUrls = new Set(); // новый запрос — сброс дедупликации картинок
 
     // Авто-название
     if (_currentAiSessionId && !_aiNameSet) {
@@ -733,6 +957,19 @@ async function _sendToAi(messageText, imageFile) {
                         }
                         _currentStreamingText += data.token;
 
+                        // Персистентный обрывок: если пользователь перезагрузит
+                        // страницу посреди генерации, при входе покажем хотя бы
+                        // накопленное (см. _recoverUnfinishedAiMessage, шаг 3).
+                        if (!_partialSaveTimer) {
+                            _partialSaveTimer = setTimeout(() => {
+                                _partialSaveTimer = null;
+                                try {
+                                    localStorage.setItem('ai_stream_partial_' + (_currentAiSessionId || 'default'),
+                                        JSON.stringify({ text: _currentStreamingText, ts: Date.now() }));
+                                } catch (e) {}
+                            }, 400);
+                        }
+
                         // Обновляем DOM с debounce (не чаще 50 мс)
                         if (!window._aiUpdateTimer) {
                             window._aiUpdateTimer = setTimeout(() => {
@@ -745,20 +982,16 @@ async function _sendToAi(messageText, imageFile) {
                             }, 50);
                         }
                     }
-                    // ======= НОВАЯ ОБРАБОТКА image_url =======
+                    // ======= ОБРАБОТКА image_url (с защитой от дублей) =======
                     else if (data.image_url) {
-    console.log('📸 image_url received:', data.image_url);  // <-- ДОБАВЛЕНО
-    const imageMarkdown = `![generated](${data.image_url})`;
-    const messageTextWithImage = `🎨 *Сгенерировано изображение:*\n\n${imageMarkdown}`;
-    _displayAiMessage(messageTextWithImage, false, null, true);
-    _saveAiMessage('assistant', messageTextWithImage, _currentAiSessionId);
-    if (!firstTokenReceived) {
-        _showAiTypingIndicator(false);
-        firstTokenReceived = true;
-    }
-    continue;
-}
-                    // ==============================================
+                        _handleImageUrlEvent(data.image_url);
+                        if (!firstTokenReceived) {
+                            _showAiTypingIndicator(false);
+                            firstTokenReceived = true;
+                        }
+                        continue;
+                    }
+                    // ========================================================
                     else if (data.error) {
                         markdownBody.textContent = '❌ ' + data.error;
                         firstTokenReceived = true;
@@ -787,9 +1020,14 @@ async function _sendToAi(messageText, imageFile) {
             _addImageDownloadButtons(markdownBody);
             _attachReasoningToggle(markdownBody);
             _saveAiMessage('assistant', _currentStreamingText, _currentAiSessionId);
+            localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default'));
             if (searchResults && searchResults.length) {
                 _displaySearchSources(searchResults);
-            } else if (useWebSearch && !searchResults) {
+            } else if (useWebSearch) {
+                // Поиск явно запрашивался кнопкой «Интернет», но источники не
+                // пришли — предупреждаем, чтобы «тихий ответ из памяти» не
+                // выглядел как результат веб-поиска.
+                _showToast('Веб-поиск не дал источников — ответ сформирован из памяти', 'warning');
                 _tryFetchSearchSources(messageText);
             }
         }
@@ -806,12 +1044,19 @@ async function _sendToAi(messageText, imageFile) {
             _showToast('Генерация остановлена', 'warning');
         } else {
             console.error('AI error:', err);
-            _showAiTypingIndicator(false);
-            if (_currentStreamingMessage?.parentNode) {
-                const errDiv = _currentStreamingMessage.querySelector('.content .markdown-body');
-                if (errDiv) errDiv.textContent = '❌ Ошибка связи с AI-сервером. Проверьте, запущен ли LM Studio.';
-            } else {
-                _displayAiMessage('❌ Ошибка связи с AI-сервером.', false, null, true);
+            // Обрыв соединения — не обязательно обрыв генерации: сервер
+            // (см. backend) продолжает считать ответ в фоне независимо от
+            // этого запроса. Пробуем один раз переподключиться и забрать
+            // то, что уже насчиталось, прежде чем показывать ошибку.
+            const recovered = await _attachToActiveAiStream().catch(() => false);
+            if (!recovered) {
+                _showAiTypingIndicator(false);
+                if (_currentStreamingMessage?.parentNode) {
+                    const errDiv = _currentStreamingMessage.querySelector('.content .markdown-body');
+                    if (errDiv) errDiv.textContent = '❌ Ошибка связи с AI-сервером. Проверьте, запущен ли LM Studio.';
+                } else {
+                    _displayAiMessage('❌ Ошибка связи с AI-сервером.', false, null, true);
+                }
             }
         }
     } finally {
@@ -1193,6 +1438,10 @@ async function _sendToAi(messageText, imageFile) {
     _aiImageGenBtn = document.getElementById('aiImageGenBtn');
     if (!_aiMessagesContainer) return;
     _loadAiHistory(_currentAiSessionId);
+    // ИСПРАВЛЕНИЕ: если последний ответ LLM не был дописан (пользователь вышел
+    // из чата или перезагрузил страницу посреди генерации) — достраиваем его
+    // с сервера: attach к идущей генерации, либо готовый ответ, либо обрывок.
+    _recoverUnfinishedAiMessage().catch(() => {});
     _setupAiUI();
     if (_aiStopBtn) _aiStopBtn.style.display = 'none';
 
