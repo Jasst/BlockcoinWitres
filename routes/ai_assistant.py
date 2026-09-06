@@ -1041,6 +1041,47 @@ class CognitiveController:
             response = f"{response}\n\n{extra.strip()}"
         return response
 
+    async def _save_sanitized_facts(self, sanitized: List[Tuple[str, str, float]]) -> None:
+        """
+        Сохраняет факты, прошедшие санитайзер (ИНТЕЛЛЕКТ-ПАКЕТ B), и
+        ставит на сохранение на диск только те слои памяти, в которые
+        реально что-то записано.
+
+        ИСПРАВЛЕНИЕ: раньше оба места вызова sanitize_search_facts делали
+        `if facts: await self.memory_service.global_memory._schedule_save()`
+        безусловно для global_memory — но sanitize_search_facts специально
+        градуирует факты по доверию источника (высокое → global, среднее →
+        shared, остальное → private/0.55), то есть в общем случае в
+        global_memory ничего не попадает вообще. private/shared-факты,
+        которые реально были записаны через remember(), не ставились на
+        сохранение никаким явным вызовом — персистентность зависела от
+        случайных сторонних триггеров (idle-эвикшн, shutdown). Теперь
+        схема сохранения не привязана к global(), а строится по фактическому
+        набору scope из sanitized.
+        """
+        if not sanitized:
+            return
+        scope_to_memory = {
+            "global": self.memory_service.global_memory,
+            "shared": self.memory_service.shared_memory,
+            "private": self.memory_service.private_memory,
+        }
+        touched_scopes = set()
+        for text, scope, conf in sanitized:
+            await self.memory_service.remember(text, scope=scope, confidence=conf)
+            touched_scopes.add(scope)
+        for scope in touched_scopes:
+            mem = scope_to_memory.get(scope)
+            if mem is not None:
+                try:
+                    await mem._schedule_save()
+                except Exception as e:
+                    logger.debug(f"_schedule_save failed for scope={scope}: {e}")
+        logger.info(
+            f"Extracted {len(sanitized)} sanitized facts from web search -> "
+            f"scopes: {sorted(touched_scopes)}"
+        )
+
     async def _verify_response(self, message: str, response: str, evidence_text: str) -> Optional[str]:
         """
         ПУНКТ №3 (верификация/критик): дешёвый второй проход LLM после
@@ -1402,16 +1443,26 @@ class CognitiveController:
                                     sources: Optional[List[Dict]]) -> str:
         """
         Три дешёвых пост-прохода над готовым ответом (пункт №3 и
-        ИНТЕЛЛЕКТ-ПАКЕТ A/E): верификация фактов, критик по плану подзадач,
+        ИНТЕЛЛЕКТ-ПАКЕТ A/E): критик по плану подзадач, верификация фактов,
         гарантия ссылок [N]. Каждый откатывается к исходному ответу при сбое.
         Раньше эти вызовы были размазаны по двум копиям пайплайна.
+
+        ИСПРАВЛЕНИЕ ПОРЯДКА: раньше _verify_response вызывалась ДО
+        _run_plan_critic. _run_plan_critic при обнаружении пропущенных
+        пунктов плана делает отдельный сырой LLM-вызов ("дополни ответ") и
+        дописывает результат в конец — то есть ровно тот текст, который
+        _verify_response должна была проверить на выдуманные факты, в
+        момент проверки ещё не существовал. Добавка проходила мимо всей
+        системы заземления (пакет A) и верификации (пункт №3). Теперь план-
+        критик работает первым, а верификация и гарантия цитат применяются
+        уже к полному финальному тексту, включая добавленный кусок.
         """
         if not response:
             return response
+        response = await self._run_plan_critic(message, response)
         note = await self._verify_response(message, response, evidence_text)
         if note:
             response = f"{response}\n\n⚠️ Уточнение: {note}"
-        response = await self._run_plan_critic(message, response)
         response = intellect_mod.ensure_citations(response, sources or [])
         return response
 
@@ -1579,12 +1630,11 @@ class CognitiveController:
                     # ИНТЕЛЛЕКТ-ПАКЕТ (B): санитайзер — факты из поиска больше
                     # не летят в global с фиксированным 0.9. Градация
                     # scope/confidence по фактологичности и доверию домена.
+                    # ИСПРАВЛЕНИЕ: сохранение на диск теперь идёт по
+                    # фактическому scope каждого факта, а не всегда в global
+                    # (см. _save_sanitized_facts).
                     sanitized = intellect_mod.sanitize_search_facts(facts, merged_sources)
-                    for text, scope, conf in sanitized:
-                        await self.memory_service.remember(text, scope=scope, confidence=conf)
-                    if facts:
-                        await self.memory_service.global_memory._schedule_save()
-                    logger.info(f"Extracted {len(facts)} facts from web search -> global memory")
+                    await self._save_sanitized_facts(sanitized)
                 except Exception as e:
                     logger.warning(f"Fact extraction error: {e}")
 
@@ -2309,13 +2359,11 @@ class CognitiveController:
                                     facts = await self._extract_facts_llm(search_meta["context"], merged_sources)
                                 else:
                                     facts = self._extract_facts_from_text(search_meta["context"])
-                                # ИНТЕЛЛЕКТ-ПАКЕТ (B): санитайзер фактов из поиска
+                                # ИНТЕЛЛЕКТ-ПАКЕТ (B): санитайзер фактов из поиска.
+                                # ИСПРАВЛЕНИЕ: сохранение по фактическому scope,
+                                # не всегда в global (см. _save_sanitized_facts).
                                 sanitized = intellect_mod.sanitize_search_facts(facts, merged_sources)
-                                for text, scope, conf in sanitized:
-                                    await self.memory_service.remember(text, scope=scope, confidence=conf)
-                                if facts:
-                                    await self.memory_service.global_memory._schedule_save()
-                                logger.info(f"Extracted {len(facts)} facts from web search -> global memory")
+                                await self._save_sanitized_facts(sanitized)
                             except Exception as e:
                                 logger.warning(f"Fact extraction error: {e}")
 

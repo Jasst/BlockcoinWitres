@@ -207,6 +207,16 @@ def sanitize_search_facts(
 _SUBQUERY_SPLIT_RE = re.compile(
     r"\s+а также\s+|\s+затем\s+|\s+потом\s+|\s+после этого\s+|;\s*|\.\s+(?=[А-ЯA-Z])"
 )
+# ИСПРАВЛЕНИЕ: использовался в _heuristic_subqueries, но нигде не был
+# определён — NameError при каждом обращении к эвристике (fallback-путь,
+# когда LLM-декомпозиция не удалась или вернула пустой список, вызывается
+# вне try/except в make_subqueries). Убирает ведущие союзы/связки, оставшиеся
+# после разбиения по _SUBQUERY_SPLIT_RE.
+_LEADING_CONNECTOR_RE = re.compile(
+    r"^(и|а|но|также|а также|затем|потом|после этого)\s+", re.IGNORECASE
+)
+
+
 def _heuristic_subqueries(message: str, max_n: int = None) -> List[str]:
     max_n = max_n or MAX_RETRIEVE_SUBQUERIES
     parts = [p.strip(" .,—-") for p in _SUBQUERY_SPLIT_RE.split(message)]

@@ -1598,9 +1598,40 @@ class GCNMemoryRouter:
         ИНТЕЛЛЕКТ-ПАКЕТ (C): если переданы subqueries — каждый подзапрос ищется
         отдельно, результаты сливаются с бустом мультихитов (см.
         _retrieve_subqueries). Если subqueries=None — прежнее поведение.
+
+        ИСПРАВЛЕНИЕ: раньше _retrieve_subqueries вызывала этот же retrieve()
+        рекурсивно на каждый подзапрос — а retrieve() сам внутри уже делает
+        LLM-реранк и _mark_accessed(). Это давало N+1 LLM-вызовов на реранк
+        вместо одного (реранк каждого подзапроса всё равно перекрывался
+        финальным общим реранком — чистый лишний латенси) и, что хуже,
+        помечало как "обращались" факты, которые прошли только промежуточный
+        top-k подзапроса и не попали в финальную выдачу после общего
+        реранка — то есть ровно тот класс порчи access_count/freshness/
+        decay, который уже чинился раньше в _mark_accessed. Сбор кандидатов
+        (без реранка и без разметки обращений) вынесен в _collect_candidates,
+        чтобы _retrieve_subqueries могла использовать его напрямую и звать
+        _llm_rerank/_mark_accessed ровно один раз — на уже слитом пуле.
         """
         if subqueries:
             return await self._retrieve_subqueries(query, subqueries, top_k, include_private)
+        unique = await self._collect_candidates(query, top_k, include_private)
+        reranked = await self._llm_rerank(query, unique, top_k)
+        final = reranked if reranked is not None else unique[:top_k]
+        self._mark_accessed(final)
+        return final
+
+    async def _collect_candidates(self, query: str, top_k: int,
+                                  include_private: bool) -> List[Dict]:
+        """
+        Сырой сбор+слияние кандидатов по всем слоям памяти: гибридный поиск
+        по private/shared/global, взвешивание по scope, подтягивание
+        кросс-слойных GROUNDS_IN-концептов, дедуп по тексту, сортировка по
+        _score. БЕЗ LLM-реранка и БЕЗ _mark_accessed() — это ответственность
+        вызывающего кода (retrieve() для одиночного запроса, либо
+        _retrieve_subqueries() один раз на весь слитый пул подзапросов),
+        чтобы не тратить лишние LLM-вызовы и не размечать как "использованные"
+        факты, которые могут быть отброшены на более позднем этапе.
+        """
         self.refresh(include_private=include_private)
         private_results = []
         shared_results = []
@@ -1646,20 +1677,7 @@ class GCNMemoryRouter:
 
         # Сортируем по _score
         unique.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
-
-        # ИСПРАВЛЕНИЕ (пункт №2 из анализа интеллекта): раньше здесь сразу
-        # обрезалось до top_k по линейной взвешенной сумме скоров — это
-        # хорошо отсеивает явно нерелевантное, но плохо разруливает
-        # "похожее по вектору, но не по сути" (близкая по эмбеддингу, но
-        # для данного вопроса бесполезная формулировка могла обойти в счёте
-        # действительно нужный факт). Даём LLM-судье посмотреть на candidate
-        # pool целиком (с запасом) и выбрать + упорядочить только реально
-        # релевантные — при сбое/пустом ответе всегда безопасно
-        # откатываемся на исходный порядок по _score.
-        reranked = await self._llm_rerank(query, unique, top_k)
-        final = reranked if reranked is not None else unique[:top_k]
-        self._mark_accessed(final)
-        return final
+        return unique
 
     async def _retrieve_subqueries(self, query: str, subqueries: List[str],
                                    top_k: int, include_private: bool) -> List[Dict]:
@@ -1677,7 +1695,12 @@ class GCNMemoryRouter:
         merged: Dict[str, Dict] = {}
         for sub in [s for s in subqueries if s][:MAX_RETRIEVE_SUBQUERIES]:
             try:
-                part = await self.retrieve(sub, top_k=top_k, include_private=include_private)
+                # ИСПРАВЛЕНИЕ: раньше здесь был self.retrieve(sub, ...) —
+                # рекурсивный вызов, который сам внутри реранкал и метил
+                # обращения на каждый подзапрос (см. комментарий в retrieve()
+                # выше). Теперь берём только сырые кандидаты; общий реранк и
+                # разметка обращений — один раз, ниже, на слитом пуле.
+                part = await self._collect_candidates(sub, top_k, include_private)
             except Exception as e:
                 logger.debug(f"subquery retrieve failed for '{sub[:60]}': {e}")
                 continue
