@@ -1416,12 +1416,15 @@ class CognitiveMemory:
             gcn_state_path = self.base_dir / GCN_STATE_FILENAME
             try:
                 await self.gcn_store.async_save(str(gcn_state_path))
-            except RuntimeError:
-                # Цикл событий/пул потоков уже в teardown процесса
-                # ("cannot schedule new futures after interpreter shutdown") —
-                # async_save через run_in_executor больше не может принять
-                # задачу. Падаем в синхронное save() тем же кодом: оно идёт
-                # в текущем потоке и не требует executor. Данные не теряем.
+            except (RuntimeError, PermissionError):
+                # RuntimeError — цикл событий/пул потоков уже в teardown
+                # процесса ("cannot schedule new futures after interpreter
+                # shutdown"), run_in_executor не принимает задачи.
+                # PermissionError — транспортный сбой сохранения (например,
+                # Windows отказала в os.replace после всех ретраев).
+                # В обоих случаях падаем в синхронное save() тем же кодом:
+                # оно идёт в текущем потоке, не требует executor и само
+                # делает ретраи замены. Данные не теряем.
                 self.gcn_store.save(str(gcn_state_path))
             # Сохраняем локальные счётчики (опционально)
             meta_path = self.base_dir / "meta.json"

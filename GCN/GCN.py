@@ -1313,7 +1313,25 @@ class MemoryStore:
             try:
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(data, f, default=str, indent=2, ensure_ascii=False)
-                os.replace(tmp_path, path)
+                # ИСПРАВЛЕНИЕ (WinError 5): os.replace на Windows падает с
+                # PermissionError, если другой процесс в этот момент держит
+                # gcn_state.json открытым (второй процесс в reload_if_stale/
+                # load, антивирус, индексатор поиска). Блокировка выше защищает
+                # от конкурентного save(), но НЕ от конкурентного load() —
+                # тот читает файл без блокировки. Плюс AV-блокировки живут
+                # доли секунды. Поэтому: несколько повторов с нарастающей
+                # паузой перед тем, как реально упасть.
+                _last_err = None
+                for _attempt in range(5):
+                    try:
+                        os.replace(tmp_path, path)
+                        _last_err = None
+                        break
+                    except PermissionError as _e:
+                        _last_err = _e
+                        time.sleep(0.15 * (_attempt + 1))
+                if _last_err is not None:
+                    raise _last_err
             finally:
                 if os.path.exists(tmp_path):
                     try:
@@ -1326,9 +1344,20 @@ class MemoryStore:
                 self._loaded_mtime = time.time()
 
     def load(self, path: str):
-        """Синхронная загрузка."""
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        """Синхронная загрузка.
+
+        ИСПРАВЛЕНИЕ (WinError 5): раньше чтение шло без кросс-процессной
+        блокировки, поэтому save() другого процесса (чат-процесс vs MCP-
+        процесс) мог попасть ровно в окно открытого здесь хендла — на Windows
+        os.replace тогда падает с PermissionError. Берём ту же advisory-
+        блокировку, что и save(): порядок захвата у обоих методов одинаковый
+        (сначала файловая, потом self._lock) — дедлока нет. При недоступности
+        блокировки за timeout выбрасываем TimeoutError; вызывающий код
+        (reload_if_stale/__init__) его ловит и работает на текущем снапшоте.
+        """
+        with _cross_process_file_lock(path, timeout=10.0):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
 
         with self._lock:
             self._objects = {}
