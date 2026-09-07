@@ -65,6 +65,7 @@ class KnowledgeType(Enum):
     HYPOTHESIS = "hypothesis"
     GOAL = "goal"          # новый тип
     MEMORY_EVENT = "memory_event"
+    NOTIFICATION = "notification"  # проактивное сообщение фонового цикла
 
 
 # GCN.py — после импортов, до KnowledgeType
@@ -915,6 +916,64 @@ class MemoryStore:
                     if author is None or obj.author == author:
                         result.append(obj)
         return result
+
+    # ---------- Проактивные уведомления ----------
+    def add_notification(self, text: str, author: str, source: str,
+                          importance: float = 0.5) -> str:
+        """
+        Проактивное сообщение, которое фоновый цикл (авто-исследование,
+        рефлексия, планирование целей — см. ai_assistant.py; либо
+        аналогичный цикл в отдельном процессе MCP-сервера) хочет сам
+        донести до пользователя, не дожидаясь его вопроса.
+
+        author = user_id (тот же адрес кошелька, что и у goal/fact) —
+        именно по нему фильтруется выдача в get_pending_notifications.
+        source — свободная метка происхождения ('auto_research',
+        'reflection', 'goal_planning', 'mcp_background' и т.п.), просто
+        для отладки/статистики.
+
+        Объект типа NOTIFICATION участвует в save()/load()/_merge_disk_state()
+        наравне со всеми остальными KnowledgeObject — специальной обработки
+        не требует, поэтому безопасно приходит из любого процесса, который
+        пишет в общий gcn_state.json.
+        """
+        obj = KnowledgeObject(
+            id=f"notif_{uuid.uuid4()}",
+            type=KnowledgeType.NOTIFICATION,
+            subject=text,
+            predicate="proactive_message",
+            object={"source": source, "importance": importance, "delivered": False},
+            author=author,
+            created=datetime.now(timezone.utc),
+            confidence=1.0,
+            evidence=[]
+        )
+        return self.create(obj, author)
+
+    def get_pending_notifications(self, author: str) -> List[KnowledgeObject]:
+        """Недоставленные проактивные сообщения конкретного пользователя,
+        от старых к новым."""
+        result = [
+            obj for obj in self._objects.values()
+            if obj.type == KnowledgeType.NOTIFICATION
+            and obj.author == author
+            and isinstance(obj.object, dict)
+            and not obj.object.get("delivered", False)
+        ]
+        result.sort(key=lambda o: o.created)
+        return result
+
+    def mark_notifications_delivered(self, notification_ids: List[str], actor: str) -> None:
+        """Помечает уведомления доставленными — идемпотентно, повторный
+        вызов на уже помеченных id безопасен."""
+        for nid in notification_ids:
+            obj = self.get(nid)
+            if obj and obj.type == KnowledgeType.NOTIFICATION and isinstance(obj.object, dict):
+                if obj.object.get("delivered"):
+                    continue
+                new_object = obj.object.copy()
+                new_object["delivered"] = True
+                self.update(nid, {"object": new_object}, actor)
 
     def delete_fact(self, fact_id: str, actor: str) -> bool:
         """Удаляет факт (объект типа CLAIM) и все связанные рёбра."""

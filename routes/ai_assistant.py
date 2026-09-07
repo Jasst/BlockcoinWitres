@@ -366,6 +366,13 @@ class CognitiveController:
         self.reflection_interval = REFLECTION_INTERVAL
         self._last_reflection_time = time.time()
 
+        # Троттлинг проактивных сообщений (см. _maybe_surface_proactively) —
+        # отдельно от _consume_autonomous_llm_budget: бюджет ограничивает
+        # СКОЛЬКО фоновых LLM-вызовов можно сделать за сутки, а это —
+        # сколько раз ассистент сам напишет пользователю, даже если бюджет
+        # позволяет чаще.
+        self._last_proactive_message_at: float = 0.0
+
         # ===== ИЗМЕНЕНИЕ: создание MCP-менеджера =====
         if mcp_manager is not None:
             # Используем переданный (глобальный) менеджер
@@ -989,7 +996,13 @@ class CognitiveController:
         for goal_dict in active_goals:
             if goal_dict["confidence"] < CURIOSITY_UNCERTAINTY_THRESHOLD:
                 logger.info(f"Auto-research triggered for goal: {goal_dict['description']}")
-                await self.research(goal_dict["description"])
+                result = await self.research(goal_dict["description"])
+                # НОВОЕ: раньше результат просто отбрасывался — цель
+                # доисследовалась молча, пользователь узнавал о находке
+                # только если сам спрашивал. Теперь то же самое проходит
+                # через _maybe_surface_proactively, которая сама решает,
+                # достаточно ли это интересно, чтобы сказать первым.
+                await self._maybe_surface_proactively(result.get("answer", ""), source="auto_research")
                 # Обновляем уверенность через сервис (пока нет метода update_goal, можно через private_memory)
                 # Найдём объект цели по описанию
                 for g in self.memory.goals:
@@ -1000,6 +1013,61 @@ class CognitiveController:
                             self.memory._sync_goal_from_gcn(g.gcn_id)
                         break
         await self.memory_service.private_memory._schedule_save()
+
+    async def _research_and_notify(self, topic: str, source: str) -> None:
+        """
+        Обёртка вокруг research(), которую можно безопасно передать в
+        _spawn_background_task: сама доносит результат до пользователя
+        через _maybe_surface_proactively и глотает любые исключения — сбой
+        фонового доисследования темы не должен ничего ронять.
+        """
+        try:
+            result = await self.research(topic)
+            await self._maybe_surface_proactively(result.get("answer", ""), source=source)
+        except Exception as e:
+            logger.error(f"Background research ({source}) failed for topic '{topic}': {e}")
+
+    async def _maybe_surface_proactively(self, finding_text: str, source: str) -> None:
+        """
+        Решает, стоит ли донести до пользователя находку фонового цикла
+        (авто-исследование по цели / доисследование темы из рефлексии), не
+        дожидаясь, пока он сам спросит.
+
+        Троттлинг двухуровневый: _consume_autonomous_llm_budget (общий
+        суточный лимит фоновых LLM-вызовов, как у планирования/рефлексии)
+        плюс отдельный PROACTIVE_MESSAGE_COOLDOWN_SECONDS — он ограничивает
+        не "сколько фоновых мыслей", а "как часто ассистент сам пишет
+        первым", что должно быть заметно реже. Любая ошибка молча гасится:
+        проактивность — бонус поверх основного цикла, а не его часть, и не
+        должна его ронять.
+        """
+        if not PROACTIVE_NOTIFICATIONS_ENABLED or not finding_text or not finding_text.strip():
+            return
+        now = time.time()
+        if now - self._last_proactive_message_at < PROACTIVE_MESSAGE_COOLDOWN_SECONDS:
+            return
+        if not self._consume_autonomous_llm_budget():
+            return
+        prompt = PROACTIVE_NOTIFICATION_PROMPT.format(
+            source_label=source,
+            finding=finding_text.strip()[:2000],
+        )
+        try:
+            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.6,
+                                  max_tokens=PROACTIVE_NOTIFICATION_MAX_TOKENS)
+        except Exception as e:
+            logger.debug(f"Proactive surfacing LLM call failed, skipping: {e}")
+            return
+        text = (raw or "").strip()
+        if not text or text.upper().startswith("NONE"):
+            return
+        try:
+            await self.memory_service.push_notification(text, source=source)
+            self._last_proactive_message_at = now
+            logger.info(f"[Proactive] Queued notification for {self.user_id[:16]} "
+                       f"(source={source}): {text[:80]}")
+        except Exception as e:
+            logger.error(f"push_notification failed: {e}")
 
     # ===== РЕФЛЕКСИЯ =====
     async def _run_plan_critic(self, message: str, response: str) -> str:
@@ -1186,7 +1254,15 @@ class CognitiveController:
             for topic in topics_to_research[:3]:
                 if isinstance(topic, str) and topic.strip():
                     logger.info(f"[Reflection] Auto-research for topic: {topic}")
-                    self._spawn_background_task(self.research(topic.strip()), name=f"auto-research:{topic.strip()[:40]}")
+                    # ИЗМЕНЕНИЕ: раньше self.research(...) запускался и его
+                    # результат просто отбрасывался — доисследование было
+                    # полностью немым. _research_and_notify — та же
+                    # background-задача, но её результат ещё и проходит
+                    # через _maybe_surface_proactively.
+                    self._spawn_background_task(
+                        self._research_and_notify(topic.strip(), source="reflection"),
+                        name=f"auto-research:{topic.strip()[:40]}"
+                    )
 
         # НОВОЕ: сохраняем предложенные рефлексией концепты как низкоуверенные
         # CONCEPT-узлы личной памяти пользователя (не глобальной — это гипотеза
@@ -2753,6 +2829,29 @@ async def enhance_prompt_endpoint(body: EnhanceRequest, address: str = Depends(r
         return {"enhanced": enhanced}
     except Exception as e:
         logger.error(f"Enhance prompt failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/notifications/poll")
+async def poll_notifications(address: str = Depends(require_auth)):
+    """
+    Проактивные находки фоновых циклов (авто-исследование по целям,
+    доисследование тем из рефлексии — см. CognitiveController._maybe_surface_proactively),
+    которые ассистент решил сам донести до пользователя, не дожидаясь
+    вопроса. Фронтенд опрашивает этот эндпоинт периодически, пока чат
+    открыт (например, раз в 20-30 секунд); каждое уведомление отдаётся
+    ровно один раз — get_pending_notifications сразу помечает выданное
+    доставленным. Общий источник с MCP-сервером (см.
+    mcp_server_blockcoin.get_notifications) — оба процесса пишут/читают
+    один и тот же GCN-стор, так что находка, сгенерированная одним
+    процессом, будет доставлена независимо от того, через какой канал
+    пользователь её заберёт первым.
+    """
+    assistant = await get_assistant(address)
+    try:
+        items = await assistant.memory_service.get_pending_notifications(mark_delivered=True)
+        return {"notifications": items}
+    except Exception as e:
+        logger.error(f"poll_notifications failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/global_stats")

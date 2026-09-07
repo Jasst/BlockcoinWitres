@@ -177,6 +177,26 @@ class MemoryService:
             for g in goals
         ]
 
+    async def push_notification(self, text: str, source: str, importance: float = 0.5) -> str:
+        """
+        Ставит проактивное сообщение в очередь пользователя — то, что
+        фоновый цикл (авто-исследование, рефлексия) решил сам донести, не
+        дожидаясь вопроса. Всегда личное (private) — уведомления не
+        расшариваются между пользователями.
+        """
+        self.refresh()
+        return await self.private_memory.push_notification(text, source, importance=importance)
+
+    async def get_pending_notifications(self, mark_delivered: bool = True) -> List[Dict]:
+        """
+        Недоставленные проактивные сообщения пользователя. Вызывается и из
+        основного чата (polling-эндпоинт), и из MCP-сервера
+        (get_notifications) — оба процесса смотрят в один и тот же
+        GCN-стор, поэтому находка одного видна другому.
+        """
+        self.refresh()
+        return await self.private_memory.get_pending_notifications(mark_delivered=mark_delivered)
+
     async def semantic_search(self, query: str, top_k: int = 5,
                               scope: Optional[str] = None) -> List[Dict]:
         """
