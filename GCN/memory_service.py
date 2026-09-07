@@ -439,13 +439,20 @@ class MemoryService:
         синглтоны. Вызывать один раз при остановке всего приложения, а НЕ при
         выгрузке отдельного простаивающего пользователя (см. комментарий в
         shutdown() выше).
+
+        ИСПРАВЛЕНИЕ: раньше использовались _get_shared_memory/_get_global_memory,
+        которые при отсутствии инстанса его СОЗДАЮТ. В atexit-фазе завершения
+        процесса это означало: конструирование CognitiveMemory (загрузка
+        SentenceTransformer из сети/кэша, run_in_executor) уже ПОСЛЕ shutdown
+        executor'ов -> "cannot schedule new futures after interpreter shutdown"
+        и "Embeddings init failed ... Disabling". Закрываем только то, что
+        реально жило в этом процессе; несуществующие слои не трогаем.
         """
         from GCN.memory_graph import GCNMemoryRouter
-        from GCN.config_ai import MEMORY_BASE_DIR
-        shared = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
-        glob = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
-        await shared.shutdown()
-        await glob.shutdown()
+        if GCNMemoryRouter._shared_instance is not None:
+            await GCNMemoryRouter._shared_instance.shutdown()
+        if GCNMemoryRouter._global_instance is not None:
+            await GCNMemoryRouter._global_instance.shutdown()
 
 
 # ===== Фабрика сервисов с LRU-кэшированием (аналогично CognitiveController) =====

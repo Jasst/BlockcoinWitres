@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 import os
 import base64
+import re
+import secrets
 from datetime import datetime
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
@@ -27,11 +29,112 @@ from GCN.image_utils import enhance_prompt, generate_image as gen_image
 from routes.ai_assistant import get_assistant
 from GCN.llm_client import call_llm
 
+# --- Вход по криптоподписи кошелька (EIP-191) ---
+# pip install eth-account
+try:
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+    ETH_ACCOUNT_AVAILABLE = True
+except ImportError:
+    Account = None
+    encode_defunct = None
+    ETH_ACCOUNT_AVAILABLE = False
+
 # --- Конфигурация ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("blockcoin-mcp")
 
 DEFAULT_USER = "default_user"
+
+# --- Идентификация пользователя на уровне MCP (см. _resolve_user) ---
+# Для локальных stdio-клиентов (Claude Desktop и т.п.) идентификатор
+# пользователя можно задать через env BLOCKCOIN_USER_ID в конфиге клиента.
+# Для хостед HTTP-клиентов — заголовком X-User-Id (см. ниже).
+_ENV_DEFAULT_USER = os.getenv("BLOCKCOIN_USER_ID", "").strip()
+
+
+# Состояние входа процесса. Для stdio-транспорта процесс обслуживает одного
+# пользователя — одной привязки достаточно. (Для streamable HTTP с сессиями
+# состояние нужно вести per-session через ctx.session_id — здесь не реализовано,
+# т.к. хостед-вариант решается заголовком X-User-Id на шлюзе.)
+_VERIFIED_USER: "Optional[str]" = None   # адрес, подтверждённый подписью
+_VERIFIED_SIGNER: "Optional[str]" = None  # ключ, которым подписан вход (для 64-hex user_id)
+_LOGIN_NONCE: "Optional[str]" = None     # одноразовый вызов подписи
+
+
+def _user_from_ctx(ctx: "Optional[Context]") -> "Optional[str]":
+    """Идентификатор пользователя из HTTP-запроса (streamable HTTP transport).
+
+    Хост/шлюз платформы обязан передавать заголовок X-User-Id с кошельком
+    текущей сессии. Для stdio-транспорта сырого HTTP-запроса нет — None.
+    Любая ошибка доступа к контексту гасится: идентификация не должна ронять тул.
+    """
+    if ctx is None:
+        return None
+    try:
+        req = getattr(ctx.request_context, "request", None)
+        if req is None:
+            return None
+        uid = req.headers.get("x-user-id")
+        return uid.strip() if uid else None
+    except Exception:
+        return None
+
+
+# Два допустимых формата идентификатора пользователя:
+#  - адрес Ethereum-кошелька: 0x + 40 hex (42 символа) — строгая проверка
+#    владения через EIP-191 (подпись должна восстанавливаться именно в него);
+#  - user_id приложения: 64 hex без префикса (такой id используется как имя
+#    папки памяти ai_memory_v3/<user_id>). К нему владение подтверждается
+#    привязкой к подписавшему ключу при первом входе (см. verify_login).
+_ADDR_ETH_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_USERID_RE = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
+
+
+def _canon_user_id(raw: "Optional[str]") -> "Optional[str]":
+    """Каноническая форма идентификатора: lower-case; у 64-hex user_id
+    префикс 0x отбрасывается — именно в таком виде id идёт в имена папок
+    памяти. None, если формат не распознан."""
+    s = (raw or "").strip().lower()
+    if _ADDR_ETH_RE.fullmatch(s):
+        return s
+    if _USERID_RE.fullmatch(s):
+        return s[2:] if s.startswith("0x") else s
+    return None
+
+
+def _is_eth_address(uid: str) -> bool:
+    return uid.startswith("0x") and len(uid) == 42
+
+
+def _resolve_user(user_id: "Optional[str]", ctx: "Optional[Context]" = None) -> str:
+    """Порядок приоритета:
+    1) идентификатор, верифицированный через verify_login (высший приоритет
+       для этого процесса; явный user_id, ему не соответствующий, отклоняется);
+    2) user_id, явно переданный вызывающей моделью (пропускается через
+       канонизацию: 0xABC...64hex -> abc...64hex, как в папках памяти);
+    3) заголовок X-User-Id из HTTP-запроса (доверенный шлюз платформы);
+    4) env BLOCKCOIN_USER_ID (локальный stdio-клиент);
+    5) DEFAULT_USER — последний резорт.
+    """
+    if _VERIFIED_USER:
+        if user_id:
+            declared = _canon_user_id(user_id) or user_id.strip().lower()
+            if declared != _VERIFIED_USER:
+                raise PermissionError(
+                    f"Этот MCP-сервер привязан к идентификатору {_VERIFIED_USER} (вход "
+                    f"подтверждён подписью). Вызов от имени '{user_id}' запрещён."
+                )
+        return _VERIFIED_USER
+    if user_id:
+        return _canon_user_id(user_id) or user_id.strip()
+    uid = _user_from_ctx(ctx)
+    if uid:
+        return uid
+    if _ENV_DEFAULT_USER:
+        return _ENV_DEFAULT_USER
+    return DEFAULT_USER
+
 
 # Таймауты для инструментов
 _MCP_TOOL_TIMEOUT_SECONDS = int(os.getenv("MCP_TOOL_TIMEOUT_SECONDS", "120"))
@@ -62,8 +165,9 @@ mcp = FastMCP(
 )
 
 _USER_ID_DESC = (
-    "Идентификатор пользователя (тот же адрес кошелька, что использует чат). "
-    "Если не передан — используется общий default_user, а не личная память конкретного человека."
+    "Идентификатор пользователя (тот же адрес кошелька/user_id, что использует чат). "
+    "Если не передан — берётся адрес, верифицированный через request_login/verify_login, "
+    "затем env BLOCKCOIN_USER_ID, иначе общий default_user."
 )
 
 # --- Вспомогательные функции ---
@@ -119,14 +223,102 @@ def _prune_last_commands(now: float) -> None:
         _last_commands.pop(k, None)
 
 @mcp.tool()
+async def request_login(
+    address: str = Field(..., description="Твой user_id приложения (64 hex, как в ai_memory_v3) или адрес кошелька (0x...)"),
+) -> Dict[str, Any]:
+    """Начало входа: возвращает текст, который нужно подписать кошельком.
+    Подпиши его (MetaMask -> Sign message / personal_sign, EIP-191) и передай
+    подпись в verify_login. После этого все операции пойдут под твоим id."""
+    global _LOGIN_NONCE
+    canon = _canon_user_id(address)
+    if canon is None:
+        return {
+            "status": "error",
+            "message": (
+                f"Некорректный идентификатор: {address!r}. Ожидается адрес кошелька "
+                f"(0x + 40 hex) или user_id приложения (64 hex, как в папках ai_memory_v3)."
+            ),
+        }
+    _LOGIN_NONCE = secrets.token_hex(16)
+    message = f"BlockcoinWitres MCP login\nUser: {canon}\nNonce: {_LOGIN_NONCE}"
+    return {
+        "status": "ok",
+        "user_id": canon,
+        "message_to_sign": message,
+        "instructions": (
+            "Подпиши message_to_sign своим кошельком (EIP-191 personal_sign) "
+            "и вызови verify_login(address, signature) с тем же идентификатором."
+        ),
+    }
+
+
+@mcp.tool()
+async def verify_login(
+    address: str = Field(..., description="Тот же идентификатор, что в request_login"),
+    signature: str = Field(..., description="Подпись строки message_to_sign из request_login"),
+) -> Dict[str, Any]:
+    """Проверяет подпись и привязывает MCP-процесс к идентификатору.
+    Дальше recall/remember/цели/уведомления идут под ним автоматически,
+    а попытка передать чужой user_id будет отклонена.
+    Для адресов 0x... подпись должна восстанавливаться строго в этот адрес.
+    Для 64-hex user_id сервер привязывает id к подписавшему ключу: при повторном
+    входе с этим id подписавший должен совпадать (защита от перехвата id)."""
+    global _VERIFIED_USER, _VERIFIED_SIGNER, _LOGIN_NONCE
+    canon = _canon_user_id(address)
+    if not ETH_ACCOUNT_AVAILABLE:
+        return {"status": "error", "message": "Сервер без eth-account: pip install eth-account"}
+    if canon is None:
+        return {"status": "error", "message": f"Некорректный идентификатор: {address!r}"}
+    if not _LOGIN_NONCE:
+        return {"status": "error", "message": "Сначала вызови request_login(address)."}
+    message = f"BlockcoinWitres MCP login\nUser: {canon}\nNonce: {_LOGIN_NONCE}"
+    try:
+        recovered = Account.recover_message(
+            encode_defunct(text=message), signature=signature
+        ).lower()
+    except Exception as e:
+        return {"status": "error", "message": f"Не удалось проверить подпись: {e}"}
+    _LOGIN_NONCE = None  # nonce одноразовый
+
+    if _is_eth_address(canon):
+        # Строгий режим: подпись обязана восстанавливаться именно в этот адрес.
+        if recovered != canon:
+            return {
+                "status": "error",
+                "message": f"Подпись не соответствует адресу (подписавший: {recovered}).",
+            }
+    else:
+        # user_id приложения (64 hex): криптографически не выводится из адреса,
+        # поэтому владение подтверждается привязкой id -> подписавший ключ.
+        if _VERIFIED_USER == canon and _VERIFIED_SIGNER and recovered != _VERIFIED_SIGNER:
+            return {
+                "status": "error",
+                "message": "Этот user_id уже привязан к другому ключу.",
+            }
+
+    _VERIFIED_USER = canon
+    _VERIFIED_SIGNER = recovered
+    return {
+        "status": "ok",
+        "user_id": canon,
+        "bound_signer": recovered,
+        "message": (
+            "Вход подтверждён. Все операции этого MCP-сервера теперь идут "
+            "под этим идентификатором."
+        ),
+    }
+
+
+@mcp.tool()
 async def execute_command(
     command: str = Field(..., description="Любая команда на естественном языке"),
     allow_web_search: bool = Field(True, description="Разрешить веб-поиск, если нужен"),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Выполняет любую команду через тот же пайплайн, что и обычный чат."""
     # === ИСПРАВЛЕНИЕ: дедупликация быстрых повторных вызовов ===
-    key = f"{user_id or DEFAULT_USER}:{command}"
+    key = f"{_resolve_user(user_id, ctx)}:{command}"
     now = time.time()
     _prune_last_commands(now)
     if key in _last_commands and now - _last_commands[key] < _DEDUP_WINDOW_SECONDS:
@@ -137,7 +329,7 @@ async def execute_command(
         }
     _last_commands[key] = now
 
-    assistant = await get_assistant(user_id or DEFAULT_USER)
+    assistant = await get_assistant(_resolve_user(user_id, ctx))
     async def _run():
         return await assistant.process_input(command, web_search=allow_web_search)
     result = await _with_timeout(_run(), "execute_command")
@@ -159,7 +351,7 @@ async def execute_command(
             "error": "empty_response",
             "message": "Модель не вернула ответ (возможно, сбой локальной LLM).",
             "meta": meta,
-            "user_id": user_id or DEFAULT_USER,
+            "user_id": _resolve_user(user_id, ctx),
             "timestamp": time.time()
         }
 
@@ -169,7 +361,7 @@ async def execute_command(
             "status": "error",
             "message": response,
             "meta": meta,
-            "user_id": user_id or DEFAULT_USER,
+            "user_id": _resolve_user(user_id, ctx),
             "timestamp": time.time()
         }
 
@@ -177,7 +369,7 @@ async def execute_command(
         "status": "ok",
         "result": response,
         "meta": meta,
-        "user_id": user_id or DEFAULT_USER,
+        "user_id": _resolve_user(user_id, ctx),
         "timestamp": time.time()
     }
 
@@ -186,10 +378,11 @@ async def recall(
     query: str = Field(..., description="Поисковый запрос"),
     top_k: int = Field(5, description="Максимальное число результатов", ge=1, le=20),
     scope: Optional[str] = Field(None, description="Фильтр по скоупу: 'private', 'shared', 'global'"),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Поиск в памяти с фильтром по скоупу."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     results = await service.recall(query, top_k, scope)
     return {
         "results": results,
@@ -200,10 +393,11 @@ async def recall(
 async def remember(
     fact: str = Field(..., description="Факт для запоминания"),
     scope: Optional[str] = Field(None, description="Скоуп: 'private', 'shared', 'global'. Если не указан – автоопределение."),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Сохраняет факт в указанный скоуп (автоопределение, если не задан)."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     result = await service.remember(fact, scope)
     return {"status": "ok", **result}
 
@@ -212,10 +406,11 @@ async def forget(
     query: str = Field(..., description="Ключевые слова для удаления фактов"),
     scope: str = Field("private", description="Из какого слоя удалять: 'private', 'shared' или 'global'"),
     dry_run: bool = Field(True, description="Если True – только показывает кандидаты"),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Удаляет факты, содержащие заданные ключевые слова, из указанного слоя памяти."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     return await service.forget(query, scope, dry_run)
 
 @mcp.tool()
@@ -295,13 +490,14 @@ async def generate_image(
     sampler: str = Field("dpmpp_2m", description="Сэмплер"),
     seed: int = Field(-1, description="Зерно (-1 для случайного)"),
     enhance_prompt: bool = Field(True, description="Улучшить промпт через LLM перед генерацией"),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Генерирует изображение. Возвращает ссылку на файл."""
     if not EASYDIFFUSION_ENABLED:
         return {"status": "error", "message": "Генерация отключена."}
 
-    assistant = await get_assistant(user_id or DEFAULT_USER)
+    assistant = await get_assistant(_resolve_user(user_id, ctx))
 
     async def _run():
         fp = prompt
@@ -379,10 +575,11 @@ async def fetch_github_file(
 async def research_topic(
     topic: str = Field(..., description="Тема для исследования"),
     depth: int = Field(2, description="Глубина (количество итераций поиска)", ge=1, le=3),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Глубокое исследование темы с генерацией гипотез и сбором доказательств."""
-    assistant = await get_assistant(user_id or DEFAULT_USER)
+    assistant = await get_assistant(_resolve_user(user_id, ctx))
     result = await _with_timeout(
         assistant.research(topic),
         "research_topic",
@@ -401,20 +598,22 @@ async def research_topic(
 @mcp.tool()
 async def get_episodes(
     limit: int = Field(5, description="Количество последних эпизодов", ge=1, le=20),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Возвращает последние диалоги (эпизоды) из личной памяти."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     episodes = await service.get_episodes(limit)
     return {"episodes": episodes, "count": len(episodes)}
 
 @mcp.tool()
 async def get_contradictions(
     limit: int = Field(5, description="Максимальное число пар противоречий", ge=1, le=10),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Возвращает неразрешённые противоречия из личной памяти."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     pairs = await service.get_contradictions(limit)
     return {
         "contradictions": [{"a": a, "b": b} for a, b in pairs],
@@ -427,18 +626,20 @@ async def resolve_contradiction(
     fact_id_b: str = Field(..., description="ID второго факта"),
     verdict: str = Field(..., description="Вердикт: 'a' (оставить A), 'b' (оставить B), 'both' (сохранить оба), 'neither' (удалить оба)"),
     reason: str = Field("", description="Причина разрешения (опционально)"),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Ручное разрешение противоречия."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     return await service.resolve_contradiction(fact_id_a, fact_id_b, verdict, reason)
 
 @mcp.tool()
 async def get_goals(
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Возвращает активные цели пользователя."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     goals = await service.get_goals()
     return {"goals": goals, "count": len(goals)}
 
@@ -446,11 +647,38 @@ async def get_goals(
 async def add_goal(
     description: str = Field(..., description="Описание цели"),
     priority: float = Field(0.5, description="Приоритет от 0 до 1", ge=0, le=1),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Добавляет новую цель в личную память."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     return await service.add_goal(description, priority)
+
+@mcp.tool()
+async def get_notifications(
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    mark_delivered: bool = Field(
+        True,
+        description="Пометить возвращённые уведомления доставленными (они не придут повторно)."
+    ),
+    ctx: Context = None
+) -> Dict[str, Any]:
+    """
+    Проактивные находки, которые фоновые циклы ассистента (авто-исследование
+    по целям, доисследование тем из рефлексии — как в основном чате, так и
+    из фонового цикла этого же MCP-процесса, если он запущен) решили сами
+    донести до пользователя, не дожидаясь вопроса.
+
+    MCP-сервер сам ничего не пушит в чат — это pull-инструмент: хост
+    (например, BiChat) вызывает его сам, периодически или в начале сессии,
+    и показывает пользователю то, что вернулось. Источник данных общий с
+    основным чатом (GCN-стор на диске), поэтому находка, сгенерированная
+    в процессе браузерного чата, будет видна и здесь, и наоборот — не
+    важно, через какой процесс её сгенерировал ассистент.
+    """
+    service = await get_memory_service(_resolve_user(user_id, ctx))
+    items = await service.get_pending_notifications(mark_delivered=mark_delivered)
+    return {"notifications": items, "count": len(items)}
 
 @mcp.tool()
 async def semantic_search(
@@ -461,10 +689,11 @@ async def semantic_search(
         description="Фильтр по слою памяти: 'private', 'shared' или 'global'. "
                     "Если не указан — поиск по всем трём слоям (личная, общая и глобальная память)."
     ),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Векторный поиск по смыслу по личной, общей и глобальной памяти (эмбеддинги)."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     results = await service.semantic_search(query, top_k, scope=scope)
     return {"results": results, "count": len(results)}
 
@@ -472,27 +701,30 @@ async def semantic_search(
 async def graph_explore(
     seed_text: str = Field(..., description="Текст для поиска стартового узла"),
     depth: int = Field(2, description="Глубина обхода графа", ge=1, le=3),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Исследует граф синапсов, начиная с фактов, содержащих seed_text."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     return await service.graph_explore(seed_text, depth)
 
 @mcp.tool()
 async def explain_fact(
     gcn_id: str = Field(..., description="Идентификатор объекта памяти (gcn_id)"),
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Объясняет происхождение и статус утверждения памяти."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     return await service.explain_fact(gcn_id)
 
 @mcp.tool()
 async def get_memory_stats(
-    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC)
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
 ) -> Dict[str, Any]:
     """Возвращает статистику по личной памяти."""
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     return await service.get_memory_stats()
 
 # ============================================================
@@ -500,7 +732,7 @@ async def get_memory_stats(
 # ============================================================
 @mcp.resource("memory://{user_id}/facts")
 async def list_facts(user_id: str) -> Dict[str, Any]:
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     stats = await service.get_memory_stats()
     # Упрощённо: возвращаем список фактов из service
     # В сервисе нет метода для получения всех фактов, поэтому используем прямой доступ к памяти
@@ -515,7 +747,7 @@ async def list_facts(user_id: str) -> Dict[str, Any]:
 
 @mcp.resource("memory://{user_id}/fact/{fact_id}")
 async def get_fact(user_id: str, fact_id: str) -> Dict[str, Any]:
-    service = await get_memory_service(user_id or DEFAULT_USER)
+    service = await get_memory_service(_resolve_user(user_id, ctx))
     memory = service.private_memory
     memory.reload_if_stale()
     obj = memory.store.get(fact_id)

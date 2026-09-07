@@ -1414,7 +1414,15 @@ class CognitiveMemory:
             # --- НОВОЕ: перестраиваем FAISS индекс перед сохранением ---
             self.gcn_store.build_faiss_index(force=True)
             gcn_state_path = self.base_dir / GCN_STATE_FILENAME
-            await self.gcn_store.async_save(str(gcn_state_path))
+            try:
+                await self.gcn_store.async_save(str(gcn_state_path))
+            except RuntimeError:
+                # Цикл событий/пул потоков уже в teardown процесса
+                # ("cannot schedule new futures after interpreter shutdown") —
+                # async_save через run_in_executor больше не может принять
+                # задачу. Падаем в синхронное save() тем же кодом: оно идёт
+                # в текущем потоке и не требует executor. Данные не теряем.
+                self.gcn_store.save(str(gcn_state_path))
             # Сохраняем локальные счётчики (опционально)
             meta_path = self.base_dir / "meta.json"
             meta = {
