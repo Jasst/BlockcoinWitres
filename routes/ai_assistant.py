@@ -751,6 +751,17 @@ class CognitiveController:
         # уничтожается — поэтому фиксируем обмен отдельно).
         self._last_exchange: Optional[Dict] = None
 
+        # ===== Автономный движок (GCN/autonomy.py): единая очередь фоновых
+        # исследований, декомпозиция целей, дайджест проактивности с обратной
+        # связью. При любой ошибке инициализации деградируем к прежним циклам.
+        self.autonomy: "Optional[AutonomyEngine]" = None
+        try:
+            from GCN.autonomy import AutonomyEngine
+            self.autonomy = AutonomyEngine(self)
+            self.autonomy.start()
+        except Exception as _autonomy_err:
+            logger.error(f"AutonomyEngine init failed, falling back to legacy loops: {_autonomy_err}")
+
         logger.info(f"CognitiveController (GCN) initialized for {user_id[:16]}")
 
     async def _force_search_if_requested(self, message: str, search_meta: Dict) -> None:
@@ -800,6 +811,10 @@ class CognitiveController:
                 return
             logger.info(f"[ForcedSearch] попытка {attempt + 1}/{attempts}: пусто для '{query[:80]}'")
         logger.warning(f"[ForcedSearch] поиск не дал результатов за {attempts} попыток")
+        if self.autonomy is not None:
+            # Пользователю нужны данные, которых нет — ставим тему в очередь
+            # фонового доисследования (источник 'search_failure' имеет высокий буст).
+            self.autonomy.on_search_failed(message)
 
     async def _ensure_external_tools_registered(self):
         """Регистрирует внешние MCP-инструменты в ToolRegistry, если они ещё не зарегистрированы."""
@@ -958,6 +973,22 @@ class CognitiveController:
             # безусловно, флаг фактически не давал его отключить.
             if not AUTO_RESEARCH_ENABLED:
                 continue
+            # ИЗМЕНЕНИЕ: цели больше не исследуются напрямую — они ставятся в
+            # приоритетную очередь AutonomyEngine (дедуп, ретраи, приоритеты,
+            # дайджестная доставка, единый бюджет). Прежний _auto_research
+            # остаётся как fallback, если движок не поднялся.
+            if self.autonomy is not None:
+                try:
+                    active_goals = await self.memory_service.get_goals()
+                    for goal_dict in active_goals:
+                        if goal_dict["confidence"] < CURIOSITY_UNCERTAINTY_THRESHOLD:
+                            self.autonomy.enqueue_topic(
+                                goal_dict["description"], source="goal",
+                                priority=goal_dict.get("priority", 0.5),
+                                related_goal=goal_dict["description"])
+                except Exception as e:
+                    logger.error(f"Auto research enqueue error: {e}")
+                continue
             if not self._consume_autonomous_llm_budget():
                 continue
             try:
@@ -1023,7 +1054,11 @@ class CognitiveController:
         """
         try:
             result = await self.research(topic)
-            await self._maybe_surface_proactively(result.get("answer", ""), source=source)
+            # ИЗМЕНЕНИЕ: доставка через дайджест движка автономности.
+            if self.autonomy is not None:
+                await self.autonomy.submit_finding(result.get("answer", ""), source=source)
+            else:
+                await self._maybe_surface_proactively(result.get("answer", ""), source=source)
         except Exception as e:
             logger.error(f"Background research ({source}) failed for topic '{topic}': {e}")
 
@@ -1041,7 +1076,14 @@ class CognitiveController:
         проактивность — бонус поверх основного цикла, а не его часть, и не
         должна его ронять.
         """
-        if not PROACTIVE_NOTIFICATIONS_ENABLED or not finding_text or not finding_text.strip():
+        if not finding_text or not finding_text.strip():
+            return
+        # ИЗМЕНЕНИЕ: находки фоновых циклов уходят в дайджест AutonomyEngine
+        # (батч-отбор, тихие часы, обратная связь), а не напрямую пользователю.
+        if self.autonomy is not None:
+            await self.autonomy.submit_finding(finding_text, source)
+            return
+        if not PROACTIVE_NOTIFICATIONS_ENABLED:
             return
         now = time.time()
         if now - self._last_proactive_message_at < PROACTIVE_MESSAGE_COOLDOWN_SECONDS:
@@ -1638,6 +1680,8 @@ class CognitiveController:
         # Подтягиваем изменения, сделанные другими процессами
         self.memory_service.refresh()
         self._last_activity_time = time.time()
+        if self.autonomy is not None:
+            self.autonomy.on_user_message(message)
 
         # 1-3. Команды памяти / классификация намерений / автоизвлечение
         pipeline_result = await self._run_memory_intent_pipeline(message)
@@ -1650,6 +1694,8 @@ class CognitiveController:
             message, web_search, image_base64, image_mime, reasoning
         )
         uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
+        if self.autonomy is not None:
+            self.autonomy.on_high_uncertainty(message, uncertainty)
 
         # Детерминированный поиск: если пользователь явно запросил интернет
         # (web_search=True) или дал прямую ссылку — ищем сразу, не полагаясь
@@ -2363,6 +2409,8 @@ class CognitiveController:
             self.memory_service.refresh()
 
             self._last_activity_time = time.time()
+            if self.autonomy is not None:
+                self.autonomy.on_user_message(message)
 
             # ИСПРАВЛЕНИЕ (#3 из чат-ревью): используем общий пайплайн памяти
             pipeline_result = await self._run_memory_intent_pipeline(message)
@@ -2377,6 +2425,8 @@ class CognitiveController:
                 message, web_search, image_base64, image_mime, reasoning
             )
             uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
+            if self.autonomy is not None:
+                self.autonomy.on_high_uncertainty(message, uncertainty)
 
             # См. process_input: детерминированный поиск до ReAct-цикла.
             await self._force_search_if_requested(message, search_meta)
@@ -2609,7 +2659,13 @@ class CognitiveController:
             self._idle_task.cancel()
         for task in list(self._background_tasks):
             task.cancel()
-        # ИЗМЕНЕНИЕ: завершаем сервис
+        # ИЗМЕНЕНИЕ: останавливаем движок автономности (сохраняет очередь и
+        # обучение), затем завершаем сервис памяти.
+        if getattr(self, "autonomy", None) is not None:
+            try:
+                await self.autonomy.shutdown()
+            except Exception as e:
+                logger.error(f"AutonomyEngine shutdown error: {e}")
         await self.memory_service.shutdown()
 
 # =====================================================================

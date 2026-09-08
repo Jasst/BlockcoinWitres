@@ -429,3 +429,48 @@ CONTRADICTION_LLM_VERIFY_ENABLED = False
 # E. Финальный критик: сверка ответа с планом подзадач и добор пропущенного.
 PLAN_CRITIC_ENABLED = True
 PLAN_CRITIC_MAX_MISSED = 3
+
+
+# =====================================================================
+# Автономность и проактивность (GCN/autonomy.py)
+# =====================================================================
+# Мастер-выключатель движка. False — прежние фоновые циклы работают как раньше.
+AUTONOMY_ENABLED = True
+# Базовый интервал главного цикла движка (сек) + дробный джиттер, чтобы
+# несколько пользователей не будили локальную LLM синхронно.
+AUTONOMY_LOOP_INTERVAL = 45
+AUTONOMY_LOOP_JITTER = 0.3
+# Не запускать фоновые исследования, пока пользователь активно переписывается
+# (последняя активность в чате младше этого окна) или идёт генерация ответа.
+AUTONOMY_USER_ACTIVE_SUPPRESS_SECONDS = 300
+# Очередь исследовательских тем: размер, TTL, ретраи.
+RESEARCH_QUEUE_MAX_SIZE = 40
+RESEARCH_TOPIC_TTL_SECONDS = 7 * 86400
+RESEARCH_MAX_ATTEMPTS = 2
+RESEARCH_RETRY_BACKOFF_SECONDS = 1800
+# Бусты приоритета темы по источнику постановки в очередь.
+RESEARCH_PRIORITY_SOURCE_BOOST = {
+    "goal": 0.25, "goal_subtask": 0.20, "reflection": 0.15,
+    "search_failure": 0.20, "contradiction": 0.15,
+    "knowledge_gap": 0.10, "refresh": 0.05,
+}
+# Декомпозиция активных целей на проверяемые подзадачи (один раз на цель).
+GOAL_DECOMPOSE_INTERVAL = 6 * 3600
+# Актуализация устаревших временно-чувствительных фактов из памяти.
+TIME_SENSITIVE_REFRESH_INTERVAL = 24 * 3600
+TIME_SENSITIVE_REFRESH_MAX_PER_RUN = 3
+# Дайджест проактивных уведомлений: находки копятся и одним LLM-вызовом
+# отбираются достойные (максимум 2 за сброс) — вместо потока отдельных тостов.
+DIGEST_ENABLED = True
+DIGEST_MAX_ITEMS = 5
+DIGEST_FLUSH_MIN_ITEMS = 1
+DIGEST_MIN_INTERVAL_SECONDS = 45 * 60
+DIGEST_MAX_NOTIFICATIONS_PER_DAY = 6
+# Тихие часы (локальное время сервера): интервал, в который дайджест не шлётся.
+QUIET_HOURS_START = 23
+QUIET_HOURS_END = 8
+# Обратная связь по уведомлениям: пользователь продолжил тему — источник
+# ценнее (бонус к приоритету его тем); проигнорировал — притухает.
+FEEDBACK_WINDOW_SECONDS = 3600
+FEEDBACK_POSITIVE_BONUS = 0.15
+FEEDBACK_NEGATIVE_DECAY = 0.05
