@@ -748,7 +748,7 @@
             menu.remove();
             const senderName = messageEl.querySelector('.content strong')?.textContent || '';
             const replyText = `${senderName ? senderName + ': ' : ''}${messageContent}`;
-            const textarea = document.getElementById('messageInput');
+            const textarea = document.getElementById('messageContent');
             if (textarea) {
                 textarea.value = replyText + '\n';
                 textarea.focus();
@@ -808,6 +808,19 @@
         }
     });
 
+    // Unpin button handler
+    document.addEventListener('DOMContentLoaded', function() {
+        const unpinBtn = document.getElementById('unpinMessageBtn');
+        if (unpinBtn) {
+            unpinBtn.addEventListener('click', () => {
+                const chatAddress = State.currentChatAddress;
+                if (chatAddress) {
+                    window.unpinMessage(chatAddress);
+                }
+            });
+        }
+    });
+
     document.addEventListener('DOMContentLoaded', initChatActions);
     window.sendMessage = sendMessage;
     window.handleFileSelection = handleFileSelection;
@@ -816,6 +829,7 @@
     window.startNewChat = startNewChat;
     window.autoResizeTextarea = autoResizeTextarea;
     window.updateSendButtonVisibility = updateSendButtonVisibility;
+    window.unpinMessage = unpinMessage;
     
     // Theme toggle function
     window.toggleTheme = function() {
