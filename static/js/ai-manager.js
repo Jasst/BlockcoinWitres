@@ -1451,8 +1451,63 @@ async function _sendToAi(messageText, imageFile) {
     }
 }
 
+    // =================================================================
+    // 5. ПРОАКТИВНЫЕ УВЕДОМЛЕНИЯ (polling фоновых находок)
+    // =================================================================
+    // Бэкенд (CognitiveController._maybe_surface_proactively) складывает
+    // находки фоновых циклов (авто-исследование по целям, доисследование
+    // тем из рефлексии) в GCN-стор как NOTIFICATION-объекты. Этот poller
+    // периодически забирает недоставленные уведомления текущего
+    // пользователя через GET /ai/notifications/poll (бэкенд помечает их
+    // доставленными сразу при выдаче — повторно они не придут).
+    let _notifPollTimer = null;
+    const NOTIF_POLL_INTERVAL_MS = 25000;
+
+    async function _pollProactiveNotifications() {
+        if (document.visibilityState !== 'visible') return;
+        try {
+            const res = await fetch('/ai/notifications/poll');
+            if (!res.ok) return;
+            const data = await res.json();
+            const items = (data && data.notifications) || [];
+            items.forEach(n => {
+                const text = (n && n.text) ? String(n.text) : '';
+                if (!text) return;
+                // Тост — виден с любого экрана (чаты, список бесед и т.д.)
+                _showToast(`🤖 ${text}`, 'info');
+                // Опционально: дублируем как сообщение в текущий AI-чат,
+                // чтобы находка сохранилась в истории сессии.
+                if (_currentAiSessionId && _aiMessagesContainer) {
+                    _displayAiMessage(`🔔 *Проактивная находка:* ${text}`, false, null, true);
+                }
+            });
+        } catch (e) {
+            // Офлайн / 401 (не авторизован) / сбой сети — молча пропускаем тик.
+        }
+    }
+
+    function _startNotificationPolling() {
+        if (_notifPollTimer) return;
+        _notifPollTimer = setInterval(_pollProactiveNotifications, NOTIF_POLL_INTERVAL_MS);
+        // Первый тик — сразу при загрузке, чтобы не ждать интервал.
+        _pollProactiveNotifications();
+        // При возврате на вкладку — сразу дотягиваем накопившееся.
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') _pollProactiveNotifications();
+        });
+    }
+
+    function _stopNotificationPolling() {
+        if (_notifPollTimer) {
+            clearInterval(_notifPollTimer);
+            _notifPollTimer = null;
+        }
+    }
+
     // ─── экспорт ───
     window._initAiChatSession = _initAiChatSession;
+    window._startNotificationPolling = _startNotificationPolling;
+    window._stopNotificationPolling = _stopNotificationPolling;
     window.createAiSession = createAiSession;
     window.getAiSessions = getAiSessions;
     window.saveAiSessions = saveAiSessions;
@@ -1465,6 +1520,8 @@ async function _sendToAi(messageText, imageFile) {
     document.addEventListener('DOMContentLoaded', function() {
         // Загружаем AI-сессии в список разговоров
         loadAiSessionsIntoConversations();
+        // Проактивные уведомления фоновых циклов ассистента
+        _startNotificationPolling();
 
         // Добавляем кнопку "Новый AI чат" в панель бесед, если её нет
         const headerActions = document.querySelector('.conversations-header .header-actions');

@@ -56,6 +56,7 @@ try:
         MAX_RETRIEVE_SUBQUERIES,
         PLAN_CRITIC_MAX_MISSED,
         GROUNDED_MAX_SOURCES,
+        GROUNDED_APPEND_SOURCES_FALLBACK,
     )
 except ImportError:
     LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
@@ -67,6 +68,7 @@ except ImportError:
     MAX_RETRIEVE_SUBQUERIES = 3
     PLAN_CRITIC_MAX_MISSED = 3
     GROUNDED_MAX_SOURCES = 8
+    GROUNDED_APPEND_SOURCES_FALLBACK = False
 
 from GCN.llm_client import call_llm
 from GCN.tool_router import _looks_compound  # единая эвристика составного запроса (была третьей копией)
@@ -122,12 +124,28 @@ _CITATION_RE = re.compile(r"\[(\d{1,2})\]")
 
 def ensure_citations(response: str, sources: List[Dict]) -> str:
     """
-    Если ответ не содержит ни одной ссылки [N], а источники были — дописывает
-    в конец ответа пронумерованный список источников. Иначе возвращает как есть.
+    ИСПРАВЛЕНИЕ (дублирование источников в чате): раньше, если ответ не
+    содержал ни одной ссылки [N], сюда дописывался ПОЛНЫЙ текстовый список
+    источников — а фронтенд НЕЗАВИСИМО от текста ответа рендерит свой блок
+    "🔍 Источники:" из search_meta["sources"] (тот же список). Пользователь
+    видел один и тот же список дважды: один раз как текст внутри ответа
+    ассистента, второй раз как отдельный UI-блок под ним. Список источников
+    и так гарантированно виден через UI-блок независимо от того, процитировала
+    ли модель их инлайн, поэтому текстовый fallback по умолчанию отключён
+    (GROUNDED_APPEND_SOURCES_FALLBACK=False) — управляет только логированием/
+    диагностикой, что модель проигнорировала указание цитировать. Включить
+    старое поведение (дублирование) можно через конфиг, если UI когда-нибудь
+    перестанет рендерить источники отдельно.
     """
     if not GROUNDED_ANSWER_ENABLED or not response or not sources:
         return response
     if _CITATION_RE.search(response):
+        return response
+    if not GROUNDED_APPEND_SOURCES_FALLBACK:
+        logger.debug(
+            "[GroundedAnswer] Ответ без инлайн-цитат [N] — источники и так "
+            "будут показаны отдельным UI-блоком, текст не дублируется."
+        )
         return response
     return f"{response}\n\n{sources_block(sources)}"
 

@@ -1377,13 +1377,55 @@ class CognitiveMemory:
     async def get_active_goals(self) -> List[Goal]:
         return [g for g in self.goals if g.status == 'active']
 
+    # ==================== ПРОАКТИВНЫЕ УВЕДОМЛЕНИЯ ====================
+    # В отличие от целей — не нуждаются в локальном кэше/синапсах, поэтому
+    # читаются/пишутся прямо через gcn_store, без зеркалирования в self.*.
+    async def push_notification(self, text: str, source: str, importance: float = 0.5) -> str:
+        notif_id = self.gcn_store.add_notification(text, self.user_id, source, importance=importance)
+        await self._schedule_save()
+        return notif_id
+
+    async def get_pending_notifications(self, mark_delivered: bool = True) -> List[Dict]:
+        """
+        Сначала reload_if_stale() — находки могли появиться из другого
+        процесса (например, из фонового цикла MCP-сервера, работающего
+        отдельно от основного FastAPI-приложения), а не только из этого.
+        """
+        self.reload_if_stale()
+        objs = self.gcn_store.get_pending_notifications(self.user_id)
+        result = [
+            {
+                "id": o.id,
+                "text": o.subject,
+                "source": (o.object or {}).get("source"),
+                "importance": (o.object or {}).get("importance", 0.5),
+                "created": o.created.isoformat(),
+            }
+            for o in objs
+        ]
+        if mark_delivered and objs:
+            self.gcn_store.mark_notifications_delivered([o.id for o in objs], self.user_id)
+            await self._schedule_save()
+        return result
+
     # ==================== СОХРАНЕНИЕ ====================
     async def _save_async(self):
         async with self._lock:
             # --- НОВОЕ: перестраиваем FAISS индекс перед сохранением ---
             self.gcn_store.build_faiss_index(force=True)
             gcn_state_path = self.base_dir / GCN_STATE_FILENAME
-            await self.gcn_store.async_save(str(gcn_state_path))
+            try:
+                await self.gcn_store.async_save(str(gcn_state_path))
+            except (RuntimeError, PermissionError):
+                # RuntimeError — цикл событий/пул потоков уже в teardown
+                # процесса ("cannot schedule new futures after interpreter
+                # shutdown"), run_in_executor не принимает задачи.
+                # PermissionError — транспортный сбой сохранения (например,
+                # Windows отказала в os.replace после всех ретраев).
+                # В обоих случаях падаем в синхронное save() тем же кодом:
+                # оно идёт в текущем потоке, не требует executor и само
+                # делает ретраи замены. Данные не теряем.
+                self.gcn_store.save(str(gcn_state_path))
             # Сохраняем локальные счётчики (опционально)
             meta_path = self.base_dir / "meta.json"
             meta = {

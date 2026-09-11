@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "recall",
+    "arguments": {
+      "query": "BlockcoinWitres GCN",
+      "top_k": 5
+    }
+  }
+}

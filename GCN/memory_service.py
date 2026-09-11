@@ -177,6 +177,26 @@ class MemoryService:
             for g in goals
         ]
 
+    async def push_notification(self, text: str, source: str, importance: float = 0.5) -> str:
+        """
+        Ставит проактивное сообщение в очередь пользователя — то, что
+        фоновый цикл (авто-исследование, рефлексия) решил сам донести, не
+        дожидаясь вопроса. Всегда личное (private) — уведомления не
+        расшариваются между пользователями.
+        """
+        self.refresh()
+        return await self.private_memory.push_notification(text, source, importance=importance)
+
+    async def get_pending_notifications(self, mark_delivered: bool = True) -> List[Dict]:
+        """
+        Недоставленные проактивные сообщения пользователя. Вызывается и из
+        основного чата (polling-эндпоинт), и из MCP-сервера
+        (get_notifications) — оба процесса смотрят в один и тот же
+        GCN-стор, поэтому находка одного видна другому.
+        """
+        self.refresh()
+        return await self.private_memory.get_pending_notifications(mark_delivered=mark_delivered)
+
     async def semantic_search(self, query: str, top_k: int = 5,
                               scope: Optional[str] = None) -> List[Dict]:
         """
@@ -419,13 +439,20 @@ class MemoryService:
         синглтоны. Вызывать один раз при остановке всего приложения, а НЕ при
         выгрузке отдельного простаивающего пользователя (см. комментарий в
         shutdown() выше).
+
+        ИСПРАВЛЕНИЕ: раньше использовались _get_shared_memory/_get_global_memory,
+        которые при отсутствии инстанса его СОЗДАЮТ. В atexit-фазе завершения
+        процесса это означало: конструирование CognitiveMemory (загрузка
+        SentenceTransformer из сети/кэша, run_in_executor) уже ПОСЛЕ shutdown
+        executor'ов -> "cannot schedule new futures after interpreter shutdown"
+        и "Embeddings init failed ... Disabling". Закрываем только то, что
+        реально жило в этом процессе; несуществующие слои не трогаем.
         """
         from GCN.memory_graph import GCNMemoryRouter
-        from GCN.config_ai import MEMORY_BASE_DIR
-        shared = GCNMemoryRouter._get_shared_memory(MEMORY_BASE_DIR)
-        glob = GCNMemoryRouter._get_global_memory(MEMORY_BASE_DIR)
-        await shared.shutdown()
-        await glob.shutdown()
+        if GCNMemoryRouter._shared_instance is not None:
+            await GCNMemoryRouter._shared_instance.shutdown()
+        if GCNMemoryRouter._global_instance is not None:
+            await GCNMemoryRouter._global_instance.shutdown()
 
 
 # ===== Фабрика сервисов с LRU-кэшированием (аналогично CognitiveController) =====

@@ -65,6 +65,7 @@ class KnowledgeType(Enum):
     HYPOTHESIS = "hypothesis"
     GOAL = "goal"          # новый тип
     MEMORY_EVENT = "memory_event"
+    NOTIFICATION = "notification"  # проактивное сообщение фонового цикла
 
 
 # GCN.py — после импортов, до KnowledgeType
@@ -916,6 +917,64 @@ class MemoryStore:
                         result.append(obj)
         return result
 
+    # ---------- Проактивные уведомления ----------
+    def add_notification(self, text: str, author: str, source: str,
+                          importance: float = 0.5) -> str:
+        """
+        Проактивное сообщение, которое фоновый цикл (авто-исследование,
+        рефлексия, планирование целей — см. ai_assistant.py; либо
+        аналогичный цикл в отдельном процессе MCP-сервера) хочет сам
+        донести до пользователя, не дожидаясь его вопроса.
+
+        author = user_id (тот же адрес кошелька, что и у goal/fact) —
+        именно по нему фильтруется выдача в get_pending_notifications.
+        source — свободная метка происхождения ('auto_research',
+        'reflection', 'goal_planning', 'mcp_background' и т.п.), просто
+        для отладки/статистики.
+
+        Объект типа NOTIFICATION участвует в save()/load()/_merge_disk_state()
+        наравне со всеми остальными KnowledgeObject — специальной обработки
+        не требует, поэтому безопасно приходит из любого процесса, который
+        пишет в общий gcn_state.json.
+        """
+        obj = KnowledgeObject(
+            id=f"notif_{uuid.uuid4()}",
+            type=KnowledgeType.NOTIFICATION,
+            subject=text,
+            predicate="proactive_message",
+            object={"source": source, "importance": importance, "delivered": False},
+            author=author,
+            created=datetime.now(timezone.utc),
+            confidence=1.0,
+            evidence=[]
+        )
+        return self.create(obj, author)
+
+    def get_pending_notifications(self, author: str) -> List[KnowledgeObject]:
+        """Недоставленные проактивные сообщения конкретного пользователя,
+        от старых к новым."""
+        result = [
+            obj for obj in self._objects.values()
+            if obj.type == KnowledgeType.NOTIFICATION
+            and obj.author == author
+            and isinstance(obj.object, dict)
+            and not obj.object.get("delivered", False)
+        ]
+        result.sort(key=lambda o: o.created)
+        return result
+
+    def mark_notifications_delivered(self, notification_ids: List[str], actor: str) -> None:
+        """Помечает уведомления доставленными — идемпотентно, повторный
+        вызов на уже помеченных id безопасен."""
+        for nid in notification_ids:
+            obj = self.get(nid)
+            if obj and obj.type == KnowledgeType.NOTIFICATION and isinstance(obj.object, dict):
+                if obj.object.get("delivered"):
+                    continue
+                new_object = obj.object.copy()
+                new_object["delivered"] = True
+                self.update(nid, {"object": new_object}, actor)
+
     def delete_fact(self, fact_id: str, actor: str) -> bool:
         """Удаляет факт (объект типа CLAIM) и все связанные рёбра."""
         obj = self.get(fact_id)
@@ -1254,7 +1313,25 @@ class MemoryStore:
             try:
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(data, f, default=str, indent=2, ensure_ascii=False)
-                os.replace(tmp_path, path)
+                # ИСПРАВЛЕНИЕ (WinError 5): os.replace на Windows падает с
+                # PermissionError, если другой процесс в этот момент держит
+                # gcn_state.json открытым (второй процесс в reload_if_stale/
+                # load, антивирус, индексатор поиска). Блокировка выше защищает
+                # от конкурентного save(), но НЕ от конкурентного load() —
+                # тот читает файл без блокировки. Плюс AV-блокировки живут
+                # доли секунды. Поэтому: несколько повторов с нарастающей
+                # паузой перед тем, как реально упасть.
+                _last_err = None
+                for _attempt in range(5):
+                    try:
+                        os.replace(tmp_path, path)
+                        _last_err = None
+                        break
+                    except PermissionError as _e:
+                        _last_err = _e
+                        time.sleep(0.15 * (_attempt + 1))
+                if _last_err is not None:
+                    raise _last_err
             finally:
                 if os.path.exists(tmp_path):
                     try:
@@ -1267,9 +1344,20 @@ class MemoryStore:
                 self._loaded_mtime = time.time()
 
     def load(self, path: str):
-        """Синхронная загрузка."""
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        """Синхронная загрузка.
+
+        ИСПРАВЛЕНИЕ (WinError 5): раньше чтение шло без кросс-процессной
+        блокировки, поэтому save() другого процесса (чат-процесс vs MCP-
+        процесс) мог попасть ровно в окно открытого здесь хендла — на Windows
+        os.replace тогда падает с PermissionError. Берём ту же advisory-
+        блокировку, что и save(): порядок захвата у обоих методов одинаковый
+        (сначала файловая, потом self._lock) — дедлока нет. При недоступности
+        блокировки за timeout выбрасываем TimeoutError; вызывающий код
+        (reload_if_stale/__init__) его ловит и работает на текущем снапшоте.
+        """
+        with _cross_process_file_lock(path, timeout=10.0):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
 
         with self._lock:
             self._objects = {}
