@@ -1435,6 +1435,11 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
   position: relative;
 }
 
+body.light-theme .message:hover {
+  background: rgba(108, 92, 231, 0.04);
+  border-radius: 8px;
+}
+
 .message:hover {
   background: rgba(255, 255, 255, 0.02);
   border-radius: 8px;
@@ -2535,6 +2540,10 @@ audio::-webkit-media-controls-time-remaining-display {
   html { scroll-behavior: auto; }
 }
 /* ===== Light Theme Additional Overrides ===== */
+body.light-theme .message {
+  opacity: 1 !important;
+}
+
 body.light-theme .message.sent .content {
   background: linear-gradient(135deg, #7c6ef5, #6c5ce7);
   box-shadow: 0 2px 12px rgba(108, 92, 231, 0.2);
