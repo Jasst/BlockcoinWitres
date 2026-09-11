@@ -654,6 +654,158 @@
                 }
             }
         }
+
+        // Закрыть контекстное меню при клике вне его
+        const contextMenu = document.querySelector('.message-context-menu.active');
+        if (contextMenu && !e.target.closest('.message-context-menu')) {
+            contextMenu.classList.remove('active');
+        }
+    });
+
+    // Контекстное меню по правому клику
+    document.addEventListener('contextmenu', async (e) => {
+        const messageEl = e.target.closest('.message');
+        if (!messageEl) return;
+
+        e.preventDefault();
+        const msgId = messageEl.dataset.messageId || messageEl.dataset.id;
+        if (!msgId) return;
+
+        // Закрыть другие открытые меню
+        document.querySelectorAll('.message-context-menu').forEach(menu => menu.remove());
+
+        // Создать контекстное меню
+        const menu = document.createElement('div');
+        menu.className = 'message-context-menu active';
+        menu.style.left = e.pageX + 'px';
+        menu.style.top = e.pageY + 'px';
+
+        const isOwnMessage = messageEl.classList.contains('sent') || messageEl.classList.contains('message-own');
+        const messageContent = messageEl.querySelector('.content p')?.textContent || '';
+
+        menu.innerHTML = `
+            <button class="copy-action"><img src="/static/icons/Copy.png" width="16" height="16" alt=""> ${t('copy')}</button>
+            ${isOwnMessage ? `<button class="edit-action"><img src="/static/icons/Edit.png" width="16" height="16" alt=""> ${t('edit')}</button>` : ''}
+            <button class="reply-action">↩️ ${t('reply')}</button>
+            <button class="pin-action">📌 ${t('pin_message')}</button>
+            <div class="separator"></div>
+            ${isOwnMessage ? `<button class="delete-action danger"><img src="/static/icons/Remove.png" width="16" height="16" alt=""> ${t('delete')}</button>` : ''}
+        `;
+
+        document.body.appendChild(menu);
+
+        // Позиционирование с учётом краёв экрана
+        const rect = menu.getBoundingClientRect();
+        if (rect.right > window.innerWidth) {
+            menu.style.left = (e.pageX - rect.width) + 'px';
+        }
+        if (rect.bottom > window.innerHeight) {
+            menu.style.top = (e.pageY - rect.height) + 'px';
+        }
+
+        // Обработчики действий
+        menu.querySelector('.copy-action').onclick = () => {
+            navigator.clipboard.writeText(messageContent).then(() => {
+                window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
+                menu.remove();
+            }).catch(err => {
+                console.error('Copy failed:', err);
+                window.NotificationManager?.showToast(t('copy_failed'), 'error');
+            });
+        };
+
+        const editBtn = menu.querySelector('.edit-action');
+        if (editBtn) {
+            editBtn.onclick = async () => {
+                menu.remove();
+                const newText = prompt(t('edit_message_prompt'), messageContent);
+                if (newText !== null && newText.trim() !== '') {
+                    try {
+                        const res = await fetch('/edit_message', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ message_id: parseInt(msgId), content: newText.trim() })
+                        });
+                        if (res.ok) {
+                            const msgDiv = document.getElementById('msg-' + msgId);
+                            if (msgDiv) {
+                                const contentP = msgDiv.querySelector('.content p');
+                                if (contentP) contentP.textContent = newText.trim();
+                            }
+                            window.NotificationManager?.showToast(t('message_edited'), 'success');
+                        } else {
+                            window.NotificationManager?.showToast(t('edit_failed'), 'error');
+                        }
+                    } catch (err) {
+                        console.error('Edit error:', err);
+                        window.NotificationManager?.showToast(t('edit_failed'), 'error');
+                    }
+                }
+            };
+        }
+
+        menu.querySelector('.reply-action').onclick = () => {
+            menu.remove();
+            const senderName = messageEl.querySelector('.content strong')?.textContent || '';
+            const replyText = `${senderName ? senderName + ': ' : ''}${messageContent}`;
+            const textarea = document.getElementById('messageInput');
+            if (textarea) {
+                textarea.value = replyText + '\n';
+                textarea.focus();
+                if (window.autoResizeTextarea) window.autoResizeTextarea(textarea);
+            }
+        };
+
+        const deleteAction = menu.querySelector('.delete-action');
+        if (deleteAction) {
+            deleteAction.onclick = async () => {
+                const confirmed = await window.showConfirmModal(t('delete_message_title'), t('delete_message_confirm'));
+                if (confirmed) {
+                    const res = await fetch('/delete_message', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ message_id: parseInt(msgId) })
+                    });
+                    if (res.ok) {
+                        const msgDiv = document.getElementById('msg-' + msgId);
+                        if (msgDiv) {
+                            msgDiv.querySelectorAll('[data-object-url]').forEach(el => {
+                                URL.revokeObjectURL(el.dataset.objectUrl);
+                            });
+                            msgDiv.remove();
+                        }
+                        window.loadConversations();
+                        window.NotificationManager?.showToast(t('message_deleted'), 'success');
+                    } else {
+                        window.NotificationManager?.showToast(t('delete_failed'), 'error');
+                    }
+                }
+                menu.remove();
+            };
+        }
+
+        // Pin message action
+        const pinAction = menu.querySelector('.pin-action');
+        if (pinAction) {
+            pinAction.onclick = async () => {
+                menu.remove();
+                const chatAddress = State.currentChatAddress;
+                if (!chatAddress) return;
+                
+                // Store pinned message in localStorage
+                const storageKey = `pinned_${chatAddress}`;
+                const pinnedData = {
+                    messageId: msgId,
+                    content: messageContent.substring(0, 100),
+                    timestamp: Date.now()
+                };
+                localStorage.setItem(storageKey, JSON.stringify(pinnedData));
+                
+                // Update UI
+                window.updatePinnedMessageBar(chatAddress);
+                window.NotificationManager?.showToast(t('pinned_message'), 'success');
+            };
+        }
     });
 
     document.addEventListener('DOMContentLoaded', initChatActions);
@@ -664,4 +816,85 @@
     window.startNewChat = startNewChat;
     window.autoResizeTextarea = autoResizeTextarea;
     window.updateSendButtonVisibility = updateSendButtonVisibility;
+    
+    // Theme toggle function
+    window.toggleTheme = function() {
+        const body = document.body;
+        const isLight = body.classList.toggle('light-theme');
+        localStorage.setItem('theme', isLight ? 'light' : 'dark');
+        
+        // Update icon visibility
+        const sunIcon = document.querySelector('.sun-icon');
+        const moonIcon = document.querySelector('.moon-icon');
+        if (sunIcon && moonIcon) {
+            sunIcon.classList.toggle('hidden', isLight);
+            moonIcon.classList.toggle('hidden', !isLight);
+        }
+    };
+    
+    // Initialize theme from localStorage
+    (function initTheme() {
+        const savedTheme = localStorage.getItem('theme') || 'dark';
+        if (savedTheme === 'light') {
+            document.body.classList.add('light-theme');
+            const sunIcon = document.querySelector('.sun-icon');
+            const moonIcon = document.querySelector('.moon-icon');
+            if (sunIcon && moonIcon) {
+                sunIcon.classList.add('hidden');
+                moonIcon.classList.remove('hidden');
+            }
+        }
+    })();
+    
+    // Search chats function
+    window.filterChats = function(query) {
+        const list = document.getElementById('conversationsList');
+        if (!list) return;
+        const items = list.querySelectorAll('.conversation-item');
+        const lowerQuery = query.toLowerCase();
+        
+        items.forEach(item => {
+            const name = item.querySelector('.name')?.textContent?.toLowerCase() || '';
+            const meta = item.querySelector('.meta')?.textContent?.toLowerCase() || '';
+            if (name.includes(lowerQuery) || meta.includes(lowerQuery)) {
+                item.style.display = '';
+            } else {
+                item.style.display = 'none';
+            }
+        });
+    };
+    
+    // Pinned message bar functions
+    window.updatePinnedMessageBar = function(chatAddress) {
+        const bar = document.getElementById('pinnedMessagesBar');
+        const preview = document.getElementById('pinnedMessagePreview');
+        if (!bar || !preview) return;
+        
+        const storageKey = `pinned_${chatAddress}`;
+        const pinnedData = localStorage.getItem(storageKey);
+        
+        if (pinnedData) {
+            const data = JSON.parse(pinnedData);
+            preview.textContent = data.content;
+            bar.classList.add('active');
+            
+            // Scroll to pinned message on click
+            preview.onclick = () => {
+                const msgEl = document.getElementById('msg-' + data.messageId);
+                if (msgEl) {
+                    msgEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    msgEl.classList.add('pinned-highlight');
+                    setTimeout(() => msgEl.classList.remove('pinned-highlight'), 2000);
+                }
+            };
+        } else {
+            bar.classList.remove('active');
+        }
+    };
+    
+    window.unpinMessage = function(chatAddress) {
+        const storageKey = `pinned_${chatAddress}`;
+        localStorage.removeItem(storageKey);
+        window.updatePinnedMessageBar(chatAddress);
+    };
 })();

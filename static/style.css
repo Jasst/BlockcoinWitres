@@ -549,10 +549,130 @@ textarea:focus:not(:focus-visible) {
   padding: 16px;
   border-bottom: 1px solid var(--border-color);
   flex-shrink: 0;
+  gap: 12px;
 }
 .conversations-header h3 {
   font-size: 18px;
   font-weight: 600;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ===== Search Box in Conversations ===== */
+.search-container {
+  position: relative;
+  flex: 1;
+  max-width: 280px;
+  min-width: 150px;
+}
+.search-input {
+  width: 100%;
+  padding: 8px 12px 8px 36px;
+  font-size: 14px;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  transition: all var(--transition-fast);
+  outline: none;
+}
+.search-input::placeholder { color: var(--text-muted); }
+.search-input:focus {
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.search-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+/* ===== Theme Toggle Button ===== */
+.theme-toggle-btn {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.theme-toggle-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  transform: rotate(15deg);
+}
+.theme-toggle-btn svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+}
+
+/* ===== Pinned Messages ===== */
+.pinned-messages-bar {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 13px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.pinned-messages-bar.active {
+  display: flex;
+}
+.pinned-message-preview {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  opacity: 0.9;
+}
+.pinned-message-preview:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+.pinned-close-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--transition-fast);
+}
+.pinned-close-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* ===== Highlight for Pinned Message ===== */
+.message.pinned {
+  border-left: 3px solid var(--accent-color);
+  background: linear-gradient(90deg, var(--accent-soft), transparent);
+}
+.message.pinned-highlight {
+  animation: newMessageHighlight 2s ease-out;
 }
 .header-actions {
   display: flex;
@@ -749,6 +869,250 @@ textarea:focus:not(:focus-visible) {
 }
 .delete-btn:active { transform: scale(0.85); }
 .delete-btn img { pointer-events: none; }
+
+/* ===== Контекстное меню сообщений ===== */
+.message-context-menu {
+  position: absolute;
+  background: var(--bg-secondary);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  padding: 6px;
+  min-width: 180px;
+  box-shadow: var(--shadow-lg);
+  z-index: 1000;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.message-context-menu.active {
+  display: flex;
+}
+
+.message-context-menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 8px;
+  transition: background var(--transition-fast);
+  text-align: left;
+}
+
+.message-context-menu button:hover {
+  background: var(--bg-hover);
+}
+
+.message-context-menu button.danger {
+  color: var(--danger-color);
+}
+
+.message-context-menu button.danger:hover {
+  background: rgba(214, 48, 49, 0.15);
+}
+
+.message-context-menu .separator {
+  height: 1px;
+  background: var(--glass-border);
+  margin: 4px 0;
+}
+
+/* ===== Кнопки действий в сообщении ===== */
+.message-actions {
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+  position: absolute;
+  top: -10px;
+  right: 10px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--glass-border);
+  border-radius: 20px;
+  padding: 4px;
+  box-shadow: var(--shadow-md);
+}
+
+.message:hover .message-actions,
+.message-message:hover .message-actions {
+  opacity: 1;
+}
+
+.message-action-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--transition-fast);
+}
+
+.message-action-btn:hover {
+  background: var(--accent-color);
+  color: white;
+  transform: scale(1.1);
+}
+
+.message-action-btn.copy-btn:hover {
+  background: var(--success-color);
+}
+
+.message-action-btn.reply-btn:hover {
+  background: var(--accent-color);
+}
+
+/* ===== Индикатор набора текста ===== */
+.typing-indicator {
+  display: flex;
+  gap: 4px;
+  padding: 8px 0;
+}
+
+.typing-indicator span {
+  width: 8px;
+  height: 8px;
+  background: var(--text-muted);
+  border-radius: 50%;
+  animation: typing 1.4s infinite;
+}
+
+.typing-indicator span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.typing-indicator span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes typing {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+.typing-status {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 4px 16px;
+  font-style: italic;
+}
+
+/* ===== Цитата в ответе ===== */
+.reply-preview {
+  background: var(--bg-tertiary);
+  border-left: 3px solid var(--accent-color);
+  padding: 8px 12px;
+  margin: 0 16px 8px 16px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.reply-preview-text {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reply-preview-close {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.reply-preview-close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* ===== Блок реакций ===== */
+.message-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--glass-border);
+}
+
+.reaction-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.reaction-badge:hover {
+  background: var(--bg-hover);
+  transform: scale(1.05);
+}
+
+.reaction-badge-count {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+/* ===== Улучшенный hover для сообщений ===== */
+.message {
+  position: relative;
+}
+
+.message:hover {
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 8px;
+}
+
+.message.sent:hover .content {
+  box-shadow: 0 4px 16px rgba(108, 92, 231, 0.35);
+}
+
+/* Анимация появления */
+@keyframes messageSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.message.animate-fade {
+  animation: messageSlideIn var(--transition-normal) ease-out;
+}
 
 /* ===== Date divider ===== */
 .date-divider {
