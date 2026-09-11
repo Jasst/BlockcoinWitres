@@ -1,3 +1,13 @@
 (static/js/actions.js) is a source file, and there are no build artifacts, dependencies, or temporary files in the changes. Therefore, no .gitignore rules are needed.
 
 Output: (empty)
+.env
+/__pycache__
+/GCN/__pycache__
+/routes/__pycache__
+/services/__pycache__
+/ai_memory_v3
+Activating
+app.pid
+messenger.log
+Stopping
