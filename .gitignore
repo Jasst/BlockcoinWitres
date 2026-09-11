@@ -62,3 +62,7 @@ htmlcov/
 *.tar.zst
 ```
 /ai_memory_v3
+/__pycache__
+/GCN/__pycache__
+/routes/__pycache__
+/services/__pycache__
