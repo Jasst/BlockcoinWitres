@@ -1,28 +1,4 @@
 services:
-  backend:
-    build: .
-    container_name: dark-backend
-    env_file:
-      - .env
-    environment:
-      - DATABASE_URL=postgresql://postgres:zXCV123zXCV@db:5432/bichat_db
-      - FLASK_ENV=production
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./uploads:/app/uploads
-      - ./logs:/app/logs
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-
   nginx:
     image: nginx:stable-alpine
     container_name: dark-nginx
@@ -36,7 +12,10 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - backend
+      db:
+        condition: service_healthy
+      coturn:
+        condition: service_started
     restart: unless-stopped
 
   coturn:
