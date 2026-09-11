@@ -70,3 +70,12 @@ htmlcov/
 *.tar.xz
 *.tar.zst
 ```
+/uploads
+*.pid
+Checking
+/ai_memory_v3
+Activating
+/generated_images
+*.0
+Stopping
+/.continue
