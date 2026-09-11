@@ -80,6 +80,33 @@
   --font-size-base: 16px;
 }
 
+/* Light theme overrides */
+body.light-theme {
+  --bg-primary: #f5f6fa;
+  --bg-secondary: #e8eaf0;
+  --bg-tertiary: #d9dbe6;
+  --bg-hover: rgba(200, 205, 220, 0.6);
+  --bg-active: #cdd2e0;
+  --bg-surface: #ffffff;
+  
+  --glass-bg: rgba(255, 255, 255, 0.75);
+  --glass-bg-light: rgba(245, 246, 250, 0.55);
+  --glass-border: rgba(0, 0, 0, 0.08);
+  --glass-border-light: rgba(0, 0, 0, 0.12);
+  
+  --text-main: #1e1e2e;
+  --text-primary: var(--text-main);
+  --text-secondary: #4a4a5a;
+  --text-muted: #6a6a7a;
+  
+  --border-color: rgba(200, 200, 215, 0.8);
+  
+  --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.08);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.12);
+  --shadow-xl: 0 12px 48px rgba(0, 0, 0, 0.15);
+}
+
 /* ===== Base Reset ===== */
 
 /* ===== Page Transitions ===== */
@@ -867,6 +894,14 @@ textarea:focus:not(:focus-visible) {
   fill: none;
   stroke: currentColor;
   stroke-width: 2;
+}
+.theme-toggle-btn .sun-icon,
+.theme-toggle-btn .moon-icon {
+  position: absolute;
+}
+.theme-toggle-btn .sun-icon.hidden,
+.theme-toggle-btn .moon-icon.hidden {
+  display: none;
 }
 
 /* ===== Pinned Messages ===== */
