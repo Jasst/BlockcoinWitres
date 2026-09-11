@@ -453,5 +453,6 @@
   "pinned_message": "Закреплённое сообщение",
   "light_theme": "Светлая тема",
   "dark_theme": "Тёмная тема",
-  "theme_toggle": "Переключить тему"
+  "theme_toggle": "Переключить тему",
+  "login": "Войти"
 }
