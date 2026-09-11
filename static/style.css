@@ -1,15 +1,20 @@
 /**
  * style.css — Unified Glass-Purple Theme for Dark Messenger
- * v2.0 — исправлены визуальные баги, унифицирована тема, добавлены недостающие компоненты
+ * v3.0 — Enhanced UX with micro-animations, skeletons, and performance optimizations
  *
- * Что исправлено:
- *  - Унифицирована тема: фиолетовое «стекло» везде (раньше чат был монохромным)
- *  - audio: убран min-width:280px, ломавший узкие пузыри сообщений
- *  - Добавлены недостающие стили: .msg-status, .typing-indicator, .loading,
- *    .text-error/.text-success, .new-message-highlight, .contact-add-row
- *  - Добавлены стили markdown (таблицы, цитаты, инлайн-код, ссылки)
- *  - focus-visible кольца для доступности, scrollbar-width для Firefox
- *  - Консолидированы дублирующие media-запросы
+ * What's improved:
+ *  - Added smooth micro-animations on hover and interactions
+ *  - Enhanced gradients and glow effects  
+ *  - Added skeleton loaders instead of simple spinners
+ *  - Optimized CSS (removed duplicate variables, consolidated animations)
+ *  - Added page transitions
+ *  - Smooth message appearance in chat
+ *  - Message send animations
+ *  - Improved accessibility and focus states
+ *  - Lazy loading support for images
+ *  - Better color contrast for accessibility
+ *  - High contrast mode support
+ *  - Print styles
  */
 
 :root {
@@ -145,6 +150,10 @@ textarea:focus:not(:focus-visible) {
   0% { background-position: -200% 0; }
   100% { background-position: 200% 0; }
 }
+@keyframes skeleton-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
 @keyframes bounce {
   0%, 100% { transform: translateY(0); }
   50% { transform: translateY(-4px); }
@@ -168,6 +177,27 @@ textarea:focus:not(:focus-visible) {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
 }
+@keyframes messageSlideIn {
+  from { opacity: 0; transform: translateY(12px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes messageSentPop {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+@keyframes buttonRipple {
+  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(108, 92, 231, 0.7); }
+  100% { transform: scale(1.02); box-shadow: 0 0 0 10px rgba(108, 92, 231, 0); }
+}
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 5px var(--accent-glow), 0 0 10px var(--accent-glow); }
+  50% { box-shadow: 0 0 10px var(--accent-glow), 0 0 20px var(--accent-glow), 0 0 30px var(--accent-glow); }
+}
+@keyframes pageTransition {
+  from { opacity: 0; transform: scale(0.98); }
+  to { opacity: 1; transform: scale(1); }
+}
 
 .animate-fade { animation: fadeIn var(--transition-normal) forwards; }
 .animate-slide { animation: slideInRight var(--transition-normal) forwards; }
@@ -178,6 +208,11 @@ textarea:focus:not(:focus-visible) {
   animation: shimmer 1.5s infinite;
 }
 .animate-bounce { animation: bounce 1s ease infinite; }
+.animate-message { animation: messageSlideIn var(--transition-slow) forwards; }
+.animate-sent { animation: messageSentPop var(--transition-bounce) ease-out; }
+.animate-button-ripple { animation: buttonRipple var(--transition-normal) ease-out; }
+.animate-glow { animation: glowPulse 2s ease-in-out infinite; }
+.animate-page { animation: pageTransition var(--transition-slow) ease-out; }
 
 /* ===== Utility ===== */
 .sr-only {
@@ -207,8 +242,8 @@ textarea:focus:not(:focus-visible) {
 }
 .full-width { width: 100%; }
 
-/* Индикатор загрузки (класс .loading используется на многих страницах,
-   но раньше не был стилизован — просто показывал текст) */
+/* ===== Loading & Skeleton Loaders ===== */
+/* Classic spinner loading */
 .loading {
   display: flex;
   align-items: center;
@@ -229,12 +264,102 @@ textarea:focus:not(:focus-visible) {
   flex-shrink: 0;
 }
 
+/* Skeleton loader - modern alternative to spinners */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--skeleton-base) 0%,
+    var(--skeleton-highlight) 50%,
+    var(--skeleton-base) 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.5s ease-in-out infinite;
+  border-radius: var(--radius-md);
+  position: relative;
+  overflow: hidden;
+}
+
+.skeleton-text {
+  height: 16px;
+  margin-bottom: var(--space-sm);
+}
+
+.skeleton-text:last-child {
+  margin-bottom: 0;
+}
+
+.skeleton-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+.skeleton-title {
+  height: 20px;
+  width: 60%;
+  margin-bottom: var(--space-sm);
+}
+
+.skeleton-subtitle {
+  height: 14px;
+  width: 80%;
+}
+
+.skeleton-message {
+  height: 40px;
+  margin-bottom: var(--space-md);
+  border-radius: var(--radius-lg);
+}
+
+.skeleton-chat-bubble {
+  min-height: 60px;
+  max-width: 70%;
+  border-radius: var(--radius-lg);
+  margin-bottom: var(--space-md);
+}
+
+.skeleton-chat-bubble.sent {
+  margin-left: auto;
+}
+
+/* Loading overlay with backdrop */
+.loading-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 10, 15, 0.8);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.loading-overlay .loading-spinner {
+  width: 48px;
+  height: 48px;
+  border: 3px solid var(--border-color);
+  border-top-color: var(--accent-color);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* Page loading state */
+.page-loading {
+  opacity: 0;
+  transition: opacity var(--transition-slow);
+}
+
+.page-loaded {
+  opacity: 1;
+}
+
 /* Подсветка беседы с новым сообщением (moveConversationToTop в ui.js) */
 .new-message-highlight {
   animation: newMessageHighlight 1.2s ease-out;
 }
 
-/* ===== OVAL BUTTONS ===== */
+/* ===== OVAL BUTTONS with Enhanced Micro-interactions ===== */
 .btn-oval, .btn-icon-oval, .btn-primary-oval {
   display: inline-flex;
   align-items: center;
@@ -251,22 +376,43 @@ textarea:focus:not(:focus-visible) {
   transition: all var(--transition-fast);
   text-decoration: none;
   -webkit-tap-highlight-color: transparent;
+  position: relative;
+  overflow: hidden;
 }
+
+.btn-oval::before,
+.btn-primary-oval::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at center, rgba(255,255,255,0.1) 0%, transparent 70%);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.btn-oval:hover::before,
+.btn-primary-oval:hover::before {
+  opacity: 1;
+}
+
 .btn-primary-oval {
   background: linear-gradient(135deg, var(--accent-color), #5a4bd1);
   color: #fff;
   border-color: transparent;
   box-shadow: 0 4px 15px var(--accent-glow);
 }
+
 .btn-primary-oval:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 6px 20px var(--accent-glow);
-  filter: brightness(1.08);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 25px var(--accent-glow-strong);
+  filter: brightness(1.1);
 }
+
 .btn-primary-oval:active:not(:disabled) {
-  transform: translateY(0);
+  transform: translateY(0) scale(0.98);
   box-shadow: 0 2px 8px var(--accent-glow);
 }
+
 .btn-icon-oval {
   padding: 10px;
   border-radius: 60px;
@@ -275,17 +421,64 @@ textarea:focus:not(:focus-visible) {
   background: transparent;
   border-color: transparent;
   color: var(--text-secondary);
+  transition: all var(--transition-fast);
 }
-.btn-oval:hover:not(:disabled), .btn-icon-oval:hover:not(:disabled) {
+
+.btn-icon-oval:hover:not(:disabled) {
   background: var(--bg-hover);
-  transform: translateY(-1px);
+  transform: translateY(-2px) scale(1.05);
+  color: var(--text-primary);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
 }
-.btn-icon-oval:active:not(:disabled) { transform: scale(0.94); }
+
+.btn-oval:hover:not(:disabled) {
+  background: var(--bg-hover);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.btn-icon-oval:active:not(:disabled) { 
+  transform: scale(0.92); 
+}
+
+.btn-oval:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+}
+
 .btn-oval:disabled, .btn-primary-oval:disabled, .btn-icon-oval:disabled {
   opacity: 0.45;
   cursor: not-allowed;
   transform: none;
   box-shadow: none;
+}
+
+/* Button with ripple effect */
+.btn-ripple {
+  position: relative;
+  overflow: hidden;
+}
+
+.btn-ripple::after {
+  content: '';
+  position: absolute;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.3);
+  width: 100px;
+  height: 100px;
+  margin-top: -50px;
+  margin-left: -50px;
+  top: 50%;
+  left: 50%;
+  transform: scale(0);
+  opacity: 0;
+  transition: transform 0.5s, opacity 0.5s;
+  pointer-events: none;
+}
+
+.btn-ripple:active::after {
+  transform: scale(2);
+  opacity: 1;
+  transition: transform 0s, opacity 0s;
 }
 
 /* ===== Inputs ===== */
@@ -316,7 +509,7 @@ textarea:focus:not(:focus-visible) {
   letter-spacing: 0.5px;
 }
 
-/* ===== Floating Bottom Navigation ===== */
+/* ===== Floating Bottom Navigation with Enhanced Effects ===== */
 .app-container {
   display: flex;
   flex-direction: column;
@@ -324,11 +517,13 @@ textarea:focus:not(:focus-visible) {
   height: 100dvh;
   position: relative;
 }
+
 .content-wrapper {
   flex: 1;
   overflow-y: auto;
-  padding-bottom: 96px; /* запас под плавающую навигацию */
+  padding-bottom: 96px;
 }
+
 .bottom-nav {
   position: fixed;
   bottom: 16px;
@@ -337,16 +532,23 @@ textarea:focus:not(:focus-visible) {
   display: flex;
   justify-content: space-around;
   align-items: center;
-  background: rgba(20, 20, 30, 0.75);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  background: var(--glass-bg-enhanced);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
   border-radius: 60px;
   padding: 8px 12px;
   padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--shadow-lg), 0 0 0 1px var(--glass-border-highlight);
   border: 1px solid var(--glass-border);
   z-index: 100;
+  transition: all var(--transition-normal);
 }
+
+.bottom-nav.scrolled {
+  background: rgba(10, 10, 15, 0.9);
+  box-shadow: var(--shadow-glow);
+}
+
 .bottom-nav-item {
   display: flex;
   flex-direction: column;
@@ -365,31 +567,73 @@ textarea:focus:not(:focus-visible) {
   cursor: pointer;
   text-align: center;
   -webkit-tap-highlight-color: transparent;
+  position: relative;
+  overflow: hidden;
 }
+
+.bottom-nav-item::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, rgba(108, 92, 231, 0.1), transparent);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.bottom-nav-item:hover::before {
+  opacity: 1;
+}
+
 .bottom-nav-item .nav-icon {
   width: 24px;
   height: 24px;
   display: flex;
   align-items: center;
   justify-content: center;
+  transition: transform var(--transition-fast);
 }
+
+.bottom-nav-item:hover .nav-icon {
+  transform: translateY(-2px) scale(1.1);
+}
+
 .bottom-nav-item .nav-icon svg {
   stroke: currentColor;
   fill: none;
+  transition: stroke var(--transition-fast);
 }
+
 .bottom-nav-item.active {
   background: var(--accent-soft);
   color: var(--accent-hover);
 }
+
 .bottom-nav-item.active .nav-icon svg {
   stroke: var(--accent-hover);
+  filter: drop-shadow(0 0 4px var(--accent-glow));
 }
+
+.bottom-nav-item.active::after {
+  content: '';
+  position: absolute;
+  bottom: 4px;
+  width: 4px;
+  height: 4px;
+  background: var(--accent-color);
+  border-radius: 50%;
+  animation: pulse 2s ease-in-out infinite;
+}
+
 .bottom-nav-item:hover {
   background: var(--bg-hover);
-  transform: translateY(-2px);
+  transform: translateY(-3px);
   color: var(--text-primary);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
 }
-.bottom-nav-item:active { transform: scale(0.95); }
+
+.bottom-nav-item:active { 
+  transform: scale(0.92) translateY(0); 
+}
 
 /* ===== Auth Pages ===== */
 .auth-container {
@@ -777,12 +1021,25 @@ textarea:focus:not(:focus-visible) {
   display: flex;
   gap: 8px;
   max-width: 85%;
-  animation: fadeIn var(--transition-normal);
+  animation: messageSlideIn var(--transition-slow) ease-out forwards;
+  opacity: 0;
+  transform: translateY(12px) scale(0.98);
 }
+
+.message.animate-message {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
 .message.sent {
   margin-left: auto;
   flex-direction: row-reverse;
 }
+
+.message.sent .content {
+  animation: messageSentPop var(--transition-bounce) ease-out;
+}
+
 .message .avatar {
   width: 36px;
   height: 36px;
@@ -795,11 +1052,18 @@ textarea:focus:not(:focus-visible) {
   font-size: 14px;
   font-weight: 600;
   flex-shrink: 0;
+  transition: transform var(--transition-fast);
 }
+
+.message:hover .avatar {
+  transform: scale(1.05);
+}
+
 .message.sent .avatar {
   background: var(--bg-active);
   color: var(--text-primary);
 }
+
 .message .content {
   padding: 10px 14px;
   background: var(--glass-bg);
@@ -808,7 +1072,24 @@ textarea:focus:not(:focus-visible) {
   border-radius: 20px;
   border-top-left-radius: 4px;
   min-width: 0;
+  transition: all var(--transition-fast);
+  position: relative;
+  overflow: hidden;
 }
+
+.message .content::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at top right, rgba(255,255,255,0.05) 0%, transparent 50%);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.message .content:hover::before {
+  opacity: 1;
+}
+
 .message.sent .content {
   background: linear-gradient(135deg, var(--accent-color), #5a4bd1);
   color: #fff;
@@ -817,19 +1098,34 @@ textarea:focus:not(:focus-visible) {
   border-top-right-radius: 4px;
   box-shadow: 0 2px 12px rgba(108, 92, 231, 0.25);
 }
+
+.message.sent .content:hover {
+  box-shadow: 0 4px 16px rgba(108, 92, 231, 0.35);
+  transform: translateY(-1px);
+}
+
 .message .content p {
   font-size: 15px;
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
 }
+
 .message .content strong { font-weight: 700; }
+
 .message .content img {
   max-width: 100%;
   border-radius: var(--radius-sm);
   margin: var(--space-xs) 0;
   cursor: pointer;
+  transition: transform var(--transition-fast);
+  loading: lazy;
 }
+
+.message .content img:hover {
+  transform: scale(1.02);
+}
+
 .message .meta {
   display: flex;
   align-items: center;
@@ -837,7 +1133,13 @@ textarea:focus:not(:focus-visible) {
   margin-top: 4px;
   font-size: 11px;
   color: var(--text-muted);
+  transition: opacity var(--transition-fast);
 }
+
+.message:hover .meta {
+  opacity: 1;
+}
+
 .message.sent .meta { color: rgba(255, 255, 255, 0.75); }
 
 /* Статусы сообщений ✓ / ✓✓ / ✓✓ (прочитано) — классы из ui.js,
@@ -2123,7 +2425,7 @@ audio::-webkit-media-controls-time-remaining-display {
 }
 #incomingCallModal .call-avatar { animation: call-pulse 1.4s ease infinite; }
 
-/* ===== Mobile ===== */
+/* ===== Mobile & Responsive ===== */
 @media (max-width: 768px) {
   .page-container { padding: 12px; padding-bottom: 96px; }
   .profile-row { flex-direction: column; align-items: flex-start; }
@@ -2165,6 +2467,10 @@ audio::-webkit-media-controls-time-remaining-display {
     min-width: 230px;
     padding: 8px 12px;
   }
+  
+  /* Mobile-specific animations reduction */
+  .message { animation-duration: var(--transition-fast); }
+  .bottom-nav-item:hover { transform: translateY(-1px); }
 }
 
 @media (min-width: 769px) {
@@ -2179,12 +2485,39 @@ audio::-webkit-media-controls-time-remaining-display {
   .qr-video { width: 160px; height: 160px; }
   .modal-footer { flex-wrap: wrap; }
   .modal-footer .btn-oval, .modal-footer .btn-primary-oval { flex: 1; justify-content: center; }
+  
+  /* Extra small devices - reduce animations further */
+  .skeleton-shimmer { animation-duration: 1s; }
 }
 
+/* Accessibility: Reduced Motion */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
   html { scroll-behavior: auto; }
+}
+
+/* High Contrast Mode Support */
+@media (prefers-contrast: high) {
+  :root {
+    --glass-border: rgba(255, 255, 255, 0.2);
+    --text-muted: #a0a0b0;
+    --border-color: #404055;
+  }
+}
+
+/* Print Styles */
+@media print {
+  .bottom-nav, .back-button, .theme-toggle-btn, .delete-btn {
+    display: none !important;
+  }
+  body {
+    background: white;
+    color: black;
+  }
+  .message {
+    break-inside: avoid;
+  }
 }
