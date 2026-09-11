@@ -1,1 +1,11 @@
 (static/js/skeleton-loader.js)
+/__pycache__
+.env
+/ai_memory_v3
+Activating
+*.pid
+/GCN/__pycache__
+/routes/__pycache__
+/services/__pycache__
+Stopping
+messenger.log
