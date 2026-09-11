@@ -2507,7 +2507,62 @@ audio::-webkit-media-controls-time-remaining-display {
      (раньше оставалась пустая полоса 80px снизу) */
   body.chat-open .chat-layout { height: 100vh; height: 100dvh; max-height: none; }
 
-  .back-button { display: block; }
+  .back-button { 
+    display: flex !important;
+    align-items: center;
+    justify-content: center;
+  }
+  
+  /* Улучшаем header для мобильных */
+  .conversations-header {
+    padding: 12px;
+    flex-wrap: wrap;
+  }
+  
+  .search-container {
+    order: 3;
+    max-width: 100%;
+    min-width: 100%;
+    margin-top: 8px;
+  }
+  
+  .header-actions {
+    display: flex;
+    gap: 8px;
+  }
+  
+  .btn-icon-oval {
+    width: 40px;
+    height: 40px;
+    padding: 8px;
+  }
+  
+  .btn-icon-oval img {
+    width: 20px;
+    height: 20px;
+  }
+  
+  .chat-panel-header {
+    padding: 10px 12px;
+  }
+  
+  /* Контекстное меню на мобильных - внизу экрана */
+  .message-context-menu {
+    position: fixed;
+    left: 50% !important;
+    top: auto !important;
+    bottom: 20px;
+    transform: translateX(-50%);
+    min-width: 280px;
+    max-width: calc(100vw - 40px);
+    box-shadow: 0 -4px 20px rgba(0,0,0,0.5);
+  }
+  
+  /* Скрываем hover кнопки действий на мобильных */
+  .message-actions {
+    display: none;
+  }
+  
   .input-area { bottom: 12px; left: 12px; right: 12px; }
   .messages { padding-bottom: 120px; }
   #aiChatContainer .input-area { bottom: 12px; left: 12px; right: 12px; }
