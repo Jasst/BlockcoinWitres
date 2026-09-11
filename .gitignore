@@ -1,16 +1,6 @@
-```gitignore
-# Compiled and binary files
-*.pyc
-__pycache__/
-*.class
-*.o
-*.exe
-*.dll
-*.so
-*.a
-*.obj
-*.out
+# Examples 1:
 
+# Example 2 (Project with artifacts):
 # Dependencies
 node_modules/
 venv/
