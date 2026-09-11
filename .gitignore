@@ -50,3 +50,15 @@ Expected Output:
     .idea/
     #Original rules preserved
     *.log
+# Examples 1:
+# Project with artifacts:
+# Final reminder: Output ONLY the .gitignore content. If nothing should be ignored, output NOTHING.
+/__pycache__
+/ai_memory_v3
+
+.env
+/.idea
+/GCN/__pycache__
+/routes/__pycache__
+/services/__pycache__
+messenger.log
