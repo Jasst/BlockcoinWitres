@@ -248,41 +248,117 @@
 
   /* Сообщения */
   .message {
+    display: flex;
+    gap: 8px;
     max-width: 70%;
-    padding: 10px 16px;
-    border-radius: 18px;
-    background: rgba(255, 255, 255, 0.06);
-    color: var(--text-main);
-    word-break: break-word;
     animation: fadeIn 0.3s ease;
-    border: 1px solid var(--glass-border);
   }
-
+  
   .message.sent {
     align-self: flex-end;
-    background: var(--accent-color);
-    color: white;
+    flex-direction: row-reverse;
+  }
+  
+  .message .avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent-color), #5a4bd1);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  
+  .message.sent .avatar {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-main);
+  }
+  
+  .message .content {
+    padding: 10px 14px;
+    border-radius: 20px;
+    border-top-left-radius: 4px;
+    background: rgba(255, 255, 255, 0.06);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--glass-border);
+    color: var(--text-main);
+    min-width: 0;
+  }
+  
+  .message.sent .content {
+    background: linear-gradient(135deg, var(--accent-color), #5a4bd1);
+    color: #fff;
     border: none;
+    border-top-right-radius: 4px;
+    box-shadow: 0 2px 12px rgba(108, 92, 231, 0.25);
   }
-
-  .message .time {
-    font-size: 10px;
-    color: var(--text-muted);
+  
+  .message .content p {
+    font-size: 15px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0;
+  }
+  
+  .message .content img {
+    max-width: 100%;
+    border-radius: 8px;
+    margin: 4px 0;
+    cursor: pointer;
+  }
+  
+  .message .meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     margin-top: 4px;
-    text-align: right;
+    font-size: 11px;
+    color: var(--text-muted);
   }
-
+  
+  .message.sent .meta {
+    color: rgba(255, 255, 255, 0.75);
+  }
+  
+  .message .time {
+    font-size: 11px;
+  }
+  
   .message.sent .time {
     color: rgba(255, 255, 255, 0.7);
   }
-
+  
+  .delete-btn {
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    padding: 0;
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+  
+  .message:hover .delete-btn {
+    opacity: 1;
+  }
+  
+  .msg-status {
+    font-size: 11px;
+    letter-spacing: -1px;
+    line-height: 1;
+  }
+  
   .message .image-attachment {
     max-width: 200px;
     border-radius: 12px;
     cursor: pointer;
     margin-bottom: 6px;
   }
-
   /* Пустое состояние */
   .empty-state {
     text-align: center;
@@ -634,6 +710,38 @@
   }
 </style>
 
+  /* Light theme message styles */
+  body.light-theme .message .content {
+    background: rgba(255, 255, 255, 0.7);
+    border: 1px solid rgba(108, 92, 231, 0.1);
+    color: #2d3436;
+  }
+  
+  body.light-theme .message.sent .content {
+    background: linear-gradient(135deg, #7c6ef5, #6c5ce7);
+    box-shadow: 0 2px 12px rgba(108, 92, 231, 0.2);
+  }
+  
+  body.light-theme .message .meta {
+    color: rgba(45, 52, 54, 0.6);
+  }
+  
+  body.light-theme .messages {
+    background: rgba(255, 255, 255, 0.3);
+  }
+  
+  body.light-theme .chat-panel {
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(108, 92, 231, 0.12);
+  }
+  
+  body.light-theme .conversations-panel {
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(108, 92, 231, 0.12);
+  }
+
 <div id="app" data-user-address="{{ address }}"></div>
 
 <div class="chat-layout">
@@ -941,3 +1049,35 @@
 })();
 </script>
 {% endblock %}
+  /* Light theme message styles */
+  body.light-theme .message .content {
+    background: rgba(255, 255, 255, 0.7);
+    border: 1px solid rgba(108, 92, 231, 0.1);
+    color: #2d3436;
+  }
+  
+  body.light-theme .message.sent .content {
+    background: linear-gradient(135deg, #7c6ef5, #6c5ce7);
+    box-shadow: 0 2px 12px rgba(108, 92, 231, 0.2);
+  }
+  
+  body.light-theme .message .meta {
+    color: rgba(45, 52, 54, 0.6);
+  }
+  
+  body.light-theme .messages {
+    background: rgba(255, 255, 255, 0.3);
+  }
+  
+  body.light-theme .chat-panel {
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(108, 92, 231, 0.12);
+  }
+  
+  body.light-theme .conversations-panel {
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(108, 92, 231, 0.12);
+  }
+</style>
