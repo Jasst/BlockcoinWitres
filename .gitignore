@@ -1,33 +1,48 @@
-*.zip
+```
+# Environment variables
 .env
-.env
-.env
-.env
-*.db
-*.log
-*.db-shm
-*.db-wal
-/ai_memory_v3
-*.pid
-/.continue
-/.idea
-/.idea
-/.idea
-/.idea
-*.0
-/__pycache__
-Activating
-.idea/vcs.xml
-.idea/modules.xml
-/buck
-/buck
-*.rar
-buck/BlockcoinWitresBackUp.rar
-Checking
-/routes/__pycache__
-/services/__pycache__
-Stopping
-turnserver.conf
-/uploads
+.env.local
+*.env.*
+
+# Dependencies
+venv/
+.venv/
+__pycache__/
 *.pyc
-*.png
+*.pyo
+*.pyd
+
+# Build/dist artifacts
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+
+# Docker (keep Dockerfile and docker-compose files, but ignore related artifacts)
+.dockerenv
+!Dockerfile
+!docker-compose.yml
+!docker-compose.test.yml
+```
