@@ -832,6 +832,14 @@
         }
     };
     
+    // Add event listener for theme toggle button
+    document.addEventListener('DOMContentLoaded', function() {
+        const themeBtn = document.getElementById('themeToggleBtn');
+        if (themeBtn) {
+            themeBtn.addEventListener('click', window.toggleTheme);
+        }
+    });
+    
     // Initialize theme from localStorage
     (function initTheme() {
         const savedTheme = localStorage.getItem('theme') || 'dark';
