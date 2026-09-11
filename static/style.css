@@ -511,6 +511,7 @@ textarea:focus:not(:focus-visible) {
   transform: translateY(-1px);
   box-shadow: 0 6px 20px var(--accent-glow);
   filter: brightness(1.08);
+}
 
 /* ===== Enhanced Button Micro-interactions ===== */
 .btn-primary-oval {
@@ -1093,14 +1094,17 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
   gap: 12px;
 }
 
-.message {
-
 /* ===== Enhanced Message Animations ===== */
 .message {
+  display: flex;
+  gap: 8px;
+  max-width: 85%;
   animation: messageSlideIn var(--transition-slow) cubic-bezier(0.16, 1, 0.3, 1) forwards;
   opacity: 0;
 }
 .message.sent {
+  margin-left: auto;
+  flex-direction: row-reverse;
   animation-name: messageSlideIn;
   transform-origin: right center;
 }
@@ -1124,16 +1128,6 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
 .message-context-menu button:hover {
   transform: translateX(4px);
   color: var(--accent-hover);
-}
-
-  display: flex;
-  gap: 8px;
-  max-width: 85%;
-  animation: fadeIn var(--transition-normal);
-}
-.message.sent {
-  margin-left: auto;
-  flex-direction: row-reverse;
 }
 .message .avatar {
   width: 36px;
@@ -2539,4 +2533,84 @@ audio::-webkit-media-controls-time-remaining-display {
     transition-duration: 0.01ms !important;
   }
   html { scroll-behavior: auto; }
+}
+/* ===== Light Theme Additional Overrides ===== */
+body.light-theme .message.sent .content {
+  background: linear-gradient(135deg, #7c6ef5, #6c5ce7);
+  box-shadow: 0 2px 12px rgba(108, 92, 231, 0.2);
+}
+
+body.light-theme .conversation-item:hover {
+  background: rgba(108, 92, 231, 0.06);
+}
+
+body.light-theme .conversation-item.active {
+  background: rgba(108, 92, 231, 0.1);
+  border-left-color: #6c5ce7;
+}
+
+body.light-theme .input {
+  background: rgba(255, 255, 255, 0.9);
+  border-color: rgba(108, 92, 231, 0.15);
+}
+
+body.light-theme .input:focus {
+  background: #ffffff;
+  border-color: #6c5ce7;
+  box-shadow: 0 0 0 3px rgba(108, 92, 231, 0.1);
+}
+
+body.light-theme .modal-content {
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid rgba(108, 92, 231, 0.15);
+}
+
+body.light-theme .card {
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(108, 92, 231, 0.12);
+}
+
+body.light-theme .chat-panel-header {
+  background: rgba(255, 255, 255, 0.85);
+  border-bottom: 1px solid rgba(108, 92, 231, 0.12);
+}
+
+body.light-theme .bottom-nav {
+  background: rgba(255, 255, 255, 0.9);
+  border-top: 1px solid rgba(108, 92, 231, 0.12);
+}
+
+body.light-theme .message .avatar {
+  background: linear-gradient(135deg, #7c6ef5, #6c5ce7);
+}
+
+body.light-theme .btn-oval:not(.btn-primary-oval):hover,
+body.light-theme .btn-icon-oval:hover {
+  background: rgba(108, 92, 231, 0.08);
+}
+
+body.light-theme .skeleton {
+  background: linear-gradient(
+    90deg,
+    #e8eaf0 0%,
+    #d9dbe6 50%,
+    #e8eaf0 100%
+  );
+  background-size: 200% 100%;
+}
+
+body.light-theme .glow-effect:hover {
+  box-shadow: 0 0 15px rgba(108, 92, 231, 0.25);
+}
+
+body.light-theme .accent-gradient-bg {
+  background: linear-gradient(135deg, #7c6ef5 0%, #8e7bf5 50%, #a29bfe 100%);
+}
+
+body.light-theme ::-webkit-scrollbar-thumb {
+  background: rgba(108, 92, 231, 0.3);
+}
+
+body.light-theme ::-webkit-scrollbar-thumb:hover {
+  background: rgba(108, 92, 231, 0.5);
 }
