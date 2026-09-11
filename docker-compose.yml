@@ -1,4 +1,28 @@
 services:
+  backend:
+    build: .
+    container_name: dark-backend
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://postgres:zXCV123zXCV@db:5432/bichat_db
+      - FLASK_ENV=production
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
   nginx:
     image: nginx:stable-alpine
     container_name: dark-nginx
@@ -11,6 +35,8 @@ services:
       - C:/nginx/html:/usr/share/nginx/html:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - backend
     restart: unless-stopped
 
   coturn:
@@ -28,17 +54,17 @@ services:
     restart: unless-stopped
 
   db:
-    image: postgres:17-alpine   # или 18, если нужна конкретная версия
+    image: postgres:17-alpine
     container_name: dark-postgres
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: zXCV123zXCV   # совпадает с вашим .env
+      POSTGRES_PASSWORD: zXCV123zXCV
       POSTGRES_DB: bichat_db
     ports:
-      - "5432:5432"   # пробрасываем порт, чтобы можно было подключаться с хоста (опционально)
+      - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data   # постоянное хранилище
-      - C:/backup:/docker-entrypoint-initdb.d    # монтируем папку с дампом
+      - postgres_data:/var/lib/postgresql/data
+      - C:/backup:/docker-entrypoint-initdb.d
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
