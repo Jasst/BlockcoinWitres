@@ -724,8 +724,141 @@ async def get_memory_stats(
     ctx: Context = None
 ) -> Dict[str, Any]:
     """Возвращает статистику по личной памяти."""
+    try:
+        service = await get_memory_service(_resolve_user(user_id, ctx))
+        return await service.get_memory_stats()
+    except Exception as e:
+        logger.warning(f"get_memory_stats failed for user {_resolve_user(user_id, ctx)}: {e}")
+        return {
+            "status": "error",
+            "message": f"Не удалось загрузить статистику: {e}",
+            "semantic_facts": 0,
+            "episodes": 0,
+            "graph_edges": 0,
+            "synapses": 0,
+            "goals": 0,
+            "active_goals": 0,
+            "working_memory": 0,
+            "faiss_trained": False,
+            "gcn_objects": 0,
+        }
+
+
+@mcp.tool()
+async def session_start(
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
+) -> Dict[str, Any]:
+    """Быстрая ориентация в начале сессии: статистика памяти, последние
+    эпизоды, активные цели и непрочитанные проактивные уведомления —
+    всё одним вызовом вместо четырёх последовательных.
+
+    Рекомендуется вызывать в начале каждого разговора, чтобы сразу иметь
+    контекст: что помним, над чем работаем, что нашли фоновые циклы.
+    """
+    uid = _resolve_user(user_id, ctx)
+    service = await get_memory_service(uid)
+
+    stats, episodes, goals, notifs = await asyncio.gather(
+        service.get_memory_stats(),
+        service.get_episodes(3),
+        service.get_goals(),
+        service.get_pending_notifications(mark_delivered=True),
+        return_exceptions=True,
+    )
+
+    return {
+        "user_id": uid,
+        "stats": stats if not isinstance(stats, Exception) else {},
+        "recent_episodes": episodes if not isinstance(episodes, Exception) else [],
+        "goals": goals if not isinstance(goals, Exception) else [],
+        "notifications": notifs if not isinstance(notifs, Exception) else [],
+    }
+
+
+@mcp.tool()
+async def remember_batch(
+    facts: List[str] = Field(..., description="Список фактов для запоминания (до 10 штук)"),
+    scope: Optional[str] = Field(None, description="Скоуп для всех фактов: 'private', 'shared', 'global'. Автоопределение, если не задан."),
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
+) -> Dict[str, Any]:
+    """Сохраняет несколько фактов за один вызов вместо последовательных
+    remember(). Факты сохраняются параллельно; ошибка одного не блокирует
+    остальные.
+    """
+    if not facts:
+        return {"status": "error", "message": "Список фактов пуст."}
+
     service = await get_memory_service(_resolve_user(user_id, ctx))
-    return await service.get_memory_stats()
+    batch = facts[:10]  # hard cap
+
+    results = await asyncio.gather(
+        *[service.remember(f.strip(), scope) for f in batch if f and f.strip()],
+        return_exceptions=True,
+    )
+
+    saved = [batch[i] for i, r in enumerate(results) if not isinstance(r, Exception)]
+    failed = [
+        {"fact": batch[i], "error": str(r)}
+        for i, r in enumerate(results) if isinstance(r, Exception)
+    ]
+
+    return {
+        "status": "ok" if saved else "error",
+        "saved_count": len(saved),
+        "failed_count": len(failed),
+        "saved": saved,
+        "failed": failed,
+    }
+
+
+@mcp.tool()
+async def update_fact(
+    gcn_id: str = Field(..., description="gcn_id факта, который нужно изменить (из результатов recall / semantic_search)"),
+    new_text: str = Field(..., description="Новый текст факта"),
+    reason: str = Field("", description="Причина изменения (опционально, сохраняется в провенанс)"),
+    user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+    ctx: Context = None
+) -> Dict[str, Any]:
+    """Атомарно заменяет текст существующего факта: сначала объясняет
+    происхождение старого (explain_fact), затем удаляет его и сохраняет
+    новый с тем же скоупом.
+
+    Удобнее пары forget(dry_run=False) + remember() — один вызов, скоуп
+    подхватывается автоматически.
+    """
+    service = await get_memory_service(_resolve_user(user_id, ctx))
+
+    # Получаем старый факт, чтобы знать его скоуп и текст
+    old_info = await service.explain_fact(gcn_id)
+    if old_info.get("status") == "error" or "not found" in str(old_info.get("error", "")).lower():
+        return {
+            "status": "error",
+            "message": f"Факт с gcn_id='{gcn_id}' не найден: {old_info}",
+        }
+
+    old_text = old_info.get("subject") or old_info.get("text", "")
+    old_scope = old_info.get("scope", "private")
+
+    # Удаляем старый факт по его тексту (forget ищет по ключевым словам)
+    if old_text:
+        # Берём первые 6 слов как ключ удаления — достаточно уникально
+        keyword = " ".join(old_text.split()[:6])
+        await service.forget(keyword, scope=old_scope, dry_run=False)
+
+    # Сохраняем новый факт в том же скоупе
+    save_result = await service.remember(new_text.strip(), scope=old_scope)
+
+    comment = f" Причина: {reason}" if reason else ""
+    return {
+        "status": "ok",
+        "old_text": old_text,
+        "new_text": new_text,
+        "scope": old_scope,
+        "comment": f"Факт обновлён.{comment}",
+        "save_result": save_result,
+    }
 
 # ============================================================
 # РЕСУРСЫ
