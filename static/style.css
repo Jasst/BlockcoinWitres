@@ -2540,6 +2540,44 @@ body.light-theme .message.sent .content {
   box-shadow: 0 2px 12px rgba(108, 92, 231, 0.2);
 }
 
+body.light-theme .message.received .content {
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(108, 92, 231, 0.15);
+  color: #2d3436;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+body.light-theme .message .content {
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(108, 92, 231, 0.1);
+  color: #2d3436;
+}
+
+body.light-theme .message .meta {
+  color: rgba(45, 52, 54, 0.6);
+}
+
+body.light-theme .messages {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+body.light-theme #messagesContainer {
+  background: transparent;
+}
+
+body.light-theme .conversations-panel {
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(108, 92, 231, 0.12);
+}
+
+body.light-theme .chat-panel {
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(108, 92, 231, 0.12);
+}
+
 body.light-theme .conversation-item:hover {
   background: rgba(108, 92, 231, 0.06);
 }
@@ -2605,6 +2643,19 @@ body.light-theme .glow-effect:hover {
 
 body.light-theme .accent-gradient-bg {
   background: linear-gradient(135deg, #7c6ef5 0%, #8e7bf5 50%, #a29bfe 100%);
+}
+
+body.light-theme .input-area {
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(108, 92, 231, 0.15);
+}
+
+body.light-theme .input-wrapper textarea {
+  color: #2d3436;
+}
+
+body.light-theme .input-wrapper textarea::placeholder {
+  color: rgba(45, 52, 54, 0.5);
 }
 
 body.light-theme ::-webkit-scrollbar-thumb {

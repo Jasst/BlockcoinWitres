@@ -1,4 +1,3 @@
-```gitignore
 # Compiled and build artifacts
 *.pyc
 __pycache__/
@@ -7,9 +6,9 @@ __pycache__/
 dist/
 build/
 *.class
-*.so
-*.dll
 *.exe
+*.dll
+*.so
 *.a
 *.out
 
@@ -17,13 +16,10 @@ build/
 .venv/
 venv/
 node_modules/
-target/
-.gradle/
 .mypy_cache/
 .pytest_cache/
-coverage/
-htmlcov/
-.coverage
+target/
+.gradle/
 
 # Logs and temp files
 *.log
@@ -34,7 +30,7 @@ htmlcov/
 # Environment
 .env
 .env.local
-.env.*
+*.env.*
 
 # Editors
 .vscode/
@@ -42,9 +38,14 @@ htmlcov/
 *.swp
 *.swo
 
-# System
+# System files
 .DS_Store
 Thumbs.db
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
 
 # Compressed files
 *.zip
@@ -69,5 +70,3 @@ Thumbs.db
 *.tar.bz2
 *.tar.xz
 *.tar.zst
-```
-/ai_memory_v3
