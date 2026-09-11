@@ -1440,6 +1440,14 @@ body.light-theme .message:hover {
   border-radius: 8px;
 }
 
+body.light-theme .message.sent:hover .content {
+  box-shadow: 0 4px 16px rgba(108, 92, 231, 0.25);
+}
+
+body.light-theme .message.received:hover .content {
+  box-shadow: 0 4px 16px rgba(108, 92, 231, 0.15);
+}
+
 .message:hover {
   background: rgba(255, 255, 255, 0.02);
   border-radius: 8px;
@@ -2544,13 +2552,22 @@ body.light-theme .message {
   opacity: 1 !important;
 }
 
+body.light-theme .message.sent {
+  opacity: 1 !important;
+}
+
+body.light-theme .message.received {
+  opacity: 1 !important;
+}
+
 body.light-theme .message.sent .content {
   background: linear-gradient(135deg, #7c6ef5, #6c5ce7);
   box-shadow: 0 2px 12px rgba(108, 92, 231, 0.2);
+  color: #ffffff;
 }
 
 body.light-theme .message.received .content {
-  background: rgba(255, 255, 255, 0.8);
+  background: rgba(255, 255, 255, 0.9);
   backdrop-filter: blur(8px);
   border: 1px solid rgba(108, 92, 231, 0.15);
   color: #2d3436;
@@ -2558,7 +2575,7 @@ body.light-theme .message.received .content {
 }
 
 body.light-theme .message .content {
-  background: rgba(255, 255, 255, 0.7);
+  background: rgba(255, 255, 255, 0.8);
   border: 1px solid rgba(108, 92, 231, 0.1);
   color: #2d3436;
 }
@@ -2568,7 +2585,7 @@ body.light-theme .message .meta {
 }
 
 body.light-theme .messages {
-  background: rgba(255, 255, 255, 0.3);
+  background: transparent;
 }
 
 body.light-theme #messagesContainer {
@@ -2581,10 +2598,19 @@ body.light-theme .conversations-panel {
   border: 1px solid rgba(108, 92, 231, 0.12);
 }
 
+body.light-theme .chat-layout {
+  background: transparent;
+}
+
 body.light-theme .chat-panel {
   background: rgba(255, 255, 255, 0.85);
   backdrop-filter: blur(16px);
   border: 1px solid rgba(108, 92, 231, 0.12);
+}
+
+body.light-theme .conversation-item {
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(108, 92, 231, 0.1);
 }
 
 body.light-theme .conversation-item:hover {
@@ -2593,7 +2619,11 @@ body.light-theme .conversation-item:hover {
 
 body.light-theme .conversation-item.active {
   background: rgba(108, 92, 231, 0.1);
-  border-left-color: #6c5ce7;
+  border-color: #6c5ce7;
+}
+
+body.light-theme .conversations-list {
+  background: transparent;
 }
 
 body.light-theme .input {
@@ -2620,6 +2650,13 @@ body.light-theme .card {
 body.light-theme .chat-panel-header {
   background: rgba(255, 255, 255, 0.85);
   border-bottom: 1px solid rgba(108, 92, 231, 0.12);
+  backdrop-filter: blur(12px);
+}
+
+body.light-theme .conversations-header {
+  background: rgba(255, 255, 255, 0.85);
+  border-bottom: 1px solid rgba(108, 92, 231, 0.12);
+  backdrop-filter: blur(12px);
 }
 
 body.light-theme .bottom-nav {
@@ -2629,6 +2666,11 @@ body.light-theme .bottom-nav {
 
 body.light-theme .message .avatar {
   background: linear-gradient(135deg, #7c6ef5, #6c5ce7);
+}
+
+body.light-theme .message.sent .avatar {
+  background: rgba(108, 92, 231, 0.15);
+  color: #6c5ce7;
 }
 
 body.light-theme .btn-oval:not(.btn-primary-oval):hover,
@@ -2657,6 +2699,11 @@ body.light-theme .accent-gradient-bg {
 body.light-theme .input-area {
   background: rgba(255, 255, 255, 0.9);
   border: 1px solid rgba(108, 92, 231, 0.15);
+  backdrop-filter: blur(20px);
+}
+
+body.light-theme .input-wrapper {
+  background: transparent;
 }
 
 body.light-theme .input-wrapper textarea {
