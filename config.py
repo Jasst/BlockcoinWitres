@@ -57,9 +57,10 @@ ENABLE_STAKING = os.getenv('ENABLE_STAKING', '1') == '1'
 STAKING_FEE_POOL_ADDRESS = 'staking_fee_pool'
 
 SECRET_KEY = os.getenv('SECRET_KEY')
-if not SECRET_KEY or len(SECRET_KEY) < 32:
-    SECRET_KEY = secrets.token_hex(32)
-    logging.warning("SECRET_KEY NOT FOUND in env! Sessions will reset on restart!")
+if not SECRET_KEY:
+    raise ValueError("SECRET_KEY environment variable is required! Generate with: python -c \"import secrets; print(secrets.token_hex(32))\"")
+if len(SECRET_KEY) < 32:
+    raise ValueError(f"SECRET_KEY must be at least 32 characters long, got {len(SECRET_KEY)}")
 
 MAX_CONTENT_LENGTH = CONFIG['MAX_UPLOAD_SIZE']
 MAX_SUPPLY = 21_000_000

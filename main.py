@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse
@@ -66,6 +67,15 @@ app = FastAPI(
     docs_url='/api/docs',
     redoc_url='/api/redoc',
     openapi_url='/api/openapi.json',
+)
+
+# CORS middleware - настройте allowed_origins для продакшена
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost,http://127.0.0.1').split(','),
+    allow_credentials=True,
+    allow_methods=['*'],
+    allow_headers=['*'],
 )
 
 app.add_middleware(
