@@ -453,5 +453,6 @@
   "pinned_message": "Pinned message",
   "light_theme": "Light theme",
   "dark_theme": "Dark theme",
-  "theme_toggle": "Toggle theme"
+  "theme_toggle": "Toggle theme",
+  "login": "Login"
 }
