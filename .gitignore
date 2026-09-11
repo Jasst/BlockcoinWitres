@@ -46,3 +46,12 @@ htmlcov/
 !docker-compose.yml
 !docker-compose.test.yml
 ```
+/uploads
+/ai_memory_v3
+/.continue
+4.12.0
+Activating
+app.pid
+Checking
+/generated_images
+Stopping
