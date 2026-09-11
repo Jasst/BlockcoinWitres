@@ -1,0 +1,56 @@
+{
+  "env": {
+    "QWEN_CUSTOM_API_KEY_OPENAI_HTTP_192_168_0_13_1234_V1_28AA9C462E22": "any-value"
+  },
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "qwopus3.5-9b-coder-mtp",
+        "name": "qwopus3.5-9b-coder-mtp",
+        "baseUrl": "http://192.168.0.13:1234/v1",
+        "envKey": "QWEN_CUSTOM_API_KEY_OPENAI_HTTP_192_168_0_13_1234_V1_28AA9C462E22",
+        "generationConfig": {
+          "extra_body": {
+            "enable_thinking": true
+          }
+        }
+      }
+    ]
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  },
+  "model": {
+    "name": "qwopus3.5-9b-coder-mtp",
+    "baseUrl": ""
+  },
+  "$version": 4,
+  "tools": {
+    "approvalMode": "plan"
+  },
+  "mcpServers": {
+    "blockcoin-memory": {
+      "trust": true,
+      "httpUrl": "https://blockcoin.ru/mcp/",
+      "headers": {
+        "X-User-Id": "e9a751094d1740e4c68233e16fbe8a92317cdd2e73154c5a39cd850f9e809828"
+      }
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(pip install *)",
+      "Bash(select-object *)",
+      "Bash(tasklist)",
+      "Bash(select-string *)",
+      "Bash(findstr *)",
+      "Bash(print)",
+      "Bash(\\\")",
+      "Bash(curl *)",
+      "Bash(mcp)"
+    ]
+  }
+}

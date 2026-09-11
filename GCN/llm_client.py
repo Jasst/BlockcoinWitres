@@ -1,0 +1,145 @@
+import asyncio
+import aiohttp
+import logging
+from typing import List, Dict, Optional
+from GCN.config_ai import LM_STUDIO_URL, LM_STUDIO_API_KEY, LM_STUDIO_TIMEOUT, LM_STUDIO_STREAM_TIMEOUT
+import json
+
+logger = logging.getLogger(__name__)
+
+# Переиспользуемая сессия с пулом соединений (keep-alive) к локальному LM
+# Studio вместо нового TCP-хендшейка на каждый вызов — это самый горячий
+# путь в проекте (каждое сообщение чата, каждый tool-call реранкинг,
+# verify_response). Закрывается через close_session() при остановке процесса.
+_session: Optional[aiohttp.ClientSession] = None
+_session_lock = asyncio.Lock()
+
+# Статусы, при которых имеет смысл повторить попытку (временная перегрузка/
+# рейт-лимит бэкенда), а не только 5xx.
+_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        async with _session_lock:
+            if _session is None or _session.closed:
+                _session = aiohttp.ClientSession(
+                    connector=aiohttp.TCPConnector(limit=20, keepalive_timeout=30)
+                )
+    return _session
+
+
+async def close_session() -> None:
+    """Вызывать при штатном завершении процесса, чтобы не оставлять открытый пул соединений."""
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
+
+
+async def call_llm_raw(
+    messages: List[Dict[str, str]],
+    temp: float = 0.7,
+    max_tokens: int = 2048,
+    tools: Optional[List[Dict]] = None,
+    retries: int = 3
+) -> Dict:
+    """
+    Возвращает сырой объект message от LLM целиком (не только content), чтобы
+    вызывающий код (GCN.tool_router) мог прочитать tool_calls при нативном
+    function calling — тем же механизмом, что использует внешний MCP-клиент.
+    """
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
+    payload = {
+        "model": "local-model",
+        "messages": messages,
+        "temperature": temp,
+        "max_tokens": max_tokens
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    for attempt in range(retries):
+        try:
+            session = await _get_session()
+            async with session.post(LM_STUDIO_URL, json=payload, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=LM_STUDIO_TIMEOUT)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("choices", [{}])[0].get("message", {}) or {}
+
+                error_text = await resp.text()
+                logger.error(f"LLM error {resp.status}: {error_text[:200]}")
+                # tools может быть не поддержан бэкендом (400) — пробуем без tools один раз
+                if tools and resp.status == 400 and attempt == 0:
+                    payload.pop("tools", None)
+                    payload.pop("tool_choice", None)
+                    continue
+                if resp.status in _RETRYABLE_STATUSES and attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return {}
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return {}
+    return {}
+
+
+async def call_llm(
+    messages: List[Dict[str, str]],
+    temp: float = 0.7,
+    max_tokens: int = 2048,
+    retries: int = 3
+) -> str:
+    """Универсальная функция вызова локальной LLM (LM Studio) — только текст ответа."""
+    msg = await call_llm_raw(messages, temp=temp, max_tokens=max_tokens, tools=None, retries=retries)
+    return msg.get("content", "") or ""
+
+
+async def call_llm_stream(
+    messages: List[Dict[str, str]],
+    temp: float = 0.7,
+    max_tokens: int = 2048
+):
+    """Потоковый вызов LLM (LM Studio) с теми же параметрами, что и call_llm."""
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
+    payload = {
+        "model": "local-model",
+        "messages": messages,
+        "temperature": temp,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    timeout = aiohttp.ClientTimeout(total=LM_STUDIO_STREAM_TIMEOUT)
+    try:
+        session = await _get_session()
+        async with session.post(LM_STUDIO_URL, json=payload, headers=headers, timeout=timeout) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                logger.error(f"Stream error {resp.status}: {error_text[:200]}")
+                yield "[Ошибка LLM]"
+                return
+            async for line in resp.content:
+                line = line.decode('utf-8').strip()
+                if not line or not line.startswith('data: '):
+                    continue
+                data = line[6:]
+                if data == '[DONE]':
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                content = chunk.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                if content:
+                    yield content
+    except asyncio.CancelledError:
+        logger.debug("Stream cancelled")
+        raise
+    except Exception as e:
+        logger.error(f"Stream error: {e}")
+        yield f"[Ошибка: {e}]"

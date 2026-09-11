@@ -1,0 +1,715 @@
+{% extends "base.html" %}
+
+{% block title %}Dark Messenger{% endblock %}
+
+{% block content %}
+<style>
+  /* === Единая тема из wallet.html === */
+  :root {
+    --glass-bg: rgba(20, 20, 30, 0.6);
+    --glass-border: rgba(255, 255, 255, 0.08);
+    --accent-color: #6c5ce7;
+    --accent-glow: rgba(108, 92, 231, 0.4);
+    --success-color: #00b894;
+    --danger-color: #d63031;
+    --text-main: #f5f6fa;
+    --text-muted: #a4b0be;
+    --bg-primary: #0a0a0f;
+  }
+
+  /* Анимация */
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .page-container {
+    animation: fadeInUp 0.6s ease-out;
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 0 15px;
+  }
+
+  .page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 25px;
+  }
+
+  .page-header h2 {
+    color: var(--text-main);
+    font-weight: 700;
+    font-size: 28px;
+    margin: 0;
+  }
+
+  /* Стеклянная карточка (контакты) */
+  .list-container {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    margin-bottom: 30px;
+  }
+
+  .list-item {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    padding: 20px 24px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 15px;
+  }
+
+  .list-item:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+
+  .list-item .info {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .list-item .info .name {
+    color: var(--text-main);
+    font-weight: 600;
+    font-size: 18px;
+  }
+
+  .list-item .info .address {
+    color: var(--text-muted);
+    font-size: 13px;
+    font-family: monospace;
+    cursor: pointer;
+  }
+
+  .list-item .actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  /* Кнопки — как в wallet */
+  .btn-primary-oval {
+    padding: 12px 24px;
+    border-radius: 50px;
+    border: none;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
+    color: white;
+    font-size: 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    box-shadow: 0 4px 15px var(--accent-glow);
+    white-space: nowrap;
+  }
+
+  .btn-primary-oval:hover {
+    opacity: 0.9;
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px var(--accent-glow);
+  }
+
+  .btn-primary-oval:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+  }
+
+  .btn-oval {
+    padding: 12px 24px;
+    border-radius: 50px;
+    border: none;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-main);
+    font-size: 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    border: 1px solid var(--glass-border);
+  }
+
+  .btn-oval:hover {
+    background: rgba(255, 255, 255, 0.1);
+    transform: translateY(-1px);
+  }
+
+  .btn-icon-oval {
+    padding: 8px;
+    border-radius: 50px;
+    border: none;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    font-size: 18px;
+  }
+
+  .btn-icon-oval:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-main);
+  }
+
+  .btn-icon-oval[style*="color:var(--status-error);"]:hover {
+    background: rgba(214, 48, 49, 0.2);
+    color: var(--danger-color);
+  }
+
+  .full-width {
+    width: 100%;
+    justify-content: center;
+  }
+
+  /* Поля ввода */
+  .input {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--glass-border);
+    border-radius: 50px;
+    padding: 12px 20px;
+    color: var(--text-main);
+    font-size: 14px;
+    outline: none;
+    transition: border 0.3s;
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .input:focus {
+    border-color: var(--accent-color);
+  }
+
+  .input-monospace {
+    font-family: monospace;
+  }
+
+  /* Форма добавления контакта */
+  .add-contact-form {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    padding: 24px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    margin-top: 10px;
+  }
+
+  .add-contact-form .input {
+    flex: 1;
+    min-width: 150px;
+  }
+
+  .add-contact-form .btn-primary-oval {
+    flex-shrink: 0;
+  }
+
+  .add-contact-form .form-hint {
+    width: 100%;
+    margin: 0;
+    font-size: 12px;
+  }
+
+  .text-muted {
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+
+  .form-hint {
+    margin-top: 6px;
+  }
+
+  /* Пустое состояние */
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  }
+
+  .empty-state .icon {
+    font-size: 64px;
+    margin-bottom: 20px;
+  }
+
+  .empty-state p {
+    color: var(--text-muted);
+    font-size: 18px;
+    margin-bottom: 8px;
+  }
+
+  .empty-state .text-muted {
+    font-size: 14px;
+  }
+
+  /* QR сканер */
+  .qr-scanner-container {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    padding: 24px;
+    margin-bottom: 25px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    text-align: center;
+  }
+
+  .qr-video-wrapper {
+    position: relative;
+    display: inline-block;
+    border-radius: 16px;
+    overflow: hidden;
+    background: #000;
+  }
+
+  .qr-video {
+    width: 100%;
+    max-width: 400px;
+    border-radius: 8px;
+    display: block;
+  }
+
+  .scan-result {
+    margin: 10px 0;
+    font-weight: 600;
+    color: var(--success-color);
+  }
+
+  /* Модальные окна — стеклянные */
+  .modal-overlay {
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+  }
+
+  .modal {
+    background: var(--glass-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+    color: var(--text-main);
+    max-width: 500px;
+    width: 90%;
+    margin: 20px auto;
+  }
+
+  .modal-header {
+    border-bottom: 1px solid var(--glass-border);
+    padding: 18px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .modal-header h3 {
+    margin: 0;
+    font-weight: 700;
+  }
+
+  .modal-close {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 28px;
+    cursor: pointer;
+    padding: 0 8px;
+  }
+
+  .modal-close:hover {
+    color: var(--text-main);
+  }
+
+  .modal-body {
+    padding: 24px;
+  }
+
+  .modal-footer {
+    padding: 16px 24px;
+    border-top: 1px solid var(--glass-border);
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+  }
+
+  .modal-footer .btn-oval,
+  .modal-footer .btn-primary-oval {
+    min-width: 80px;
+    justify-content: center;
+  }
+
+  /* Адаптив */
+  @media (max-width: 768px) {
+    .page-header {
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .page-header h2 {
+      font-size: 24px;
+    }
+    .list-item {
+      flex-direction: column;
+      align-items: stretch;
+    }
+    .list-item .actions {
+      justify-content: flex-start;
+    }
+    .add-contact-form {
+      flex-direction: column;
+      align-items: stretch;
+    }
+    .add-contact-form .btn-primary-oval {
+      width: 100%;
+      justify-content: center;
+    }
+    .modal {
+      width: 95%;
+      margin: 10px auto;
+    }
+  }
+</style>
+
+<div class="page-container">
+  <div class="page-header">
+    <h2 data-i18n="contacts">Contacts</h2>
+    <button class="btn-primary-oval" onclick="QRManager.openForContacts()"  >
+    <img src="/static/icons/Cam.png" width="24" height="24" alt="Scan QR" style="filter: invert(1);"> Scan QR
+</button>
+  </div>
+
+  <div id="qrScannerContainer" class="qr-scanner-container hidden">
+    <div class="qr-video-wrapper">
+        <video id="qrVideo" playsinline autoplay muted disablepictureinpicture></video>
+        <div class="qr-frame"></div>
+    </div>
+    <p class="text-muted" style="margin: 12px 0 8px;" data-i18n="scan_qr">Point camera at QR code</p>
+    <div id="scanResult" class="scan-result hidden"></div>
+    <button class="btn-oval" onclick="QRManager.closeScanner()" data-i18n="cancel">Cancel</button>
+</div>
+
+  <div class="list-container" id="contactsList">
+    <div class="loading" data-i18n="loading">Loading contacts…</div>
+  </div>
+
+  <div class="add-contact-form">
+    <input type="text" id="contactName" class="input" placeholder="Name" maxlength="50" data-i18n="name">
+    <input type="text" id="contactAddress" class="input input-monospace" placeholder="64-char address" maxlength="64" data-i18n="address">
+    <button class="btn-primary-oval" onclick="addContact()" data-i18n="add_contact">Add</button>
+    <p class="text-muted form-hint" data-i18n="form_hint">Name: 1–50 chars • Address: exactly 64 hex characters</p>
+  </div>
+</div>
+
+
+<script>
+(function() {
+  if (window._contactsScriptLoaded) return;
+  window._contactsScriptLoaded = true;
+
+  const MAX_NAME_LENGTH = 50;
+  const ADDRESS_REGEX = /^[0-9a-f]{64}$/i;
+
+  let allContacts = [];
+  let csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+
+  const $ = (id) => document.getElementById(id);
+  const escapeHtml = (str) => {
+    const div = document.createElement('div');
+    div.textContent = str ?? '';
+    return div.innerHTML;
+  };
+  const escapeAttr = (str) => String(str ?? '').replace(/'/g, "&#39;").replace(/"/g, "&quot;");
+  const isValidAddress = (addr) => ADDRESS_REGEX.test(String(addr || '').trim());
+  const isValidName = (name) => {
+    const n = String(name || '').trim();
+    return n.length >= 1 && n.length <= MAX_NAME_LENGTH && !/[\u0000-\u001F\u007F]/.test(n);
+  };
+
+  async function secureFetch(url, options = {}) {
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(csrfToken && { 'X-CSRF-Token': csrfToken }),
+      ...(options.headers || {})
+    };
+    try {
+      const res = await fetch(url, { ...options, headers, credentials: 'same-origin' });
+      if (res.status === 401) {
+        window.NotificationManager?.showToast('Session expired', 'error');
+        setTimeout(() => location.href = '/login', 1500);
+        return null;
+      }
+      return res;
+    } catch (e) {
+      console.error('Network error:', e);
+      window.NotificationManager?.showToast('Connection failed', 'error');
+      return null;
+    }
+  }
+
+  function showCustomModal(options) {
+    return new Promise((resolve) => {
+      const modalId = 'custom-modal-' + Date.now();
+      const modalHtml = `
+        <div id="${modalId}" class="modal-overlay hidden">
+          <div class="modal" style="max-width:400px;">
+            <header class="modal-header"><h3>${escapeHtml(options.title)}</h3><button class="modal-close" data-close>&times;</button></header>
+            <div class="modal-body">${options.bodyHtml || ''}</div>
+            <footer class="modal-footer">
+              ${options.buttons.map(btn => `<button class="${btn.className || 'btn-oval'}" data-action="${btn.action}">${escapeHtml(btn.label)}</button>`).join('')}
+            </footer>
+          </div>
+        </div>`;
+      document.body.insertAdjacentHTML('beforeend', modalHtml);
+      const modalEl = document.getElementById(modalId);
+      ModalManager.open(modalId, { closeOnOverlay: false, preventEscClose: false });
+      const close = (result) => { ModalManager.close(modalId); modalEl.remove(); resolve(result); };
+      modalEl.querySelector('[data-close]')?.addEventListener('click', () => close(null));
+      options.buttons.forEach(btn => {
+        const btnEl = modalEl.querySelector(`[data-action="${btn.action}"]`);
+        if (btnEl) {
+          btnEl.addEventListener('click', () => {
+            let result = btn.value;
+            if (btn.getValue) result = btn.getValue(modalEl);
+            close(result);
+          });
+        }
+      });
+    });
+  }
+
+  async function showPromptModal(title, placeholder, defaultValue = '') {
+    return await showCustomModal({
+      title: title,
+      bodyHtml: `<input type="text" id="prompt-input" class="input" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(defaultValue)}" style="width:100%;">`,
+      buttons: [
+        { label: i18next.t('cancel'), className: 'btn-oval', action: 'cancel', value: null },
+        { label: i18next.t('save'), className: 'btn-primary-oval', action: 'save', getValue: (modal) => modal.querySelector('#prompt-input').value }
+      ]
+    });
+  }
+
+  async function showConfirmModal(title, message) {
+    return await showCustomModal({
+      title: title,
+      bodyHtml: `<p>${escapeHtml(message)}</p>`,
+      buttons: [
+        { label: i18next.t('cancel'), className: 'btn-oval', action: 'cancel', value: false },
+        { label: i18next.t('delete'), className: 'btn-primary-oval', action: 'confirm', value: true }
+      ]
+    });
+  }
+
+  async function loadContacts() {
+    const container = $('contactsList');
+    if (!container) return;
+    container.innerHTML = '<div class="loading">' + i18next.t('loading') + '</div>';
+    try {
+      const res = await secureFetch('/get_contacts');
+      if (!res) throw new Error('Network error');
+      const data = await res.json();
+      if (!res.ok || !Array.isArray(data.contacts)) throw new Error(data.error || 'Invalid response');
+      allContacts = data.contacts;
+      if (allContacts.length === 0) {
+        container.innerHTML = `<div class="empty-state">
+  <div class="icon">👥</div>
+  <p data-i18n="no_contacts">No contacts</p>
+  <p class="text-muted" data-i18n="add_contact_hint">Add a contact to start chatting</p>
+</div>`;
+        return;
+      }
+      container.innerHTML = '';
+      allContacts.forEach((c, i) => {
+        const item = document.createElement('div');
+        item.className = 'list-item';
+        item.dataset.address = c.address;
+        const shortAddress = c.address.slice(0, 10) + '…' + c.address.slice(-6);
+        item.innerHTML = `
+          <div class="info">
+            <div class="name truncate">${escapeHtml(c.name)}</div>
+            <div class="address font-mono truncate" style="cursor:pointer; font-size: 12px;" title="${i18next.t('copy_address')}">${escapeHtml(shortAddress)}</div>
+          </div>
+          <div class="actions">
+            <button class="btn-icon-oval" onclick="copyAddressFromElement('${escapeAttr(c.address)}')" title="${i18next.t('copy_address')}">
+    <img src="/static/icons/Copy.png" width="20" height="20" alt="Copy" style="filter: invert(1);">
+</button>
+
+            <button class="btn-icon-oval" onclick="startChatWithContact('${escapeAttr(c.address)}', '${escapeAttr(c.name)}')" title="${i18next.t('start_chat')}">💬</button>
+           <button class="btn-icon-oval" onclick="editContact('${escapeAttr(c.address)}', '${escapeAttr(c.name)}', this)" title="${i18next.t('edit')}">
+    <img src="/static/icons/Edit.png" width="20" height="20" alt="Edit" style="filter: invert(1);">
+</button>
+            <button class="btn-icon-oval" style="color:var(--status-error);" onclick="deleteContact('${escapeAttr(c.address)}', this)" title="${i18next.t('delete')}">
+    <img src="/static/icons/Remove.png" width="20" height="20" alt="Remove" style="filter: invert(1);">
+</button>
+          </div>`;
+        container.appendChild(item);
+      });
+      document.querySelectorAll('.address').forEach(el => {
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const fullAddr = el.closest('.list-item')?.dataset.address;
+          if (fullAddr) copyAddressToClipboard(fullAddr);
+        });
+      });
+      if (window.localizePage) window.localizePage();
+    } catch (error) {
+      console.error(error);
+      container.innerHTML = '<p class="text-muted text-center">' + i18next.t('error_load') + '</p>';
+      window.NotificationManager?.showToast(i18next.t('error_load'), 'error');
+    }
+  }
+
+  function copyAddressToClipboard(text) {
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(() => {
+      window.NotificationManager?.showToast(i18next.t('copied'), 'success');
+    }).catch(() => fallbackCopy(text));
+  }
+  function fallbackCopy(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    window.NotificationManager?.showToast(i18next.t('copied'), 'success');
+  }
+  function copyAddressFromElement(addr) { copyAddressToClipboard(addr); }
+
+  function startChatWithContact(address, name) {
+    if (!isValidAddress(address)) { window.NotificationManager?.showToast(i18next.t('invalid_address'), 'error'); return; }
+    const params = new URLSearchParams({ start_with: address, name: name || '' });
+    location.href = '/chat?' + params.toString();
+  }
+
+  async function addContact() {
+    const nameInput = $('contactName');
+    const addrInput = $('contactAddress');
+    const name = nameInput?.value.trim();
+    const address = addrInput?.value.trim().toLowerCase();
+    if (!name || !address) { window.NotificationManager?.showToast(i18next.t('fill_both'), 'warning'); return false; }
+    if (!isValidName(name)) { window.NotificationManager?.showToast(i18next.t('invalid_name'), 'warning'); return false; }
+    if (!isValidAddress(address)) { window.NotificationManager?.showToast(i18next.t('invalid_address'), 'error'); return false; }
+    const exists = allContacts.some(c => c.address.toLowerCase() === address);
+    if (exists) { window.NotificationManager?.showToast(i18next.t('contact_exists'), 'warning'); startChatWithContact(address, name); return true; }
+    try {
+      const res = await secureFetch('/add_contact', { method: 'POST', body: JSON.stringify({ name, address }) });
+      if (!res) return false;
+      const data = await res.json();
+      if (res.ok) {
+        nameInput.value = '';
+        addrInput.value = '';
+        await loadContacts();
+        window.NotificationManager?.showToast(i18next.t('contact_added'), 'success');
+        return true;
+      } else {
+        window.NotificationManager?.showToast(data.error || i18next.t('error'), 'error');
+        return false;
+      }
+    } catch (error) { console.error(error); return false; }
+  }
+
+  async function editContact(address, currentName, btn) {
+    if (!isValidAddress(address)) { window.NotificationManager?.showToast(i18next.t('invalid_contact'), 'error'); return; }
+    const newName = await showPromptModal(i18next.t('edit_contact'), i18next.t('enter_new_name'), currentName);
+    if (newName === null) return;
+    const trimmed = newName.trim();
+    if (!isValidName(trimmed)) { window.NotificationManager?.showToast(i18next.t('invalid_name'), 'warning'); return; }
+    if (trimmed === currentName) return;
+    btn.disabled = true;
+    const originalText = btn.innerHTML;
+    btn.innerHTML = '⏳';
+    try {
+      const res = await secureFetch('/edit_contact', { method: 'POST', body: JSON.stringify({ address, name: trimmed }) });
+      if (!res) return;
+      const data = await res.json();
+      if (res.ok) {
+        const item = btn.closest('.list-item');
+        const nameEl = item?.querySelector('.name');
+        if (nameEl) nameEl.textContent = escapeHtml(trimmed);
+        const idx = allContacts.findIndex(c => c.address.toLowerCase() === address.toLowerCase());
+        if (idx !== -1) allContacts[idx].name = trimmed;
+        window.NotificationManager?.showToast(i18next.t('name_updated'), 'success');
+      } else {
+        window.NotificationManager?.showToast(data.error || i18next.t('error'), 'error');
+      }
+    } catch (error) { console.error(error); window.NotificationManager?.showToast(i18next.t('network_error'), 'error'); }
+    finally { btn.disabled = false; btn.innerHTML = originalText; }
+  }
+
+  async function deleteContact(address, btn) {
+    if (!isValidAddress(address)) return;
+    const confirmed = await showConfirmModal(i18next.t('delete_contact'), i18next.t('confirm_delete_contact'));
+    if (!confirmed) return;
+    btn.disabled = true;
+    btn.innerHTML = '⏳';
+    try {
+      const res = await secureFetch('/delete_contact', { method: 'POST', body: JSON.stringify({ address }) });
+      if (!res) return;
+      if (res.ok) {
+        const item = btn.closest('.list-item');
+        item?.remove();
+        allContacts = allContacts.filter(c => c.address.toLowerCase() !== address.toLowerCase());
+        window.NotificationManager?.showToast(i18next.t('contact_deleted'), 'success');
+        if (allContacts.length === 0) {
+          $('contactsList').innerHTML = `<div class="empty-state"><div class="icon">👥</div><p>${i18next.t('no_contacts')}</p><p class="text-muted">${i18next.t('add_contact_hint')}</p></div>`;
+        }
+      } else {
+        const data = await res.json();
+        window.NotificationManager?.showToast(data.error || i18next.t('delete_failed'), 'error');
+      }
+    } catch (error) { console.error(error); window.NotificationManager?.showToast(i18next.t('network_error'), 'error'); }
+    finally { btn.disabled = false; btn.innerHTML = '✕'; }
+  }
+
+  document.addEventListener('DOMContentLoaded', function() {
+    loadContacts();
+    $('contactAddress')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') addContact(); });
+    setTimeout(() => $('contactName')?.focus(), 300);
+    const params = new URLSearchParams(window.location.search);
+    const startWith = params.get('start_with');
+    const startName = params.get('name');
+    if (startWith && isValidAddress(startWith) && startName) {
+      setTimeout(() => startChatWithContact(decodeURIComponent(startWith), decodeURIComponent(startName)), 200);
+    }
+  });
+
+  window.addContact = addContact;
+  window.startChatWithContact = startChatWithContact;
+  window.loadContacts = loadContacts;
+  window.copyAddressFromElement = copyAddressFromElement;
+  window.editContact = editContact;
+  window.deleteContact = deleteContact;
+  window.showConfirmModal = showConfirmModal;
+  window.showPromptModal = showPromptModal;
+})();
+</script>
+{% endblock %}

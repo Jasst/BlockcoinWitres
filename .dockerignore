@@ -1,0 +1,53 @@
+# --- Git ---
+.git
+.gitignore
+
+# --- Python / Виртуальные окружения ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+
+# --- Данные и Базы данных (САМОЕ ВАЖНОЕ!) ---
+# Эти данные должны быть подключены через volumes, а не копироваться в образ
+data/
+*.db
+*.sqlite3
+uploads/
+backups/
+
+# --- Логи и временные файлы ---
+*.log
+logs/
+tmp/
+temp/
+.DS_Store
+Thumbs.db
+
+# --- IDE и редакторы ---
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Тесты и документация (не нужны в продакшене) ---
+tests/
+test/
+*.md
+docs/
+.env.example
+docker-compose*.yml
+Dockerfile*
+
+# --- SSL ключи (никогда не должны быть в образе) ---
+*.key
+*.pem
+ssl/
