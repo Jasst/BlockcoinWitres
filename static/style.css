@@ -1100,7 +1100,6 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
   gap: 8px;
   max-width: 85%;
   animation: messageSlideIn var(--transition-slow) cubic-bezier(0.16, 1, 0.3, 1) forwards;
-  opacity: 0;
 }
 .message.sent {
   margin-left: auto;
