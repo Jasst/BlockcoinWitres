@@ -475,6 +475,10 @@ RESEARCH_PRIORITY_SOURCE_BOOST = {
     "goal": 0.25, "goal_subtask": 0.20, "reflection": 0.15,
     "search_failure": 0.20, "contradiction": 0.15,
     "knowledge_gap": 0.10, "refresh": 0.05,
+    # Эндогенные источники из MotivationEngine
+    "curiosity_uncertainty": 0.12, "curiosity_skill_improvement": 0.10,
+    "novelty_exploration": 0.08, "gap_stalled_goal": 0.15,
+    "quality_improvement": 0.18, "quality_confidence_boost": 0.12,
 }
 # Декомпозиция активных целей на проверяемые подзадачи (один раз на цель).
 GOAL_DECOMPOSE_INTERVAL = 6 * 3600
