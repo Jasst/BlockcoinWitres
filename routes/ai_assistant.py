@@ -2995,9 +2995,15 @@ async def _evict_stale_assistants(exclude_uid: Optional[str] = None) -> None:
             logger.info(f"Ассистент {uid[:16]} выгружен из памяти (простой > {_ASSISTANT_MAX_IDLE_SECONDS}с)")
 
     while len(_assistants) > _ASSISTANT_MAX_COUNT:
-        oldest_uid, oldest_assistant = next(iter(_assistants.items()))
-        if oldest_uid == exclude_uid:
-            break
+        # LRU-эвикция: пропускаем exclude_uid и берём следующего самого старого
+        oldest_uid = None
+        for uid in _assistants:
+            if uid != exclude_uid:
+                oldest_uid = uid
+                break
+        if oldest_uid is None:
+            break  # все оставшиеся — это exclude_uid
+        oldest_assistant = _assistants[oldest_uid]
         _assistants.pop(oldest_uid, None)
         _assistant_last_used.pop(oldest_uid, None)
         try:
