@@ -1,12 +1,29 @@
-(static/style.css) is a source file, and there are no build artifacts, dependencies, or temporary files in the changes. Therefore, no .gitignore rules are needed.
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-Output: (empty)
-/__pycache__
-/ai_memory_v3
-/GCN/__pycache__
-/routes/__pycache__
-/services/__pycache__
-/.idea
-messenger.log
+# Logs
+*.log
+
+# Environment
 .env
-/uploads
+.env.local
+*.env.*
+
+# Dependencies
+.venv/
+venv/
+.env/
+
+# Editors
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+```

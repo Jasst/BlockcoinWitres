@@ -271,6 +271,18 @@ class AutonomyEngine:
         self.user_id = controller.user_id
         self.queue = ResearchQueue(controller.user_dir / "autonomy_queue.json")
 
+        # Инициализация SelfModel и MotivationEngine
+        try:
+            from GCN.self_model import SelfModel
+            from GCN.motivation_engine import MotivationEngine
+            
+            self.self_model = SelfModel(controller.user_dir)
+            self.motivation = MotivationEngine(self.self_model, getattr(controller, 'memory', None))
+        except ImportError as e:
+            logger.warning(f"[Autonomy] не удалось загрузить модули сознания: {e}")
+            self.self_model = None
+            self.motivation = None
+
         self._task: Optional[asyncio.Task] = None
         self._stopped = False
 
@@ -280,6 +292,7 @@ class AutonomyEngine:
         self._digest_count_today: int = 0
         self._last_goal_decompose: float = 0.0
         self._last_refresh: float = 0.0
+        self._last_motivation_tick: float = 0.0
 
         # Обратная связь по проактивности.
         self._notified: List[Dict[str, Any]] = []       # {keywords, ts, source}
@@ -363,6 +376,14 @@ class AutonomyEngine:
                     continue  # человек в чате — не конкурируем за LLM
                 if self._generation_running():
                     continue  # ответ сейчас генерируется — не мешаем
+                
+                # Запуск метакогнитивного тика (генерация внутренних целей)
+                if self.motivation and time.time() - self._last_motivation_tick > 600:
+                    goal = self.motivation.tick()
+                    if goal:
+                        logger.info(f"[Autonomy] эндогенная цель: {goal.get('goal', '')[:60]}")
+                    self._last_motivation_tick = time.time()
+                
                 await self._pump_queue()
                 await self._maybe_decompose_goals()
                 await self._maybe_refresh_time_sensitive()
