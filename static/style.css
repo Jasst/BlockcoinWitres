@@ -2746,6 +2746,15 @@ body.light-theme .modal-content {
   border: 1px solid rgba(108, 92, 231, 0.15);
 }
 
+/* Fix modal close button in light theme */
+body.light-theme .modal-close {
+  color: #5a5a7a;
+}
+body.light-theme .modal-close:hover {
+  color: #2d3436;
+  background: rgba(108, 92, 231, 0.08);
+}
+
 body.light-theme .card {
   background: rgba(255, 255, 255, 0.9);
   border: 1px solid rgba(108, 92, 231, 0.12);
@@ -2755,6 +2764,13 @@ body.light-theme .chat-panel-header {
   background: rgba(255, 255, 255, 0.85);
   border-bottom: 1px solid rgba(108, 92, 231, 0.12);
   backdrop-filter: blur(12px);
+}
+
+/* Fix pinned messages bar in light theme */
+body.light-theme .pinned-messages-bar {
+  background: rgba(108, 92, 231, 0.12);
+  border-bottom: 1px solid rgba(108, 92, 231, 0.18);
+  color: #2d3436;
 }
 
 body.light-theme .conversations-header {
@@ -2835,6 +2851,15 @@ body.light-theme .search-icon,
 body.light-theme .empty-state .icon {
   stroke: #2d3436;
   color: #2d3436;
+  fill: none;
+}
+
+/* Fix for PNG icons with filter: invert(1) in light theme */
+body.light-theme img[style*="filter: invert(1)"],
+body.light-theme .btn-icon-oval img[style*="filter: invert(1)"],
+body.light-theme .btn-oval img[style*="filter: invert(1)"] {
+  filter: invert(0) !important;
+  opacity: 0.85;
 }
 
 body.light-theme .bottom-nav-item.active .nav-icon svg {
