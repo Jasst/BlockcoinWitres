@@ -588,6 +588,17 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
   background: transparent;
   border-color: transparent;
   color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Ensure SVG icons inside buttons are visible */
+.btn-icon-oval svg {
+  stroke: currentColor;
+  fill: none;
+  width: 20px;
+  height: 20px;
 }
 .btn-oval:hover:not(:disabled), .btn-icon-oval:hover:not(:disabled) {
   background: var(--bg-hover);
@@ -905,6 +916,14 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
   height: 16px;
   color: var(--text-muted);
   pointer-events: none;
+  stroke: currentColor;
+  fill: none;
+}
+
+/* Light theme search icon visibility */
+body.light-theme .search-icon {
+  color: #5a5a7a;
+  stroke: #5a5a7a;
 }
 
 /* ===== Theme Toggle Button ===== */
@@ -2805,4 +2824,31 @@ body.light-theme ::-webkit-scrollbar-thumb {
 
 body.light-theme ::-webkit-scrollbar-thumb:hover {
   background: rgba(108, 92, 231, 0.5);
+}
+
+/* ===== Light Theme Icon Visibility Fixes ===== */
+/* Ensure icons are visible on light backgrounds */
+body.light-theme .nav-icon svg,
+body.light-theme .btn-icon-oval svg,
+body.light-theme .theme-toggle-btn svg,
+body.light-theme .search-icon,
+body.light-theme .empty-state .icon {
+  stroke: #2d3436;
+  color: #2d3436;
+}
+
+body.light-theme .bottom-nav-item.active .nav-icon svg {
+  stroke: #6c5ce7;
+  color: #6c5ce7;
+}
+
+body.light-theme .btn-icon-oval:hover svg {
+  stroke: #5a4bd1;
+  color: #5a4bd1;
+}
+
+/* Emoji icons in empty states should remain visible */
+body.light-theme .empty-state .icon {
+  opacity: 1;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.1));
 }
