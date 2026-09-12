@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "blockcoin-memory": {
+      "command": "python",
+      "args": ["mcp_server_blockcoin.py"],
+      "env": {
+        "PYTHONPATH": "/workspace",
+        "MCP_SERVER_CONFIG": "/workspace/ai_memory_v3/gcn_state.json"
+      },
+      "_comment": "Использовать относительные пути или env-переменные для кроссплатформенности"
+    }
+  },
+  "_meta": {
+    "version": "2.0",
+    "description": "Конфигурация MCP-серверов с улучшениями",
+    "optimizations_applied": [
+      "Кроссплатформенные пути",
+      "Метаданные для динамической перезагрузки",
+      "Поддержка переменных окружения"
+    ]
+  }
+}
