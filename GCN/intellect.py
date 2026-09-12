@@ -129,6 +129,8 @@ async def metacognitive_check(
         return False, base_confidence, reason
     
     # Для пограничных случаев используем LLM-оценку
+    reason = ""
+    final_confidence = base_confidence
     if base_confidence < 0.6:
         try:
             experience = self_model.generate_self_prompt()
@@ -160,7 +162,7 @@ async def metacognitive_check(
                     )
                     return False, final_confidence, reason
             
-            return True, final_confidence if 'final_confidence' in dir() else base_confidence, reason or "LLM-оценка пройдена"
+            return True, final_confidence, reason or "LLM-оценка пройдена"
             
         except Exception as e:
             logger.warning(f"[Metacognition] ошибка LLM-оценки: {e}")

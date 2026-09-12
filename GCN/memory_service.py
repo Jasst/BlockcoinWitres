@@ -496,9 +496,14 @@ async def _evict_stale_services(exclude_uid: Optional[str] = None) -> None:
             logger.info(f"MemoryService {uid[:16]} выгружен (простой > {_SERVICE_MAX_IDLE}с)")
 
     while len(_services) > _SERVICE_MAX_COUNT:
-        oldest_uid = min(_services_last_used, key=_services_last_used.get, default=None)
-        if oldest_uid is None or oldest_uid == exclude_uid:
-            break
+        # LRU-эвикция: пропускаем exclude_uid и берём следующего самого старого
+        oldest_uid = None
+        for uid in _services_last_used:
+            if uid != exclude_uid:
+                oldest_uid = uid
+                break
+        if oldest_uid is None:
+            break  # все оставшиеся — это exclude_uid
         service = _services.pop(oldest_uid, None)
         _services_last_used.pop(oldest_uid, None)
         if service is not None:

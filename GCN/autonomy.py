@@ -479,8 +479,13 @@ class AutonomyEngine:
             self.queue.complete(topic)
             if answer and answer.strip():
                 await self.submit_finding(answer, source=topic.source)
+            # Завершаем цель из motivation: если тема связана с goal из SelfModel,
+            # удаляем её после успешного исследования.
             if topic.source in ("goal", "goal_subtask") and topic.related_goal:
                 self._bump_goal_confidence(topic.related_goal, +0.10)
+                # Также пробуем удалить из SelfModel.active_goals (для целей от motivation)
+                if hasattr(self, 'self_model') and self.self_model is not None:
+                    self.self_model.remove_goal(topic.related_goal)
 
     def _bump_goal_confidence(self, goal_description: str, delta: float) -> None:
         try:
