@@ -1,42 +1,12 @@
-```
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+(static/style.css) is a source file, and there are no build artifacts, dependencies, or temporary files in the changes. Therefore, no .gitignore rules are needed.
 
-# Dependencies
-.venv/
-venv/
-env/
+Output: (empty)
+/__pycache__
+/ai_memory_v3
+/GCN/__pycache__
+/routes/__pycache__
+/services/__pycache__
+/.idea
+messenger.log
 .env
-.env.local
-.env.*
-
-# Logs
-*.log
-
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Build artifacts
-dist/
-build/
-*.so
-*.dylib
-*.dll
-*.exe
-*.out
-
-# Testing
-.pytest_cache/
-.mypy_cache/
-```
+/uploads
