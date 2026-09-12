@@ -1813,6 +1813,24 @@ class CognitiveController:
             })
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
+            
+            # УЛУЧШЕНИЕ №4: Немедленный Hebbian update при высокой ошибке предсказания
+            if error > 0.65 and self.current_working_memory:
+                try:
+                    from GCN.memory_graph import CognitiveMemory
+                    seed_ids = []
+                    kw = CognitiveMemory._extract_keywords(message)
+                    for word in list(kw)[:3]:
+                        seed_ids.extend(self.memory._keyword_index.get(word, [])[:3])
+                    seed_ids = list(dict.fromkeys(seed_ids))[:5]
+                    if len(seed_ids) >= 2:
+                        self._spawn_background_task(
+                            self.memory.spread_activation(seed_ids, max_depth=2, decay=0.6),
+                            name="hebbian-error-spread"
+                        )
+                except Exception as e:
+                    logger.debug(f"[Hebbian] spread_activation on error failed: {e}")
+            
             if (error > 0.85
                     and len(response) > 50
                     and not response.strip().lower().startswith(("привет", "здравствуйте", "hello"))
@@ -1894,7 +1912,8 @@ class CognitiveController:
         if hasattr(self, 'self_model') and self.self_model is not None:
             try:
                 from GCN import intellect as intellect_mod
-                action_type = "tool_call" if tool_trace else "reasoning"
+                # tool_trace ещё неизвестен (объявлен ниже), используем эвристику
+                action_type = "tool_call" if search_meta.get("search_requested") else "reasoning"
                 can_proceed, conf, reason = await intellect_mod.metacognitive_check(
                     task=message[:300],
                     action_type=action_type,  # должен совпадать с тем что пишет record_action

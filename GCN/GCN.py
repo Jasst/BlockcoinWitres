@@ -362,6 +362,35 @@ class KnowledgeGraph:
         self._reverse: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
         self._edge_meta: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
+    # УЛУЧШЕНИЕ №5: Типизированные каузальные рёбра
+    CAUSAL_RELATIONS = frozenset({"CAUSES", "ENABLES", "PREVENTS", "INHIBITS", "REQUIRES"})
+
+    def add_causal_relation(self, cause_id: str, effect_id: str,
+                             relation: str, strength: float = 0.7) -> None:
+        """Добавляет типизированное каузальное ребро."""
+        if relation not in self.CAUSAL_RELATIONS:
+            raise ValueError(f"relation должен быть одним из {self.CAUSAL_RELATIONS}")
+        self.add_relation(cause_id, relation, effect_id, weight=strength)
+
+    def get_causal_chain(self, start_id: str, max_depth: int = 3) -> list:
+        """Возвращает цепочку причинно-следственных связей от узла."""
+        chain = []
+        visited = set()
+        queue = [(start_id, 0)]
+        while queue:
+            node_id, depth = queue.pop(0)
+            if depth >= max_depth or node_id in visited:
+                continue
+            visited.add(node_id)
+            for rel_type in self.CAUSAL_RELATIONS:
+                # get_neighbors возвращает список кортежей (relation, target_id)
+                for relation, target_id in self.get_neighbors(node_id, relation=rel_type):
+                    chain.append((node_id, relation, target_id, self.get_relation_weight(node_id, relation, target_id) or 1.0))
+                    # Добавляем соседа в очередь для дальнейшего обхода
+                    if target_id not in visited:
+                        queue.append((target_id, depth + 1))
+        return chain
+
     def add_relation(self, source_id: str, relation: str, target_id: str, weight: float = 1.0):
         key = (source_id, relation, target_id)
         if key not in self._edge_meta:
