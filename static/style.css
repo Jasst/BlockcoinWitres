@@ -588,6 +588,17 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
   background: transparent;
   border-color: transparent;
   color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Ensure SVG icons inside buttons are visible */
+.btn-icon-oval svg {
+  stroke: currentColor;
+  fill: none;
+  width: 20px;
+  height: 20px;
 }
 .btn-oval:hover:not(:disabled), .btn-icon-oval:hover:not(:disabled) {
   background: var(--bg-hover);
@@ -905,6 +916,14 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
   height: 16px;
   color: var(--text-muted);
   pointer-events: none;
+  stroke: currentColor;
+  fill: none;
+}
+
+/* Light theme search icon visibility */
+body.light-theme .search-icon {
+  color: #5a5a7a;
+  stroke: #5a5a7a;
 }
 
 /* ===== Theme Toggle Button ===== */
@@ -995,6 +1014,32 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
 .message.pinned-highlight {
   animation: newMessageHighlight 2s ease-out;
 }
+
+/* ===== Empty State ===== */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--text-muted);
+}
+.empty-state .icon {
+  font-size: 64px;
+  margin-bottom: 20px;
+  opacity: 0.8;
+}
+.empty-state p {
+  font-size: 16px;
+  margin: 8px 0;
+  color: var(--text-secondary);
+}
+.empty-state .text-muted {
+  font-size: 14px;
+  opacity: 0.8;
+}
+
 .header-actions {
   display: flex;
   gap: 8px;
@@ -2507,7 +2552,62 @@ audio::-webkit-media-controls-time-remaining-display {
      (раньше оставалась пустая полоса 80px снизу) */
   body.chat-open .chat-layout { height: 100vh; height: 100dvh; max-height: none; }
 
-  .back-button { display: block; }
+  .back-button { 
+    display: flex !important;
+    align-items: center;
+    justify-content: center;
+  }
+  
+  /* Улучшаем header для мобильных */
+  .conversations-header {
+    padding: 12px;
+    flex-wrap: wrap;
+  }
+  
+  .search-container {
+    order: 3;
+    max-width: 100%;
+    min-width: 100%;
+    margin-top: 8px;
+  }
+  
+  .header-actions {
+    display: flex;
+    gap: 8px;
+  }
+  
+  .btn-icon-oval {
+    width: 40px;
+    height: 40px;
+    padding: 8px;
+  }
+  
+  .btn-icon-oval img {
+    width: 20px;
+    height: 20px;
+  }
+  
+  .chat-panel-header {
+    padding: 10px 12px;
+  }
+  
+  /* Контекстное меню на мобильных - внизу экрана */
+  .message-context-menu {
+    position: fixed;
+    left: 50% !important;
+    top: auto !important;
+    bottom: 20px;
+    transform: translateX(-50%);
+    min-width: 280px;
+    max-width: calc(100vw - 40px);
+    box-shadow: 0 -4px 20px rgba(0,0,0,0.5);
+  }
+  
+  /* Скрываем hover кнопки действий на мобильных */
+  .message-actions {
+    display: none;
+  }
+  
   .input-area { bottom: 12px; left: 12px; right: 12px; }
   .messages { padding-bottom: 120px; }
   #aiChatContainer .input-area { bottom: 12px; left: 12px; right: 12px; }
@@ -2646,6 +2746,15 @@ body.light-theme .modal-content {
   border: 1px solid rgba(108, 92, 231, 0.15);
 }
 
+/* Fix modal close button in light theme */
+body.light-theme .modal-close {
+  color: #5a5a7a;
+}
+body.light-theme .modal-close:hover {
+  color: #2d3436;
+  background: rgba(108, 92, 231, 0.08);
+}
+
 body.light-theme .card {
   background: rgba(255, 255, 255, 0.9);
   border: 1px solid rgba(108, 92, 231, 0.12);
@@ -2655,6 +2764,13 @@ body.light-theme .chat-panel-header {
   background: rgba(255, 255, 255, 0.85);
   border-bottom: 1px solid rgba(108, 92, 231, 0.12);
   backdrop-filter: blur(12px);
+}
+
+/* Fix pinned messages bar in light theme */
+body.light-theme .pinned-messages-bar {
+  background: rgba(108, 92, 231, 0.12);
+  border-bottom: 1px solid rgba(108, 92, 231, 0.18);
+  color: #2d3436;
 }
 
 body.light-theme .conversations-header {
@@ -2706,6 +2822,11 @@ body.light-theme .input-area {
   backdrop-filter: blur(20px);
 }
 
+/* AI Chat Container input area specific fix */
+body.light-theme #aiChatContainer .input-area {
+  background: rgba(255, 255, 255, 0.95) !important;
+}
+
 body.light-theme .input-wrapper {
   background: transparent;
 }
@@ -2718,10 +2839,63 @@ body.light-theme .input-wrapper textarea::placeholder {
   color: rgba(45, 52, 54, 0.5);
 }
 
+/* AI Chat Container textarea fix for light theme */
+body.light-theme #aiChatContainer .input-wrapper textarea {
+  color: #1e1e2e !important;
+  background: transparent !important;
+}
+
+body.light-theme #aiChatContainer .input-wrapper textarea::placeholder {
+  color: rgba(30, 30, 46, 0.6) !important;
+}
+
+/* Additional fix for any textarea in light theme within chat */
+body.light-theme #aiChatContainer textarea#aiMessageInput {
+  color: #1e1e2e !important;
+}
+
 body.light-theme ::-webkit-scrollbar-thumb {
   background: rgba(108, 92, 231, 0.3);
 }
 
 body.light-theme ::-webkit-scrollbar-thumb:hover {
   background: rgba(108, 92, 231, 0.5);
+}
+
+/* ===== Light Theme Icon Visibility Fixes ===== */
+/* Ensure icons are visible on light backgrounds */
+body.light-theme .nav-icon svg,
+body.light-theme .btn-icon-oval svg,
+body.light-theme .theme-toggle-btn svg,
+body.light-theme .search-icon,
+body.light-theme .empty-state .icon {
+  stroke: #2d3436;
+  color: #2d3436;
+  fill: none;
+}
+
+/* Fix for PNG icons with filter: invert(1) in light theme */
+body.light-theme img[style*="filter: invert(1)"],
+body.light-theme .btn-icon-oval img[style*="filter: invert(1)"] {
+  filter: invert(0) !important;
+}
+
+body.light-theme .ai-tool-btn img[style*="filter: invert(1)"] {
+  filter: invert(0) !important;
+}
+
+body.light-theme .bottom-nav-item.active .nav-icon svg {
+  stroke: #6c5ce7;
+  color: #6c5ce7;
+}
+
+body.light-theme .btn-icon-oval:hover svg {
+  stroke: #5a4bd1;
+  color: #5a4bd1;
+}
+
+/* Emoji icons in empty states should remain visible */
+body.light-theme .empty-state .icon {
+  opacity: 1;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.1));
 }
