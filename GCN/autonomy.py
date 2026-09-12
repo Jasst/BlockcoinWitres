@@ -238,7 +238,14 @@ class ResearchQueue:
         return topic
 
     def requeue(self, topic: ResearchTopic) -> None:
+        """Переносит тему в будущее с экспоненциальным бэкоффом (для ошибок)."""
         topic.available_at = time.time() + RESEARCH_RETRY_BACKOFF_SECONDS
+        self._items.append(topic)
+        self.save()
+
+    def defer(self, topic: ResearchTopic, seconds: float) -> None:
+        """Откладывает тему на указанное время без инкремента попыток (для budget exhaustion)."""
+        topic.available_at = time.time() + seconds
         self._items.append(topic)
         self.save()
 
@@ -372,8 +379,15 @@ class AutonomyEngine:
             {"text": text[:2000], "source": source, "ts": time.time()}
         )
         # Бэкпрессер: скопилось слишком много — не ждём интервала.
+        # Но force=True теперь НЕ игнорирует тихие часы: если накопилось много,
+        # просто сбрасываем старые находки до DIGEST_MAX_ITEMS, а не шлём ночью.
         if len(self._pending_findings) >= DIGEST_MAX_ITEMS * 2:
-            await self._maybe_flush_digest(force=True)
+            # Тихие часы всё равно проверяем — просто обрезаем буфер, не шлём.
+            if not self._quiet_hours():
+                await self._maybe_flush_digest(force=True)
+            else:
+                # В тихие часы просто держим буфер в разумных пределах.
+                self._pending_findings = self._pending_findings[-DIGEST_MAX_ITEMS:]
         else:
             await self._maybe_flush_digest(force=False)
 
@@ -449,7 +463,9 @@ class AutonomyEngine:
             if topic is None:
                 return
             if not self._consume_budget(_BUDGET_WEIGHT_RESEARCH):
-                self.queue.requeue(topic)
+                # Бюджет исчерпан — откладываем тему на короткое время (не 30 мин),
+                # чтобы не "замораживать" очередь на весь период exhaustion.
+                self.queue.defer(topic, AUTONOMY_LOOP_INTERVAL * 4)
                 return
             logger.info(
                 f"[Autonomy] исследую ({topic.source}, p={topic.priority:.2f}): {topic.topic[:80]}"
@@ -572,15 +588,15 @@ class AutonomyEngine:
 
     # ---------------- противоречия ----------------
     def _maybe_enqueue_contradictions(self) -> None:
-        try:
-            pairs = self.ctl.memory.get_unverified_contradictions(limit=3)
-        except Exception:
-            return
-        for a, b in pairs:
-            self.enqueue_topic(
-                f"Разобрать противоречие в памяти: «{a.text[:110]}» против «{b.text[:110]}»",
-                source="contradiction", priority=0.50,
-            )
+        """
+        Противоречия теперь НЕ отправляются в research-очередь.
+        Исследование через веб-поиск не разрешает само противоречие в памяти —
+        пользователь получит дайджест, но факты останутся помеченными CONTRADICTS.
+        Разрешением занимается только _verify_pending_contradictions в ai_assistant.py,
+        который через LLM-вердикт вызывает _demote_or_retract / удаляет рёбра.
+        """
+        # Раньше здесь был enqueue_topic с source="contradiction" — удалено.
+        pass
 
     # ---------------- дайджест проактивных уведомлений ----------------
     def _roll_digest_day(self) -> None:
