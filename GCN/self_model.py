@@ -185,8 +185,11 @@ class SelfModel:
             self.self_concept[key] = max(0.2, current - 0.05)
         
         # Добавляем мета-знание о своих паттернах
-        recent_failures = sum(1 for r in self.action_history[-20:] if not r.success)
-        self.self_concept["recent_failure_rate"] = recent_failures / 20.0
+        recent = self.action_history[-20:]
+        if recent:
+            self.self_concept["recent_failure_rate"] = sum(1 for r in recent if not r.success) / len(recent)
+        else:
+            self.self_concept["recent_failure_rate"] = 0.0
     
     def add_goal(self, goal: str, priority: float = 0.5, source: str = "external") -> None:
         """Добавляет активную цель."""
