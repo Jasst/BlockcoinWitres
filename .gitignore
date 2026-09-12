@@ -51,3 +51,5 @@ pip-delete-this-directory.txt
 .DS_Store
 Thumbs.db
 ```
+/ai_memory_v3
+/uploads
