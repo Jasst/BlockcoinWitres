@@ -2822,6 +2822,11 @@ body.light-theme .input-area {
   backdrop-filter: blur(20px);
 }
 
+/* AI Chat Container input area specific fix */
+body.light-theme #aiChatContainer .input-area {
+  background: rgba(255, 255, 255, 0.95) !important;
+}
+
 body.light-theme .input-wrapper {
   background: transparent;
 }
@@ -2832,6 +2837,15 @@ body.light-theme .input-wrapper textarea {
 
 body.light-theme .input-wrapper textarea::placeholder {
   color: rgba(45, 52, 54, 0.5);
+}
+
+/* AI Chat Container textarea fix for light theme */
+body.light-theme #aiChatContainer .input-wrapper textarea {
+  color: #2d3436 !important;
+}
+
+body.light-theme #aiChatContainer .input-wrapper textarea::placeholder {
+  color: rgba(45, 52, 54, 0.5) !important;
 }
 
 body.light-theme ::-webkit-scrollbar-thumb {
@@ -2857,10 +2871,6 @@ body.light-theme .empty-state .icon {
 /* Fix for PNG icons with filter: invert(1) in light theme */
 body.light-theme img[style*="filter: invert(1)"],
 body.light-theme .btn-icon-oval img[style*="filter: invert(1)"],
-body.light-theme .btn-oval img[style*="filter: invert(1)"] {
-  filter: invert(0) !important;
-  opacity: 0.85;
-}
 
 body.light-theme .bottom-nav-item.active .nav-icon svg {
   stroke: #6c5ce7;
