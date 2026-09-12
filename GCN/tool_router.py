@@ -266,6 +266,10 @@ class ToolRegistry:
             "internal__web_search": '{"query": "курс доллара"} ИЛИ {"queries": ["курс доллара", "евро"]}',
             "internal__generate_image": '{"prompt": "красивая девушка", "enhance_prompt": true, "steps": 30}',
             "internal__list_tools": '{}',
+            "internal__read_code": '{"path": "GCN/tool_router.py", "max_lines": 100}',
+            "internal__search_code": '{"pattern": "TOOL_CALL_TIMEOUT", "max_results": 5}',
+            "internal__project_structure": '{"max_depth": 2}',
+            "internal__analyze_error": '{"error": "KeyError: \'user_id\'", "traceback": "..."}',
         }
         lines = []
         for t in self._tools.values():
@@ -294,6 +298,7 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - Если нужна актуальная информация из интернета — вызови `internal__web_search`.
 - **Если пользователь просит сгенерировать изображение (например, "нарисуй", "сгенерируй изображение", "создай картинку", "покажи картинку", "визуализируй" и т.п.) — ОБЯЗАТЕЛЬНО вызови инструмент `internal__generate_image`. НЕ ОТВЕЧАЙ ТЕКСТОМ, пока не получишь результат от этого инструмента.**
 - **Если пользователь спрашивает о твоих возможностях, какие инструменты доступны, что ты умеешь, какие команды есть — вызови инструмент `internal__list_tools`.**
+- **Если пользователь просит проанализировать код, найти ошибку, посмотреть структуру проекта или найти что-то в коде — используй инструменты `internal__read_code`, `internal__search_code`, `internal__project_structure`, `internal__analyze_error`.**
 - Если запрос обычный, не требующий обращения к памяти или поиску — отвечай напрямую.
 - Если ниже уже есть результаты вызванных инструментов и их достаточно, чтобы ответить — верни {{"action": "answer_directly"}}, не вызывай инструмент повторно.
 - **Важно: если запрос содержит несколько независимых действий (например, "запомни X и найди Y" или "вспомни мои цели и добавь новую") — ты должен вызывать инструменты последовательно, по одному за раунд. Не считай задачу выполненной, пока не обработаны все части запроса.**
@@ -330,6 +335,11 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
   (если это папка, инструмент вернёт список файлов; если файл – его содержимое)
 - Запрос: "посмотри файл https://github.com/Jasst/BlockcoinWitres/blob/main/GCN/config_ai.py" -> 
   {{"action": "call_tool", "tool": "internal__fetch_github_file", "arguments": {{"path": "GCN/config_ai.py"}}}}
+# === ИСПРАВЛЕНИЕ (добавлены примеры с инструментами анализа кода) ===
+- Запрос: "покажи структуру проекта" -> {{"action": "call_tool", "tool": "internal__project_structure", "arguments": {{"max_depth": 2}}}}
+- Запрос: "найди в коде все упоминания TOOL_CALL_TIMEOUT" -> {{"action": "call_tool", "tool": "internal__search_code", "arguments": {{"pattern": "TOOL_CALL_TIMEOUT", "max_results": 10}}}}
+- Запрос: "прочитай файл GCN/tool_router.py" -> {{"action": "call_tool", "tool": "internal__read_code", "arguments": {{"path": "GCN/tool_router.py"}}}}
+- Запрос: "проанализируй ошибку KeyError: 'user_id'" -> {{"action": "call_tool", "tool": "internal__analyze_error", "arguments": {{"error": "KeyError: 'user_id'", "traceback": "..."}}}}
 
 Последние реплики диалога:
 {history_tail}
