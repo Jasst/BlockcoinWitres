@@ -1,19 +1,12 @@
-```
-# Compiled Python files
-*.pyc
-__pycache__/
+(static/style.css) is a source file, and there are no build artifacts, dependencies, or temporary files in the changes. Therefore, no .gitignore rules are needed.
 
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-
-# Environment
+Output: (empty)
+/__pycache__
+/ai_memory_v3
+/GCN/__pycache__
+/routes/__pycache__
+/services/__pycache__
+/.idea
+messenger.log
 .env
-.env.local
-*.env.*
-
-# Editors
-.vscode/
-.idea/
-```
+/uploads
