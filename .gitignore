@@ -25,12 +25,19 @@ requirements.txt.bak
 *.swp
 *.swo
 
-# Build artifacts
-dist/
-build/
-*.egg-info/
-.coverage
-htmlcov/
-.mypy_cache/
-.pytest_cache/
+# Dependencies
+.venv/
+venv/
 ```
+(static/style.css) is a source file, and there are no build artifacts, dependencies, or temporary files in the changes. Therefore, no .gitignore rules are needed.
+
+Output: (empty)
+/__pycache__
+/ai_memory_v3
+/GCN/__pycache__
+/routes/__pycache__
+/services/__pycache__
+/.idea
+messenger.log
+.env
+/uploads

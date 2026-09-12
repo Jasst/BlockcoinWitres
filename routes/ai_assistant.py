@@ -39,9 +39,7 @@ from GCN.config_ai import GROUNDED_ANSWER_ENABLED, PLAN_CRITIC_ENABLED
 # ИЗМЕНЕНИЕ: импорт MemoryService и фабрики
 from GCN.memory_service import MemoryService, get_memory_service
 
-# Импорт конфигурации самоанализа кода ПЕРЕД использованием
 from GCN.config_ai import ENABLE_CODE_SELF_REFLECTION
-
 # Импорт инструментов самоанализа кода
 if ENABLE_CODE_SELF_REFLECTION:
     from GCN.code_analyzer import get_analyzer
