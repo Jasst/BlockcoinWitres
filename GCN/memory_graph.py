@@ -1443,7 +1443,11 @@ class CognitiveMemory:
             self._save_task = asyncio.create_task(self._periodic_save())
 
     async def _periodic_save(self):
-        await asyncio.sleep(5)
+        # Увеличен интервал с 5 до 15 секунд — снижает частоту I/O операций
+        # при активной работе (множественные recall/remember подряд), но сохраняет
+        # приемлемую гарантию сохранности данных. Для критичных данных вызывайте
+        # await memory._save_async() явно после важных операций.
+        await asyncio.sleep(15)
         if self._dirty:
             await self._save_async()
 
