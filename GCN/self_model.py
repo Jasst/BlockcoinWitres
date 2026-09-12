@@ -218,6 +218,9 @@ class SelfModel:
             "curiosity": round(self.state.curiosity, 2),
             "stress": round(self.state.stress, 2),
             "engagement": round(self.state.engagement, 2),
+            "recent_failure_rate": round(
+                self.self_concept.get("recent_failure_rate", 0.0), 2
+            ),
             "active_goals_count": len(self.active_goals),
             "recent_actions": len(self.action_history),
             "self_concept_keys": list(self.self_concept.keys()),

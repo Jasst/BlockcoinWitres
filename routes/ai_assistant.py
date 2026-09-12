@@ -407,9 +407,7 @@ class CognitiveController:
             logger.warning(f"[CognitiveController] не удалось загрузить SelfModel: {e}")
             self.self_model = None
         
-        # Передаём self_model в AutonomyEngine при инициализации
-        if hasattr(self, 'autonomy') and self.autonomy is not None and self.self_model is not None:
-            self.autonomy.self_model = self.self_model
+        # AutonomyEngine теперь сам берёт self_model из контроллера
 
         # Регистрация внутренних инструментов
         async def _internal_recall(args: Dict) -> str:
@@ -1625,6 +1623,43 @@ class CognitiveController:
         goal_hint = ""
         if active_goals:
             goal_hint = "Активные цели: " + ", ".join([g["description"] for g in active_goals[:2]])
+        
+        # УЛУЧШЕНИЕ №3: Goal-directed retrieval bias — дополнительный поиск по активным целям
+        relevant_with_boost = list(relevant)  # копируем базовый результат
+        if active_goals and len(active_goals) > 0:
+            try:
+                goal_texts = [g["description"] for g in active_goals[:3]]
+                goal_relevant = []
+                for g_text in goal_texts:
+                    extra = await self.memory_service.recall(g_text, top_k=3)
+                    for item in extra:
+                        item_copy = dict(item)
+                        item_copy["_goal_boosted"] = True
+                        item_copy["_score"] = item_copy.get("_score", item_copy.get("score", 0.5)) + 0.15
+                        goal_relevant.append(item_copy)
+                
+                # Merge с dedup по gcn_id или text
+                seen_ids = {f.get("gcn_id") or f["text"][:100]: i for i, f in enumerate(relevant_with_boost)}
+                for item in goal_relevant:
+                    key = item.get("gcn_id") or item["text"][:100]
+                    if key in seen_ids:
+                        # Поднимаем существующий факт если он goal-boosted
+                        idx = seen_ids[key]
+                        if item.get("_goal_boosted"):
+                            relevant_with_boost[idx]["_goal_boosted"] = True
+                            relevant_with_boost[idx]["_score"] = max(
+                                relevant_with_boost[idx].get("_score", 0),
+                                item.get("_score", 0)
+                            )
+                    else:
+                        relevant_with_boost.append(item)
+                        seen_ids[key] = len(relevant_with_boost) - 1
+                
+                # Сортируем по score с учётом буста
+                relevant_with_boost.sort(key=lambda x: x.get("_score", x.get("score", 0)), reverse=True)
+                relevant_with_boost = relevant_with_boost[:7]  # ограничиваем размер
+            except Exception as e:
+                logger.debug(f"[Goal-retrieval] ошибка бустинга: {e}")
 
         messages = self._build_messages(
             message=message,
@@ -1637,7 +1672,8 @@ class CognitiveController:
             uncertainty=uncertainty,
             predictions=predictions,
             goal_hint=goal_hint,
-            sources=sources
+            sources=sources,
+            relevant_facts=relevant_with_boost if 'relevant_with_boost' in locals() else relevant
         )
 
         search_meta["context"] = search_context
@@ -1789,11 +1825,15 @@ class CognitiveController:
         # УЛУЧШЕНИЕ №1: записываем действие в SelfModel после каждого ответа
         if hasattr(self, 'self_model') and self.self_model is not None:
             try:
-                tool_success = bool(tool_trace) or True  # считаем успехом если нет явных ошибок
+                # Корректное определение успеха: инструмент вызван И ответ не содержит ошибок
+                tool_success = bool(tool_trace) and len(response) > 20 and not response.startswith("[Ошибка")
+                reasoning_success = len(response) > 20 and not response.startswith("[Ошибка")
+                action_type = "tool_call" if tool_trace else "reasoning"
+                
                 self.self_model.record_action(
-                    action_type="tool_call" if tool_trace else "reasoning",
-                    description=response[:200],
-                    success=tool_success and len(response) > 20,
+                    action_type=action_type,
+                    description=message[:100],  # описание запроса, не ответа
+                    success=tool_success if tool_trace else reasoning_success,
                     confidence=1.0 - self._last_prepare_meta.get("uncertainty", 0.5),
                 )
             except Exception as e:
@@ -1854,9 +1894,10 @@ class CognitiveController:
         if hasattr(self, 'self_model') and self.self_model is not None:
             try:
                 from GCN import intellect as intellect_mod
+                action_type = "tool_call" if tool_trace else "reasoning"
                 can_proceed, conf, reason = await intellect_mod.metacognitive_check(
                     task=message[:300],
-                    action_type="tool_execution",
+                    action_type=action_type,  # должен совпадать с тем что пишет record_action
                     self_model=self.self_model,
                 )
                 if not can_proceed:
@@ -2301,7 +2342,8 @@ class CognitiveController:
                         memory_context: str, image_base64: Optional[str],
                         image_mime: Optional[str], reasoning: bool,
                         uncertainty: float, predictions: List[str], goal_hint: str,
-                        sources: Optional[List[Dict]] = None) -> List[Dict]:
+                        sources: Optional[List[Dict]] = None,
+                        relevant_facts: Optional[List[Dict]] = None) -> List[Dict]:
         """Строит сообщения для LLM с разделением концептов и фактов."""
         # Защита от None
         memory_context = memory_context or ""
@@ -2319,6 +2361,17 @@ class CognitiveController:
                     facts.append(line)
         concepts_block = "\n".join(concepts) if concepts else ""
         facts_block = "\n".join(facts) if facts else ""
+        
+        # УЛУЧШЕНИЕ №3: помечаем goal-boosted факты в working memory
+        if relevant_facts:
+            boosted_texts = [f["text"][:80] for f in relevant_facts if f.get("_goal_boosted")]
+            if boosted_texts:
+                wm_block_prefix = "  [! — приоритет по целям]\n"
+            else:
+                wm_block_prefix = ""
+        else:
+            boosted_texts = []
+            wm_block_prefix = ""
 
         # УЛУЧШЕНИЕ №3: Когнитивный системный промпт с элементами сознания
         sm = getattr(self, 'self_model', None)
@@ -2332,7 +2385,7 @@ class CognitiveController:
         ) or "  (целей нет)"
         
         # Рабочая память
-        wm_block = "\n".join(
+        wm_block = wm_block_prefix + "\n".join(
             f"  • {t[:100]}" for t in self.current_working_memory[:7]
         ) or "  (рабочая память пуста)"
         
