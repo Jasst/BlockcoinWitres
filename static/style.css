@@ -2841,11 +2841,17 @@ body.light-theme .input-wrapper textarea::placeholder {
 
 /* AI Chat Container textarea fix for light theme */
 body.light-theme #aiChatContainer .input-wrapper textarea {
-  color: #2d3436 !important;
+  color: #1e1e2e !important;
+  background: transparent !important;
 }
 
 body.light-theme #aiChatContainer .input-wrapper textarea::placeholder {
-  color: rgba(45, 52, 54, 0.5) !important;
+  color: rgba(30, 30, 46, 0.6) !important;
+}
+
+/* Additional fix for any textarea in light theme within chat */
+body.light-theme #aiChatContainer textarea#aiMessageInput {
+  color: #1e1e2e !important;
 }
 
 body.light-theme ::-webkit-scrollbar-thumb {
@@ -2870,7 +2876,13 @@ body.light-theme .empty-state .icon {
 
 /* Fix for PNG icons with filter: invert(1) in light theme */
 body.light-theme img[style*="filter: invert(1)"],
-body.light-theme .btn-icon-oval img[style*="filter: invert(1)"],
+body.light-theme .btn-icon-oval img[style*="filter: invert(1)"] {
+  filter: invert(0) !important;
+}
+
+body.light-theme .ai-tool-btn img[style*="filter: invert(1)"] {
+  filter: invert(0) !important;
+}
 
 body.light-theme .bottom-nav-item.active .nav-icon svg {
   stroke: #6c5ce7;
