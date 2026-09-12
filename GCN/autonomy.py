@@ -276,8 +276,17 @@ class AutonomyEngine:
             from GCN.self_model import SelfModel
             from GCN.motivation_engine import MotivationEngine
             
-            self.self_model = SelfModel(controller.user_dir)
-            self.motivation = MotivationEngine(self.self_model, getattr(controller, 'memory', None))
+            # Используем SelfModel контроллера если он уже есть
+            self.self_model = getattr(controller, 'self_model', None)
+            if self.self_model is None:
+                self.self_model = SelfModel(controller.user_dir)
+                # Передаём обратно в контроллер
+                controller.self_model = self.self_model
+            
+            self.motivation = MotivationEngine(
+                self.self_model,
+                getattr(controller, 'memory', None)
+            )
         except ImportError as e:
             logger.warning(f"[Autonomy] не удалось загрузить модули сознания: {e}")
             self.self_model = None
