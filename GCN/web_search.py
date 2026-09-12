@@ -270,6 +270,7 @@ class _BM25:
     def __init__(self, docs_tokens: List[List[str]], k1: float = 1.5, b: float = 0.75):
         self.k1 = k1
         self.b = b
+        self._docs = docs_tokens  # храним как instance-атрибут, а не class-level
         self.dl = [len(d) for d in docs_tokens]
         self.avgdl = (sum(self.dl) / len(self.dl)) if docs_tokens else 0.0
         df: Counter = Counter()
@@ -300,14 +301,9 @@ class _BM25:
             score += idf * (tf * (self.k1 + 1)) / denom
         return score
 
-    # docs запоминаем отдельно, чтобы score() не требовал передачи токенов
-    _docs: List[List[str]] = []
-
     @classmethod
     def fit(cls, docs_tokens: List[List[str]], **kwargs) -> "_BM25":
-        bm = cls(docs_tokens, **kwargs)
-        bm._docs = docs_tokens  # instance attr shadows class attr
-        return bm
+        return cls(docs_tokens, **kwargs)
 
 
 def bm25_scores(query: str, docs: List[str]) -> List[float]:

@@ -20,6 +20,7 @@ import logging
 import os
 import time
 import asyncio
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from contextlib import AsyncExitStack
@@ -88,6 +89,13 @@ class MCPToolManager:
         self._server_stacks: Dict[str, AsyncExitStack] = {}
         self._failed_servers: Dict[str, float] = {}  # name -> timestamp последней неудачи
         self._initialized = False
+        # Кэш результатов вызовов инструментов: (server, tool, args_hash) -> (result, timestamp)
+        self._tool_cache: Dict[tuple, tuple] = {}
+        self._cache_ttl = int(os.getenv("MCP_TOOL_CACHE_TTL", "300"))  # 5 минут по умолчанию
+        # Rate limiting: (server, tool) -> [timestamps]
+        self._rate_limits: Dict[tuple, List[float]] = {}
+        self._rate_limit_calls = int(os.getenv("MCP_RATE_LIMIT_CALLS", "10"))  # вызовов
+        self._rate_limit_window = int(os.getenv("MCP_RATE_LIMIT_WINDOW", "60"))  # секунд
 
     async def initialize(self):
         """Подключиться ко всем серверам из конфига."""
@@ -177,12 +185,79 @@ class MCPToolManager:
                 all_tools.append(tool_with_server)
         return all_tools
 
+    def _check_rate_limit(self, server_name: str, tool_name: str) -> bool:
+        """Проверяет rate limit для инструмента. Возвращает True, если вызов разрешён."""
+        key = (server_name, tool_name)
+        now = time.time()
+        
+        # Очищаем старые записи за пределами окна
+        if key in self._rate_limits:
+            self._rate_limits[key] = [
+                ts for ts in self._rate_limits[key]
+                if now - ts < self._rate_limit_window
+            ]
+        else:
+            self._rate_limits[key] = []
+        
+        # Проверяем лимит
+        if len(self._rate_limits[key]) >= self._rate_limit_calls:
+            return False
+        
+        # Записываем текущий вызов
+        self._rate_limits[key].append(now)
+        return True
+
+    def _get_cache_key(self, server_name: str, tool_name: str, arguments: Dict) -> tuple:
+        """Создаёт хэш-ключ для кэширования результата вызова."""
+        args_str = json.dumps(arguments, sort_keys=True)
+        args_hash = hashlib.sha256(args_str.encode()).hexdigest()[:16]
+        return (server_name, tool_name, args_hash)
+
+    def _get_cached_result(self, cache_key: tuple) -> Optional[str]:
+        """Возвращает закэшированный результат, если он ещё валиден."""
+        if cache_key not in self._tool_cache:
+            return None
+        result, timestamp = self._tool_cache[cache_key]
+        if time.time() - timestamp > self._cache_ttl:
+            del self._tool_cache[cache_key]
+            return None
+        return result
+
+    def _cache_result(self, cache_key: tuple, result: str):
+        """Кэширует результат вызова инструмента."""
+        self._tool_cache[cache_key] = (result, time.time())
+        # Очистка старого кэша при переполнении
+        if len(self._tool_cache) > 1000:
+            oldest_keys = sorted(self._tool_cache.keys(), key=lambda k: self._tool_cache[k][1])[:100]
+            for k in oldest_keys:
+                del self._tool_cache[k]
+
     async def call_tool(self, server_name: str, tool_name: str, arguments: Dict) -> str:
         """Вызвать инструмент на указанном сервере — с ограничением по времени,
-        чтобы зависший внешний сервер не вешал весь ответ чата навсегда."""
+        кэшированием результатов и rate limiting, чтобы зависший внешний сервер
+        не вешал весь ответ чата навсегда, а частые одинаковые вызовы не перегружали сервер."""
         session = self.sessions.get(server_name)
         if not session:
             raise ValueError(f"Сервер '{server_name}' не найден")
+        
+        # Проверка rate limit
+        if not self._check_rate_limit(server_name, tool_name):
+            logger.warning(
+                f"Rate limit превышен для {server_name}.{tool_name} "
+                f"({self._rate_limit_calls} вызовов за {self._rate_limit_window}с)"
+            )
+            raise RuntimeError(
+                f"Rate limit для инструмента '{server_name}.{tool_name}': "
+                f"не более {self._rate_limit_calls} вызовов за {self._rate_limit_window}с"
+            )
+        
+        # Проверка кэша (только для инструментов без побочных эффектов)
+        cache_key = self._get_cache_key(server_name, tool_name, arguments)
+        cached = self._get_cached_result(cache_key)
+        if cached is not None:
+            logger.debug(f"Кэш-хит для {server_name}.{tool_name}")
+            return cached
+        
         timeout = _resolve_tool_timeout(tool_name)
         try:
             result = await asyncio.wait_for(
@@ -193,9 +268,14 @@ class MCPToolManager:
             raise TimeoutError(
                 f"MCP-инструмент '{server_name}.{tool_name}' не ответил за {timeout}с"
             )
-        if result.content:
-            return result.content[0].text
-        return str(result)
+        
+        response_text = result.content[0].text if result.content else str(result)
+        
+        # Кэшируем только успешные результаты (без ошибок в тексте)
+        if "error" not in response_text.lower() and "exception" not in response_text.lower():
+            self._cache_result(cache_key, response_text)
+        
+        return response_text
 
     async def close(self):
         """Закрыть все соединения."""

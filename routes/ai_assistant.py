@@ -39,6 +39,11 @@ from GCN.config_ai import GROUNDED_ANSWER_ENABLED, PLAN_CRITIC_ENABLED
 # ИЗМЕНЕНИЕ: импорт MemoryService и фабрики
 from GCN.memory_service import MemoryService, get_memory_service
 
+from GCN.config_ai import ENABLE_CODE_SELF_REFLECTION
+# Импорт инструментов самоанализа кода
+if ENABLE_CODE_SELF_REFLECTION:
+    from GCN.code_analyzer import get_analyzer
+
 from GCN.config_ai import *
 
 logger = logging.getLogger(__name__)
@@ -393,6 +398,17 @@ class CognitiveController:
             llm_text_caller=call_llm,
         )
 
+        # Инициализация SelfModel для CognitiveController
+        try:
+            from GCN.self_model import SelfModel
+            self.self_model = SelfModel(self.user_dir)
+            logger.info(f"[CognitiveController] SelfModel инициализирован для {user_id[:16]}")
+        except ImportError as e:
+            logger.warning(f"[CognitiveController] не удалось загрузить SelfModel: {e}")
+            self.self_model = None
+        
+        # AutonomyEngine теперь сам берёт self_model из контроллера
+
         # Регистрация внутренних инструментов
         async def _internal_recall(args: Dict) -> str:
             query = args.get("query", "")
@@ -726,6 +742,104 @@ class CognitiveController:
             server="internal"
         )
 
+        # ===== Инструменты для самоанализа кода (Code Self-Reflection) =====
+        if ENABLE_CODE_SELF_REFLECTION:
+            code_analyzer = get_analyzer()  # из GCN.code_analyzer
+            
+            async def _internal_read_code(args: Dict) -> str:
+                """Читает файл исходного кода проекта."""
+                file_path = args.get("path", "")
+                max_lines = args.get("max_lines", 500)
+                if not file_path:
+                    return "Ошибка: не указан путь к файлу (аргумент 'path')."
+                return await code_analyzer.read_file(file_path, max_lines=max_lines)
+            
+            async def _internal_search_code(args: Dict) -> str:
+                """Ищет паттерн в коде проекта."""
+                pattern = args.get("pattern", "")
+                max_results = args.get("max_results", 20)
+                if not pattern:
+                    return "Ошибка: не указан поисковый запрос (аргумент 'pattern')."
+                return await code_analyzer.search_in_code(pattern, max_results=max_results)
+            
+            async def _internal_project_structure(args: Dict) -> str:
+                """Возвращает структуру проекта."""
+                max_depth = args.get("max_depth", 3)
+                return await code_analyzer.get_project_structure(max_depth=max_depth)
+            
+            async def _internal_analyze_error(args: Dict) -> str:
+                """Анализирует ошибку и предлагает исправления."""
+                error_message = args.get("error", "")
+                traceback_str = args.get("traceback", "")
+                if not error_message:
+                    return "Ошибка: не указано сообщение об ошибке (аргумент 'error')."
+                return await code_analyzer.analyze_error_location(error_message, traceback_str)
+            
+            # Регистрируем инструменты анализа кода
+            self.tool_registry.register(
+                name="read_code",
+                description="Читает файл исходного кода проекта. Используй для анализа своей работы. Аргументы: path (str, путь относительно корня, например 'GCN/config_ai.py'), max_lines (int, опционально)",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Путь к файлу"},
+                        "max_lines": {"type": "integer", "default": 500}
+                    },
+                    "required": ["path"]
+                },
+                handler=_internal_read_code,
+                server="internal"
+            )
+            
+            self.tool_registry.register(
+                name="search_code",
+                description="Ищет текст или паттерн в коде проекта. Аргументы: pattern (str), max_results (int, опционально)",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Поисковый запрос"},
+                        "max_results": {"type": "integer", "default": 20}
+                    },
+                    "required": ["pattern"]
+                },
+                handler=_internal_search_code,
+                server="internal"
+            )
+            
+            self.tool_registry.register(
+                name="project_structure",
+                description="Возвращает структуру проекта в виде дерева",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "max_depth": {"type": "integer", "default": 3}
+                    }
+                },
+                handler=_internal_project_structure,
+                server="internal"
+            )
+            
+            self.tool_registry.register(
+                name="analyze_error",
+                description="Анализирует ошибку по traceback и предлагает исправления. Аргументы: error (str, сообщение ошибки), traceback (str, трассировка стека)",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "error": {"type": "string", "description": "Сообщение об ошибке"},
+                        "traceback": {"type": "string", "description": "Трассировка стека"}
+                    },
+                    "required": ["error"]
+                },
+                handler=_internal_analyze_error,
+                server="internal"
+            )
+            
+            logger.info("Инструменты самоанализа кода зарегистрированы")
+        else:
+            logger.info("Самоанализ кода отключён в конфигурации")
+        
+        # ===== КОНЕЦ инструментов самоанализа кода =====
+
         self._external_tools_registered = False
 
 
@@ -1053,6 +1167,11 @@ class CognitiveController:
         фонового доисследования темы не должен ничего ронять.
         """
         try:
+            # ПРОВЕРКА БЮДЖЕТА: фоновые исследования из рефлексии/коррекции
+            # должны списывать бюджет так же, как автономные research-темы.
+            if not self._consume_autonomous_llm_budget(n=3):
+                logger.info(f"[Budget] пропуск фонового исследования '{topic[:50]}': бюджет исчерпан")
+                return
             result = await self.research(topic)
             # ИЗМЕНЕНИЕ: доставка через дайджест движка автономности.
             if self.autonomy is not None:
@@ -1341,7 +1460,12 @@ class CognitiveController:
         self._last_reflection_time = time.time()
 
     async def _quick_correction(self, query: str, predicted: List[str], actual: str):
+        """Фоновая коррекция по высокой ошибке предсказания — с проверкой бюджета."""
         logger.info(f"[QuickCorrection] High error detected for: {query[:50]}...")
+        # ПРОВЕРКА БЮДЖЕТА: быстрая коррекция тоже тратит LLM-вызовы
+        if not self._consume_autonomous_llm_budget(n=3):
+            logger.info(f"[Budget] пропуск quick_correction '{query[:50]}': бюджет исчерпан")
+            return
         await self.research(query)
 
     # ===== НОВЫЙ МЕТОД: автоматическое извлечение фактов из сообщения =====
@@ -1509,6 +1633,43 @@ class CognitiveController:
         goal_hint = ""
         if active_goals:
             goal_hint = "Активные цели: " + ", ".join([g["description"] for g in active_goals[:2]])
+        
+        # УЛУЧШЕНИЕ №3: Goal-directed retrieval bias — дополнительный поиск по активным целям
+        relevant_with_boost = list(relevant)  # копируем базовый результат
+        if active_goals and len(active_goals) > 0:
+            try:
+                goal_texts = [g["description"] for g in active_goals[:3]]
+                goal_relevant = []
+                for g_text in goal_texts:
+                    extra = await self.memory_service.recall(g_text, top_k=3)
+                    for item in extra:
+                        item_copy = dict(item)
+                        item_copy["_goal_boosted"] = True
+                        item_copy["_score"] = item_copy.get("_score", item_copy.get("score", 0.5)) + 0.15
+                        goal_relevant.append(item_copy)
+                
+                # Merge с dedup по gcn_id или text
+                seen_ids = {f.get("gcn_id") or f["text"][:100]: i for i, f in enumerate(relevant_with_boost)}
+                for item in goal_relevant:
+                    key = item.get("gcn_id") or item["text"][:100]
+                    if key in seen_ids:
+                        # Поднимаем существующий факт если он goal-boosted
+                        idx = seen_ids[key]
+                        if item.get("_goal_boosted"):
+                            relevant_with_boost[idx]["_goal_boosted"] = True
+                            relevant_with_boost[idx]["_score"] = max(
+                                relevant_with_boost[idx].get("_score", 0),
+                                item.get("_score", 0)
+                            )
+                    else:
+                        relevant_with_boost.append(item)
+                        seen_ids[key] = len(relevant_with_boost) - 1
+                
+                # Сортируем по score с учётом буста
+                relevant_with_boost.sort(key=lambda x: x.get("_score", x.get("score", 0)), reverse=True)
+                relevant_with_boost = relevant_with_boost[:7]  # ограничиваем размер
+            except Exception as e:
+                logger.debug(f"[Goal-retrieval] ошибка бустинга: {e}")
 
         messages = self._build_messages(
             message=message,
@@ -1521,7 +1682,8 @@ class CognitiveController:
             uncertainty=uncertainty,
             predictions=predictions,
             goal_hint=goal_hint,
-            sources=sources
+            sources=sources,
+            relevant_facts=relevant_with_boost if 'relevant_with_boost' in locals() else relevant
         )
 
         search_meta["context"] = search_context
@@ -1661,6 +1823,24 @@ class CognitiveController:
             })
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
+            
+            # УЛУЧШЕНИЕ №4: Немедленный Hebbian update при высокой ошибке предсказания
+            if error > 0.65 and self.current_working_memory:
+                try:
+                    from GCN.memory_graph import CognitiveMemory
+                    seed_ids = []
+                    kw = CognitiveMemory._extract_keywords(message)
+                    for word in list(kw)[:3]:
+                        seed_ids.extend(self.memory._keyword_index.get(word, [])[:3])
+                    seed_ids = list(dict.fromkeys(seed_ids))[:5]
+                    if len(seed_ids) >= 2:
+                        self._spawn_background_task(
+                            self.memory.spread_activation(seed_ids, max_depth=2, decay=0.6),
+                            name="hebbian-error-spread"
+                        )
+                except Exception as e:
+                    logger.debug(f"[Hebbian] spread_activation on error failed: {e}")
+            
             if (error > 0.85
                     and len(response) > 50
                     and not response.strip().lower().startswith(("привет", "здравствуйте", "hello"))
@@ -1670,6 +1850,23 @@ class CognitiveController:
                 self._last_quick_correction = time.time()
                 self._spawn_background_task(self._quick_correction(message, predictions, response),
                                             name="quick-correction")
+        # УЛУЧШЕНИЕ №1: записываем действие в SelfModel после каждого ответа
+        if hasattr(self, 'self_model') and self.self_model is not None:
+            try:
+                # Корректное определение успеха: инструмент вызван И ответ не содержит ошибок
+                tool_success = bool(tool_trace) and len(response) > 20 and not response.startswith("[Ошибка")
+                reasoning_success = len(response) > 20 and not response.startswith("[Ошибка")
+                action_type = "tool_call" if tool_trace else "reasoning"
+                
+                self.self_model.record_action(
+                    action_type=action_type,
+                    description=message[:100],  # описание запроса, не ответа
+                    success=tool_success if tool_trace else reasoning_success,
+                    confidence=1.0 - self._last_prepare_meta.get("uncertainty", 0.5),
+                )
+            except Exception as e:
+                logger.debug(f"[SelfModel] ошибка записи действия: {e}")
+        
         return response
 
     # ===== ПРОЦЕССИНГ ВХОДА (изменён: добавлена классификация и автоизвлечение) =====
@@ -1706,6 +1903,7 @@ class CognitiveController:
         if uncertainty > 0.7 and not web_search and not reasoning:
             clarification = await self._ask_clarification(message, uncertainty)
             if clarification:
+                self.history.append({"role": "user", "content": message})
                 self.history.append({"role": "assistant", "content": clarification})
                 self._save_history()
                 return clarification, {"clarification": True, "uncertainty": uncertainty}
@@ -1720,6 +1918,39 @@ class CognitiveController:
                 f"internal__web_search]\n{history_tail}" if history_tail else
                 "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри вызов internal__web_search]"
             )
+        
+        # УЛУЧШЕНИЕ №2: Metacognitive gate перед выполнением инструмента
+        if hasattr(self, 'self_model') and self.self_model is not None:
+            try:
+                from GCN import intellect as intellect_mod
+                # tool_trace ещё неизвестен (объявлен ниже), используем эвристику
+                action_type = "tool_call" if search_meta.get("search_requested") else "reasoning"
+                can_proceed, conf, reason = await intellect_mod.metacognitive_check(
+                    task=message[:300],
+                    action_type=action_type,  # должен совпадать с тем что пишет record_action
+                    self_model=self.self_model,
+                )
+                if not can_proceed:
+                    # Автоматически добавляем тему в очередь исследования
+                    if self.autonomy is not None:
+                        self.autonomy.enqueue_topic(
+                            message[:200],
+                            source="knowledge_gap",
+                            priority=0.7
+                        )
+                    # Честный ответ вместо галлюцинации
+                    response = (
+                        f"Уверенность недостаточна ({conf:.2f}): {reason}. "
+                        f"Тема добавлена в очередь исследования. "
+                        f"Могу ответить на основе имеющихся данных, но точность будет низкой."
+                    )
+                    self.history.append({"role": "user", "content": message})
+                    self.history.append({"role": "assistant", "content": response})
+                    self._save_history()
+                    return response, {"metacognition_blocked": True, "confidence": conf}
+            except Exception as e:
+                logger.warning(f"[Metacognition] ошибка проверки: {e}")
+        
         tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
         tool_trace = tool_run.get("tool_trace", [])
 
@@ -2141,7 +2372,8 @@ class CognitiveController:
                         memory_context: str, image_base64: Optional[str],
                         image_mime: Optional[str], reasoning: bool,
                         uncertainty: float, predictions: List[str], goal_hint: str,
-                        sources: Optional[List[Dict]] = None) -> List[Dict]:
+                        sources: Optional[List[Dict]] = None,
+                        relevant_facts: Optional[List[Dict]] = None) -> List[Dict]:
         """Строит сообщения для LLM с разделением концептов и фактов."""
         # Защита от None
         memory_context = memory_context or ""
@@ -2159,23 +2391,89 @@ class CognitiveController:
                     facts.append(line)
         concepts_block = "\n".join(concepts) if concepts else ""
         facts_block = "\n".join(facts) if facts else ""
+        
+        # УЛУЧШЕНИЕ №3: помечаем goal-boosted факты в working memory
+        if relevant_facts:
+            boosted_texts = [f["text"][:80] for f in relevant_facts if f.get("_goal_boosted")]
+            if boosted_texts:
+                wm_block_prefix = "  [! — приоритет по целям]\n"
+            else:
+                wm_block_prefix = ""
+        else:
+            boosted_texts = []
+            wm_block_prefix = ""
 
+        # УЛУЧШЕНИЕ №3: Когнитивный системный промпт с элементами сознания
+        sm = getattr(self, 'self_model', None)
+        state = sm.get_state_summary() if sm else {}
+        
+        # Получаем активные цели из памяти
+        active_goals = getattr(self.memory, 'goals', [])[:5]
+        goals_block = "\n".join(
+            f"  [{i+1}] (p={g.priority:.2f}) {g.description[:80]}"
+            for i, g in enumerate(active_goals)
+        ) or "  (целей нет)"
+        
+        # Рабочая память
+        wm_block = wm_block_prefix + "\n".join(
+            f"  • {t[:100]}" for t in self.current_working_memory[:7]
+        ) or "  (рабочая память пуста)"
+        
         system_parts = [
-            "Ты — когнитивный AI-ассистент с доступом к трём источникам знаний:",
-            "1. ОБОБЩЁННЫЕ ЗНАНИЯ (КОНЦЕПТЫ) — сжатые, проверенные обобщения, используй их как основу.",
-            "2. ЛИЧНАЯ ПАМЯТЬ (конкретные факты) — детали, которые подтверждают или уточняют концепты.",
-            "3. РЕЗУЛЬТАТЫ ПОИСКА В ИНТЕРНЕТЕ — актуальные данные, если они есть.",
+            "=" * 50,
+            "КОГНИТИВНЫЙ АССИСТЕНТ С ЭЛЕМЕНТАМИ СОЗНАНИЯ",
+            "=" * 50,
             "",
-            "ПРАВИЛА ОТВЕТА:",
-            "- Если есть концепты по теме, начинай ответ с них, затем добавляй детали из фактов.",
-            "- Всегда отдавай приоритет личной памяти над поиском, если информация совпадает.",
-            "- Если информация из разных источников противоречит, укажи это и предложи пользователю уточнить.",
-            "- Если ты не уверен в ответе (уверенность < 0.7), честно скажи об этом.",
-            "- Не выдумывай фактов, которых нет в предоставленном контексте.",
+            "━━━ ТЕКУЩЕЕ СОСТОЯНИЕ СИСТЕМЫ ━━━",
+            sm.generate_self_prompt() if sm else "(SelfModel не инициализирован)",
+            "",
+            "━━━ АКТИВНЫЕ ЦЕЛИ (приоритет → действие) ━━━",
+            goals_block,
+            "",
+            "━━━ РАБОЧАЯ ПАМЯТЬ (топ фактов по релевантности) ━━━",
+            wm_block,
+            "",
+            "━━━ ПРАВИЛА КОГНИТИВНОГО ПОВЕДЕНИЯ ━━━",
+            "",
+            "МЕТАКОГНИЦИЯ:",
+            "- Перед каждым утверждением оценивай свою уверенность (0.0–1.0).",
+            "- Если уверенность < 0.4 по конкретному факту — явно скажи об этом.",
+            "- Если задача вне твоих текущих возможностей — не угадывай, запроси уточнение.",
+            "- Различай: «я не знаю» (нет данных) vs «я не уверен» (данные есть, низкая conf).",
+            "",
+            "ЗАЗЕМЛЁННОСТЬ:",
+            "- Конкретные числа, даты, имена — только из контекста памяти или поиска.",
+            "- Каждое конкретное утверждение подкрепляй источником [N] если он есть.",
+            "- При противоречии источников — покажи оба варианта, укажи более надёжный.",
+            "",
+            "ЦЕЛЕОРИЕНТИРОВАННОСТЬ:",
+            "- Активные цели из блока выше влияют на то, что важно в ответе.",
+            "- Если сообщение пользователя продвигает активную цель — отметь это явно.",
+            "",
+            "КАУЗАЛЬНОЕ РАССУЖДЕНИЕ:",
+            "- При объяснении цепочек событий используй явные связи:",
+            "  «X ВЫЗЫВАЕТ Y потому что...», «X ТРЕБУЕТ Y», «X ПРЕДОТВРАЩАЕТ Y».",
+            "- Не смешивай корреляцию и причинность.",
+            "",
+            "ВНУТРЕННИЕ СТАНДАРТЫ:",
+            f"- Текущий уровень уверенности системы: {state.get('confidence', 0.5):.2f}",
+            f"- Текущий уровень любопытства: {state.get('curiosity', 0.5):.2f}",
+            f"- Текущий уровень нагрузки: {state.get('stress', 0.0):.2f}",
+            f"- Частота неудач в последних действиях: {state.get('recent_failure_rate', 0.0):.2f}",
+            "- Если stress > 0.6: замедлись, используй более консервативные стратегии.",
+            "- Если curiosity > 0.7: предложи связанные темы для исследования.",
+            "- Если recent_failure_rate > 0.3: приоритет точности над скоростью.",
+            "",
+            "УПРАВЛЕНИЕ ВНИМАНИЕМ (Global Workspace):",
+            "- В рабочей памяти не более 7±2 факторов одновременно.",
+            "- Приоритет: высокая confidence > свежесть > частота обращений.",
+            "",
+            "=" * 50,
             "Если пользователь явно просит что-то сделать (запомнить, найти, сгенерировать, "
             "добавить цель) – используй соответствующие инструменты из своего набора. Не пытайся "
             "ответить текстом, если для выполнения действия нужен вызов инструмента – это "
-            "будет обработано автоматически. Просто вызови нужный инструмент через JSON."
+            "будет обработано автоматически. Просто вызови нужный инструмент через JSON.",
+            "=" * 50,
         ]
 
         if uncertainty > 0.6:
@@ -2437,6 +2735,7 @@ class CognitiveController:
                 if clarification:
                     await push(f"data: {json.dumps({'token': clarification})}\n\n")
                     await push("data: [DONE]\n\n")
+                    self.history.append({"role": "user", "content": message})
                     self.history.append({"role": "assistant", "content": clarification})
                     self._save_history()
                     return
@@ -2696,9 +2995,15 @@ async def _evict_stale_assistants(exclude_uid: Optional[str] = None) -> None:
             logger.info(f"Ассистент {uid[:16]} выгружен из памяти (простой > {_ASSISTANT_MAX_IDLE_SECONDS}с)")
 
     while len(_assistants) > _ASSISTANT_MAX_COUNT:
-        oldest_uid, oldest_assistant = next(iter(_assistants.items()))
-        if oldest_uid == exclude_uid:
-            break
+        # LRU-эвикция: пропускаем exclude_uid и берём следующего самого старого
+        oldest_uid = None
+        for uid in _assistants:
+            if uid != exclude_uid:
+                oldest_uid = uid
+                break
+        if oldest_uid is None:
+            break  # все оставшиеся — это exclude_uid
+        oldest_assistant = _assistants[oldest_uid]
         _assistants.pop(oldest_uid, None)
         _assistant_last_used.pop(oldest_uid, None)
         try:

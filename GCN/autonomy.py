@@ -104,6 +104,10 @@ except ImportError:
         "goal": 0.25, "goal_subtask": 0.20, "reflection": 0.15,
         "search_failure": 0.20, "contradiction": 0.15,
         "knowledge_gap": 0.10, "refresh": 0.05,
+        # Эндогенные источники из MotivationEngine
+        "curiosity_uncertainty": 0.12, "curiosity_skill_improvement": 0.10,
+        "novelty_exploration": 0.08, "gap_stalled_goal": 0.15,
+        "quality_improvement": 0.18, "quality_confidence_boost": 0.12,
     }
     GOAL_DECOMPOSE_INTERVAL = 6 * 3600
     TIME_SENSITIVE_REFRESH_INTERVAL = 24 * 3600
@@ -137,8 +141,10 @@ _STOPWORDS = {
 
 
 def _keywords(text: str, limit: int = 30) -> set:
+    """Извлекает ключевые слова, сортируя по длине (более длинные — важнее)."""
     words = {w for w in _WORD_RE.findall((text or "").lower()) if w not in _STOPWORDS}
-    return set(sorted(words)[:limit])
+    # Сортируем по убыванию длины: более длинные слова обычно содержательнее
+    return set(sorted(words, key=len, reverse=True)[:limit])
 
 
 # =====================================================================
@@ -232,7 +238,14 @@ class ResearchQueue:
         return topic
 
     def requeue(self, topic: ResearchTopic) -> None:
+        """Переносит тему в будущее с экспоненциальным бэкоффом (для ошибок)."""
         topic.available_at = time.time() + RESEARCH_RETRY_BACKOFF_SECONDS
+        self._items.append(topic)
+        self.save()
+
+    def defer(self, topic: ResearchTopic, seconds: float) -> None:
+        """Откладывает тему на указанное время без инкремента попыток (для budget exhaustion)."""
+        topic.available_at = time.time() + seconds
         self._items.append(topic)
         self.save()
 
@@ -271,6 +284,27 @@ class AutonomyEngine:
         self.user_id = controller.user_id
         self.queue = ResearchQueue(controller.user_dir / "autonomy_queue.json")
 
+        # Инициализация SelfModel и MotivationEngine
+        try:
+            from GCN.self_model import SelfModel
+            from GCN.motivation_engine import MotivationEngine
+            
+            # Используем SelfModel контроллера если он уже есть
+            self.self_model = getattr(controller, 'self_model', None)
+            if self.self_model is None:
+                self.self_model = SelfModel(controller.user_dir)
+                # Передаём обратно в контроллер
+                controller.self_model = self.self_model
+            
+            self.motivation = MotivationEngine(
+                self.self_model,
+                getattr(controller, 'memory', None)
+            )
+        except ImportError as e:
+            logger.warning(f"[Autonomy] не удалось загрузить модули сознания: {e}")
+            self.self_model = None
+            self.motivation = None
+
         self._task: Optional[asyncio.Task] = None
         self._stopped = False
 
@@ -280,6 +314,7 @@ class AutonomyEngine:
         self._digest_count_today: int = 0
         self._last_goal_decompose: float = 0.0
         self._last_refresh: float = 0.0
+        self._last_motivation_tick: float = 0.0
 
         # Обратная связь по проактивности.
         self._notified: List[Dict[str, Any]] = []       # {keywords, ts, source}
@@ -344,8 +379,15 @@ class AutonomyEngine:
             {"text": text[:2000], "source": source, "ts": time.time()}
         )
         # Бэкпрессер: скопилось слишком много — не ждём интервала.
+        # Но force=True теперь НЕ игнорирует тихие часы: если накопилось много,
+        # просто сбрасываем старые находки до DIGEST_MAX_ITEMS, а не шлём ночью.
         if len(self._pending_findings) >= DIGEST_MAX_ITEMS * 2:
-            await self._maybe_flush_digest(force=True)
+            # Тихие часы всё равно проверяем — просто обрезаем буфер, не шлём.
+            if not self._quiet_hours():
+                await self._maybe_flush_digest(force=True)
+            else:
+                # В тихие часы просто держим буфер в разумных пределах.
+                self._pending_findings = self._pending_findings[-DIGEST_MAX_ITEMS:]
         else:
             await self._maybe_flush_digest(force=False)
 
@@ -363,6 +405,20 @@ class AutonomyEngine:
                     continue  # человек в чате — не конкурируем за LLM
                 if self._generation_running():
                     continue  # ответ сейчас генерируется — не мешаем
+                
+                # Запуск метакогнитивного тика (генерация внутренних целей)
+                if self.motivation and time.time() - self._last_motivation_tick > 600:
+                    goal = self.motivation.tick()
+                    if goal:
+                        logger.info(f"[Autonomy] эндогенная цель: {goal.get('goal', '')[:60]}")
+                        # Эндогенная цель должна попадать в очередь исследований, а не только в SelfModel
+                        self.enqueue_topic(
+                            goal["goal"],
+                            source=goal["source"],
+                            priority=goal["priority"],
+                        )
+                    self._last_motivation_tick = time.time()
+                
                 await self._pump_queue()
                 await self._maybe_decompose_goals()
                 await self._maybe_refresh_time_sensitive()
@@ -407,7 +463,9 @@ class AutonomyEngine:
             if topic is None:
                 return
             if not self._consume_budget(_BUDGET_WEIGHT_RESEARCH):
-                self.queue.requeue(topic)
+                # Бюджет исчерпан — откладываем тему на короткое время (не 30 мин),
+                # чтобы не "замораживать" очередь на весь период exhaustion.
+                self.queue.defer(topic, AUTONOMY_LOOP_INTERVAL * 4)
                 return
             logger.info(
                 f"[Autonomy] исследую ({topic.source}, p={topic.priority:.2f}): {topic.topic[:80]}"
@@ -421,8 +479,13 @@ class AutonomyEngine:
             self.queue.complete(topic)
             if answer and answer.strip():
                 await self.submit_finding(answer, source=topic.source)
+            # Завершаем цель из motivation: если тема связана с goal из SelfModel,
+            # удаляем её после успешного исследования.
             if topic.source in ("goal", "goal_subtask") and topic.related_goal:
                 self._bump_goal_confidence(topic.related_goal, +0.10)
+                # Также пробуем удалить из SelfModel.active_goals (для целей от motivation)
+                if hasattr(self, 'self_model') and self.self_model is not None:
+                    self.self_model.remove_goal(topic.related_goal)
 
     def _bump_goal_confidence(self, goal_description: str, delta: float) -> None:
         try:
@@ -530,15 +593,15 @@ class AutonomyEngine:
 
     # ---------------- противоречия ----------------
     def _maybe_enqueue_contradictions(self) -> None:
-        try:
-            pairs = self.ctl.memory.get_unverified_contradictions(limit=3)
-        except Exception:
-            return
-        for a, b in pairs:
-            self.enqueue_topic(
-                f"Разобрать противоречие в памяти: «{a.text[:110]}» против «{b.text[:110]}»",
-                source="contradiction", priority=0.50,
-            )
+        """
+        Противоречия теперь НЕ отправляются в research-очередь.
+        Исследование через веб-поиск не разрешает само противоречие в памяти —
+        пользователь получит дайджест, но факты останутся помеченными CONTRADICTS.
+        Разрешением занимается только _verify_pending_contradictions в ai_assistant.py,
+        который через LLM-вердикт вызывает _demote_or_retract / удаляет рёбра.
+        """
+        # Раньше здесь был enqueue_topic с source="contradiction" — удалено.
+        pass
 
     # ---------------- дайджест проактивных уведомлений ----------------
     def _roll_digest_day(self) -> None:

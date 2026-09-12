@@ -37,6 +37,12 @@ intellect.py — пакет улучшений "интеллекта" когни
      После генерации ответа LLM сверяет его с планом; пропущенные пункты
      добираются одним дополнительным проходом генерации (не ReAct-циклом,
      просто "дополни ответ").
+
+  F. Метакогнитивный мониторинг (НОВЫЙ механизм).
+     Оценка уверенности системы в своих действиях перед выполнением.
+     Использует SelfModel для определения уровня компетенции в конкретной
+     области и блокирует выполнение действий с низкой уверенностью,
+     предлагая альтернативы или запрашивая уточнение.
 """
 
 import json
@@ -57,6 +63,8 @@ try:
         PLAN_CRITIC_MAX_MISSED,
         GROUNDED_MAX_SOURCES,
         GROUNDED_APPEND_SOURCES_FALLBACK,
+        METACOGNITION_ENABLED,
+        METACOGNITION_CONFIDENCE_THRESHOLD,
     )
 except ImportError:
     LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
@@ -69,12 +77,99 @@ except ImportError:
     PLAN_CRITIC_MAX_MISSED = 3
     GROUNDED_MAX_SOURCES = 8
     GROUNDED_APPEND_SOURCES_FALLBACK = False
+    METACOGNITION_ENABLED = True
+    METACOGNITION_CONFIDENCE_THRESHOLD = 0.4
 
 from GCN.llm_client import call_llm
-from GCN.tool_router import _looks_compound  # единая эвристика составного запроса (была третьей копией)
+from GCN.tool_router import _looks_compound
 from GCN.web_search import domain_trust
 
 logger = logging.getLogger(__name__)
+
+
+# =====================================================================
+# F. МЕТАКОГНИТИВНЫЙ МОНИТОРИНГ
+# =====================================================================
+
+_METACOG_CHECK_PROMPT = (
+    "Ты — метакогнитивный модуль оценки уверенности. Тебе даны:\n"
+    "- Задача: {task}\n"
+    "- Тип действия: {action_type}\n"
+    "- Предыдущий опыт в этой области: {experience}\n\n"
+    "Оцени уверенность системы в успешном выполнении задачи (0.0..1.0).\n"
+    "Ответь ТОЛЬКО JSON-объектом вида {{\"confidence\": 0.XX, \"reason\": \"краткое обоснование\"}}."
+)
+
+
+async def metacognitive_check(
+    task: str,
+    action_type: str,
+    self_model=None
+) -> Tuple[bool, float, str]:
+    """
+    Проверяет уверенность системы в выполнении задачи.
+    
+    Возвращает кортеж:
+      - can_proceed: можно ли выполнять задачу (True/False)
+      - confidence: уровень уверенности (0.0..1.0)
+      - reason: обоснование решения
+    
+    Если уверенность ниже порога — задача блокируется.
+    """
+    if not METACOGNITION_ENABLED or not self_model:
+        return True, 0.5, "Метакогниция отключена"
+    
+    # Получаем оценку уверенности из SelfModel
+    base_confidence = self_model.get_confidence_for_action(action_type)
+    
+    # Если уверенность очень низкая — блокируем без LLM
+    if base_confidence < METACOGNITION_CONFIDENCE_THRESHOLD:
+        reason = f"Низкая уверенность системы ({base_confidence:.2f}) в области {action_type}"
+        logger.info(f"[Metacognition] блокировка действия '{task[:50]}': {reason}")
+        return False, base_confidence, reason
+    
+    # Для пограничных случаев используем LLM-оценку
+    reason = ""
+    final_confidence = base_confidence
+    if base_confidence < 0.6:
+        try:
+            experience = self_model.generate_self_prompt()
+            prompt = _METACOG_CHECK_PROMPT.format(
+                task=task[:300],
+                action_type=action_type,
+                experience=experience[:500]
+            )
+            response = await call_llm(
+                [{"role": "user", "content": prompt}],
+                temp=0.0,
+                max_tokens=100
+            )
+            
+            # Парсим ответ
+            m = re.search(r'\{.*\}', response, re.DOTALL)
+            if m:
+                data = json.loads(m.group(0))
+                llm_confidence = float(data.get("confidence", 0.5))
+                reason = data.get("reason", "Нет обоснования")
+                
+                # Комбинируем оценки
+                final_confidence = (base_confidence * 0.4 + llm_confidence * 0.6)
+                
+                if final_confidence < METACOGNITION_CONFIDENCE_THRESHOLD:
+                    logger.info(
+                        f"[Metacognition] блокировка после LLM-оценки: "
+                        f"{reason} (уверенность: {final_confidence:.2f})"
+                    )
+                    return False, final_confidence, reason
+            
+            return True, final_confidence, reason or "LLM-оценка пройдена"
+            
+        except Exception as e:
+            logger.warning(f"[Metacognition] ошибка LLM-оценки: {e}")
+            # При ошибке полагаемся на базовую оценку
+            return base_confidence >= METACOGNITION_CONFIDENCE_THRESHOLD, base_confidence, "Ошибка LLM-оценки, используем базовую уверенность"
+    
+    return True, base_confidence, "Уверенность достаточна"
 
 
 # =====================================================================

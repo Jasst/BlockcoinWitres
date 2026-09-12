@@ -194,6 +194,17 @@ REFLECTION_LLM_TEMP = 0.5
 REFLECTION_LLM_MAX_TOKENS = 300
 
 # -------------------------------
+# Самоанализ кода (Code Self-Reflection)
+# -------------------------------
+# Позволяет ИИ читать свой код, анализировать ошибки и предлагать исправления
+ENABLE_CODE_SELF_REFLECTION = True
+CODE_ANALYSIS_MAX_FILES = 10  # лимит файлов за один анализ
+CODE_CONTEXT_MAX_LINES = 50  # макс. строк контекста вокруг ошибки
+AUTO_FIX_SUGGESTIONS = True  # предлагать исправления автоматически
+CODE_ACCESS_ROOT = Path(__file__).resolve().parent.parent  # корень для доступа к коду
+ALLOWED_CODE_EXTENSIONS = {".py", ".json", ".md", ".txt", ".yml", ".yaml"}  # безопасные расширения
+
+# -------------------------------
 # Проактивные уведомления
 # -------------------------------
 # Фоновые циклы (авто-исследование по целям, доисследование тем из
@@ -230,6 +241,17 @@ DEFAULT_SALIENCE = 0.0
 DEFAULT_STABILITY = 0.5
 DEFAULT_PLASTICITY = 0.5
 DEFAULT_PREDICTION_ERROR = 0.0
+
+# -------------------------------
+# Метакогнитивный мониторинг (НОВЫЙ раздел)
+# -------------------------------
+# Включение метакогнитивной проверки перед выполнением действий.
+# Система оценивает свою уверенность в конкретной области через SelfModel
+# и блокирует действия с низкой уверенностью (< METACOGNITION_CONFIDENCE_THRESHOLD).
+METACOGNITION_ENABLED = True
+# Порог уверенности для выполнения действий. При значении ниже этого порога
+# действие блокируется или требует уточнения/альтернативы.
+METACOGNITION_CONFIDENCE_THRESHOLD = 0.4
 
 # -------------------------------
 # Синапсы / Hebbian / STDP (memory_graph.Synapse)
@@ -453,6 +475,10 @@ RESEARCH_PRIORITY_SOURCE_BOOST = {
     "goal": 0.25, "goal_subtask": 0.20, "reflection": 0.15,
     "search_failure": 0.20, "contradiction": 0.15,
     "knowledge_gap": 0.10, "refresh": 0.05,
+    # Эндогенные источники из MotivationEngine
+    "curiosity_uncertainty": 0.12, "curiosity_skill_improvement": 0.10,
+    "novelty_exploration": 0.08, "gap_stalled_goal": 0.15,
+    "quality_improvement": 0.18, "quality_confidence_boost": 0.12,
 }
 # Декомпозиция активных целей на проверяемые подзадачи (один раз на цель).
 GOAL_DECOMPOSE_INTERVAL = 6 * 3600
