@@ -398,6 +398,19 @@ class CognitiveController:
             llm_text_caller=call_llm,
         )
 
+        # Инициализация SelfModel для CognitiveController
+        try:
+            from GCN.self_model import SelfModel
+            self.self_model = SelfModel(self.user_dir)
+            logger.info(f"[CognitiveController] SelfModel инициализирован для {user_id[:16]}")
+        except ImportError as e:
+            logger.warning(f"[CognitiveController] не удалось загрузить SelfModel: {e}")
+            self.self_model = None
+        
+        # Передаём self_model в AutonomyEngine при инициализации
+        if hasattr(self, 'autonomy') and self.autonomy is not None and self.self_model is not None:
+            self.autonomy.self_model = self.self_model
+
         # Регистрация внутренних инструментов
         async def _internal_recall(args: Dict) -> str:
             query = args.get("query", "")
@@ -1773,6 +1786,19 @@ class CognitiveController:
                 self._last_quick_correction = time.time()
                 self._spawn_background_task(self._quick_correction(message, predictions, response),
                                             name="quick-correction")
+        # УЛУЧШЕНИЕ №1: записываем действие в SelfModel после каждого ответа
+        if hasattr(self, 'self_model') and self.self_model is not None:
+            try:
+                tool_success = bool(tool_trace) or True  # считаем успехом если нет явных ошибок
+                self.self_model.record_action(
+                    action_type="tool_call" if tool_trace else "reasoning",
+                    description=response[:200],
+                    success=tool_success and len(response) > 20,
+                    confidence=1.0 - self._last_prepare_meta.get("uncertainty", 0.5),
+                )
+            except Exception as e:
+                logger.debug(f"[SelfModel] ошибка записи действия: {e}")
+        
         return response
 
     # ===== ПРОЦЕССИНГ ВХОДА (изменён: добавлена классификация и автоизвлечение) =====
@@ -1823,6 +1849,37 @@ class CognitiveController:
                 f"internal__web_search]\n{history_tail}" if history_tail else
                 "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри вызов internal__web_search]"
             )
+        
+        # УЛУЧШЕНИЕ №2: Metacognitive gate перед выполнением инструмента
+        if hasattr(self, 'self_model') and self.self_model is not None:
+            try:
+                from GCN import intellect as intellect_mod
+                can_proceed, conf, reason = await intellect_mod.metacognitive_check(
+                    task=message[:300],
+                    action_type="tool_execution",
+                    self_model=self.self_model,
+                )
+                if not can_proceed:
+                    # Автоматически добавляем тему в очередь исследования
+                    if self.autonomy is not None:
+                        self.autonomy.enqueue_topic(
+                            message[:200],
+                            source="knowledge_gap",
+                            priority=0.7
+                        )
+                    # Честный ответ вместо галлюцинации
+                    response = (
+                        f"Уверенность недостаточна ({conf:.2f}): {reason}. "
+                        f"Тема добавлена в очередь исследования. "
+                        f"Могу ответить на основе имеющихся данных, но точность будет низкой."
+                    )
+                    self.history.append({"role": "user", "content": message})
+                    self.history.append({"role": "assistant", "content": response})
+                    self._save_history()
+                    return response, {"metacognition_blocked": True, "confidence": conf}
+            except Exception as e:
+                logger.warning(f"[Metacognition] ошибка проверки: {e}")
+        
         tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
         tool_trace = tool_run.get("tool_trace", [])
 
@@ -2263,22 +2320,77 @@ class CognitiveController:
         concepts_block = "\n".join(concepts) if concepts else ""
         facts_block = "\n".join(facts) if facts else ""
 
+        # УЛУЧШЕНИЕ №3: Когнитивный системный промпт с элементами сознания
+        sm = getattr(self, 'self_model', None)
+        state = sm.get_state_summary() if sm else {}
+        
+        # Получаем активные цели из памяти
+        active_goals = getattr(self.memory, 'goals', [])[:5]
+        goals_block = "\n".join(
+            f"  [{i+1}] (p={g.priority:.2f}) {g.description[:80]}"
+            for i, g in enumerate(active_goals)
+        ) or "  (целей нет)"
+        
+        # Рабочая память
+        wm_block = "\n".join(
+            f"  • {t[:100]}" for t in self.current_working_memory[:7]
+        ) or "  (рабочая память пуста)"
+        
         system_parts = [
-            "Ты — когнитивный AI-ассистент с доступом к трём источникам знаний:",
-            "1. ОБОБЩЁННЫЕ ЗНАНИЯ (КОНЦЕПТЫ) — сжатые, проверенные обобщения, используй их как основу.",
-            "2. ЛИЧНАЯ ПАМЯТЬ (конкретные факты) — детали, которые подтверждают или уточняют концепты.",
-            "3. РЕЗУЛЬТАТЫ ПОИСКА В ИНТЕРНЕТЕ — актуальные данные, если они есть.",
+            "=" * 50,
+            "КОГНИТИВНЫЙ АССИСТЕНТ С ЭЛЕМЕНТАМИ СОЗНАНИЯ",
+            "=" * 50,
             "",
-            "ПРАВИЛА ОТВЕТА:",
-            "- Если есть концепты по теме, начинай ответ с них, затем добавляй детали из фактов.",
-            "- Всегда отдавай приоритет личной памяти над поиском, если информация совпадает.",
-            "- Если информация из разных источников противоречит, укажи это и предложи пользователю уточнить.",
-            "- Если ты не уверен в ответе (уверенность < 0.7), честно скажи об этом.",
-            "- Не выдумывай фактов, которых нет в предоставленном контексте.",
+            "━━━ ТЕКУЩЕЕ СОСТОЯНИЕ СИСТЕМЫ ━━━",
+            sm.generate_self_prompt() if sm else "(SelfModel не инициализирован)",
+            "",
+            "━━━ АКТИВНЫЕ ЦЕЛИ (приоритет → действие) ━━━",
+            goals_block,
+            "",
+            "━━━ РАБОЧАЯ ПАМЯТЬ (топ фактов по релевантности) ━━━",
+            wm_block,
+            "",
+            "━━━ ПРАВИЛА КОГНИТИВНОГО ПОВЕДЕНИЯ ━━━",
+            "",
+            "МЕТАКОГНИЦИЯ:",
+            "- Перед каждым утверждением оценивай свою уверенность (0.0–1.0).",
+            "- Если уверенность < 0.4 по конкретному факту — явно скажи об этом.",
+            "- Если задача вне твоих текущих возможностей — не угадывай, запроси уточнение.",
+            "- Различай: «я не знаю» (нет данных) vs «я не уверен» (данные есть, низкая conf).",
+            "",
+            "ЗАЗЕМЛЁННОСТЬ:",
+            "- Конкретные числа, даты, имена — только из контекста памяти или поиска.",
+            "- Каждое конкретное утверждение подкрепляй источником [N] если он есть.",
+            "- При противоречии источников — покажи оба варианта, укажи более надёжный.",
+            "",
+            "ЦЕЛЕОРИЕНТИРОВАННОСТЬ:",
+            "- Активные цели из блока выше влияют на то, что важно в ответе.",
+            "- Если сообщение пользователя продвигает активную цель — отметь это явно.",
+            "",
+            "КАУЗАЛЬНОЕ РАССУЖДЕНИЕ:",
+            "- При объяснении цепочек событий используй явные связи:",
+            "  «X ВЫЗЫВАЕТ Y потому что...», «X ТРЕБУЕТ Y», «X ПРЕДОТВРАЩАЕТ Y».",
+            "- Не смешивай корреляцию и причинность.",
+            "",
+            "ВНУТРЕННИЕ СТАНДАРТЫ:",
+            f"- Текущий уровень уверенности системы: {state.get('confidence', 0.5):.2f}",
+            f"- Текущий уровень любопытства: {state.get('curiosity', 0.5):.2f}",
+            f"- Текущий уровень нагрузки: {state.get('stress', 0.0):.2f}",
+            f"- Частота неудач в последних действиях: {state.get('recent_failure_rate', 0.0):.2f}",
+            "- Если stress > 0.6: замедлись, используй более консервативные стратегии.",
+            "- Если curiosity > 0.7: предложи связанные темы для исследования.",
+            "- Если recent_failure_rate > 0.3: приоритет точности над скоростью.",
+            "",
+            "УПРАВЛЕНИЕ ВНИМАНИЕМ (Global Workspace):",
+            "- В рабочей памяти не более 7±2 факторов одновременно.",
+            "- Приоритет: высокая confidence > свежесть > частота обращений.",
+            "",
+            "=" * 50,
             "Если пользователь явно просит что-то сделать (запомнить, найти, сгенерировать, "
             "добавить цель) – используй соответствующие инструменты из своего набора. Не пытайся "
             "ответить текстом, если для выполнения действия нужен вызов инструмента – это "
-            "будет обработано автоматически. Просто вызови нужный инструмент через JSON."
+            "будет обработано автоматически. Просто вызови нужный инструмент через JSON.",
+            "=" * 50,
         ]
 
         if uncertainty > 0.6:

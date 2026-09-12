@@ -1,29 +1,4 @@
 ```
-# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-
-# Logs
-*.log
-
-# Environment
-.env
-.env.local
-*.env.*
-
-# Dependencies
-.venv/
-venv/
-.env/
-
-# Editors
-.vscode/
-.idea/
-
-# Build artifacts
-build/
-dist/
-*.egg-info/
 ```
