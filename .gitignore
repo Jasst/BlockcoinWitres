@@ -1,4 +1,4 @@
-(static/style.css) is just a source file, no build artifacts, dependencies, or temp files in the changes.
+(static/style.css) is a source file, and there are no build artifacts, dependencies, or temporary files in the changes. Therefore, no .gitignore rules are needed.
 
 Output: (empty)
 /__pycache__
