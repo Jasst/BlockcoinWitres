@@ -865,7 +865,7 @@ async def update_fact(
 # ============================================================
 @mcp.resource("memory://{user_id}/facts")
 async def list_facts(user_id: str) -> Dict[str, Any]:
-    service = await get_memory_service(_resolve_user(user_id, ctx))
+    service = await get_memory_service(_resolve_user(user_id, None))
     stats = await service.get_memory_stats()
     # Упрощённо: возвращаем список фактов из service
     # В сервисе нет метода для получения всех фактов, поэтому используем прямой доступ к памяти
@@ -880,7 +880,7 @@ async def list_facts(user_id: str) -> Dict[str, Any]:
 
 @mcp.resource("memory://{user_id}/fact/{fact_id}")
 async def get_fact(user_id: str, fact_id: str) -> Dict[str, Any]:
-    service = await get_memory_service(_resolve_user(user_id, ctx))
+    service = await get_memory_service(_resolve_user(user_id, None))
     memory = service.private_memory
     memory.reload_if_stale()
     obj = memory.store.get(fact_id)

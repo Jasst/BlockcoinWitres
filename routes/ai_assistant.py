@@ -1167,6 +1167,11 @@ class CognitiveController:
         фонового доисследования темы не должен ничего ронять.
         """
         try:
+            # ПРОВЕРКА БЮДЖЕТА: фоновые исследования из рефлексии/коррекции
+            # должны списывать бюджет так же, как автономные research-темы.
+            if not self._consume_autonomous_llm_budget(n=3):
+                logger.info(f"[Budget] пропуск фонового исследования '{topic[:50]}': бюджет исчерпан")
+                return
             result = await self.research(topic)
             # ИЗМЕНЕНИЕ: доставка через дайджест движка автономности.
             if self.autonomy is not None:
@@ -1455,7 +1460,12 @@ class CognitiveController:
         self._last_reflection_time = time.time()
 
     async def _quick_correction(self, query: str, predicted: List[str], actual: str):
+        """Фоновая коррекция по высокой ошибке предсказания — с проверкой бюджета."""
         logger.info(f"[QuickCorrection] High error detected for: {query[:50]}...")
+        # ПРОВЕРКА БЮДЖЕТА: быстрая коррекция тоже тратит LLM-вызовы
+        if not self._consume_autonomous_llm_budget(n=3):
+            logger.info(f"[Budget] пропуск quick_correction '{query[:50]}': бюджет исчерпан")
+            return
         await self.research(query)
 
     # ===== НОВЫЙ МЕТОД: автоматическое извлечение фактов из сообщения =====
@@ -1893,6 +1903,7 @@ class CognitiveController:
         if uncertainty > 0.7 and not web_search and not reasoning:
             clarification = await self._ask_clarification(message, uncertainty)
             if clarification:
+                self.history.append({"role": "user", "content": message})
                 self.history.append({"role": "assistant", "content": clarification})
                 self._save_history()
                 return clarification, {"clarification": True, "uncertainty": uncertainty}
@@ -2724,6 +2735,7 @@ class CognitiveController:
                 if clarification:
                     await push(f"data: {json.dumps({'token': clarification})}\n\n")
                     await push("data: [DONE]\n\n")
+                    self.history.append({"role": "user", "content": message})
                     self.history.append({"role": "assistant", "content": clarification})
                     self._save_history()
                     return

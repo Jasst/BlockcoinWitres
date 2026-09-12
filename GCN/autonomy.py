@@ -104,6 +104,10 @@ except ImportError:
         "goal": 0.25, "goal_subtask": 0.20, "reflection": 0.15,
         "search_failure": 0.20, "contradiction": 0.15,
         "knowledge_gap": 0.10, "refresh": 0.05,
+        # Эндогенные источники из MotivationEngine
+        "curiosity_uncertainty": 0.12, "curiosity_skill_improvement": 0.10,
+        "novelty_exploration": 0.08, "gap_stalled_goal": 0.15,
+        "quality_improvement": 0.18, "quality_confidence_boost": 0.12,
     }
     GOAL_DECOMPOSE_INTERVAL = 6 * 3600
     TIME_SENSITIVE_REFRESH_INTERVAL = 24 * 3600
@@ -137,8 +141,10 @@ _STOPWORDS = {
 
 
 def _keywords(text: str, limit: int = 30) -> set:
+    """Извлекает ключевые слова, сортируя по длине (более длинные — важнее)."""
     words = {w for w in _WORD_RE.findall((text or "").lower()) if w not in _STOPWORDS}
-    return set(sorted(words)[:limit])
+    # Сортируем по убыванию длины: более длинные слова обычно содержательнее
+    return set(sorted(words, key=len, reverse=True)[:limit])
 
 
 # =====================================================================
@@ -391,6 +397,12 @@ class AutonomyEngine:
                     goal = self.motivation.tick()
                     if goal:
                         logger.info(f"[Autonomy] эндогенная цель: {goal.get('goal', '')[:60]}")
+                        # Эндогенная цель должна попадать в очередь исследований, а не только в SelfModel
+                        self.enqueue_topic(
+                            goal["goal"],
+                            source=goal["source"],
+                            priority=goal["priority"],
+                        )
                     self._last_motivation_tick = time.time()
                 
                 await self._pump_queue()
