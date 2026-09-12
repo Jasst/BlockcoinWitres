@@ -1,45 +1,12 @@
-```
-# Compiled and build artifacts
-*.pyc
-__pycache__/
-*.o
-*.obj
-*.so
-*.dll
-*.exe
-*.class
-*.out
+(static/style.css) is a source file, and there are no build artifacts, dependencies, or temporary files in the changes. Therefore, no .gitignore rules are needed.
 
-# Dependencies
-.venv/
-venv/
+Output: (empty)
+/__pycache__
+/ai_memory_v3
+/GCN/__pycache__
+/routes/__pycache__
+/services/__pycache__
+/.idea
+messenger.log
 .env
-.env.local
-.env.*
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-
-# Editors
-.vscode/
-.idea/
-
-# Coverage and testing
-.coverage
-coverage/
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-
-# Build directories
-dist/
-build/
-target/
-.gradle/
-
-# System files
-.DS_Store
-Thumbs.db
-```
+/uploads
