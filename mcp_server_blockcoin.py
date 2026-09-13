@@ -28,6 +28,7 @@ from GCN.web_search import deep_search
 from GCN.image_utils import enhance_prompt, generate_image as gen_image
 from routes.ai_assistant import get_assistant
 from GCN.llm_client import call_llm
+from GCN.code_analyzer import get_analyzer
 
 # --- Вход по криптоподписи кошелька (EIP-191) ---
 # pip install eth-account
@@ -859,6 +860,83 @@ async def update_fact(
         "comment": f"Факт обновлён.{comment}",
         "save_result": save_result,
     }
+
+# ============================================================
+# ИНСТРУМЕНТЫ РАБОТЫ С КОДОМ (CodeAnalyzer)
+# ============================================================
+
+@mcp.tool()
+async def read_code_file(
+    file_path: str = Field(..., description="Относительный путь от корня проекта, например 'GCN/config_ai.py'"),
+    max_lines: int = Field(500, description="Максимум строк для возврата", ge=10, le=2000),
+) -> Dict[str, Any]:
+    """Читает файл исходного кода проекта с проверкой безопасности.
+    Доступны только файлы внутри CODE_ACCESS_ROOT с разрешёнными расширениями
+    (.py, .json, .md, .txt, .yml, .yaml).
+    """
+    analyzer = get_analyzer()
+    content = await analyzer.read_file(file_path, max_lines=max_lines)
+    ok = not content.startswith("Ошибка")
+    return {
+        "status": "ok" if ok else "error",
+        "file_path": file_path,
+        "content": content,
+        "truncated": "обрезан" in content,
+    }
+
+
+@mcp.tool()
+async def search_in_code(
+    pattern: str = Field(..., description="Строка или регулярное выражение для поиска в коде проекта"),
+    max_results: int = Field(20, description="Максимум результатов", ge=1, le=50),
+) -> Dict[str, Any]:
+    """Ищет паттерн (строку или regex) по всем файлам кода проекта.
+    Возвращает файл, номер строки и контекст вокруг каждого совпадения.
+    Полезно для поиска использований функции, класса, переменной или любого паттерна.
+    """
+    analyzer = get_analyzer()
+    result = await analyzer.search_in_code(pattern, max_results=max_results)
+    found = not result.startswith("Ничего не найдено") and not result.startswith("Ошибка")
+    return {
+        "status": "ok" if found else "not_found",
+        "pattern": pattern,
+        "result": result,
+    }
+
+
+@mcp.tool()
+async def get_project_structure(
+    max_depth: int = Field(3, description="Максимальная глубина обхода директорий", ge=1, le=5),
+) -> Dict[str, Any]:
+    """Возвращает дерево файлов проекта — только разрешённые расширения кода.
+    Удобно для ориентации в проекте перед чтением конкретных файлов.
+    """
+    analyzer = get_analyzer()
+    tree = await analyzer.get_project_structure(max_depth=max_depth)
+    return {
+        "status": "ok",
+        "max_depth": max_depth,
+        "tree": tree,
+    }
+
+
+@mcp.tool()
+async def analyze_error(
+    error_message: str = Field(..., description="Текст ошибки (например, 'KeyError: config not found')"),
+    traceback_str: str = Field("", description="Полная трассировка стека из Python (необязательно, но улучшает анализ)"),
+) -> Dict[str, Any]:
+    """Анализирует Python-ошибку: извлекает файлы и строки из traceback,
+    читает проблемный код и предлагает возможные причины и исправления.
+    Передай traceback целиком для наилучшего результата.
+    """
+    analyzer = get_analyzer()
+    analysis = await analyzer.analyze_error_location(error_message, traceback_str)
+    return {
+        "status": "ok",
+        "error_message": error_message,
+        "analysis": analysis,
+    }
+
 
 # ============================================================
 # РЕСУРСЫ
