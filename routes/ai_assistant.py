@@ -34,7 +34,7 @@ from GCN.tool_router import ToolRegistry, ToolRouter, build_tool_trace_context
 # ИНТЕЛЛЕКТ-ПАКЕТ: заземлённые ответы, санитайзер фактов, подзапросный retrieval,
 # критик по плану (см. GCN/intellect.py)
 from GCN import intellect as intellect_mod
-from GCN.config_ai import GROUNDED_ANSWER_ENABLED, PLAN_CRITIC_ENABLED
+from GCN.config_ai import GROUNDED_ANSWER_ENABLED, PLAN_CRITIC_ENABLED, DEFAULT_MAX_TOKENS
 
 # ИЗМЕНЕНИЕ: импорт MemoryService и фабрики
 from GCN.memory_service import MemoryService, get_memory_service
@@ -2848,7 +2848,7 @@ class CognitiveController:
                             "content": build_tool_trace_context(tool_trace) + "\n\nТеперь дай финальный ответ пользователю."
                         })
 
-                    async for token in call_llm_stream(messages):
+                    async for token in call_llm_stream(messages, max_tokens=DEFAULT_MAX_TOKENS):
                         full_response += token
                         await push(f"data: {json.dumps({'token': token})}\n\n")
                 else:

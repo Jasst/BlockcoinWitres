@@ -15,10 +15,11 @@ MEMORY_BASE_DIR.mkdir(exist_ok=True)
 # -------------------------------
 LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
 LM_STUDIO_API_KEY = "lm-studio"
-LM_STUDIO_TIMEOUT = 600
-LM_STUDIO_STREAM_TIMEOUT = 900
+LM_STUDIO_TIMEOUT = 1800          # увеличено с 600 до 1800 сек (30 мин) для длительных запросов
+LM_STUDIO_STREAM_TIMEOUT = 2700   # увеличено с 900 до 2700 сек (45 мин) для потоковых ответов
 LM_STUDIO_USE_STREAM = True
 LM_STUDIO_VISION_SUPPORTED = True
+DEFAULT_MAX_TOKENS = 4096         # увеличенная длина ответа по умолчанию (было 2048)
 
 # -------------------------------
 # Параметры памяти (GCN)
