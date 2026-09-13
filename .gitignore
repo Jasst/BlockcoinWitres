@@ -1,55 +1,34 @@
 ```
-# Compiled and build artifacts
-*.pyc
+# Python
 __pycache__/
-*.o
-*.obj
+*.pyc
+*.pyo
+*.pyd
 
 # Dependencies
 .venv/
 venv/
-node_modules/
+env/
+.env
+.env.local
+.env.*
 
 # Logs and temp files
 *.log
 *.tmp
 *.swp
 
-# Environment
-.env
-.env.local
-*.env.*
-
 # Editors
 .vscode/
 .idea/
 
-# Coverage reports
+# Coverage
+.coverage
 coverage/
 htmlcov/
-.coverage
-
-# Python specific
-*.pyo
-*.pyd
-.Python
-*.so
-*.egg-info/
 
 # Distribution / packaging
-*.tar.gz
-*.whl
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Testing
-.pytest_cache/
-.mypy_cache/
-.hypothesis/
-
-# OS generated files
-.DS_Store
-Thumbs.db
+dist/
+build/
+*.egg-info/
 ```
-/ai_memory_v3
-/uploads
