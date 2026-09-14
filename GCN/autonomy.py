@@ -698,9 +698,9 @@ class AutonomyEngine:
 
         texts = await self._select_notifications(batch)
         self._last_digest_at = time.time()
-        for i, text in enumerate(texts[:2]):
+        for idx, text in texts[:2]:
             try:
-                topic_key = batch[i].get("topic_key") if i < len(batch) else None
+                topic_key = batch[idx].get("topic_key") if 0 <= idx < len(batch) else None
                 await self.ctl.memory_service.push_notification(
                     text, source="autonomy_digest"
                 )
@@ -718,8 +718,13 @@ class AutonomyEngine:
                 logger.error(f"push_notification failed: {e}")
         self._save_state()
 
-    async def _select_notifications(self, batch: List[Dict[str, Any]]) -> List[str]:
-        """Один LLM-выбор: какие из находок достойны уведомления (≤2)."""
+    async def _select_notifications(self, batch: List[Dict[str, Any]]) -> List[Tuple[int, str]]:
+        """Один LLM-выбор: какие из находок достойны уведомления (≤2).
+        
+        ИСПРАВЛЕНИЕ (пункт 2): возвращаем пары (original_index, rewritten_text),
+        чтобы topic_key привязывался к исходной находке, а не к переписанному тексту.
+        LLM обязана отвечать с указанием индекса: {"notify": [{"idx": 0, "text": "..."}]}.
+        """
         listing = "\n".join(
             f"[{i}] ({item['source']}) {item['text'][:400]}"
             for i, item in enumerate(batch)
@@ -732,11 +737,12 @@ class AutonomyEngine:
             "конкретные, не тривиальные, полезные. Максимум 2. Для каждой перепиши "
             "текст одним коротким сообщением от первого лица (1-2 предложения, "
             "разговорный тон, без вступлений вроде «вот что я нашёл»).\n"
-            "Ответь ТОЛЬКО JSON-объектом вида {\"notify\": [\"текст1\", \"текст2\"]}; "
+            "Ответь ТОЛЬКО JSON-объектом вида {\"notify\": [{\"idx\": 0, \"text\": \"...\"}, {\"idx\": 3, \"text\": \"...\"}]}; "
+            "где idx — индекс исходной находки из списка выше. "
             "если ничего не достойно — {\"notify\": []}."
         )
         try:
-            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.3, max_tokens=300)
+            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.3, max_tokens=400)
         except Exception as e:
             logger.debug(f"digest selection failed: {e}")
             return []
@@ -750,7 +756,20 @@ class AutonomyEngine:
         notify = data.get("notify", [])
         if not isinstance(notify, list):
             return []
-        return [str(x).strip() for x in notify if isinstance(x, str) and len(str(x).strip()) >= 20]
+        
+        result: List[Tuple[int, str]] = []
+        for item in notify:
+            if isinstance(item, dict):
+                idx = item.get("idx")
+                text = item.get("text", "")
+                if isinstance(idx, int) and 0 <= idx < len(batch) and isinstance(text, str) and len(text.strip()) >= 20:
+                    result.append((idx, text.strip()))
+            elif isinstance(item, str) and len(item.strip()) >= 20:
+                # Fallback для обратной совместимости: если LLM вернула просто строки,
+                # берём первые N элементов batch по порядку
+                if len(result) < len(batch):
+                    result.append((len(result), item.strip()))
+        return result
 
     # ---------------- обратная связь ----------------
     def _register_feedback(self, message: str) -> None:
