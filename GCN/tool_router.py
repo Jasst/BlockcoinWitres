@@ -91,6 +91,30 @@ Claude Desktop, к mcp_server_blockcoin.py) всё работает надёжн
    пользовательское сообщение-подсказку, явно указывающее, что нужно
    вызвать `internal__fetch_github_file` с правильным `path`. Это снижает
    нагрузку на LLM и гарантирует, что вызов будет сделан с первого раза.
+
+5) ДЕЛЕГИРОВАНИЕ СУБАГЕНТАМ (переработано).
+   Раньше на КАЖДОЕ нормальное сообщение шёл LLM-классификатор роли
+   (auto_route) и, что хуже, при первом же возвращённом role возвращался
+   из run(), полностью пропуская основной ReAct-цикл: план подзадач,
+   scratchpad, рефлексию над ошибкой, _verify_tool_result, трекинг плана,
+   дедуп seen_calls/seen_errors. Отдельно: delegation передавала роль
+   СТРОКОЙ ("coder"/"researcher"), что работало лишь как побочный эффект
+   str-mixin у AgentRole и ломалось на любой другой версии Python;
+   в одном из мест был SyntaxError из-за лишнего бэкслеша в f-string.
+   ИСПРАВЛЕНО:
+     - делегируется только роль CODER, и только на строгие маркеры
+       (расширения файлов, traceback/exception, github.com, имена
+       coder-инструментов). Убраны широкие "код"/"файл"/"ошибка"/"поиск",
+       матчившие "код города", "прикрепи файл", "типичные ошибки";
+     - роль researcher больше не делегируется: её инструменты
+       (web_search/fetch_github_file) уже есть в основном цикле, а сам
+       цикл дополнительно делает параллельные queries, дедуп источников,
+       sanitize_search_facts, сбор _web_search_results_this_turn для
+       фронта и _verify_response — субагент всего этого не проходит,
+       и его tool_trace попадал в ai_assistant.py без заземления;
+     - роль передаётся как AgentRole.CODER (enum), а не строкой;
+     - в возврате при делегировании честно `used_native: False` и
+       `plan: ""` (native не вызывался, план ещё не строили).
 """
 
 import json
@@ -101,13 +125,21 @@ from typing import Any, Callable, Dict, List, Optional, Awaitable
 import asyncio
 from pathlib import Path
 
+# Логгер — до всех условных импортов и до функций, которые могут его
+# использовать (раньше он определялся условно внутри except ImportError,
+# из-за чего любое обращение к logger вне этого except могло упасть с
+# NameError в ветке, где subagent импортировался успешно).
+logger = logging.getLogger(__name__)
+
 # ПУНКТ №5: Импорт субагентов для делегирования
 try:
     from GCN.subagent import SubAgentOrchestrator, AgentRole, ROLE_TOOLS
     SUBAGENTS_AVAILABLE = True
 except ImportError:
     SUBAGENTS_AVAILABLE = False
-    logger = logging.getLogger(__name__)
+    SubAgentOrchestrator = None
+    AgentRole = None
+    ROLE_TOOLS = None
 
 # ИСПРАВЛЕНИЕ #4: путь для персистентного флага native_supported
 _NATIVE_FLAG_PATH = Path(__file__).resolve().parent.parent / "ai_memory_v3" / "_native_flag.json"
@@ -129,6 +161,7 @@ except ImportError:
     MAX_SUBTASKS = 4
     MCP_TOOL_TIMEOUT_OVERRIDES = {}
 
+
 # ИСПРАВЛЕНИЕ (генерация изображений в чате "не всегда работает"): тяжёлые
 # инструменты убивались единым TOOL_CALL_TIMEOUT_SECONDS=45 ещё ДО того, как
 # EasyDiffusion успевал сгенерировать картинку (только enhance-промпт через
@@ -142,7 +175,6 @@ def _resolve_timeout(tool_name: str):
             return t
     return None
 
-logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 3  # сколько раундов вызова инструментов разрешено за один ответ
 MAX_TOOL_ITERATIONS_DYNAMIC = 7  # максимум при активном перепланировании
@@ -400,11 +432,11 @@ class ToolRouter:
         self._subagent_orchestrator: Optional[Any] = None
         if SUBAGENTS_AVAILABLE:
             try:
-                # Исправлено: имена аргументов должны совпадать с __init__ SubAgentOrchestrator
+                # Имена аргументов должны совпадать с __init__ SubAgentOrchestrator
                 self._subagent_orchestrator = SubAgentOrchestrator(
                     llm_raw_caller=llm_raw_caller,
                     llm_text_caller=llm_text_caller,
-                    tool_registry=registry
+                    tool_registry=registry,
                 )
                 logger.info("SubAgentOrchestrator успешно инициализирован")
             except Exception as e:
@@ -494,10 +526,10 @@ class ToolRouter:
         """
         if not plan_text:
             return []
-        
+
         lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
         unrealizable = []
-        
+
         # Простая эвристика: если пункт содержит название инструмента — проверяем наличие
         for line in lines:
             found_tool = False
@@ -508,10 +540,10 @@ class ToolRouter:
             # Если инструмент не найден в названии, но есть общие маркеры действий
             action_markers = ["найди", "поиск", "проверь", "прочти", "открой", "вспомни", "запомни"]
             has_action = any(m in line.lower() for m in action_markers)
-            
+
             if not found_tool and not has_action:
                 unrealizable.append(line)
-        
+
         return unrealizable
 
     async def _track_plan_progress(self, plan_text: str, tool_trace: List[Dict]) -> Dict[str, bool]:
@@ -521,20 +553,20 @@ class ToolRouter:
         """
         if not plan_text:
             return {}
-        
+
         lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
         progress = {}
-        
+
         for line in lines:
             # Проверяем, есть ли в tool_trace инструменты, релевантные этому пункту
             covered = False
             for entry in tool_trace:
                 tool_name = entry.get("tool", "").lower()
                 result = str(entry.get("result", "")).lower()
-                
+
                 # Ключевые слова из пункта плана
                 plan_words = set(line.lower().split())
-                
+
                 # Если инструмент или результат содержат слова из плана
                 if any(word in tool_name for word in plan_words if len(word) > 3):
                     covered = True
@@ -542,12 +574,12 @@ class ToolRouter:
                 if any(word in result for word in plan_words if len(word) > 3):
                     covered = True
                     break
-            
+
             progress[line] = covered
-        
+
         return progress
 
-    async def _reflect_on_failure(self, tool: str, args: Dict, error: str, 
+    async def _reflect_on_failure(self, tool: str, args: Dict, error: str,
                                    plan: str, history_tail: str) -> Dict:
         """
         ПУНКТ №1: После ошибки/пустого результата — короткий LLM-проход для диагностики.
@@ -574,7 +606,7 @@ class ToolRouter:
     "suggested_tool": "название другого инструмента если нужно" или null,
     "new_plan": "новый план если требуется перепланирование" или null
 }}"""
-        
+
         try:
             raw = await self.llm_text_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=400)
             result = _strict_parse_json_object(raw)
@@ -582,7 +614,7 @@ class ToolRouter:
                 return result
         except Exception as e:
             logger.debug(f"Reflection on failure failed: {e}")
-        
+
         # Fallback: базовая эвристика
         error_lower = error.lower()
         if "не найдено" in error_lower or "404" in error_lower or "not found" in error_lower:
@@ -599,27 +631,27 @@ class ToolRouter:
         """
         if not result or result.strip() == "":
             return "error"
-        
+
         result_lower = result.lower()
-        
+
         # Явные маркеры ошибки
         if any(m in result_lower for m in ["ошибка", "error", "exception", "timeout", "не удалось"]):
             if any(m in result_lower for m in ["не найдено", "404", "nothing found", "no results"]):
                 return "irrelevant"  # Не ошибка, просто пусто
             return "error"
-        
+
         # Маркеры пустого/нерелевантного результата
         if any(m in result_lower for m in ["ничего не найдено", "no results found", "пусто", "empty"]):
             return "irrelevant"
-        
+
         # Если результат очень короткий и не содержит данных
         if len(result) < 20 and not any(c.isdigit() for c in result):
             return "partial"
-        
+
         # Эвристика: если результат содержит данные (URL, числа, текст > 50 символов)
         if len(result) > 50 or any(m in result for m in ["http", "www", "."]):
             return "sufficient"
-        
+
         return "partial"
 
     async def _decide_fallback(self, message: str, history_tail: str,
@@ -633,7 +665,7 @@ class ToolRouter:
         raw = await self.llm_text_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=300)
         return _strict_parse_json_object(raw)
 
-    # ===== ОСНОВНОЙ МЕТОД (с изменениями) =====
+    # ===== ОСНОВНОЙ МЕТОД =====
     async def run(self, message: str, base_messages: List[Dict], history_tail: str = "") -> Dict[str, Any]:
         """
         Запускает ReAct-цикл: до MAX_TOOL_ITERATIONS раундов вызова инструментов,
@@ -650,46 +682,48 @@ class ToolRouter:
         # === Очистка scratchpad для нового запроса (предотвращение загрязнения контекста) ===
         self._scratchpad = []
 
-        # === ПУНКТ №5: Делегирование субагенту для специализированных задач ===
-        # Включаем субагентов ТОЛЬКО на явные keyword-триггеры, без LLM-классификатора.
-        # Это предотвращает перехват запросов и поломку основного ReAct-цикла.
+        message_lower = (message or "").lower()
+
+        # === ПУНКТ №5: Делегирование субагенту ===
+        # Делегируем ТОЛЬКО роль CODER, и только на строгие маркеры анализа кода.
+        # Убраны широкие "код"/"файл"/"ошибка"/"поиск": они матчатся на бытовые
+        # фразы ("код города", "прикрепи файл", "типичные ошибки") и уводили
+        # запрос в субагента в обход всего основного цикла (план, scratchpad,
+        # рефлексия, verify_tool_result, трекинг плана, дедуп).
+        #
+        # Роль RESEARCHER больше не делегируется: её инструменты
+        # (internal__web_search / internal__fetch_github_file) уже доступны
+        # основному ReAct-циклу, а сам цикл делает больше — параллельные
+        # queries, дедуп источников, sanitize_search_facts, сбор
+        # _web_search_results_this_turn для фронта, _verify_response.
+        # Субагент все эти шаги пропускает, и его tool_trace приходил в
+        # ai_assistant.py без заземления/валидации.
         if self._subagent_orchestrator is not None:
             try:
-                # Проверяем явные маркеры для делегирования
-                message_lower = message.lower()
-                
-                # Coder: анализ кода, ошибки, файлы
-                coder_keywords = ["код", "ошибка", "exception", "traceback", "файл",
-                                 "дебаг", "исправь", ".py", ".js", ".ts", "github.com",
-                                 "прочитай код", "анализируй код", "search_code", "read_code"]
-                
-                # Researcher: поиск информации, актуальные данные
-                researcher_keywords = ["найди информацию", "актуальное", "последняя версия",
-                                      "исследуй", "узнай про", "web_search", "поиск в интернете"]
-                
-                should_delegate = False
-                delegate_role = None
-                
-                if any(kw in message_lower for kw in coder_keywords):
-                    should_delegate = True
-                    delegate_role = "coder"
-                elif any(kw in message_lower for kw in researcher_keywords):
-                    should_delegate = True
-                    delegate_role = "researcher"
-                
-                if should_delegate and delegate_role:
-                    logger.info(f\"Делегировано субагенту: {delegate_role}\")
+                coder_markers = (
+                    ".py", ".js", ".ts", ".tsx", ".jsx",
+                    "traceback", "exception",
+                    "github.com",
+                    "read_code", "search_code", "analyze_error",
+                    "project_structure",
+                    "прочитай код", "анализируй код", "структуру проекта",
+                )
+                if any(m in message_lower for m in coder_markers):
+                    logger.info("Делегировано субагенту: coder")
                     role_result = await self._subagent_orchestrator.execute_task(
                         task=message,
-                        role=delegate_role,
-                        context={"history_tail": history_tail[:500] if history_tail else ""}
+                        role=AgentRole.CODER,
+                        context={"history_tail": history_tail[:500] if history_tail else ""},
                     )
                     if role_result and role_result.get("result"):
                         return {
                             "tool_trace": role_result.get("tool_trace", []),
-                            "used_native": True,
-                            "delegated_to": delegate_role,
-                            "plan": getattr(self, "_last_plan", "")
+                            # Native-режим здесь не вызывался, и план ещё не строили —
+                            # возвращаем честные значения, чтобы ai_assistant не сверял
+                            # ответ с чужим (прошлым) планом.
+                            "used_native": False,
+                            "delegated_to": AgentRole.CODER.value,
+                            "plan": "",
                         }
             except Exception as e:
                 logger.debug(f"SubAgent delegation failed, fallback to ToolRouter: {e}")
@@ -734,11 +768,11 @@ class ToolRouter:
         seen_calls: set = set()
         # === ИСПРАВЛЕНИЕ: отслеживаем ошибки, чтобы не повторять их ===
         seen_errors: set = set()   # (tool, frozenset(sorted(args.items())))
-        
+
         # ПУНКТ №1: Динамический лимит итераций при активном перепланировании
         max_iterations = MAX_TOOL_ITERATIONS
         replan_count = 0  # счётчик перепланирований
-        
+
         # ПУНКТ №4: Валидация плана перед выполнением
         if plan_text:
             available_tools = list(self.registry._tools.keys())
@@ -851,10 +885,10 @@ class ToolRouter:
                             plan_text, history_tail
                         )
                         logger.info(f"Рефлексия над ошибкой: {reflection.get('diagnosis', 'неизвестно')}")
-                        
+
                         # === ИСПРАВЛЕНИЕ: реально используем результат рефлексии ===
                         next_action = reflection.get("next_action", "give_up")
-                        
+
                         if next_action == "give_up":
                             logger.info("Reflection: сдаюсь, завершаю ReAct-цикл для этого инструмента")
                             entry["verification"] = "error"
@@ -879,7 +913,7 @@ class ToolRouter:
                                 ),
                             })
                             logger.info("Reflection: предложены исправленные аргументы")
-                        
+
                         # Если модель предлагает перепланирование
                         if reflection.get("new_plan") and replan_count < 2:
                             replan_count += 1
@@ -924,16 +958,16 @@ class ToolRouter:
                         "Без воды, только конкретика."
                     )
                     scratchpad_summary = await self.llm_text_caller(
-                        [{"role": "user", "content": scratchpad_prompt}], 
-                        temp=0.0, 
-                        max_tokens=150
+                        [{"role": "user", "content": scratchpad_prompt}],
+                        temp=0.0,
+                        max_tokens=150,
                     )
                     if scratchpad_summary:
                         self._scratchpad.append(scratchpad_summary.strip())
                         # Держим только последние 3 записи
                         if len(self._scratchpad) > 3:
                             self._scratchpad = self._scratchpad[-3:]
-                        
+
                         # Добавляем scratchpad в контекст для следующего раунда
                         running_messages = running_messages + [{
                             "role": "user",
