@@ -651,25 +651,48 @@ class ToolRouter:
         self._scratchpad = []
 
         # === ПУНКТ №5: Делегирование субагенту для специализированных задач ===
-        # Если есть оркестратор и запрос подходит для делегирования — используем субагента
+        # Включаем субагентов ТОЛЬКО на явные keyword-триггеры, без LLM-классификатора.
+        # Это предотвращает перехват запросов и поломку основного ReAct-цикла.
         if self._subagent_orchestrator is not None:
             try:
-                # Пробуем автоклассифицировать и выполнить через субагента
-                role_result = await self._subagent_orchestrator.auto_route(
-                    task=message,
-                    context={"history_tail": history_tail[:500] if history_tail else ""}
-                )
-                if role_result and role_result.get("role") and role_result.get("result"):
-                    logger.info(f"Делегировано субагенту: {role_result['role']}")
-                    # Возвращаем результат субагента как(tool_trace, финальный ответ)
-                    return {
-                        "tool_trace": role_result.get("tool_trace", []),
-                        "used_native": True,
-                        "delegated_to": role_result.get("role"),
-                        "plan": getattr(self, "_last_plan", "")
-                    }
+                # Проверяем явные маркеры для делегирования
+                message_lower = message.lower()
+                
+                # Coder: анализ кода, ошибки, файлы
+                coder_keywords = ["код", "ошибка", "exception", "traceback", "файл",
+                                 "дебаг", "исправь", ".py", ".js", ".ts", "github.com",
+                                 "прочитай код", "анализируй код", "search_code", "read_code"]
+                
+                # Researcher: поиск информации, актуальные данные
+                researcher_keywords = ["найди информацию", "актуальное", "последняя версия",
+                                      "исследуй", "узнай про", "web_search", "поиск в интернете"]
+                
+                should_delegate = False
+                delegate_role = None
+                
+                if any(kw in message_lower for kw in coder_keywords):
+                    should_delegate = True
+                    delegate_role = "coder"
+                elif any(kw in message_lower for kw in researcher_keywords):
+                    should_delegate = True
+                    delegate_role = "researcher"
+                
+                if should_delegate and delegate_role:
+                    logger.info(f\"Делегировано субагенту: {delegate_role}\")
+                    role_result = await self._subagent_orchestrator.execute_task(
+                        task=message,
+                        role=delegate_role,
+                        context={"history_tail": history_tail[:500] if history_tail else ""}
+                    )
+                    if role_result and role_result.get("result"):
+                        return {
+                            "tool_trace": role_result.get("tool_trace", []),
+                            "used_native": True,
+                            "delegated_to": delegate_role,
+                            "plan": getattr(self, "_last_plan", "")
+                        }
             except Exception as e:
-                logger.debug(f"SubAgent auto_route failed, fallback to ToolRouter: {e}")
+                logger.debug(f"SubAgent delegation failed, fallback to ToolRouter: {e}")
                 # Продолжаем обычный ReAct-цикл если делегирование не сработало
 
         tool_trace: List[Dict[str, Any]] = []

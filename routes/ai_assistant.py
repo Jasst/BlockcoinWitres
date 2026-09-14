@@ -1899,15 +1899,14 @@ class CognitiveController:
         # на решение локальной LLM вызвать internal__web_search.
         await self._force_search_if_requested(message, search_meta)
 
-        # === НОВОЕ: активное уточнение ===
-        if uncertainty > 0.7 and not web_search and not reasoning:
-            clarification = await self._ask_clarification(message, uncertainty)
-            if clarification:
-                self.history.append({"role": "user", "content": message})
-                self.history.append({"role": "assistant", "content": clarification})
-                self._save_history()
-                return clarification, {"clarification": True, "uncertainty": uncertainty}
-
+        # === ИСПРАВЛЕНИЕ: активное уточнение перемещено ПОСЛЕ ReAct-цикла ===
+        # Раньше clarification срабатывал до вызова инструментов, блокируя даже web_search.
+        # Теперь сначала даём возможность инструментам повысить уверенность,
+        # и только потом спрашиваем уточняющий вопрос если всё ещё не уверены.
+        # Исключение: если в сообщении есть URL или явный запрос поиска — не уточняем.
+        has_url = bool(re.search(r'https?://', message))
+        skip_clarification_before_react = web_search or reasoning or has_url or search_meta.get("search_requested")
+        
         # РЕШЕНИЕ (нужен ли инструмент) через ToolRouter
         history_tail = "\n".join(
             f"{m.get('role')}: {str(m.get('content'))[:200]}" for m in self.history[-6:]
@@ -1953,6 +1952,24 @@ class CognitiveController:
         
         tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
         tool_trace = tool_run.get("tool_trace", [])
+
+        # === ИСПРАВЛЕНИЕ: активное уточнение ПОСЛЕ ReAct-цикла ===
+        # Теперь, после того как инструменты отработали, пересчитываем уверенность
+        # и только если она всё ещё высокая — задаём уточняющий вопрос.
+        if not skip_clarification_before_react:
+            # После выполнения инструментов uncertainty может измениться
+            # (например, web_search нашёл данные). Проверяем снова.
+            post_react_uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
+            # Если были использованы инструменты поиска, снижаем порог неопределённости
+            if tool_trace and any("web_search" in str(t.get("tool", "")) for t in tool_trace):
+                post_react_uncertainty *= 0.7  # Поиск дал результаты — уверенность выросла
+            if post_react_uncertainty > 0.7:
+                clarification = await self._ask_clarification(message, post_react_uncertainty)
+                if clarification:
+                    self.history.append({"role": "user", "content": message})
+                    self.history.append({"role": "assistant", "content": clarification})
+                    self._save_history()
+                    return clarification, {"clarification": True, "uncertainty": post_react_uncertainty}
 
         # Обработка результатов поиска (из внутреннего web_search)
         if self._web_search_results_this_turn:
@@ -2729,16 +2746,9 @@ class CognitiveController:
             # См. process_input: детерминированный поиск до ReAct-цикла.
             await self._force_search_if_requested(message, search_meta)
 
-            # === НОВОЕ: активное уточнение ===
-            if uncertainty > 0.7 and not web_search and not reasoning:
-                clarification = await self._ask_clarification(message, uncertainty)
-                if clarification:
-                    await push(f"data: {json.dumps({'token': clarification})}\n\n")
-                    await push("data: [DONE]\n\n")
-                    self.history.append({"role": "user", "content": message})
-                    self.history.append({"role": "assistant", "content": clarification})
-                    self._save_history()
-                    return
+            # === ИСПРАВЛЕНИЕ: активное уточнение перемещено ПОСЛЕ ReAct-цикла ===
+            has_url = bool(re.search(r'https?://', message))
+            skip_clarification_before_react = web_search or reasoning or has_url or search_meta.get("search_requested")
 
             full_response = ""
             tool_trace: List[Dict[str, Any]] = []
@@ -2756,6 +2766,22 @@ class CognitiveController:
                         )
                     tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
                     tool_trace = tool_run.get("tool_trace", [])
+                    
+                    # === ИСПРАВЛЕНИЕ: активное уточнение ПОСЛЕ ReAct-цикла (для stream) ===
+                    if not skip_clarification_before_react:
+                        post_react_uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
+                        if tool_trace and any("web_search" in str(t.get("tool", "")) for t in tool_trace):
+                            post_react_uncertainty *= 0.7
+                        if post_react_uncertainty > 0.7:
+                            clarification = await self._ask_clarification(message, post_react_uncertainty)
+                            if clarification:
+                                await push(f"data: {json.dumps({'token': clarification})}\n\n")
+                                await push("data: [DONE]\n\n")
+                                self.history.append({"role": "user", "content": message})
+                                self.history.append({"role": "assistant", "content": clarification})
+                                self._save_history()
+                                return
+                    
                     logger.info(
                         f"ToolRouter decisions for '{message[:50]}': used_native={tool_run.get('used_native')}, trace_len={len(tool_trace)}")
                     logger.info(f"Tool trace: {tool_trace}")
