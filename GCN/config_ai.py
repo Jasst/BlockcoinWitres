@@ -43,9 +43,14 @@ HYBRID_WEIGHT_CONFIDENCE = 0.05    # вес доверия
 DYNAMIC_WEIGHTS_ENABLED = True
 
 # -------------------------------
-# Эмбеддинги (заглушка – можно подключить SentenceTransformer)
+# Эмбеддинги (SentenceTransformer + FAISS)
 # -------------------------------
-EMBEDDING_DIM = 128                # размерность векторов (для демо)
+# ИСПРАВЛЕНИЕ #1: EMBEDDING_DIM теперь определяется динамически из модели,
+# а не захардкожено. Значение 384 соответствует paraphrase-multilingual-MiniLM-L12-v2
+# и all-MiniLM-L6-v2. Для multilingual-e5-large используется 1024.
+# Реальная размерность берётся из model.get_sentence_embedding_dimension()
+# в memory_graph.py:CognitiveMemory.__init__().
+EMBEDDING_DIM = 384                # размерность векторов (по умолчанию для MiniLM)
 USE_EMBEDDINGS = True
 GLOBAL_FACT_CONFIDENCE_THRESHOLD = 0.75
 
