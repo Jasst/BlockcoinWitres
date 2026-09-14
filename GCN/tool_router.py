@@ -137,6 +137,7 @@ def _resolve_timeout(tool_name: str):
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 3  # сколько раундов вызова инструментов разрешено за один ответ
+MAX_TOOL_ITERATIONS_DYNAMIC = 7  # максимум при активном перепланировании
 
 # Простые маркеры составного/многочастного запроса — пункт №4 (планирование).
 # Эвристика намеренно дешёвая: полноценная классификация "сложности" запроса
@@ -462,6 +463,141 @@ class ToolRouter:
             logger.debug(f"Planning step failed, continuing without a plan: {e}")
             return ""
 
+    async def _validate_plan(self, plan_text: str, available_tools: List[str]) -> List[str]:
+        """
+        ПУНКТ №4: Проверяет, что каждый пункт плана реализуем имеющимися инструментами.
+        Возвращает список нереализуемых пунктов.
+        """
+        if not plan_text:
+            return []
+        
+        lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
+        unrealizable = []
+        
+        # Простая эвристика: если пункт содержит название инструмента — проверяем наличие
+        for line in lines:
+            found_tool = False
+            for tool in available_tools:
+                if tool.lower() in line.lower():
+                    found_tool = True
+                    break
+            # Если инструмент не найден в названии, но есть общие маркеры действий
+            action_markers = ["найди", "поиск", "проверь", "прочти", "открой", "вспомни", "запомни"]
+            has_action = any(m in line.lower() for m in action_markers)
+            
+            if not found_tool and not has_action:
+                unrealizable.append(line)
+        
+        return unrealizable
+
+    async def _track_plan_progress(self, plan_text: str, tool_trace: List[Dict]) -> Dict[str, bool]:
+        """
+        ПУНКТ №4: Отмечает, какие пункты плана покрыты выполненными инструментами.
+        Возвращает dict {пункт_плана: выполнено}.
+        """
+        if not plan_text:
+            return {}
+        
+        lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
+        progress = {}
+        
+        for line in lines:
+            # Проверяем, есть ли в tool_trace инструменты, релевантные этому пункту
+            covered = False
+            for entry in tool_trace:
+                tool_name = entry.get("tool", "").lower()
+                result = str(entry.get("result", "")).lower()
+                
+                # Ключевые слова из пункта плана
+                plan_words = set(line.lower().split())
+                
+                # Если инструмент или результат содержат слова из плана
+                if any(word in tool_name for word in plan_words if len(word) > 3):
+                    covered = True
+                    break
+                if any(word in result for word in plan_words if len(word) > 3):
+                    covered = True
+                    break
+            
+            progress[line] = covered
+        
+        return progress
+
+    async def _reflect_on_failure(self, tool: str, args: Dict, error: str, 
+                                   plan: str, history_tail: str) -> Dict:
+        """
+        ПУНКТ №1: После ошибки/пустого результата — короткий LLM-проход для диагностики.
+        Возвращает JSON: {"diagnosis": "...", "next_action": "...", "modified_args": {...}, "new_plan": "..."}
+        """
+        prompt = f"""Инструмент {tool} с аргументами {args} вернул ошибку/пусто:
+{error}
+
+Текущий план: {plan or "нет плана"}
+Контекст диалога: {history_tail[:500] if history_tail else "пусто"}
+
+Проанализируй почему это произошло и что делать дальше.
+Возможные причины:
+- Неправильные аргументы (нужно переформулировать)
+- Инструмент не подходит для этой задачи
+- Нужно попробовать другой инструмент
+- План неверен и требует пересмотра
+
+Ответь ТОЛЬКО валидным JSON без markdown:
+{{
+    "diagnosis": "краткая причина неудачи",
+    "next_action": "retry_modified|different_tool|replan|give_up",
+    "modified_args": {{}},
+    "suggested_tool": "название другого инструмента если нужно" или null,
+    "new_plan": "новый план если требуется перепланирование" или null
+}}"""
+        
+        try:
+            raw = await self.llm_text_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=400)
+            result = _strict_parse_json_object(raw)
+            if result:
+                return result
+        except Exception as e:
+            logger.debug(f"Reflection on failure failed: {e}")
+        
+        # Fallback: базовая эвристика
+        error_lower = error.lower()
+        if "не найдено" in error_lower or "404" in error_lower:
+            return {"diagnosis": "Ресурс не найден", "next_action": "different_tool", "modified_args": {}, "suggested_tool": None, "new_plan": None}
+        elif "ошибка" in error_lower or "error" in error_lower:
+            return {"diagnosis": "Ошибка выполнения", "next_action": "retry_modified", "modified_args": {}, "suggested_tool": None, "new_plan": None}
+        else:
+            return {"diagnosis": "Неясная ошибка", "next_action": "give_up", "modified_args": {}, "suggested_tool": None, "new_plan": None}
+
+    async def _verify_tool_result(self, question: str, tool: str, result: str) -> str:
+        """
+        ПУНКТ №2: Дешёвый судья для проверки результата инструмента.
+        Возвращает: 'sufficient' | 'partial' | 'irrelevant' | 'error'.
+        """
+        if not result or result.strip() == "":
+            return "error"
+        
+        result_lower = result.lower()
+        
+        # Явные маркеры ошибки
+        if any(m in result_lower for m in ["ошибка", "error", "exception", "timeout", "не удалось"]):
+            if any(m in result_lower for m in ["не найдено", "404", "nothing found", "no results"]):
+                return "irrelevant"  # Не ошибка, просто пусто
+            return "error"
+        
+        # Маркеры пустого/нерелевантного результата
+        if any(m in result_lower for m in ["ничего не найдено", "no results found", "пусто", "empty"]):
+            return "irrelevant"
+        
+        # Если результат очень короткий и не содержит данных
+        if len(result) < 20 and not any(c.isdigit() for c in result):
+            return "partial"
+        
+        # Эвристика: если результат содержит данные (URL, числа, текст > 50 символов)
+        if len(result) > 50 or any(m in result for m in ["http", "www", "."]):
+            return "sufficient"
+        
+        return "partial"
+
     async def _decide_fallback(self, message: str, history_tail: str,
                                 tool_results_so_far: str, temp: float) -> Optional[Dict]:
         prompt = TOOL_DECISION_PROMPT.format(
@@ -526,8 +662,19 @@ class ToolRouter:
         seen_calls: set = set()
         # === ИСПРАВЛЕНИЕ: отслеживаем ошибки, чтобы не повторять их ===
         seen_errors: set = set()   # (tool, frozenset(sorted(args.items())))
+        
+        # ПУНКТ №1: Динамический лимит итераций при активном перепланировании
+        max_iterations = MAX_TOOL_ITERATIONS
+        replan_count = 0  # счётчик перепланирований
+        
+        # ПУНКТ №4: Валидация плана перед выполнением
+        if plan_text:
+            available_tools = list(self.registry._tools.keys())
+            unrealizable = await self._validate_plan(plan_text, available_tools)
+            if unrealizable:
+                logger.warning(f"План содержит нереализуемые пункты: {unrealizable}")
 
-        for round_idx in range(MAX_TOOL_ITERATIONS):
+        for round_idx in range(max_iterations):
             decisions: Optional[List[Dict]] = None
 
             if self._native_supported is not False:
@@ -626,6 +773,33 @@ class ToolRouter:
                     if "ошибка" in result_str or "не найдено" in result_str or "404" in result_str:
                         sig = (d["tool"], json.dumps(d.get("arguments", {}), sort_keys=True, ensure_ascii=False))
                         seen_errors.add(sig)
+                        
+                        # ПУНКТ №1: Рефлексия над неудачей
+                        reflection = await self._reflect_on_failure(
+                            d["tool"], d.get("arguments", {}), result, 
+                            plan_text, history_tail
+                        )
+                        logger.info(f"Рефлексия над ошибкой: {reflection.get('diagnosis', 'неизвестно')}")
+                        
+                        # Если модель предлагает перепланирование — увеличиваем лимит итераций
+                        if reflection.get("new_plan") and replan_count < 2:
+                            replan_count += 1
+                            max_iterations = min(MAX_TOOL_ITERATIONS_DYNAMIC, max_iterations + 2)
+                            logger.info(f"Перепланирование #{replan_count}, новый лимит: {max_iterations}")
+
+                    # ПУНКТ №2: Верификация результата
+                    verification = await self._verify_tool_result(message, d["tool"], result)
+                    if verification == "irrelevant":
+                        logger.info(f"Результат инструмента {d['tool']} нерелевантен")
+                        # Помечаем как нерелевантный для модели
+                        entry["verification"] = "irrelevant"
+                    elif verification == "error":
+                        logger.warning(f"Результат инструмента {d['tool']} содержит ошибку")
+                        entry["verification"] = "error"
+                    elif verification == "partial":
+                        entry["verification"] = "partial"
+                    else:
+                        entry["verification"] = "sufficient"
 
             if new_calls_this_round == 0:
                 break
@@ -639,7 +813,19 @@ class ToolRouter:
                 ),
             }]
 
-            if not used_native and len(tool_trace) >= MAX_TOOL_ITERATIONS:
+            # ПУНКТ №4: Трекинг прогресса по плану
+            if plan_text:
+                progress = await self._track_plan_progress(plan_text, tool_trace)
+                uncovered = [k for k, v in progress.items() if not v]
+                if uncovered and round_idx < max_iterations - 1:
+                    logger.info(f"Не покрыты пункты плана: {uncovered[:2]}")
+                    # Добавляем напоминание о непокрытых пунктах
+                    running_messages = running_messages + [{
+                        "role": "user",
+                        "content": f"[Напоминание: ещё не выполнены пункты плана: {', '.join(uncovered[:2])}]",
+                    }]
+
+            if not used_native and len(tool_trace) >= max_iterations:
                 break
 
         return {"tool_trace": tool_trace, "used_native": used_native, "plan": getattr(self, "_last_plan", "")}
