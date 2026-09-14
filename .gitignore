@@ -1,5 +1,4 @@
 ```
-# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -38,3 +37,4 @@ htmlcov/
 .mypy_cache/
 .pytest_cache/
 ```
+
