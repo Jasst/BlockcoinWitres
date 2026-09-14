@@ -237,6 +237,7 @@ class SubAgent:
                     self.state.record_success(confidence=0.8)
                     
                     return {
+                        "role": self.role.value,  # Ключ на верхнем уровне для проверки в tool_router
                         "result": content,
                         "tool_trace": tool_trace,
                         "confidence": self.state.avg_confidence,
@@ -287,6 +288,7 @@ class SubAgent:
         self.state.record_success(confidence=0.6)
         
         return {
+            "role": self.role.value,  # Ключ на верхнем уровне для проверки в tool_router
             "result": running_messages[-1].get("content", "Лимит итераций исчерпан"),
             "tool_trace": tool_trace,
             "confidence": self.state.avg_confidence,
@@ -501,7 +503,39 @@ class SubAgentOrchestrator:
         Returns:
             Результат выполнения
         """
-        # Используем LLM для классификации задачи
+        # === ЭВРИСТИКА: не делегировать простые запросы ===
+        # Это предотвращает лишний LLM-вызов классификатора на каждое сообщение
+        task_lower = task.lower().strip()
+        
+        # Простые приветствия, вопросы без контекста, односложные запросы
+        simple_patterns = [
+            "привет", "здравствуй", "hello", "hi", "hey",
+            "как дела", "что нового", "кто ты",
+            "спасибо", "пока", "до свидания",
+            "?", "!",  # Очень короткие сообщения
+        ]
+        
+        if any(task_lower.startswith(p) for p in simple_patterns) or len(task_lower.split()) < 3:
+            # Не делегировать — слишком просто
+            logger.debug(f"[Orchestrator] Пропуск делегирования: простой запрос")
+            return await self.execute_task(task, AgentRole.GENERALIST, context)
+        
+        # Явные маркеры для coder
+        coder_keywords = ["код", "ошибка", "exception", "traceback", "файл", 
+                         "прочитай", "анализируй код", "дебаг", "исправь",
+                         ".py", ".js", ".ts", "github.com"]
+        if any(kw in task_lower for kw in coder_keywords):
+            logger.info(f"[Orchestrator] Явный маркер coder — делегирую")
+            return await self.execute_task(task, AgentRole.CODER, context)
+        
+        # Явные маркеры для researcher
+        researcher_keywords = ["найди информацию", "актуальное", "последняя версия",
+                              "поиск", "исследуй", "узнай про", "google", "web"]
+        if any(kw in task_lower for kw in researcher_keywords):
+            logger.info(f"[Orchestrator] Явный маркер researcher — делегирую")
+            return await self.execute_task(task, AgentRole.RESEARCHER, context)
+        
+        # Для остальных задач — используем LLM-классификатор
         classifier_prompt = (
             f"Классифицируй задачу и выбери подходящую роль:\n"
             f"Задача: {task}\n\n"

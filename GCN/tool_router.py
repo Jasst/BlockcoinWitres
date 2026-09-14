@@ -400,14 +400,15 @@ class ToolRouter:
         self._subagent_orchestrator: Optional[Any] = None
         if SUBAGENTS_AVAILABLE:
             try:
+                # Исправлено: имена аргументов должны совпадать с __init__ SubAgentOrchestrator
                 self._subagent_orchestrator = SubAgentOrchestrator(
-                    llm_raw=llm_raw_caller,
-                    llm_text=llm_text_caller,
+                    llm_raw_caller=llm_raw_caller,
+                    llm_text_caller=llm_text_caller,
                     tool_registry=registry
                 )
-                logger.info("SubAgentOrchestrator инициализирован")
+                logger.info("SubAgentOrchestrator успешно инициализирован")
             except Exception as e:
-                logger.debug(f"SubAgentOrchestrator init failed: {e}")
+                logger.warning(f"Не удалось инициализировать SubAgentOrchestrator: {e}. Делегирование отключено.")
                 self._subagent_orchestrator = None
 
     def _load_native_flag(self) -> Optional[bool]:
@@ -646,6 +647,9 @@ class ToolRouter:
         if self.registry.is_empty():
             return {"tool_trace": [], "used_native": False}
 
+        # === Очистка scratchpad для нового запроса (предотвращение загрязнения контекста) ===
+        self._scratchpad = []
+
         # === ПУНКТ №5: Делегирование субагенту для специализированных задач ===
         # Если есть оркестратор и запрос подходит для делегирования — используем субагента
         if self._subagent_orchestrator is not None:
@@ -882,7 +886,8 @@ class ToolRouter:
                 break
 
             # === ПУНКТ №10: Обновление scratchpad после каждого раунда ===
-            if round_idx > 0 and tool_trace:
+            # Гейт: только для сложных задач (2+ инструментов) и не на первом раунде
+            if round_idx > 0 and len(tool_trace) >= 2 and _looks_compound(message):
                 try:
                     # Короткий LLM-вызов для сжатия состояния
                     scratchpad_prompt = (

@@ -27,19 +27,4 @@ node_modules/
 dist/
 build/
 target/
-
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# MyPy
-.mypy_cache/
-
-# Pytest
-.pytest_cache/
-
-# OS
-.DS_Store
-Thumbs.db
 ```
