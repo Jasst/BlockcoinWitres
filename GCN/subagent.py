@@ -278,6 +278,7 @@ class SubAgent:
                 self.state.record_failure()
                 
                 return {
+                    "role": self.role.value,  # Ключ на верхнем уровне для проверки в tool_router
                     "result": f"Ошибка выполнения задачи: {e}",
                     "tool_trace": tool_trace,
                     "confidence": 0.2,
