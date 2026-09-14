@@ -258,7 +258,12 @@ class ResearchQueue:
         if not topic or not AUTONOMY_ENABLED:
             return False
         self._purge_stale()
-        key = ResearchTopic(topic=topic).key
+        t = ResearchTopic(
+            topic=topic[:300], source=source,
+            priority=max(0.0, min(1.0, priority)),
+            related_goal=related_goal[:200],
+        )
+        key = t.key
         for existing in self._items:
             if existing.key == key:
                 # Повторная постановка — лёгкий буст приоритета, не дубль.
@@ -270,11 +275,7 @@ class ResearchQueue:
             if self._items and self._items[0].priority >= priority:
                 return False  # очередь полна и всё в ней важнее
             self._items.pop(0)
-        self._items.append(ResearchTopic(
-            topic=topic[:300], source=source,
-            priority=max(0.0, min(1.0, priority)),
-            related_goal=related_goal[:200],
-        ))
+        self._items.append(t)
         self.save()
         return True
 
@@ -706,6 +707,7 @@ class AutonomyEngine:
                     "keywords": _keywords(text),
                     "ts": time.time(),
                     "source": "autonomy_digest",
+                    "topic_key": batch[i]["topic"].key if i < len(batch) else None,
                 })
                 logger.info(
                     f"[Autonomy] дайджест для {self.user_id[:16]}: {text[:80]}"
@@ -767,6 +769,10 @@ class AutonomyEngine:
                     f"(источник {item['source']} → x{w:.2f})"
                 )
                 self._save_state()
+                # === ИСПРАВЛЕНИЕ: обучаем bandit при успехе ===
+                topic_key = item.get("topic_key")
+                if topic_key:
+                    self.queue._bandit_update(topic_key, success=True)
                 continue  # обработано, из списка убираем
             if age < FEEDBACK_WINDOW_SECONDS:
                 still_pending.append(item)
@@ -775,6 +781,10 @@ class AutonomyEngine:
                 w = max(0.5, self._source_weight.get(item["source"], 1.0) - FEEDBACK_NEGATIVE_DECAY)
                 self._source_weight[item["source"]] = w
                 self._save_state()
+                # === ИСПРАВЛЕНИЕ: обучаем bandit при неудаче ===
+                topic_key = item.get("topic_key")
+                if topic_key:
+                    self.queue._bandit_update(topic_key, success=False)
         self._notified = still_pending[-20:]
 
     # ---------------- персистентность обучения ----------------

@@ -195,17 +195,21 @@ class SelfModel:
         
         Если модель говорит «уверен 0.9», но в этом бакете успех только 60% —
         вернёт 0.6. Это радикально улучшает метакогницию.
+        
+        Использует Bayesian-сглаживание для плавного перехода при малом количестве данных.
         """
         bucket = round(predicted * 10) / 10
         bucket_key = f"calibration_bucket_{bucket}"
         
         b = self.self_concept.get(bucket_key, {"n": 0, "success": 0})
         
-        # Если недостаточно данных — используем априорную оценку (0.5)
-        if b["n"] < 5:
-            return 0.5
+        # Bayesian-сглаживание: смешиваем prior (0.5) с наблюдениями
+        # n=0 → 0.5, n=1 success=1 → 0.58, n=5 success=5 → 0.75
+        prior_n = 5
+        prior_success = 2.5  # prior mean = 0.5
+        smoothed_rate = (prior_success + b["success"]) / (prior_n + b["n"])
         
-        return b["success"] / b["n"]
+        return smoothed_rate
     
     def get_calibration_stats(self) -> Dict[str, Any]:
         """Возвращает статистику калибровки по всем бакетам."""
