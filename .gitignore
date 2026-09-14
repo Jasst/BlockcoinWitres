@@ -1,25 +1,8 @@
 ```
-<<<<<<< Updated upstream
-# Compiled Python files
-*.pyc
 __pycache__/
-
-# Environment files
-.env
-.env.local
-*.env.*
-```
-=======
-# Compiled and build artifacts
 *.pyc
-__pycache__/
-*.o
-*.obj
-
-# Dependencies
-.venv/
-venv/
-node_modules/
+*.pyo
+*.pyd
 
 # Logs and temp files
 *.log
@@ -35,33 +18,23 @@ node_modules/
 .vscode/
 .idea/
 
-# Coverage reports
+# Dependencies
+.venv/
+venv/
+node_modules/
+
+# Build artifacts
+dist/
+build/
+target/
+
+# Coverage
+.coverage
 coverage/
 htmlcov/
-.coverage
 
-# Python specific
-*.pyo
-*.pyd
-.Python
-*.so
-*.egg-info/
-
-# Distribution / packaging
-*.tar.gz
-*.whl
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Testing
-.pytest_cache/
+# Cache
 .mypy_cache/
-.hypothesis/
-
-# OS generated files
-.DS_Store
-Thumbs.db
+.pytest_cache/
 ```
-/ai_memory_v3
-/uploads
->>>>>>> Stashed changes
+

@@ -773,18 +773,50 @@ class ToolRouter:
                     if "ошибка" in result_str or "не найдено" in result_str or "404" in result_str:
                         sig = (d["tool"], json.dumps(d.get("arguments", {}), sort_keys=True, ensure_ascii=False))
                         seen_errors.add(sig)
-                        
                         # ПУНКТ №1: Рефлексия над неудачей
                         reflection = await self._reflect_on_failure(
-                            d["tool"], d.get("arguments", {}), result, 
+                            d["tool"], d.get("arguments", {}), result,
                             plan_text, history_tail
                         )
                         logger.info(f"Рефлексия над ошибкой: {reflection.get('diagnosis', 'неизвестно')}")
                         
-                        # Если модель предлагает перепланирование — увеличиваем лимит итераций
+                        # === ИСПРАВЛЕНИЕ: реально используем результат рефлексии ===
+                        next_action = reflection.get("next_action", "give_up")
+                        
+                        if next_action == "give_up":
+                            logger.info("Reflection: сдаюсь, завершаю ReAct-цикл для этого инструмента")
+                            entry["verification"] = "error"
+                        elif next_action == "different_tool" and reflection.get("suggested_tool"):
+                            suggested = reflection["suggested_tool"]
+                            modified_args = reflection.get("modified_args", {})
+                            running_messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"[Диагноз: {reflection.get('diagnosis', 'неизвестно')}]\n"
+                                    f"[Попробуй другой инструмент: {suggested} "
+                                    f"с аргументами {modified_args if modified_args else '{}'}]"
+                                ),
+                            })
+                            logger.info(f"Reflection: предложен другой инструмент {suggested}")
+                        elif next_action == "retry_modified" and reflection.get("modified_args"):
+                            running_messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"[Диагноз: {reflection.get('diagnosis', 'неизвестно')}]\n"
+                                    f"[Попробуй снова с исправленными аргументами: {reflection['modified_args']}]"
+                                ),
+                            })
+                            logger.info("Reflection: предложены исправленные аргументы")
+                        
+                        # Если модель предлагает перепланирование
                         if reflection.get("new_plan") and replan_count < 2:
                             replan_count += 1
                             max_iterations = min(MAX_TOOL_ITERATIONS_DYNAMIC, max_iterations + 2)
+                            self._last_plan = reflection["new_plan"]
+                            running_messages.append({
+                                "role": "user",
+                                "content": f"[Новый план после ошибки]\n{reflection['new_plan']}",
+                            })
                             logger.info(f"Перепланирование #{replan_count}, новый лимит: {max_iterations}")
 
                     # ПУНКТ №2: Верификация результата
