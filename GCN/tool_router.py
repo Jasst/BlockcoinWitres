@@ -101,6 +101,14 @@ from typing import Any, Callable, Dict, List, Optional, Awaitable
 import asyncio
 from pathlib import Path
 
+# ПУНКТ №5: Импорт субагентов для делегирования
+try:
+    from GCN.subagent import SubAgentOrchestrator, AgentRole, ROLE_TOOLS
+    SUBAGENTS_AVAILABLE = True
+except ImportError:
+    SUBAGENTS_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+
 # ИСПРАВЛЕНИЕ #4: путь для персистентного флага native_supported
 _NATIVE_FLAG_PATH = Path(__file__).resolve().parent.parent / "ai_memory_v3" / "_native_flag.json"
 
@@ -386,6 +394,21 @@ class ToolRouter:
         # ИНТЕЛЛЕКТ-ПАКЕТ (E): план подзадач текущего запуска — читает
         # PlanCritic из ai_assistant через этот атрибут или run()["plan"].
         self._last_plan: str = ""
+        # ПУНКТ №10: Scratchpad для persistent reasoning между раундами ReAct
+        self._scratchpad: List[str] = []
+        # ПУНКТ №5: Инициализация оркестратора субагентов если доступен
+        self._subagent_orchestrator: Optional[Any] = None
+        if SUBAGENTS_AVAILABLE:
+            try:
+                self._subagent_orchestrator = SubAgentOrchestrator(
+                    llm_raw=llm_raw_caller,
+                    llm_text=llm_text_caller,
+                    tool_registry=registry
+                )
+                logger.info("SubAgentOrchestrator инициализирован")
+            except Exception as e:
+                logger.debug(f"SubAgentOrchestrator init failed: {e}")
+                self._subagent_orchestrator = None
 
     def _load_native_flag(self) -> Optional[bool]:
         """Загружает персистентный флаг поддержки native function calling."""
@@ -561,10 +584,10 @@ class ToolRouter:
         
         # Fallback: базовая эвристика
         error_lower = error.lower()
-        if "не найдено" in error_lower or "404" in error_lower:
-            return {"diagnosis": "Ресурс не найден", "next_action": "different_tool", "modified_args": {}, "suggested_tool": None, "new_plan": None}
-        elif "ошибка" in error_lower or "error" in error_lower:
-            return {"diagnosis": "Ошибка выполнения", "next_action": "retry_modified", "modified_args": {}, "suggested_tool": None, "new_plan": None}
+        if "не найдено" in error_lower or "404" in error_lower or "not found" in error_lower:
+            return {"diagnosis": "Ресурс не найден", "next_action": "different_tool", "modified_args": {}, "suggested_tool": "internal__recall", "new_plan": None}
+        elif "ошибка" in error_lower or "error" in error_lower or "exception" in error_lower:
+            return {"diagnosis": "Ошибка выполнения", "next_action": "retry_modified", "modified_args": {}, "suggested_tool": tool, "new_plan": None}
         else:
             return {"diagnosis": "Неясная ошибка", "next_action": "give_up", "modified_args": {}, "suggested_tool": None, "new_plan": None}
 
@@ -622,6 +645,28 @@ class ToolRouter:
         """
         if self.registry.is_empty():
             return {"tool_trace": [], "used_native": False}
+
+        # === ПУНКТ №5: Делегирование субагенту для специализированных задач ===
+        # Если есть оркестратор и запрос подходит для делегирования — используем субагента
+        if self._subagent_orchestrator is not None:
+            try:
+                # Пробуем автоклассифицировать и выполнить через субагента
+                role_result = await self._subagent_orchestrator.auto_route(
+                    task=message,
+                    context={"history_tail": history_tail[:500] if history_tail else ""}
+                )
+                if role_result and role_result.get("role") and role_result.get("result"):
+                    logger.info(f"Делегировано субагенту: {role_result['role']}")
+                    # Возвращаем результат субагента как(tool_trace, финальный ответ)
+                    return {
+                        "tool_trace": role_result.get("tool_trace", []),
+                        "used_native": True,
+                        "delegated_to": role_result.get("role"),
+                        "plan": getattr(self, "_last_plan", "")
+                    }
+            except Exception as e:
+                logger.debug(f"SubAgent auto_route failed, fallback to ToolRouter: {e}")
+                # Продолжаем обычный ReAct-цикл если делегирование не сработало
 
         tool_trace: List[Dict[str, Any]] = []
         used_native = False
@@ -835,6 +880,40 @@ class ToolRouter:
 
             if new_calls_this_round == 0:
                 break
+
+            # === ПУНКТ №10: Обновление scratchpad после каждого раунда ===
+            if round_idx > 0 and tool_trace:
+                try:
+                    # Короткий LLM-вызов для сжатия состояния
+                    scratchpad_prompt = (
+                        f"Запрос: {message[:200]}\n"
+                        f"Выполнено инструментов: {len(tool_trace)}\n"
+                        f"Что уже знаю:\n{build_tool_trace_context(round_results)[:1500]}\n\n"
+                        "Сформулируй в 3 строках максимум:\n"
+                        "1) Что я уже установил (факты)\n"
+                        "2) Чего ещё не хватает\n"
+                        "3) Какой следующий логичный шаг\n"
+                        "Без воды, только конкретика."
+                    )
+                    scratchpad_summary = await self.llm_text_caller(
+                        [{"role": "user", "content": scratchpad_prompt}], 
+                        temp=0.0, 
+                        max_tokens=150
+                    )
+                    if scratchpad_summary:
+                        self._scratchpad.append(scratchpad_summary.strip())
+                        # Держим только последние 3 записи
+                        if len(self._scratchpad) > 3:
+                            self._scratchpad = self._scratchpad[-3:]
+                        
+                        # Добавляем scratchpad в контекст для следующего раунда
+                        running_messages = running_messages + [{
+                            "role": "user",
+                            "content": f"[Scratchpad — что я уже знаю]\n{scratchpad_summary.strip()}",
+                        }]
+                        logger.debug(f"Scratchpad обновлён: {scratchpad_summary[:80]}...")
+                except Exception as e:
+                    logger.debug(f"Scratchpad update failed: {e}")
 
             running_messages = running_messages + [{
                 "role": "user",
