@@ -426,7 +426,7 @@ class AutonomyEngine:
             )
         return ok
 
-    async def submit_finding(self, finding_text: str, source: str) -> None:
+    async def submit_finding(self, finding_text: str, source: str, topic_key: Optional[str] = None) -> None:
         """Находка фонового исследования — в дайджест, а не сразу пользователю."""
         if not PROACTIVE_NOTIFICATIONS_ENABLED or not finding_text:
             return
@@ -434,7 +434,7 @@ class AutonomyEngine:
         if not text:
             return
         self._pending_findings.append(
-            {"text": text[:2000], "source": source, "ts": time.time()}
+            {"text": text[:2000], "source": source, "ts": time.time(), "topic_key": topic_key}
         )
         # Бэкпрессер: скопилось слишком много — не ждём интервала.
         # Но force=True теперь НЕ игнорирует тихие часы: если накопилось много,
@@ -536,7 +536,8 @@ class AutonomyEngine:
             answer = (result or {}).get("answer", "")
             self.queue.complete(topic)
             if answer and answer.strip():
-                await self.submit_finding(answer, source=topic.source)
+                # Передаём topic_key для bandit feedback
+                await self.submit_finding(answer, source=topic.source, topic_key=topic.key)
             # Завершаем цель из motivation: если тема связана с goal из SelfModel,
             # удаляем её после успешного исследования.
             if topic.source in ("goal", "goal_subtask") and topic.related_goal:
@@ -697,8 +698,9 @@ class AutonomyEngine:
 
         texts = await self._select_notifications(batch)
         self._last_digest_at = time.time()
-        for text in texts[:2]:
+        for i, text in enumerate(texts[:2]):
             try:
+                topic_key = batch[i].get("topic_key") if i < len(batch) else None
                 await self.ctl.memory_service.push_notification(
                     text, source="autonomy_digest"
                 )
@@ -707,7 +709,7 @@ class AutonomyEngine:
                     "keywords": _keywords(text),
                     "ts": time.time(),
                     "source": "autonomy_digest",
-                    "topic_key": batch[i]["topic"].key if i < len(batch) else None,
+                    "topic_key": topic_key,
                 })
                 logger.info(
                     f"[Autonomy] дайджест для {self.user_id[:16]}: {text[:80]}"
