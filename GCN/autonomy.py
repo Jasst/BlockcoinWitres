@@ -62,6 +62,9 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# === НОВОЕ: Thompson Sampling для тем (пункт 6 — bandit-подход) ===
+import random as random_mod
+
 from GCN.llm_client import call_llm
 from GCN.web_search import is_time_sensitive_query
 
@@ -172,7 +175,56 @@ class ResearchQueue:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._items: List[ResearchTopic] = []
+        # === НОВОЕ: Thompson Sampling bandit для тем ===
+        self._bandit_arms: Dict[str, tuple] = {}  # topic_key -> (alpha, beta)
         self._load()
+        self._load_bandits()
+    
+    def _load_bandits(self) -> None:
+        """Загружает состояния bandit-армов из файла."""
+        bandit_path = self.path.parent / "autonomy_bandits.json"
+        try:
+            if bandit_path.exists():
+                raw = json.loads(bandit_path.read_text(encoding="utf-8"))
+                self._bandit_arms = {k: tuple(v) for k, v in raw.items()}
+        except Exception:
+            self._bandit_arms = {}
+    
+    def _save_bandits(self) -> None:
+        """Сохраняет состояния bandit-армов."""
+        bandit_path = self.path.parent / "autonomy_bandits.json"
+        try:
+            bandit_path.parent.mkdir(parents=True, exist_ok=True)
+            bandit_path.write_text(
+                json.dumps({k: list(v) for k, v in self._bandit_arms.items()}, 
+                          ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.debug(f"Bandit save failed: {e}")
+    
+    def _bandit_score(self, topic_key: str) -> float:
+        """
+        Thompson Sampling: возвращает случайную выборку из Beta(alpha, beta).
+        
+        alpha = 1 + сколько раз тема была успешной (использована пользователем)
+        beta = 1 + сколько раз тема была проигнорирована
+        
+        Это даёт exploration-exploitation: новые темы получают шанс,
+        а успешные — повышают вероятность выбора.
+        """
+        alpha, beta = self._bandit_arms.get(topic_key, (1, 1))
+        return random_mod.betavariate(alpha, beta)
+    
+    def _bandit_update(self, topic_key: str, success: bool) -> None:
+        """Обновляет bandit-арм на основе успеха/неудачи."""
+        alpha, beta = self._bandit_arms.get(topic_key, (1, 1))
+        if success:
+            alpha += 1
+        else:
+            beta += 1
+        self._bandit_arms[topic_key] = (alpha, beta)
+        self._save_bandits()
 
     def __len__(self) -> int:
         return len(self._items)
@@ -231,8 +283,13 @@ class ResearchQueue:
         due = [t for t in self._items if t.available_at <= now]
         if not due:
             return None
-        due.sort(key=lambda t: (-t.priority, t.enqueued_at))
-        topic = due[0]
+        
+        # === НОВОЕ: Выбор темы через Thompson Sampling вместо чистого приоритета ===
+        # Считаем score = priority * bandit_score для каждой темы
+        scored = [(t, t.priority * self._bandit_score(t.key)) for t in due]
+        scored.sort(key=lambda x: -x[1])  # Сортируем по убыванию score
+        
+        topic = scored[0][0]
         self._items.remove(topic)
         self.save()
         return topic
