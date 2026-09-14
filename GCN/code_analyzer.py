@@ -45,13 +45,19 @@ class CodeAnalyzer:
         self._structure_cache: Optional[Dict] = None  # кэш структуры проекта
         
     def _is_safe_path(self, file_path: str) -> bool:
-        """Проверяет, что файл находится в разрешённой директории и имеет безопасное расширение."""
+        """Проверяет, что файл находится в разрешённой директории и имеет безопасное расширение.
+        
+        ИСПРАВЛЕНИЕ (пункт 4): используем Path.relative_to() вместо startswith(),
+        чтобы избежать path traversal атак через префикс (например, /app/GCN_malicious/evil.py).
+        """
         try:
             # Нормализуем путь
             abs_path = Path(file_path).resolve()
             
-            # Проверяем, что путь внутри root
-            if not str(abs_path).startswith(str(self.root.resolve())):
+            # Проверяем, что путь внутри root через relative_to (безопаснее startswith)
+            try:
+                abs_path.relative_to(self.root.resolve())
+            except ValueError:
                 logger.warning(f"Попытка доступа к файлу вне root: {file_path}")
                 return False
             
@@ -289,16 +295,16 @@ class CodeAnalyzer:
         for file_path, line_num in matches[:3]:  # Берём первые 3 локации
             # Пытаемся найти относительный путь
             try:
-                abs_path = Path(file_path)
-                if str(abs_path).startswith(str(self.root)):
-                    rel_path = str(abs_path.relative_to(self.root))
+                abs_path = Path(file_path).resolve()
+                # ИСПРАВЛЕНИЕ (пункт 4): используем relative_to вместо startswith
+                try:
+                    rel_path_obj = abs_path.relative_to(self.root.resolve())
+                    rel_path = str(rel_path_obj)
                     
                     # Читаем файл с контекстом
                     content = await self.read_file(rel_path, max_lines=int(line_num) + 10)
                     
                     analysis_parts.append(f"\n📁 Файл: {rel_path}, строка {line_num}")
-                    analysis_parts.append("-" * 40)
-                    
                     # Выделяем проблемную строку
                     lines = content.split('\n')
                     if int(line_num) <= len(lines):

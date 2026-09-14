@@ -91,12 +91,25 @@ class MemoryService:
                 # Повысить confidence существующего факта
                 if ex_id:
                     try:
-                        ko = self.router.private_memory.store.get_fact(ex_id)
+                        # Определяем правильный слой памяти по scope найденного факта
+                        scope_name = ex.get("scope", "private")
+                        memory_layer = {
+                            "private": self.router.private_memory,
+                            "shared": self.router.shared_memory,
+                            "global": self.router.global_memory,
+                        }.get(scope_name, self.router.private_memory)
+                        
+                        # Используем корректные методы MemoryStore: get() и update()
+                        ko = memory_layer.store.get(ex_id)
                         if ko:
-                            ko.confidence = min(1.0, max(ko.confidence, confidence))
-                            self.router.private_memory.store._update_fact(ko)
-                    except Exception:
-                        pass
+                            new_confidence = min(1.0, max(ko.confidence, confidence))
+                            memory_layer.store.update(
+                                ex_id,
+                                {"confidence": new_confidence},
+                                actor=self.user_id
+                            )
+                    except Exception as e:
+                        logger.debug(f"[remember] не удалось обновить дубль {ex_id}: {e}")
                 return {"id": ex_id, "scope": ex.get("scope", "private"),
                         "action": "updated_existing", "similarity": ex["score"]}
         # ── конец проверки дубля ──────────────────────────────────────────
