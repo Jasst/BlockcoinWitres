@@ -99,6 +99,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Awaitable
 import asyncio
+from pathlib import Path
+
+# ИСПРАВЛЕНИЕ #4: путь для персистентного флага native_supported
+_NATIVE_FLAG_PATH = Path(__file__).resolve().parent.parent / "ai_memory_v3" / "_native_flag.json"
 
 try:
     from GCN.config_ai import (
@@ -376,10 +380,31 @@ class ToolRouter:
         self.registry = registry
         self.llm_raw_caller = llm_raw_caller
         self.llm_text_caller = llm_text_caller
-        self._native_supported: Optional[bool] = None
+        # ИСПРАВЛЕНИЕ #4: загружаем персистентный флаг native_supported
+        self._native_supported: Optional[bool] = self._load_native_flag()
         # ИНТЕЛЛЕКТ-ПАКЕТ (E): план подзадач текущего запуска — читает
         # PlanCritic из ai_assistant через этот атрибут или run()["plan"].
         self._last_plan: str = ""
+
+    def _load_native_flag(self) -> Optional[bool]:
+        """Загружает персистентный флаг поддержки native function calling."""
+        try:
+            if _NATIVE_FLAG_PATH.exists():
+                import json as json_mod
+                data = json_mod.loads(_NATIVE_FLAG_PATH.read_text())
+                return data.get("native_supported")
+        except Exception:
+            pass
+        return None
+
+    def _save_native_flag(self, value: bool) -> None:
+        """Сохраняет флаг поддержки native function calling."""
+        try:
+            _NATIVE_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            import json as json_mod
+            _NATIVE_FLAG_PATH.write_text(json_mod.dumps({"native_supported": value}))
+        except Exception:
+            pass
 
     async def _execute_tool(self, qualified_name: str, arguments: Dict[str, Any]) -> str:
         spec = self.registry.get(qualified_name)
@@ -510,6 +535,7 @@ class ToolRouter:
                 if decisions is not None:
                     used_native = True
                     self._native_supported = True
+                    self._save_native_flag(True)  # ИСПРАВЛЕНИЕ #4: сохраняем флаг
                 elif used_native:
                     break
 
@@ -542,6 +568,7 @@ class ToolRouter:
 
                 if self._native_supported is None:
                     self._native_supported = False
+                    self._save_native_flag(False)  # ИСПРАВЛЕНИЕ #4: сохраняем флаг
 
             if decisions:
                 logger.info(f"ToolRouter: round {round_idx}, decisions: {decisions}")

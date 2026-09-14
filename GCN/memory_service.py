@@ -75,8 +75,32 @@ class MemoryService:
         """
         Сохраняет факт в указанный скоуп (автоопределение, если scope не задан).
         Возвращает id и скоуп.
+        
+        ИСПРАВЛЕНИЕ #3: проверка дублей перед созданием нового факта.
         """
         self.refresh()
+        
+        # ── ИСПРАВЛЕНИЕ #3: проверка дубля ──────────────────────────────────────────
+        DEDUP_THRESHOLD = 0.88   # косинусное сходство
+        existing = await self.recall(fact, top_k=3, scope=scope)
+        for ex in existing:
+            if ex.get("score", 0) >= DEDUP_THRESHOLD:
+                ex_id = ex.get("gcn_id") or ex.get("id")
+                logger.info(f"[remember] дубль обнаружен (score={ex['score']:.2f}), "
+                            f"обновляю confidence вместо создания нового факта")
+                # Повысить confidence существующего факта
+                if ex_id:
+                    try:
+                        ko = self.router.private_memory.store.get_fact(ex_id)
+                        if ko:
+                            ko.confidence = min(1.0, max(ko.confidence, confidence))
+                            self.router.private_memory.store._update_fact(ko)
+                    except Exception:
+                        pass
+                return {"id": ex_id, "scope": ex.get("scope", "private"),
+                        "action": "updated_existing", "similarity": ex["score"]}
+        # ── конец проверки дубля ──────────────────────────────────────────
+        
         if scope is None:
             if "глобально" in fact.lower() or "global" in fact.lower():
                 scope_enum = MemoryScope.GLOBAL

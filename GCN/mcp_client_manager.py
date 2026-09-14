@@ -88,6 +88,7 @@ class MCPToolManager:
         self._server_configs: Dict[str, Dict] = {}
         self._server_stacks: Dict[str, AsyncExitStack] = {}
         self._failed_servers: Dict[str, float] = {}  # name -> timestamp последней неудачи
+        self._fail_counts: Dict[str, int] = {}  # счётчик попыток для экспоненциального backoff (ИСПРАВЛЕНИЕ #11)
         self._initialized = False
         # Кэш результатов вызовов инструментов: (server, tool, args_hash) -> (result, timestamp)
         self._tool_cache: Dict[tuple, tuple] = {}
@@ -96,6 +97,11 @@ class MCPToolManager:
         self._rate_limits: Dict[tuple, List[float]] = {}
         self._rate_limit_calls = int(os.getenv("MCP_RATE_LIMIT_CALLS", "10"))  # вызовов
         self._rate_limit_window = int(os.getenv("MCP_RATE_LIMIT_WINDOW", "60"))  # секунд
+        # ИСПРАВЛЕНИЕ #2: write-инструменты не кешируются, их вызов инвалидирует кеш
+        self._write_tools = {
+            "remember", "forget", "add_goal", "resolve_contradiction",
+            "update_fact", "record_action",
+        }
 
     async def initialize(self):
         """Подключиться ко всем серверам из конфига."""
@@ -161,19 +167,27 @@ class MCPToolManager:
 
     async def ensure_connected(self):
         """Повторяет попытку подключения к серверам, которые не удалось поднять
-        при старте (или отвалились позже) — не чаще MCP_RECONNECT_INTERVAL на
-        сервер. Безопасно вызывать часто — сама решает, нужна ли попытка."""
+        при старте (или отвалились позже) — с экспоненциальным backoff (ИСПРАВЛЕНИЕ #11).
+        Безопасно вызывать часто — сама решает, нужна ли попытка."""
         if not self._failed_servers:
             return
         now = time.time()
         for name, failed_at in list(self._failed_servers.items()):
-            if now - failed_at < MCP_RECONNECT_INTERVAL:
+            # Экспоненциальный backoff: 2^attempt * base_interval, max 1 hour
+            fail_count = self._fail_counts.get(name, 0)
+            wait = min(MCP_RECONNECT_INTERVAL * (2 ** fail_count), 3600)
+            if now - failed_at < wait:
                 continue
             cfg = self._server_configs.get(name)
             if not cfg:
                 continue
-            logger.info(f"Повторная попытка подключения к MCP серверу '{name}'...")
-            await self._connect_one(name, cfg)
+            logger.info(f"Reconnect attempt #{fail_count+1} for '{name}' (wait was {wait}s)")
+            success = await self._connect_one(name, cfg)
+            if success:
+                self._fail_counts.pop(name, None)
+            else:
+                self._fail_counts[name] = fail_count + 1
+                self._failed_servers[name] = now  # сбрасываем таймер
 
     def get_all_tools(self) -> List[Dict]:
         """Возвращает все инструменты со всех серверов с меткой сервера."""
@@ -232,10 +246,17 @@ class MCPToolManager:
             for k in oldest_keys:
                 del self._tool_cache[k]
 
+    def _is_write_tool(self, tool_name: str) -> bool:
+        """Проверяет, является ли инструмент write-инструментом (изменяет состояние)."""
+        return any(w in tool_name.lower() for w in self._write_tools)
+
     async def call_tool(self, server_name: str, tool_name: str, arguments: Dict) -> str:
         """Вызвать инструмент на указанном сервере — с ограничением по времени,
         кэшированием результатов и rate limiting, чтобы зависший внешний сервер
-        не вешал весь ответ чата навсегда, а частые одинаковые вызовы не перегружали сервер."""
+        не вешал весь ответ чата навсегда, а частые одинаковые вызовы не перегружали сервер.
+        
+        ИСПРАВЛЕНИЕ #2: write-инструменты не кешируются, их вызов инвалидирует кеш сервера.
+        """
         session = self.sessions.get(server_name)
         if not session:
             raise ValueError(f"Сервер '{server_name}' не найден")
@@ -251,13 +272,37 @@ class MCPToolManager:
                 f"не более {self._rate_limit_calls} вызовов за {self._rate_limit_window}с"
             )
         
-        # Проверка кэша (только для инструментов без побочных эффектов)
+        # ИСПРАВЛЕНИЕ #2: Для write-инструментов: не кешировать + инвалидировать кеш сервера
+        if self._is_write_tool(tool_name):
+            # Удалить все кешированные результаты этого сервера
+            stale = [k for k in self._tool_cache if k[0] == server_name]
+            for k in stale:
+                del self._tool_cache[k]
+            logger.debug(f"Write-инструмент {tool_name}: инвалидация кеша для {server_name}")
+            # Выполнить без кэша
+            return await self._execute_tool(server_name, tool_name, arguments)
+        
+        # read-инструменты: обычный cache lookup
         cache_key = self._get_cache_key(server_name, tool_name, arguments)
         cached = self._get_cached_result(cache_key)
         if cached is not None:
             logger.debug(f"Кэш-хит для {server_name}.{tool_name}")
             return cached
         
+        result = await self._execute_tool(server_name, tool_name, arguments)
+        
+        # Кэшируем только успешные результаты (без ошибок в тексте)
+        response_lower = result.lower()
+        if "error" not in response_lower and "exception" not in response_lower:
+            self._cache_result(cache_key, result)
+        
+        return result
+
+    async def _execute_tool(self, server_name: str, tool_name: str, arguments: Dict) -> str:
+        """Вынести прямой вызов session.call_tool сюда (рефакторинг для ИСПРАВЛЕНИЯ #2)."""
+        session = self.sessions.get(server_name)
+        if not session:
+            raise ValueError(f"Сервер '{server_name}' не найден")
         timeout = _resolve_tool_timeout(tool_name)
         try:
             result = await asyncio.wait_for(
@@ -268,14 +313,7 @@ class MCPToolManager:
             raise TimeoutError(
                 f"MCP-инструмент '{server_name}.{tool_name}' не ответил за {timeout}с"
             )
-        
-        response_text = result.content[0].text if result.content else str(result)
-        
-        # Кэшируем только успешные результаты (без ошибок в тексте)
-        if "error" not in response_text.lower() and "exception" not in response_text.lower():
-            self._cache_result(cache_key, response_text)
-        
-        return response_text
+        return result.content[0].text if result.content else str(result)
 
     async def close(self):
         """Закрыть все соединения."""
