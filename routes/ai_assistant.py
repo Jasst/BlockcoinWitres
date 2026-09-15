@@ -1911,6 +1911,12 @@ class CognitiveController:
                     success=tool_success if tool_trace else reasoning_success,
                     confidence=1.0 - self._last_prepare_meta.get("uncertainty", 0.5),
                 )
+                # Персистентность — вынесена из record_action и делается
+                # в фоне, чтобы не блокировать event loop на дисковом I/O.
+                self._spawn_background_task(
+                    asyncio.to_thread(self.self_model.save),
+                    name="self-model-save",
+                )
             except Exception as e:
                 logger.debug(f"[SelfModel] ошибка записи действия: {e}")
         
