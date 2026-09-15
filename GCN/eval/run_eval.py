@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from GCN.ai_assistant import get_assistant
+from routes.ai_assistant import get_assistant
 from GCN.eval.agent_eval import create_test_cases, run_agent_eval
 
 
