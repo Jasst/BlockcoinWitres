@@ -427,68 +427,9 @@ class CognitiveController:
         from GCN.internal_tools import search_tools
         search_tools.register(self.tool_registry, self, query_expander=_search_query_expander)
 
-        # ИСПРАВЛЕНИЕ (картинки "иногда не показывались"): возвращаем dict с
-        # ключом image_url. Стрим-обработчик в _stream_response_worker делает
-        # json.loads(result) и ждёт именно {"image_url": ...} — со старой
-        # строкой "Изображение сгенерировано: <url>" парсинг падал, событие
-        # image_url в SSE не отправлялось, и фронтенд картинку не рендерил
-        # (файл при этом молча сохранялся на диск).
-        async def _internal_generate_image(args: Dict) -> Dict:
-            prompt = args.get("prompt", "")
-            enhance = args.get("enhance_prompt", True)
-            steps = args.get("steps", 20)
-            width = args.get("width", 512)
-            height = args.get("height", 512)
-            cfg_scale = args.get("cfg_scale", 7.0)
-            seed = args.get("seed", -1)
-            sampler = args.get("sampler", "dpmpp_2m")
-            if enhance:
-                prompt = await self.enhance_prompt(prompt)
-            image_b64 = await self.generate_image(prompt, steps=steps, width=width,
-                                                  height=height, cfg_scale=cfg_scale,
-                                                  seed=seed, sampler_name=sampler)
-            if image_b64:
-                from GCN.config_ai import GENERATED_IMAGES_DIR
-                import base64
-                from datetime import datetime
-                output_dir = GENERATED_IMAGES_DIR
-                output_dir.mkdir(exist_ok=True)
-                # %f — защита от коллизий имён при двух генерациях в одну секунду
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                filename = output_dir / f"image_{timestamp}.png"
-                with open(filename, "wb") as f:
-                    f.write(base64.b64decode(image_b64))
-                BASE_URL = os.getenv("SERVER_BASE_URL", "http://localhost:8000")
-                image_url = f"{BASE_URL}/generated_images/{filename.name}"
-                return {"status": "ok", "image_url": image_url, "prompt": prompt}
-            return {"status": "error", "message": "Не удалось сгенерировать изображение."}
-
-        # Регистрируем в tool_registry
-        self.tool_registry.register(
-            name="generate_image",
-            description="Генерирует изображение по текстовому описанию. Аргументы: prompt (str), enhance_prompt (bool, опционально), steps, width, height, cfg_scale, seed, sampler",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string"},
-                    "enhance_prompt": {"type": "boolean", "default": True},
-                    "steps": {"type": "integer", "default": 20},
-                    "width": {"type": "integer", "default": 512},
-                    "height": {"type": "integer", "default": 512},
-                    "cfg_scale": {"type": "number", "default": 7.0},
-                    "seed": {"type": "integer", "default": -1},
-                    "sampler": {"type": "string", "default": "dpmpp_2m"}
-                },
-                "required": ["prompt"]
-            },
-            handler=_internal_generate_image,
-            server="internal",
-            # Тяжёлый инструмент: enhance-промпт (LLM) + переключение модели +
-            # генерация до EASYDIFFUSION_TIMEOUT (140с). Было: единый 45с
-            # таймаут ToolRouter обрывал генерацию под нагрузкой — отсюда
-            # "иногда работает". 300с — как в MCP_TOOL_TIMEOUT_OVERRIDES.
-            timeout_seconds=300
-        )
+        # Инструмент генерации изображений вынесен в GCN/internal_tools/image_tools.py
+        from GCN.internal_tools import image_tools
+        image_tools.register(self.tool_registry, self)
 
         # ===== Инструменты для самоанализа кода (Code Self-Reflection) =====
         if ENABLE_CODE_SELF_REFLECTION:
