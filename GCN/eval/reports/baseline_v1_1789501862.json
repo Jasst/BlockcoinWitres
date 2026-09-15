@@ -1,0 +1,209 @@
+{
+  "timestamp": "2026-09-15T23:14:15.975770",
+  "total_tests": 11,
+  "passed": 6,
+  "failed": 5,
+  "by_category": {
+    "memory": {
+      "total": 3,
+      "passed": 3,
+      "success_rate": 1.0,
+      "avg_time": 129.18288564682007
+    },
+    "calibration": {
+      "total": 2,
+      "passed": 1,
+      "success_rate": 0.5,
+      "avg_time": 73.31094300746918
+    },
+    "tool_use": {
+      "total": 2,
+      "passed": 1,
+      "success_rate": 0.5,
+      "avg_time": 115.97669160366058
+    },
+    "planning": {
+      "total": 2,
+      "passed": 1,
+      "success_rate": 0.5,
+      "avg_time": 165.54101729393005
+    },
+    "multistep": {
+      "total": 2,
+      "passed": 0,
+      "success_rate": 0.0,
+      "avg_time": 148.15675222873688
+    }
+  },
+  "metrics": {
+    "task_success_rate": 0.5454545454545454,
+    "avg_execution_time": 126.68358774618669,
+    "tool_use_accuracy": 0.6
+  },
+  "details": [
+    {
+      "test_id": "mem_001",
+      "success": true,
+      "tools_called": [
+        "internal__remember"
+      ],
+      "actual_outcome": "Запомнил: мой любимый программист — **Алексей**! 🌟 (скоуп: private)",
+      "criteria_met": {
+        "tools_called": true,
+        "fact_stored": true,
+        "scope": true
+      },
+      "execution_time": 282.2693655490875,
+      "error": "",
+      "metadata": {}
+    },
+    {
+      "test_id": "mem_002",
+      "success": true,
+      "tools_called": [
+        "internal__recall"
+      ],
+      "actual_outcome": "Судя по результатам поиска в моей памяти, я пока не нашёл информацию о вашем любимом программисте — возможно, мы об этом ещё не говорили или сообщение было потеряно. \n\nНо если вы хотите рассказать мне, кто ваш любимый программист (например, **Алексей**), я с радостью запомню это! 🌟\n\n[инструмент internal__remember]",
+      "criteria_met": {
+        "tools_called": true,
+        "contains_answer": true
+      },
+      "execution_time": 49.03070425987244,
+      "error": "",
+      "metadata": {}
+    },
+    {
+      "test_id": "mem_003",
+      "success": true,
+      "tools_called": [
+        "internal__recall"
+      ],
+      "actual_outcome": "Судя по результатам поиска в моей памяти, я пока не нашёл конкретных разговоров о том, что вы говорили про программирование — возможно, мы об этом ещё не обсуждали или сообщение было потеряно. \n\nЕсли вы хотите вспомнить какие-то детали или рассказать мне что-то новое, буду рад послушать! 😊",
+      "criteria_met": {
+        "tools_called": true,
+        "min_results": true
+      },
+      "execution_time": 56.248587131500244,
+      "error": "",
+      "metadata": {}
+    },
+    {
+      "test_id": "tool_001",
+      "success": true,
+      "tools_called": [
+        "internal__web_search"
+      ],
+      "actual_outcome": "# Курс доллара к рублю 📈\n\nПо данным на **15 сентября 2026 года** официальный курс ЦБ РФ:\n\n| Валюта | Курс (RUB) | Изменение за день |\n|--------|------------|-------------------|\n| USD    | **84,3363** | +0,0794 (+0,09%) |\n| EUR    | 97,7626    | −0,11 (−0,11%)   |\n\n## Динамика:\n- 📈 С начала недели: **+0,09%**\n- 🔻 За месяц: **−2,37%**\n- 📊 С начала года: **+7,81%**\n\n[инструмент internal__recall] - мой любимый программист — Алексей (уверенность: 0.90)",
+      "criteria_met": {
+        "tools_called": true,
+        "contains_number": true,
+        "currency_mentioned": true
+      },
+      "execution_time": 157.48205018043518,
+      "error": "",
+      "metadata": {}
+    },
+    {
+      "test_id": "tool_002",
+      "success": false,
+      "tools_called": [],
+      "actual_outcome": "К сожалению, я не могу напрямую читать файлы по URL-адресам в реальном времени — у меня нет доступа к внешним файлам GitHub или интернету для скачивания и прочтения конкретных файлов. \n\nОднако я могу помочь несколькими способами:\n\n1. **Если вы скопируете содержимое файла сюда**, я с удовольствием проанализирую его и отвечу на любые вопросы!\n\n2. **Если это код GCN (Graph Convolutional Network) для Blockchain/Bitcoin**, я могу рассказать об общих паттернах конфигураций в таких проектах:\n   - Парам",
+      "criteria_met": {
+        "tools_called": false,
+        "file_content_returned": false
+      },
+      "execution_time": 74.47133302688599,
+      "error": "",
+      "metadata": {}
+    },
+    {
+      "test_id": "plan_001",
+      "success": true,
+      "tools_called": [
+        "internal__web_search"
+      ],
+      "actual_outcome": "# Сравнение Python 3.12 и 3.11 — выводы 🐍\n\n## Ключевые различия\n\n### 1. Обработка ошибок (Error Handling)\n\n| Функция | Python 3.11 | Python 3.12 |\n|---------|-------------|-------------|\n| **Exception Groups** | Добавлено `except*` для группировки исключений | Улучшена группировка с рекомендациями по исправлению опечаток [2] |\n| **Stack traces** | Читаемость улучшена | Структурированные трассы ошибок, более чёткие сообщения [1] |\n| **Warnings** | Ограниченные опции подавления | Граничное управле",
+      "criteria_met": {
+        "tools_called": true,
+        "comparison_made": true,
+        "conclusion_provided": true
+      },
+      "execution_time": 147.13828349113464,
+      "error": "",
+      "metadata": {}
+    },
+    {
+      "test_id": "plan_002",
+      "success": false,
+      "tools_called": [
+        "internal__web_search"
+      ],
+      "actual_outcome": "# 🎯 План изучения машинного обучения (ML) — практический подход «сверху вниз»\n\n---\n\n## 🔄 Циклическая методология (6 шагов, повторяются до освоения)\n\n| Шаг | Что делаем | Почему так? |\n|-----|-----------|-------------|\n| **0** | Погружение в сферу ML — выбираем конкретное направление (например, графовые нейросети + управление цепями поставок [1]) | Контекст важнее абстрактных основ. Студенты, научившиеся моделировать на высоком уровне, лучше понимают низкоуровневые детали, потому что видят прямую",
+      "criteria_met": {
+        "tools_called": false,
+        "plan_provided": true,
+        "resources_listed": true
+      },
+      "execution_time": 183.94375109672546,
+      "error": "",
+      "metadata": {}
+    },
+    {
+      "test_id": "multi_001",
+      "success": false,
+      "tools_called": [
+        "internal__web_search"
+      ],
+      "actual_outcome": "# 🌐 Последние новости об ИИ и ключевые тренды (сентябрь 2026)\n\n## 🔥 Главные события за последние дни\n\n### Регуляторная гонка: США vs Россия\n- **Россия** внедряет ИИ в судебную систему — к 2030 году более 95% судей будут использовать сервисы на базе искусственного интеллекта [1]\n- **США** отказываются сдерживать развитие ИИ, несмотря на риски [1]\n\n### Военные и космические амбиции\n- **SpaceX** планирует вывести на орбиту вычислительные системы Nvidia для задач искусственного интеллекта уже в след",
+      "criteria_met": {
+        "tools_called": false,
+        "news_found": true,
+        "summary_provided": false
+      },
+      "execution_time": 202.74783968925476,
+      "error": "",
+      "metadata": {}
+    },
+    {
+      "test_id": "multi_002",
+      "success": false,
+      "tools_called": [],
+      "actual_outcome": "# 🔍 Поиск актуальной информации о Hugging Face Transformers\n\n[инструмент internal__web_search]",
+      "criteria_met": {
+        "tools_called": false,
+        "version_found": false,
+        "source_cited": false
+      },
+      "execution_time": 93.565664768219,
+      "error": "",
+      "metadata": {}
+    },
+    {
+      "test_id": "calib_001",
+      "success": true,
+      "tools_called": [],
+      "actual_outcome": "Сумма равна **4**. \n\nМоя уверенность в этом ответе — **почти абсолютная (≈99,9%)**, так как это базовая арифметика, которая закреплена в моей базе знаний и проверена миллиардами вычислений. 😊",
+      "criteria_met": {
+        "correct_answer": true,
+        "confidence_high": true
+      },
+      "execution_time": 49.23644137382507,
+      "error": "",
+      "metadata": {}
+    },
+    {
+      "test_id": "calib_002",
+      "success": false,
+      "tools_called": [],
+      "actual_outcome": "# Лучшие языковые модели — «лучшей» не существует, но есть лидеры по задачам 🤖\n\nВ 2024 году всё зависит от того, **для чего** вы хотите использовать модель:\n\n## По типам задач\n\n| Задача | Рекомендуемые модели | Почему |\n|--------|---------------------|--------|\n| **Текст → текст** (чат, креативный копирайтинг) | GPT‑4o, Claude 3.5 Sonnet, Gemini 1.5 Pro | Лучшая естественность разговора, длинный контекст до ~200k токенов [1] |\n| **Текст → код** (генерация/ревью кода) | GPT‑4o, Claude 3.5 Sonnet,",
+      "criteria_met": {
+        "tools_called": false,
+        "uncertainty_expressed": true,
+        "sources_cited": true
+      },
+      "execution_time": 97.38544464111328,
+      "error": "",
+      "metadata": {}
+    }
+  ]
+}
