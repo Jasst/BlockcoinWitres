@@ -2,7 +2,7 @@ import asyncio
 import aiohttp
 import logging
 from typing import List, Dict, Optional
-from GCN.config_ai import LM_STUDIO_URL, LM_STUDIO_API_KEY, LM_STUDIO_TIMEOUT, LM_STUDIO_STREAM_TIMEOUT
+from GCN.config_ai import LM_STUDIO_URL, LM_STUDIO_API_KEY, LM_STUDIO_TIMEOUT, LM_STUDIO_STREAM_TIMEOUT, DEFAULT_MAX_TOKENS
 import json
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ async def close_session() -> None:
 async def call_llm_raw(
     messages: List[Dict[str, str]],
     temp: float = 0.7,
-    max_tokens: int = 2048,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     tools: Optional[List[Dict]] = None,
     retries: int = 3
 ) -> Dict:
@@ -92,7 +92,7 @@ async def call_llm_raw(
 async def call_llm(
     messages: List[Dict[str, str]],
     temp: float = 0.7,
-    max_tokens: int = 2048,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     retries: int = 3
 ) -> str:
     """Универсальная функция вызова локальной LLM (LM Studio) — только текст ответа."""
@@ -103,7 +103,7 @@ async def call_llm(
 async def call_llm_stream(
     messages: List[Dict[str, str]],
     temp: float = 0.7,
-    max_tokens: int = 2048
+    max_tokens: int = DEFAULT_MAX_TOKENS
 ):
     """Потоковый вызов LLM (LM Studio) с теми же параметрами, что и call_llm."""
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}

@@ -172,7 +172,59 @@ class SelfModel:
         # Обновляем самоконцепцию на основе паттернов
         self._update_self_concept(action_type, success)
         
+        # === НОВОЕ: Калибровка уверенности (Brier score buckets) ===
+        self._record_calibration(confidence, success)
+        
         self.save()
+    
+    def _record_calibration(self, predicted_confidence: float, actual_success: bool) -> None:
+        """Записывает результат в бакет калибровки для последующей коррекции уверенности."""
+        bucket = round(predicted_confidence * 10) / 10  # 0.0, 0.1, ..., 1.0
+        bucket_key = f"calibration_bucket_{bucket}"
+        
+        if bucket_key not in self.self_concept:
+            self.self_concept[bucket_key] = {"n": 0, "success": 0}
+        
+        b = self.self_concept[bucket_key]
+        b["n"] += 1
+        b["success"] += int(actual_success)
+    
+    def get_calibrated_confidence(self, predicted: float) -> float:
+        """
+        Возвращает калиброванную вероятность успеха для заявленной уверенности.
+        
+        Если модель говорит «уверен 0.9», но в этом бакете успех только 60% —
+        вернёт 0.6. Это радикально улучшает метакогницию.
+        
+        Использует Bayesian-сглаживание для плавного перехода при малом количестве данных.
+        """
+        bucket = round(predicted * 10) / 10
+        bucket_key = f"calibration_bucket_{bucket}"
+        
+        b = self.self_concept.get(bucket_key, {"n": 0, "success": 0})
+        
+        # Bayesian-сглаживание: смешиваем prior (0.5) с наблюдениями
+        # n=0 → 0.5, n=1 success=1 → 0.58, n=5 success=5 → 0.75
+        prior_n = 5
+        prior_success = 2.5  # prior mean = 0.5
+        smoothed_rate = (prior_success + b["success"]) / (prior_n + b["n"])
+        
+        return smoothed_rate
+    
+    def get_calibration_stats(self) -> Dict[str, Any]:
+        """Возвращает статистику калибровки по всем бакетам."""
+        stats = {}
+        for key, value in self.self_concept.items():
+            if key.startswith("calibration_bucket_"):
+                bucket = key.replace("calibration_bucket_", "")
+                n = value.get("n", 0)
+                success = value.get("success", 0)
+                if n > 0:
+                    stats[bucket] = {
+                        "n": n,
+                        "success_rate": round(success / n, 3),
+                    }
+        return stats
     
     def _update_self_concept(self, action_type: str, success: bool) -> None:
         """Обновляет абстрактную самоконцепцию на основе паттернов действий."""
@@ -257,7 +309,11 @@ class SelfModel:
         skill_level = self.self_concept.get(skill_key, 0.5)
         
         # Комбинируем базовую уверенность с навыком
-        return (base * 0.4 + skill_level * 0.6)
+        raw_confidence = (base * 0.4 + skill_level * 0.6)
+        
+        # === НОВОЕ: Применяем калибровку ===
+        # Вместо сырой уверенности используем калиброванную
+        return self.get_calibrated_confidence(raw_confidence)
     
     def is_overloaded(self) -> bool:
         """Проверяет, перегружена ли система."""

@@ -75,8 +75,45 @@ class MemoryService:
         """
         Сохраняет факт в указанный скоуп (автоопределение, если scope не задан).
         Возвращает id и скоуп.
+        
+        ИСПРАВЛЕНИЕ #3: проверка дублей перед созданием нового факта.
         """
         self.refresh()
+        
+        # ── ИСПРАВЛЕНИЕ #3: проверка дубля ──────────────────────────────────────────
+        DEDUP_THRESHOLD = 0.88   # косинусное сходство
+        existing = await self.recall(fact, top_k=3, scope=scope)
+        for ex in existing:
+            if ex.get("score", 0) >= DEDUP_THRESHOLD:
+                ex_id = ex.get("gcn_id") or ex.get("id")
+                logger.info(f"[remember] дубль обнаружен (score={ex['score']:.2f}), "
+                            f"обновляю confidence вместо создания нового факта")
+                # Повысить confidence существующего факта
+                if ex_id:
+                    try:
+                        # Определяем правильный слой памяти по scope найденного факта
+                        scope_name = ex.get("scope", "private")
+                        memory_layer = {
+                            "private": self.router.private_memory,
+                            "shared": self.router.shared_memory,
+                            "global": self.router.global_memory,
+                        }.get(scope_name, self.router.private_memory)
+                        
+                        # Используем корректные методы MemoryStore: get() и update()
+                        ko = memory_layer.store.get(ex_id)
+                        if ko:
+                            new_confidence = min(1.0, max(ko.confidence, confidence))
+                            memory_layer.store.update(
+                                ex_id,
+                                {"confidence": new_confidence},
+                                actor=self.user_id
+                            )
+                    except Exception as e:
+                        logger.debug(f"[remember] не удалось обновить дубль {ex_id}: {e}")
+                return {"id": ex_id, "scope": ex.get("scope", "private"),
+                        "action": "updated_existing", "similarity": ex["score"]}
+        # ── конец проверки дубля ──────────────────────────────────────────
+        
         if scope is None:
             if "глобально" in fact.lower() or "global" in fact.lower():
                 scope_enum = MemoryScope.GLOBAL

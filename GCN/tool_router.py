@@ -91,6 +91,30 @@ Claude Desktop, к mcp_server_blockcoin.py) всё работает надёжн
    пользовательское сообщение-подсказку, явно указывающее, что нужно
    вызвать `internal__fetch_github_file` с правильным `path`. Это снижает
    нагрузку на LLM и гарантирует, что вызов будет сделан с первого раза.
+
+5) ДЕЛЕГИРОВАНИЕ СУБАГЕНТАМ (переработано).
+   Раньше на КАЖДОЕ нормальное сообщение шёл LLM-классификатор роли
+   (auto_route) и, что хуже, при первом же возвращённом role возвращался
+   из run(), полностью пропуская основной ReAct-цикл: план подзадач,
+   scratchpad, рефлексию над ошибкой, _verify_tool_result, трекинг плана,
+   дедуп seen_calls/seen_errors. Отдельно: delegation передавала роль
+   СТРОКОЙ ("coder"/"researcher"), что работало лишь как побочный эффект
+   str-mixin у AgentRole и ломалось на любой другой версии Python;
+   в одном из мест был SyntaxError из-за лишнего бэкслеша в f-string.
+   ИСПРАВЛЕНО:
+     - делегируется только роль CODER, и только на строгие маркеры
+       (расширения файлов, traceback/exception, github.com, имена
+       coder-инструментов). Убраны широкие "код"/"файл"/"ошибка"/"поиск",
+       матчившие "код города", "прикрепи файл", "типичные ошибки";
+     - роль researcher больше не делегируется: её инструменты
+       (web_search/fetch_github_file) уже есть в основном цикле, а сам
+       цикл дополнительно делает параллельные queries, дедуп источников,
+       sanitize_search_facts, сбор _web_search_results_this_turn для
+       фронта и _verify_response — субагент всего этого не проходит,
+       и его tool_trace попадал в ai_assistant.py без заземления;
+     - роль передаётся как AgentRole.CODER (enum), а не строкой;
+     - в возврате при делегировании честно `used_native: False` и
+       `plan: ""` (native не вызывался, план ещё не строили).
 """
 
 import json
@@ -99,6 +123,26 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Awaitable
 import asyncio
+from pathlib import Path
+
+# Логгер — до всех условных импортов и до функций, которые могут его
+# использовать (раньше он определялся условно внутри except ImportError,
+# из-за чего любое обращение к logger вне этого except могло упасть с
+# NameError в ветке, где subagent импортировался успешно).
+logger = logging.getLogger(__name__)
+
+# ПУНКТ №5: Импорт субагентов для делегирования
+try:
+    from GCN.subagent import SubAgentOrchestrator, AgentRole, ROLE_TOOLS
+    SUBAGENTS_AVAILABLE = True
+except ImportError:
+    SUBAGENTS_AVAILABLE = False
+    SubAgentOrchestrator = None
+    AgentRole = None
+    ROLE_TOOLS = None
+
+# ИСПРАВЛЕНИЕ #4: путь для персистентного флага native_supported
+_NATIVE_FLAG_PATH = Path(__file__).resolve().parent.parent / "ai_memory_v3" / "_native_flag.json"
 
 try:
     from GCN.config_ai import (
@@ -117,6 +161,7 @@ except ImportError:
     MAX_SUBTASKS = 4
     MCP_TOOL_TIMEOUT_OVERRIDES = {}
 
+
 # ИСПРАВЛЕНИЕ (генерация изображений в чате "не всегда работает"): тяжёлые
 # инструменты убивались единым TOOL_CALL_TIMEOUT_SECONDS=45 ещё ДО того, как
 # EasyDiffusion успевал сгенерировать картинку (только enhance-промпт через
@@ -130,9 +175,9 @@ def _resolve_timeout(tool_name: str):
             return t
     return None
 
-logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 3  # сколько раундов вызова инструментов разрешено за один ответ
+MAX_TOOL_ITERATIONS_DYNAMIC = 7  # максимум при активном перепланировании
 
 # Простые маркеры составного/многочастного запроса — пункт №4 (планирование).
 # Эвристика намеренно дешёвая: полноценная классификация "сложности" запроса
@@ -376,10 +421,47 @@ class ToolRouter:
         self.registry = registry
         self.llm_raw_caller = llm_raw_caller
         self.llm_text_caller = llm_text_caller
-        self._native_supported: Optional[bool] = None
+        # ИСПРАВЛЕНИЕ #4: загружаем персистентный флаг native_supported
+        self._native_supported: Optional[bool] = self._load_native_flag()
         # ИНТЕЛЛЕКТ-ПАКЕТ (E): план подзадач текущего запуска — читает
         # PlanCritic из ai_assistant через этот атрибут или run()["plan"].
         self._last_plan: str = ""
+        # ПУНКТ №10: Scratchpad для persistent reasoning между раундами ReAct
+        self._scratchpad: List[str] = []
+        # ПУНКТ №5: Инициализация оркестратора субагентов если доступен
+        self._subagent_orchestrator: Optional[Any] = None
+        if SUBAGENTS_AVAILABLE:
+            try:
+                # Имена аргументов должны совпадать с __init__ SubAgentOrchestrator
+                self._subagent_orchestrator = SubAgentOrchestrator(
+                    llm_raw_caller=llm_raw_caller,
+                    llm_text_caller=llm_text_caller,
+                    tool_registry=registry,
+                )
+                logger.info("SubAgentOrchestrator успешно инициализирован")
+            except Exception as e:
+                logger.warning(f"Не удалось инициализировать SubAgentOrchestrator: {e}. Делегирование отключено.")
+                self._subagent_orchestrator = None
+
+    def _load_native_flag(self) -> Optional[bool]:
+        """Загружает персистентный флаг поддержки native function calling."""
+        try:
+            if _NATIVE_FLAG_PATH.exists():
+                import json as json_mod
+                data = json_mod.loads(_NATIVE_FLAG_PATH.read_text())
+                return data.get("native_supported")
+        except Exception:
+            pass
+        return None
+
+    def _save_native_flag(self, value: bool) -> None:
+        """Сохраняет флаг поддержки native function calling."""
+        try:
+            _NATIVE_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            import json as json_mod
+            _NATIVE_FLAG_PATH.write_text(json_mod.dumps({"native_supported": value}))
+        except Exception:
+            pass
 
     async def _execute_tool(self, qualified_name: str, arguments: Dict[str, Any]) -> str:
         spec = self.registry.get(qualified_name)
@@ -437,6 +519,141 @@ class ToolRouter:
             logger.debug(f"Planning step failed, continuing without a plan: {e}")
             return ""
 
+    async def _validate_plan(self, plan_text: str, available_tools: List[str]) -> List[str]:
+        """
+        ПУНКТ №4: Проверяет, что каждый пункт плана реализуем имеющимися инструментами.
+        Возвращает список нереализуемых пунктов.
+        """
+        if not plan_text:
+            return []
+
+        lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
+        unrealizable = []
+
+        # Простая эвристика: если пункт содержит название инструмента — проверяем наличие
+        for line in lines:
+            found_tool = False
+            for tool in available_tools:
+                if tool.lower() in line.lower():
+                    found_tool = True
+                    break
+            # Если инструмент не найден в названии, но есть общие маркеры действий
+            action_markers = ["найди", "поиск", "проверь", "прочти", "открой", "вспомни", "запомни"]
+            has_action = any(m in line.lower() for m in action_markers)
+
+            if not found_tool and not has_action:
+                unrealizable.append(line)
+
+        return unrealizable
+
+    async def _track_plan_progress(self, plan_text: str, tool_trace: List[Dict]) -> Dict[str, bool]:
+        """
+        ПУНКТ №4: Отмечает, какие пункты плана покрыты выполненными инструментами.
+        Возвращает dict {пункт_плана: выполнено}.
+        """
+        if not plan_text:
+            return {}
+
+        lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
+        progress = {}
+
+        for line in lines:
+            # Проверяем, есть ли в tool_trace инструменты, релевантные этому пункту
+            covered = False
+            for entry in tool_trace:
+                tool_name = entry.get("tool", "").lower()
+                result = str(entry.get("result", "")).lower()
+
+                # Ключевые слова из пункта плана
+                plan_words = set(line.lower().split())
+
+                # Если инструмент или результат содержат слова из плана
+                if any(word in tool_name for word in plan_words if len(word) > 3):
+                    covered = True
+                    break
+                if any(word in result for word in plan_words if len(word) > 3):
+                    covered = True
+                    break
+
+            progress[line] = covered
+
+        return progress
+
+    async def _reflect_on_failure(self, tool: str, args: Dict, error: str,
+                                   plan: str, history_tail: str) -> Dict:
+        """
+        ПУНКТ №1: После ошибки/пустого результата — короткий LLM-проход для диагностики.
+        Возвращает JSON: {"diagnosis": "...", "next_action": "...", "modified_args": {...}, "new_plan": "..."}
+        """
+        prompt = f"""Инструмент {tool} с аргументами {args} вернул ошибку/пусто:
+{error}
+
+Текущий план: {plan or "нет плана"}
+Контекст диалога: {history_tail[:500] if history_tail else "пусто"}
+
+Проанализируй почему это произошло и что делать дальше.
+Возможные причины:
+- Неправильные аргументы (нужно переформулировать)
+- Инструмент не подходит для этой задачи
+- Нужно попробовать другой инструмент
+- План неверен и требует пересмотра
+
+Ответь ТОЛЬКО валидным JSON без markdown:
+{{
+    "diagnosis": "краткая причина неудачи",
+    "next_action": "retry_modified|different_tool|replan|give_up",
+    "modified_args": {{}},
+    "suggested_tool": "название другого инструмента если нужно" или null,
+    "new_plan": "новый план если требуется перепланирование" или null
+}}"""
+
+        try:
+            raw = await self.llm_text_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=400)
+            result = _strict_parse_json_object(raw)
+            if result:
+                return result
+        except Exception as e:
+            logger.debug(f"Reflection on failure failed: {e}")
+
+        # Fallback: базовая эвристика
+        error_lower = error.lower()
+        if "не найдено" in error_lower or "404" in error_lower or "not found" in error_lower:
+            return {"diagnosis": "Ресурс не найден", "next_action": "different_tool", "modified_args": {}, "suggested_tool": "internal__recall", "new_plan": None}
+        elif "ошибка" in error_lower or "error" in error_lower or "exception" in error_lower:
+            return {"diagnosis": "Ошибка выполнения", "next_action": "retry_modified", "modified_args": {}, "suggested_tool": tool, "new_plan": None}
+        else:
+            return {"diagnosis": "Неясная ошибка", "next_action": "give_up", "modified_args": {}, "suggested_tool": None, "new_plan": None}
+
+    async def _verify_tool_result(self, question: str, tool: str, result: str) -> str:
+        """
+        ПУНКТ №2: Дешёвый судья для проверки результата инструмента.
+        Возвращает: 'sufficient' | 'partial' | 'irrelevant' | 'error'.
+        """
+        if not result or result.strip() == "":
+            return "error"
+
+        result_lower = result.lower()
+
+        # Явные маркеры ошибки
+        if any(m in result_lower for m in ["ошибка", "error", "exception", "timeout", "не удалось"]):
+            if any(m in result_lower for m in ["не найдено", "404", "nothing found", "no results"]):
+                return "irrelevant"  # Не ошибка, просто пусто
+            return "error"
+
+        # Маркеры пустого/нерелевантного результата
+        if any(m in result_lower for m in ["ничего не найдено", "no results found", "пусто", "empty"]):
+            return "irrelevant"
+
+        # Если результат очень короткий и не содержит данных
+        if len(result) < 20 and not any(c.isdigit() for c in result):
+            return "partial"
+
+        # Эвристика: если результат содержит данные (URL, числа, текст > 50 символов)
+        if len(result) > 50 or any(m in result for m in ["http", "www", "."]):
+            return "sufficient"
+
+        return "partial"
+
     async def _decide_fallback(self, message: str, history_tail: str,
                                 tool_results_so_far: str, temp: float) -> Optional[Dict]:
         prompt = TOOL_DECISION_PROMPT.format(
@@ -448,7 +665,7 @@ class ToolRouter:
         raw = await self.llm_text_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=300)
         return _strict_parse_json_object(raw)
 
-    # ===== ОСНОВНОЙ МЕТОД (с изменениями) =====
+    # ===== ОСНОВНОЙ МЕТОД =====
     async def run(self, message: str, base_messages: List[Dict], history_tail: str = "") -> Dict[str, Any]:
         """
         Запускает ReAct-цикл: до MAX_TOOL_ITERATIONS раундов вызова инструментов,
@@ -461,6 +678,56 @@ class ToolRouter:
         """
         if self.registry.is_empty():
             return {"tool_trace": [], "used_native": False}
+
+        # === Очистка scratchpad для нового запроса (предотвращение загрязнения контекста) ===
+        self._scratchpad = []
+
+        message_lower = (message or "").lower()
+
+        # === ПУНКТ №5: Делегирование субагенту ===
+        # Делегируем ТОЛЬКО роль CODER, и только на строгие маркеры анализа кода.
+        # Убраны широкие "код"/"файл"/"ошибка"/"поиск": они матчатся на бытовые
+        # фразы ("код города", "прикрепи файл", "типичные ошибки") и уводили
+        # запрос в субагента в обход всего основного цикла (план, scratchpad,
+        # рефлексия, verify_tool_result, трекинг плана, дедуп).
+        #
+        # Роль RESEARCHER больше не делегируется: её инструменты
+        # (internal__web_search / internal__fetch_github_file) уже доступны
+        # основному ReAct-циклу, а сам цикл делает больше — параллельные
+        # queries, дедуп источников, sanitize_search_facts, сбор
+        # _web_search_results_this_turn для фронта, _verify_response.
+        # Субагент все эти шаги пропускает, и его tool_trace приходил в
+        # ai_assistant.py без заземления/валидации.
+        if self._subagent_orchestrator is not None:
+            try:
+                coder_markers = (
+                    ".py", ".js", ".ts", ".tsx", ".jsx",
+                    "traceback", "exception",
+                    "github.com",
+                    "read_code", "search_code", "analyze_error",
+                    "project_structure",
+                    "прочитай код", "анализируй код", "структуру проекта",
+                )
+                if any(m in message_lower for m in coder_markers):
+                    logger.info("Делегировано субагенту: coder")
+                    role_result = await self._subagent_orchestrator.execute_task(
+                        task=message,
+                        role=AgentRole.CODER,
+                        context={"history_tail": history_tail[:500] if history_tail else ""},
+                    )
+                    if role_result and role_result.get("result"):
+                        return {
+                            "tool_trace": role_result.get("tool_trace", []),
+                            # Native-режим здесь не вызывался, и план ещё не строили —
+                            # возвращаем честные значения, чтобы ai_assistant не сверял
+                            # ответ с чужим (прошлым) планом.
+                            "used_native": False,
+                            "delegated_to": AgentRole.CODER.value,
+                            "plan": "",
+                        }
+            except Exception as e:
+                logger.debug(f"SubAgent delegation failed, fallback to ToolRouter: {e}")
+                # Продолжаем обычный ReAct-цикл если делегирование не сработало
 
         tool_trace: List[Dict[str, Any]] = []
         used_native = False
@@ -502,7 +769,18 @@ class ToolRouter:
         # === ИСПРАВЛЕНИЕ: отслеживаем ошибки, чтобы не повторять их ===
         seen_errors: set = set()   # (tool, frozenset(sorted(args.items())))
 
-        for round_idx in range(MAX_TOOL_ITERATIONS):
+        # ПУНКТ №1: Динамический лимит итераций при активном перепланировании
+        max_iterations = MAX_TOOL_ITERATIONS
+        replan_count = 0  # счётчик перепланирований
+
+        # ПУНКТ №4: Валидация плана перед выполнением
+        if plan_text:
+            available_tools = list(self.registry._tools.keys())
+            unrealizable = await self._validate_plan(plan_text, available_tools)
+            if unrealizable:
+                logger.warning(f"План содержит нереализуемые пункты: {unrealizable}")
+
+        for round_idx in range(max_iterations):
             decisions: Optional[List[Dict]] = None
 
             if self._native_supported is not False:
@@ -510,6 +788,7 @@ class ToolRouter:
                 if decisions is not None:
                     used_native = True
                     self._native_supported = True
+                    self._save_native_flag(True)  # ИСПРАВЛЕНИЕ #4: сохраняем флаг
                 elif used_native:
                     break
 
@@ -542,6 +821,7 @@ class ToolRouter:
 
                 if self._native_supported is None:
                     self._native_supported = False
+                    self._save_native_flag(False)  # ИСПРАВЛЕНИЕ #4: сохраняем флаг
 
             if decisions:
                 logger.info(f"ToolRouter: round {round_idx}, decisions: {decisions}")
@@ -599,9 +879,103 @@ class ToolRouter:
                     if "ошибка" in result_str or "не найдено" in result_str or "404" in result_str:
                         sig = (d["tool"], json.dumps(d.get("arguments", {}), sort_keys=True, ensure_ascii=False))
                         seen_errors.add(sig)
+                        # ПУНКТ №1: Рефлексия над неудачей
+                        reflection = await self._reflect_on_failure(
+                            d["tool"], d.get("arguments", {}), result,
+                            plan_text, history_tail
+                        )
+                        logger.info(f"Рефлексия над ошибкой: {reflection.get('diagnosis', 'неизвестно')}")
+
+                        # === ИСПРАВЛЕНИЕ: реально используем результат рефлексии ===
+                        next_action = reflection.get("next_action", "give_up")
+
+                        if next_action == "give_up":
+                            logger.info("Reflection: сдаюсь, завершаю ReAct-цикл для этого инструмента")
+                            entry["verification"] = "error"
+                        elif next_action == "different_tool" and reflection.get("suggested_tool"):
+                            suggested = reflection["suggested_tool"]
+                            modified_args = reflection.get("modified_args", {})
+                            running_messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"[Диагноз: {reflection.get('diagnosis', 'неизвестно')}]\n"
+                                    f"[Попробуй другой инструмент: {suggested} "
+                                    f"с аргументами {modified_args if modified_args else '{}'}]"
+                                ),
+                            })
+                            logger.info(f"Reflection: предложен другой инструмент {suggested}")
+                        elif next_action == "retry_modified" and reflection.get("modified_args"):
+                            running_messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"[Диагноз: {reflection.get('diagnosis', 'неизвестно')}]\n"
+                                    f"[Попробуй снова с исправленными аргументами: {reflection['modified_args']}]"
+                                ),
+                            })
+                            logger.info("Reflection: предложены исправленные аргументы")
+
+                        # Если модель предлагает перепланирование
+                        if reflection.get("new_plan") and replan_count < 2:
+                            replan_count += 1
+                            max_iterations = min(MAX_TOOL_ITERATIONS_DYNAMIC, max_iterations + 2)
+                            self._last_plan = reflection["new_plan"]
+                            running_messages.append({
+                                "role": "user",
+                                "content": f"[Новый план после ошибки]\n{reflection['new_plan']}",
+                            })
+                            logger.info(f"Перепланирование #{replan_count}, новый лимит: {max_iterations}")
+
+                    # ПУНКТ №2: Верификация результата
+                    verification = await self._verify_tool_result(message, d["tool"], result)
+                    if verification == "irrelevant":
+                        logger.info(f"Результат инструмента {d['tool']} нерелевантен")
+                        # Помечаем как нерелевантный для модели
+                        entry["verification"] = "irrelevant"
+                    elif verification == "error":
+                        logger.warning(f"Результат инструмента {d['tool']} содержит ошибку")
+                        entry["verification"] = "error"
+                    elif verification == "partial":
+                        entry["verification"] = "partial"
+                    else:
+                        entry["verification"] = "sufficient"
 
             if new_calls_this_round == 0:
                 break
+
+            # === ПУНКТ №10: Обновление scratchpad после каждого раунда ===
+            # Гейт: только для сложных задач (2+ инструментов) и не на первом раунде
+            if round_idx > 0 and len(tool_trace) >= 2 and _looks_compound(message):
+                try:
+                    # Короткий LLM-вызов для сжатия состояния
+                    scratchpad_prompt = (
+                        f"Запрос: {message[:200]}\n"
+                        f"Выполнено инструментов: {len(tool_trace)}\n"
+                        f"Что уже знаю:\n{build_tool_trace_context(round_results)[:1500]}\n\n"
+                        "Сформулируй в 3 строках максимум:\n"
+                        "1) Что я уже установил (факты)\n"
+                        "2) Чего ещё не хватает\n"
+                        "3) Какой следующий логичный шаг\n"
+                        "Без воды, только конкретика."
+                    )
+                    scratchpad_summary = await self.llm_text_caller(
+                        [{"role": "user", "content": scratchpad_prompt}],
+                        temp=0.0,
+                        max_tokens=150,
+                    )
+                    if scratchpad_summary:
+                        self._scratchpad.append(scratchpad_summary.strip())
+                        # Держим только последние 3 записи
+                        if len(self._scratchpad) > 3:
+                            self._scratchpad = self._scratchpad[-3:]
+
+                        # Добавляем scratchpad в контекст для следующего раунда
+                        running_messages = running_messages + [{
+                            "role": "user",
+                            "content": f"[Scratchpad — что я уже знаю]\n{scratchpad_summary.strip()}",
+                        }]
+                        logger.debug(f"Scratchpad обновлён: {scratchpad_summary[:80]}...")
+                except Exception as e:
+                    logger.debug(f"Scratchpad update failed: {e}")
 
             running_messages = running_messages + [{
                 "role": "user",
@@ -612,7 +986,19 @@ class ToolRouter:
                 ),
             }]
 
-            if not used_native and len(tool_trace) >= MAX_TOOL_ITERATIONS:
+            # ПУНКТ №4: Трекинг прогресса по плану
+            if plan_text:
+                progress = await self._track_plan_progress(plan_text, tool_trace)
+                uncovered = [k for k, v in progress.items() if not v]
+                if uncovered and round_idx < max_iterations - 1:
+                    logger.info(f"Не покрыты пункты плана: {uncovered[:2]}")
+                    # Добавляем напоминание о непокрытых пунктах
+                    running_messages = running_messages + [{
+                        "role": "user",
+                        "content": f"[Напоминание: ещё не выполнены пункты плана: {', '.join(uncovered[:2])}]",
+                    }]
+
+            if not used_native and len(tool_trace) >= max_iterations:
                 break
 
         return {"tool_trace": tool_trace, "used_native": used_native, "plan": getattr(self, "_last_plan", "")}

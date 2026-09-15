@@ -152,10 +152,18 @@ window.selectConversation = function(address, name, isGroup) {
     let _currentAiSessionId = null;
     let _aiNameSet = false;
     let _partialSaveTimer = null;
-    // ИСПРАВЛЕНИЕ (дубли картинок): URL уже показанных изображений — чтобы
-    // событие image_url не обрабатывалось повторно (attach-реплей, сетевой
-    // обрыв и повторное подключение к тому же потоку).
     let _displayedImageUrls = new Set();
+
+// === ФИКС ДУБЛИРОВАНИЯ ПОТОКА ===
+// _attachInFlight — true, пока выполняется _attachToActiveAiStream(), чтобы
+//   два visibilitychange-события (или visibilitychange + catch из _sendToAi)
+//   не запустили два параллельных attach-потока.
+// _mainSendActive — true на всё время работы _sendToAi(), включая окно
+//   между fetch() и присвоением _currentStreamReader. В этом окне
+//   visibilitychange НЕ должен дёргать attach: основной путь ещё жив,
+//   и они будут писать в один буфер.
+    let _attachInFlight = false;
+    let _mainSendActive = false;
 
     const CONFIG = {
         historyMaxLength: 200,
@@ -174,17 +182,27 @@ window.selectConversation = function(address, name, isGroup) {
     // Вместо того чтобы показывать ошибку и терять почти готовый ответ —
     // при возврате на вкладку молча пробуем переподключиться и забрать
     // то, что уже накопилось + доиграть остаток.
-    document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible' && _isSending && !_currentStreamReader) {
-            _attachToActiveAiStream().then((recovered) => {
-                if (!recovered) {
-                    _isSending = false;
-                    if (_aiSendBtn) _aiSendBtn.style.display = 'inline-flex';
-                    if (_aiStopBtn) _aiStopBtn.style.display = 'none';
-                }
-            }).catch(() => {});
+    // === ФИКС ДУБЛИРОВАНИЯ ПОТОКА ===
+// Раньше условия было только `_isSending && !_currentStreamReader` — оно
+// истинно в окне между `fetch('/ai/chat')` и присвоением `_currentStreamReader`
+// (например, пока сервер обрабатывает tool_router и веб-поиск). Если в это
+// окно пользователь переключал вкладку, attach запускался ПАРАЛЛЕЛЬНО с
+// основным fetch-потоком, и оба писали в один _currentStreamingText —
+// отсюда удвоение каждого токена в ответе.
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (!_isSending) return;
+    if (_currentStreamReader) return;   // основной поток уже читает — не мешаем
+    if (_attachInFlight) return;         // attach уже идёт — не дублируем
+    if (_mainSendActive) return;         // основной путь жив (fetch ещё не отдал reader) — не гоняемся
+    _attachToActiveAiStream().then((recovered) => {
+        if (!recovered) {
+            _isSending = false;
+            if (_aiSendBtn) _aiSendBtn.style.display = 'inline-flex';
+            if (_aiStopBtn) _aiStopBtn.style.display = 'none';
         }
-    });
+    }).catch(() => {});
+});
 
     // ─── работа с историей сессии ───
     function _getStoredHistory(sessionId) {
@@ -213,13 +231,33 @@ window.selectConversation = function(address, name, isGroup) {
 
     // ─── восстановление ответа, если пользователь вышел из чата или перезагрузил
     // страницу до завершения генерации ───
+        // ─── восстановление ответа, если пользователь вышел из чата или перезагрузил
+    // страницу до завершения генерации ───
+    // === ФИКС ДУБЛИРОВАНИЯ ПОТОКА ===
+    // Раньше функция безусловно звала _attachToActiveAiStream() при каждом
+    // входе в сессию. Если в этот момент основной путь _sendToAi ещё был жив
+    // (например, между fetch('/ai/chat') и присвоением _currentStreamReader),
+    // attach запускался ПАРАЛЛЕЛЬНО и оба потока писали в один буфер — отсюда
+    // удвоение блоков ответа (инцидент "=== ШАГ 1/2/3 ===" × 2).
+    // Теперь: если основной поток жив, или уже читает, или attach уже идёт —
+    // выходим, ничего не восстанавливаем.
     async function _recoverUnfinishedAiMessage() {
+        if (typeof _mainSendActive !== 'undefined' && _mainSendActive) return;
+        if (typeof _currentStreamReader !== 'undefined' && _currentStreamReader) return;
+        if (typeof _attachInFlight !== 'undefined' && _attachInFlight) return;
+
         const sessionId = _currentAiSessionId || 'default';
         const history = _getStoredHistory(sessionId);
         const lastUserIdx = history.map(m => m.role).lastIndexOf('user');
-        if (lastUserIdx === -1) { localStorage.removeItem('ai_stream_partial_' + sessionId); return; }
+        if (lastUserIdx === -1) {
+            localStorage.removeItem('ai_stream_partial_' + sessionId);
+            return;
+        }
         const hasReply = history.slice(lastUserIdx + 1).some(m => m.role === 'assistant');
-        if (hasReply) { localStorage.removeItem('ai_stream_partial_' + sessionId); return; }
+        if (hasReply) {
+            localStorage.removeItem('ai_stream_partial_' + sessionId);
+            return;
+        }
         const lastUserText = history[lastUserIdx].text;
 
         // 1) Генерация ещё идёт на сервере (worker досчитывает её независимо
@@ -232,7 +270,10 @@ window.selectConversation = function(address, name, isGroup) {
                 localStorage.removeItem('ai_stream_partial_' + sessionId);
                 return;
             }
-        } catch (e) { console.warn('attach recovery failed', e); _isSending = false; }
+        } catch (e) {
+            console.warn('attach recovery failed', e);
+            _isSending = false;
+        }
 
         // 2) Генерация уже завершилась, пока пользователя не было —
         //    заберём готовый ответ с сервера.
@@ -246,7 +287,9 @@ window.selectConversation = function(address, name, isGroup) {
                     return;
                 }
             }
-        } catch (e) { console.warn('last_response recovery failed', e); }
+        } catch (e) {
+            console.warn('last_response recovery failed', e);
+        }
 
         // 3) Сервер ничего не знает — покажем последний сохранённый обрывок.
         const raw = localStorage.getItem('ai_stream_partial_' + sessionId);
@@ -254,7 +297,10 @@ window.selectConversation = function(address, name, isGroup) {
             try {
                 const partial = JSON.parse(raw);
                 if (partial.text && partial.text.trim()) {
-                    _displayAiMessage(partial.text + '\n\n_⏸ Ответ оборван (страница была перезагружена)_', false, null, true);
+                    _displayAiMessage(
+                        partial.text + '\n\n_⏸ Ответ оборван (страница была перезагружена)_',
+                        false, null, true
+                    );
                 }
             } catch (e) {}
             localStorage.removeItem('ai_stream_partial_' + sessionId);
@@ -669,118 +715,203 @@ function _clearAiHistory() {
     // ─── основная отправка ───
     // ai-manager.js — функция _sendToAi (полностью, с исправлением)
     // ─── попытка переподключения к уже идущей на сервере генерации ───
-    async function _attachToActiveAiStream() {
-        // ИСПРАВЛЕНИЕ: раньше функция сразу возвращала false без активного
-        // _currentStreamingMessage, поэтому её нельзя было использовать для
-        // восстановления ответа после перезагрузки страницы. Теперь при
-        // отсутствии сообщения создаём новое и достраиваем ответ в него.
-        const createdMessage = !_currentStreamingMessage;
-        if (createdMessage) {
-            _currentStreamingMessage = _displayAiMessage('', false, null, false);
-            _currentStreamingText = '';
-        }
-        const markdownBody = _currentStreamingMessage.querySelector('.content .markdown-body');
-        if (!markdownBody) {
-            if (createdMessage) _currentStreamingMessage = null;
-            return false;
-        }
+    // === ФИКС ДУБЛИРОВАНИЯ ПОТОКА ===
+// Ключевые изменения по сравнению со старой версией:
+//   1. В начале — три guard-а: не запускаемся, если основной reader жив
+//      (_currentStreamReader), если attach уже идёт (_attachInFlight),
+//      если основной путь ещё не отдал reader (см. force-флаг ниже).
+//   2. force=true (вызывается ТОЛЬКО из catch-блока _sendToAi, когда основной
+//      поток уже умер) — разрешает работать, даже если _currentStreamReader
+//      ещё не успел обнулиться в finally.
+//   3. Пишем во ЛОКАЛЬНЫЙ буфер `localText`, а не в общий _currentStreamingText.
+//      Даже если каким-то чудом гонка случится, два писателя не сложатся
+//      друг с другом в одну строку.
+//   4. _currentStreamingText присваивается только в самом конце — когда
+//      attach успешно досчитал ответ.
+    // === ФИКС ДУБЛИРОВАНИЯ ПОТОКА ===
+    // Ключевые изменения по сравнению со старой версией:
+    //   1. В начале — три guard-а: не запускаемся, если основной reader жив
+    //      (_currentStreamReader), если attach уже идёт (_attachInFlight),
+    //      если основной путь ещё не отдал reader (см. force-флаг ниже).
+    //   2. force=true (вызывается ТОЛЬКО из catch-блока _sendToAi, когда основной
+    //      поток уже умер) — разрешает работать, даже если _currentStreamReader
+    //      ещё не успел обнулиться в finally.
+    //   3. Пишем во ЛОКАЛЬНЫЙ буфер `localText`, а не в общий _currentStreamingText.
+    //      Даже если каким-то чудом гонка случится, два писателя не сложатся
+    //      друг с другом в одну строку.
+    //   4. _currentStreamingText присваивается только в самом конце — когда
+    //      attach успешно досчитал ответ.
+    //   5. Если сервер сказал no_active_generation, но у нас уже есть
+    //      существующий DOM-элемент с обрывком (createdMessage === false) —
+    //      пробуем забрать полный ответ через /ai/chat/last_response. Иначе
+    //      пользователь видел бы оборванный текст, хотя на сервере уже
+    //      сохранён полный ответ в _last_exchange.
+    async function _attachToActiveAiStream(force = false) {
+        // Не запускаем attach поверх живого основного reader-а.
+        if (!force && _currentStreamReader) return false;
+        // Не запускаем два attach-а параллельно.
+        if (_attachInFlight) return false;
+        _attachInFlight = true;
 
-        let response;
+        let createdMessage = false;
+        let localMessage = _currentStreamingMessage;
+
         try {
-            response = await fetch(CONFIG.attachEndpoint, { method: 'GET' });
-        } catch (e) {
-            return false;
-        }
-        if (!response.ok) return false;
+            if (!localMessage) {
+                localMessage = _displayAiMessage('', false, null, false);
+                _currentStreamingMessage = localMessage;
+                _currentStreamingText = '';
+                createdMessage = true;
+            }
+            const markdownBody = localMessage.querySelector('.content .markdown-body');
+            if (!markdownBody) {
+                if (createdMessage) { localMessage.remove(); _currentStreamingMessage = null; }
+                return false;
+            }
 
-        // Сервер реплеит генерацию с самого начала (весь накопленный буфер),
-        // поэтому локальный текст пересобираем заново, а не дописываем.
-        _currentStreamingText = '';
-        let firstTokenReceived = false, streamFinished = false, searchResults = null, noActiveGeneration = false;
-        const reader = response.body.getReader();
-        _currentStreamReader = reader;
-        const decoder = new TextDecoder();
-        let buffer = '';
+            let response;
+            try {
+                response = await fetch(CONFIG.attachEndpoint, { method: 'GET' });
+            } catch (e) {
+                if (createdMessage) { localMessage.remove(); _currentStreamingMessage = null; }
+                return false;
+            }
+            if (!response.ok) {
+                if (createdMessage) { localMessage.remove(); _currentStreamingMessage = null; }
+                return false;
+            }
 
-        try {
-            while (!streamFinished) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop() || '';
+            // Локальный буфер. НЕ трогаем общий _currentStreamingText до самого конца.
+            let localText = '';
 
-                for (const line of lines) {
-                    if (!line.startsWith('data: ')) continue;
-                    const dataStr = line.slice(6).trim();
-                    if (dataStr === '[DONE]') { streamFinished = true; break; }
+            let firstTokenReceived = false;
+            let streamFinished = false;
+            let searchResults = null;
+            let noActiveGeneration = false;
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let rafTimer = null;
 
-                    try {
-                        const data = JSON.parse(dataStr);
-                        if (data.no_active_generation) { noActiveGeneration = true; continue; }
-                        if (data.token) {
-                            if (!firstTokenReceived) {
-                                _showAiTypingIndicator(false);
+            const flushUI = () => {
+                markdownBody.innerHTML = _renderMarkdown(localText);
+                _enhanceCodeBlocks(markdownBody);
+                _addImageDownloadButtons(markdownBody);
+                _attachReasoningToggle(markdownBody);
+                if (_aiMessagesContainer) {
+                    _aiMessagesContainer.scrollTop = _aiMessagesContainer.scrollHeight;
+                }
+            };
+
+            try {
+                while (!streamFinished) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const dataStr = line.slice(6).trim();
+                        if (dataStr === '[DONE]') { streamFinished = true; break; }
+
+                        try {
+                            const data = JSON.parse(dataStr);
+                            if (data.no_active_generation) { noActiveGeneration = true; continue; }
+                            if (data.token) {
+                                if (!firstTokenReceived) {
+                                    _showAiTypingIndicator(false);
+                                    firstTokenReceived = true;
+                                }
+                                localText += data.token;
+                                if (!rafTimer) {
+                                    rafTimer = setTimeout(() => {
+                                        rafTimer = null;
+                                        flushUI();
+                                    }, 50);
+                                }
+                            } else if (data.image_url) {
+                                _handleImageUrlEvent(data.image_url);
                                 firstTokenReceived = true;
+                            } else if (data.error) {
+                                markdownBody.textContent = '❌ ' + data.error;
+                                firstTokenReceived = true;
+                                streamFinished = true;
+                                break;
+                            } else if (data.sources) {
+                                searchResults = data.sources;
                             }
-                            _currentStreamingText += data.token;
-                            if (!window._aiUpdateTimer) {
-                                window._aiUpdateTimer = setTimeout(() => {
-                                    markdownBody.innerHTML = _renderMarkdown(_currentStreamingText);
-                                    _enhanceCodeBlocks(markdownBody);
-                                    _addImageDownloadButtons(markdownBody);
-                                    _attachReasoningToggle(markdownBody);
-                                    if (_aiMessagesContainer) _aiMessagesContainer.scrollTop = _aiMessagesContainer.scrollHeight;
-                                    window._aiUpdateTimer = null;
-                                }, 50);
-                            }
-                        } else if (data.image_url) {
-                            _handleImageUrlEvent(data.image_url);
-                            firstTokenReceived = true;
-                        } else if (data.error) {
-                            markdownBody.textContent = '❌ ' + data.error;
-                            firstTokenReceived = true;
-                            streamFinished = true;
-                            break;
-                        } else if (data.sources) {
-                            searchResults = data.sources;
+                        } catch (e) {}
+                    }
+                }
+            } catch (e) {
+                // mid-stream обрыв — оставляем то, что успели
+            } finally {
+                if (rafTimer) { clearTimeout(rafTimer); rafTimer = null; }
+                try { reader.releaseLock(); } catch (e) {}
+            }
+
+            // === ОБРАБОТКА noActiveGeneration ===
+            if (noActiveGeneration && !firstTokenReceived) {
+                // Нечего доигрывать: либо ответ уже досчитался раньше, чем мы
+                // переподключились, либо генерации не было.
+                if (createdMessage) {
+                    // Мы создали пустое сообщение сами — убираем его, не ошибка.
+                    localMessage.remove();
+                    if (_currentStreamingMessage === localMessage) _currentStreamingMessage = null;
+                    return false;
+                }
+                // === ФИКС ОБРЫВАННОГО ОТВЕТА ===
+                // У нас уже есть существующий DOM-элемент с обрывком (созданный
+                // основным потоком до падения). Сервер говорит, что генерации
+                // сейчас нет — но в _last_exchange у него уже может лежать
+                // полный ответ (генерация завершилась в фоне, пока шёл
+                // сетевой обрыв). Пробуем забрать его через last_response,
+                // чтобы пользователь не остался с оборванным текстом.
+                try {
+                    const res = await fetch('/ai/chat/last_response');
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data && data.assistant) {
+                            const fullText = data.assistant;
+                            _currentStreamingText = fullText;
+                            markdownBody.innerHTML = _renderMarkdown(fullText);
+                            _enhanceCodeBlocks(markdownBody);
+                            _addImageDownloadButtons(markdownBody);
+                            _attachReasoningToggle(markdownBody);
+                            _saveAiMessage('assistant', fullText, _currentAiSessionId);
+                            localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default'));
+                            return true;
                         }
-                    } catch (e) {}
+                    }
+                } catch (e) {
+                    console.warn('[attach] last_response fallback failed:', e);
+                }
+                // last_response тоже ничего не дал — оставляем как есть
+                // (обрывок), не удаляем DOM-элемент, чтобы пользователь хотя
+                // бы видел, что успело прийти.
+                return false;
+            }
+            // === КОНЕЦ ОБРАБОТКИ noActiveGeneration ===
+
+            if (firstTokenReceived && localText) {
+                // Публикуем локальный буфер как финальный текст.
+                _currentStreamingText = localText;
+                markdownBody.innerHTML = _renderMarkdown(localText);
+                _enhanceCodeBlocks(markdownBody);
+                _addImageDownloadButtons(markdownBody);
+                _attachReasoningToggle(markdownBody);
+                _saveAiMessage('assistant', localText, _currentAiSessionId);
+                localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default'));
+                if (searchResults && searchResults.length) {
+                    _displaySearchSources(searchResults);
                 }
             }
+            return true;
         } finally {
-            if (_currentStreamReader === reader) _currentStreamReader = null;
+            _attachInFlight = false;
         }
-
-        if (window._aiUpdateTimer) {
-            clearTimeout(window._aiUpdateTimer);
-            window._aiUpdateTimer = null;
-        }
-
-        if (noActiveGeneration && !firstTokenReceived) {
-            // Нечего доигрывать: либо ответ уже досчитался и сохранился
-            // раньше, чем мы переподключились, либо генерации не было —
-            // в обоих случаях это не ошибка. Пустое созданное сообщение убираем.
-            if (createdMessage && _currentStreamingMessage) {
-                _currentStreamingMessage.remove();
-                _currentStreamingMessage = null;
-            }
-            return false;
-        }
-
-        if (firstTokenReceived && _currentStreamingText) {
-            const finalHtml = _renderMarkdown(_currentStreamingText);
-            markdownBody.innerHTML = finalHtml;
-            _enhanceCodeBlocks(markdownBody);
-            _addImageDownloadButtons(markdownBody);
-            _attachReasoningToggle(markdownBody);
-            _saveAiMessage('assistant', _currentStreamingText, _currentAiSessionId);
-            localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default'));
-            if (searchResults && searchResults.length) {
-                _displaySearchSources(searchResults);
-            }
-        }
-        return true;
     }
 
 async function _sendToAi(messageText, imageFile) {
@@ -801,6 +932,13 @@ async function _sendToAi(messageText, imageFile) {
     if (!messageText.trim() && !imageFile) { _showToast('Введите сообщение или выберите изображение', 'warning'); return; }
     try { localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default')); } catch (e) {}
     _displayedImageUrls = new Set(); // новый запрос — сброс дедупликации картинок
+
+    // === ФИКС ДУБЛИРОВАНИЯ ПОТОКА ===
+    // Пока _mainSendActive = true, visibilitychange НЕ будет дёргать attach —
+    // иначе он мог бы запуститься параллельно с основным fetch-потоком и
+    // записать тот же поток токенов второй раз (см. шапку файла и
+    // обработчик visibilitychange).
+    _mainSendActive = true;
 
     // Авто-название
     if (_currentAiSessionId && !_aiNameSet) {
@@ -847,6 +985,7 @@ async function _sendToAi(messageText, imageFile) {
             if (_aiStopBtn) _aiStopBtn.disabled = false;
             _aiMessageInput.focus();
             _isSending = false;
+            _mainSendActive = false;  // === ФИКС ===
         }
         return;
     }
@@ -957,9 +1096,6 @@ async function _sendToAi(messageText, imageFile) {
                         }
                         _currentStreamingText += data.token;
 
-                        // Персистентный обрывок: если пользователь перезагрузит
-                        // страницу посреди генерации, при входе покажем хотя бы
-                        // накопленное (см. _recoverUnfinishedAiMessage, шаг 3).
                         if (!_partialSaveTimer) {
                             _partialSaveTimer = setTimeout(() => {
                                 _partialSaveTimer = null;
@@ -970,7 +1106,6 @@ async function _sendToAi(messageText, imageFile) {
                             }, 400);
                         }
 
-                        // Обновляем DOM с debounce (не чаще 50 мс)
                         if (!window._aiUpdateTimer) {
                             window._aiUpdateTimer = setTimeout(() => {
                                 markdownBody.innerHTML = _renderMarkdown(_currentStreamingText);
@@ -982,7 +1117,6 @@ async function _sendToAi(messageText, imageFile) {
                             }, 50);
                         }
                     }
-                    // ======= ОБРАБОТКА image_url (с защитой от дублей) =======
                     else if (data.image_url) {
                         _handleImageUrlEvent(data.image_url);
                         if (!firstTokenReceived) {
@@ -991,7 +1125,6 @@ async function _sendToAi(messageText, imageFile) {
                         }
                         continue;
                     }
-                    // ========================================================
                     else if (data.error) {
                         markdownBody.textContent = '❌ ' + data.error;
                         firstTokenReceived = true;
@@ -1004,7 +1137,6 @@ async function _sendToAi(messageText, imageFile) {
             }
         }
 
-        // Принудительно обновляем после завершения стрима (если есть таймер)
         if (window._aiUpdateTimer) {
             clearTimeout(window._aiUpdateTimer);
             window._aiUpdateTimer = null;
@@ -1024,16 +1156,22 @@ async function _sendToAi(messageText, imageFile) {
             if (searchResults && searchResults.length) {
                 _displaySearchSources(searchResults);
             } else if (useWebSearch) {
-                // Поиск явно запрашивался кнопкой «Интернет», но источники не
-                // пришли — предупреждаем, чтобы «тихий ответ из памяти» не
-                // выглядел как результат веб-поиска.
                 _showToast('Веб-поиск не дал источников — ответ сформирован из памяти', 'warning');
                 _tryFetchSearchSources(messageText);
             }
         }
 
     } catch (err) {
+        // === ФИКС ДУБЛИРОВАНИЯ ПОТОКА ===
+        // Если ошибка пришла из середины чтения (не user-abort), основной
+        // reader уже мёртв, но _currentStreamReader всё ещё ссылается на него
+        // до finally. Принудительно освобождаем и обнуляем — иначе attach
+        // упрётся в свой же guard `if (_currentStreamReader) return false`.
         if (err.name === 'AbortError') {
+            if (_currentStreamReader) {
+                try { _currentStreamReader.cancel(); } catch(e) {}
+                _currentStreamReader = null;
+            }
             _showAiTypingIndicator(false);
             if (_currentStreamingMessage?.parentNode) {
                 const errDiv = _currentStreamingMessage.querySelector('.content .markdown-body');
@@ -1044,11 +1182,12 @@ async function _sendToAi(messageText, imageFile) {
             _showToast('Генерация остановлена', 'warning');
         } else {
             console.error('AI error:', err);
-            // Обрыв соединения — не обязательно обрыв генерации: сервер
-            // (см. backend) продолжает считать ответ в фоне независимо от
-            // этого запроса. Пробуем один раз переподключиться и забрать
-            // то, что уже насчиталось, прежде чем показывать ошибку.
-            const recovered = await _attachToActiveAiStream().catch(() => false);
+            if (_currentStreamReader) {
+                try { _currentStreamReader.releaseLock(); } catch(e) {}
+                _currentStreamReader = null;
+            }
+            // force=true: основной путь мёртв, attach имеет право забрать поток.
+            const recovered = await _attachToActiveAiStream(true).catch(() => false);
             if (!recovered) {
                 _showAiTypingIndicator(false);
                 if (_currentStreamingMessage?.parentNode) {
@@ -1068,6 +1207,7 @@ async function _sendToAi(messageText, imageFile) {
         _currentStreamingText = '';
         _isSending = false;
         _currentAbortController = null;
+        _mainSendActive = false;  // === ФИКС ===
 
         if (_aiSendBtn) _aiSendBtn.style.display = 'inline-flex';
         if (_aiStopBtn) _aiStopBtn.style.display = 'none';

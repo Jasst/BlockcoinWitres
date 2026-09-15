@@ -62,6 +62,9 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# === НОВОЕ: Thompson Sampling для тем (пункт 6 — bandit-подход) ===
+import random as random_mod
+
 from GCN.llm_client import call_llm
 from GCN.web_search import is_time_sensitive_query
 
@@ -172,7 +175,56 @@ class ResearchQueue:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._items: List[ResearchTopic] = []
+        # === НОВОЕ: Thompson Sampling bandit для тем ===
+        self._bandit_arms: Dict[str, tuple] = {}  # topic_key -> (alpha, beta)
         self._load()
+        self._load_bandits()
+    
+    def _load_bandits(self) -> None:
+        """Загружает состояния bandit-армов из файла."""
+        bandit_path = self.path.parent / "autonomy_bandits.json"
+        try:
+            if bandit_path.exists():
+                raw = json.loads(bandit_path.read_text(encoding="utf-8"))
+                self._bandit_arms = {k: tuple(v) for k, v in raw.items()}
+        except Exception:
+            self._bandit_arms = {}
+    
+    def _save_bandits(self) -> None:
+        """Сохраняет состояния bandit-армов."""
+        bandit_path = self.path.parent / "autonomy_bandits.json"
+        try:
+            bandit_path.parent.mkdir(parents=True, exist_ok=True)
+            bandit_path.write_text(
+                json.dumps({k: list(v) for k, v in self._bandit_arms.items()}, 
+                          ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.debug(f"Bandit save failed: {e}")
+    
+    def _bandit_score(self, topic_key: str) -> float:
+        """
+        Thompson Sampling: возвращает случайную выборку из Beta(alpha, beta).
+        
+        alpha = 1 + сколько раз тема была успешной (использована пользователем)
+        beta = 1 + сколько раз тема была проигнорирована
+        
+        Это даёт exploration-exploitation: новые темы получают шанс,
+        а успешные — повышают вероятность выбора.
+        """
+        alpha, beta = self._bandit_arms.get(topic_key, (1, 1))
+        return random_mod.betavariate(alpha, beta)
+    
+    def _bandit_update(self, topic_key: str, success: bool) -> None:
+        """Обновляет bandit-арм на основе успеха/неудачи."""
+        alpha, beta = self._bandit_arms.get(topic_key, (1, 1))
+        if success:
+            alpha += 1
+        else:
+            beta += 1
+        self._bandit_arms[topic_key] = (alpha, beta)
+        self._save_bandits()
 
     def __len__(self) -> int:
         return len(self._items)
@@ -206,7 +258,12 @@ class ResearchQueue:
         if not topic or not AUTONOMY_ENABLED:
             return False
         self._purge_stale()
-        key = ResearchTopic(topic=topic).key
+        t = ResearchTopic(
+            topic=topic[:300], source=source,
+            priority=max(0.0, min(1.0, priority)),
+            related_goal=related_goal[:200],
+        )
+        key = t.key
         for existing in self._items:
             if existing.key == key:
                 # Повторная постановка — лёгкий буст приоритета, не дубль.
@@ -218,11 +275,7 @@ class ResearchQueue:
             if self._items and self._items[0].priority >= priority:
                 return False  # очередь полна и всё в ней важнее
             self._items.pop(0)
-        self._items.append(ResearchTopic(
-            topic=topic[:300], source=source,
-            priority=max(0.0, min(1.0, priority)),
-            related_goal=related_goal[:200],
-        ))
+        self._items.append(t)
         self.save()
         return True
 
@@ -231,8 +284,13 @@ class ResearchQueue:
         due = [t for t in self._items if t.available_at <= now]
         if not due:
             return None
-        due.sort(key=lambda t: (-t.priority, t.enqueued_at))
-        topic = due[0]
+        
+        # === НОВОЕ: Выбор темы через Thompson Sampling вместо чистого приоритета ===
+        # Считаем score = priority * bandit_score для каждой темы
+        scored = [(t, t.priority * self._bandit_score(t.key)) for t in due]
+        scored.sort(key=lambda x: -x[1])  # Сортируем по убыванию score
+        
+        topic = scored[0][0]
         self._items.remove(topic)
         self.save()
         return topic
@@ -368,7 +426,7 @@ class AutonomyEngine:
             )
         return ok
 
-    async def submit_finding(self, finding_text: str, source: str) -> None:
+    async def submit_finding(self, finding_text: str, source: str, topic_key: Optional[str] = None) -> None:
         """Находка фонового исследования — в дайджест, а не сразу пользователю."""
         if not PROACTIVE_NOTIFICATIONS_ENABLED or not finding_text:
             return
@@ -376,7 +434,7 @@ class AutonomyEngine:
         if not text:
             return
         self._pending_findings.append(
-            {"text": text[:2000], "source": source, "ts": time.time()}
+            {"text": text[:2000], "source": source, "ts": time.time(), "topic_key": topic_key}
         )
         # Бэкпрессер: скопилось слишком много — не ждём интервала.
         # Но force=True теперь НЕ игнорирует тихие часы: если накопилось много,
@@ -478,7 +536,8 @@ class AutonomyEngine:
             answer = (result or {}).get("answer", "")
             self.queue.complete(topic)
             if answer and answer.strip():
-                await self.submit_finding(answer, source=topic.source)
+                # Передаём topic_key для bandit feedback
+                await self.submit_finding(answer, source=topic.source, topic_key=topic.key)
             # Завершаем цель из motivation: если тема связана с goal из SelfModel,
             # удаляем её после успешного исследования.
             if topic.source in ("goal", "goal_subtask") and topic.related_goal:
@@ -639,8 +698,9 @@ class AutonomyEngine:
 
         texts = await self._select_notifications(batch)
         self._last_digest_at = time.time()
-        for text in texts[:2]:
+        for idx, text in texts[:2]:
             try:
+                topic_key = batch[idx].get("topic_key") if 0 <= idx < len(batch) else None
                 await self.ctl.memory_service.push_notification(
                     text, source="autonomy_digest"
                 )
@@ -649,6 +709,7 @@ class AutonomyEngine:
                     "keywords": _keywords(text),
                     "ts": time.time(),
                     "source": "autonomy_digest",
+                    "topic_key": topic_key,
                 })
                 logger.info(
                     f"[Autonomy] дайджест для {self.user_id[:16]}: {text[:80]}"
@@ -657,8 +718,13 @@ class AutonomyEngine:
                 logger.error(f"push_notification failed: {e}")
         self._save_state()
 
-    async def _select_notifications(self, batch: List[Dict[str, Any]]) -> List[str]:
-        """Один LLM-выбор: какие из находок достойны уведомления (≤2)."""
+    async def _select_notifications(self, batch: List[Dict[str, Any]]) -> List[Tuple[int, str]]:
+        """Один LLM-выбор: какие из находок достойны уведомления (≤2).
+        
+        ИСПРАВЛЕНИЕ (пункт 2): возвращаем пары (original_index, rewritten_text),
+        чтобы topic_key привязывался к исходной находке, а не к переписанному тексту.
+        LLM обязана отвечать с указанием индекса: {"notify": [{"idx": 0, "text": "..."}]}.
+        """
         listing = "\n".join(
             f"[{i}] ({item['source']}) {item['text'][:400]}"
             for i, item in enumerate(batch)
@@ -671,11 +737,12 @@ class AutonomyEngine:
             "конкретные, не тривиальные, полезные. Максимум 2. Для каждой перепиши "
             "текст одним коротким сообщением от первого лица (1-2 предложения, "
             "разговорный тон, без вступлений вроде «вот что я нашёл»).\n"
-            "Ответь ТОЛЬКО JSON-объектом вида {\"notify\": [\"текст1\", \"текст2\"]}; "
+            "Ответь ТОЛЬКО JSON-объектом вида {\"notify\": [{\"idx\": 0, \"text\": \"...\"}, {\"idx\": 3, \"text\": \"...\"}]}; "
+            "где idx — индекс исходной находки из списка выше. "
             "если ничего не достойно — {\"notify\": []}."
         )
         try:
-            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.3, max_tokens=300)
+            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.3, max_tokens=400)
         except Exception as e:
             logger.debug(f"digest selection failed: {e}")
             return []
@@ -689,7 +756,20 @@ class AutonomyEngine:
         notify = data.get("notify", [])
         if not isinstance(notify, list):
             return []
-        return [str(x).strip() for x in notify if isinstance(x, str) and len(str(x).strip()) >= 20]
+        
+        result: List[Tuple[int, str]] = []
+        for item in notify:
+            if isinstance(item, dict):
+                idx = item.get("idx")
+                text = item.get("text", "")
+                if isinstance(idx, int) and 0 <= idx < len(batch) and isinstance(text, str) and len(text.strip()) >= 20:
+                    result.append((idx, text.strip()))
+            elif isinstance(item, str) and len(item.strip()) >= 20:
+                # Fallback для обратной совместимости: если LLM вернула просто строки,
+                # берём первые N элементов batch по порядку
+                if len(result) < len(batch):
+                    result.append((len(result), item.strip()))
+        return result
 
     # ---------------- обратная связь ----------------
     def _register_feedback(self, message: str) -> None:
@@ -710,6 +790,10 @@ class AutonomyEngine:
                     f"(источник {item['source']} → x{w:.2f})"
                 )
                 self._save_state()
+                # === ИСПРАВЛЕНИЕ: обучаем bandit при успехе ===
+                topic_key = item.get("topic_key")
+                if topic_key:
+                    self.queue._bandit_update(topic_key, success=True)
                 continue  # обработано, из списка убираем
             if age < FEEDBACK_WINDOW_SECONDS:
                 still_pending.append(item)
@@ -718,6 +802,10 @@ class AutonomyEngine:
                 w = max(0.5, self._source_weight.get(item["source"], 1.0) - FEEDBACK_NEGATIVE_DECAY)
                 self._source_weight[item["source"]] = w
                 self._save_state()
+                # === ИСПРАВЛЕНИЕ: обучаем bandit при неудаче ===
+                topic_key = item.get("topic_key")
+                if topic_key:
+                    self.queue._bandit_update(topic_key, success=False)
         self._notified = still_pending[-20:]
 
     # ---------------- персистентность обучения ----------------

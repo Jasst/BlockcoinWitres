@@ -15,10 +15,11 @@ MEMORY_BASE_DIR.mkdir(exist_ok=True)
 # -------------------------------
 LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
 LM_STUDIO_API_KEY = "lm-studio"
-LM_STUDIO_TIMEOUT = 600
-LM_STUDIO_STREAM_TIMEOUT = 900
+LM_STUDIO_TIMEOUT = 1800          # увеличено с 600 до 1800 сек (30 мин) для длительных запросов
+LM_STUDIO_STREAM_TIMEOUT = 2700   # увеличено с 900 до 2700 сек (45 мин) для потоковых ответов
 LM_STUDIO_USE_STREAM = True
 LM_STUDIO_VISION_SUPPORTED = True
+DEFAULT_MAX_TOKENS = 4096         # увеличенная длина ответа по умолчанию (было 2048)
 
 # -------------------------------
 # Параметры памяти (GCN)
@@ -42,9 +43,14 @@ HYBRID_WEIGHT_CONFIDENCE = 0.05    # вес доверия
 DYNAMIC_WEIGHTS_ENABLED = True
 
 # -------------------------------
-# Эмбеддинги (заглушка – можно подключить SentenceTransformer)
+# Эмбеддинги (SentenceTransformer + FAISS)
 # -------------------------------
-EMBEDDING_DIM = 128                # размерность векторов (для демо)
+# ИСПРАВЛЕНИЕ #1: EMBEDDING_DIM теперь определяется динамически из модели,
+# а не захардкожено. Значение 384 соответствует paraphrase-multilingual-MiniLM-L12-v2
+# и all-MiniLM-L6-v2. Для multilingual-e5-large используется 1024.
+# Реальная размерность берётся из model.get_sentence_embedding_dimension()
+# в memory_graph.py:CognitiveMemory.__init__().
+EMBEDDING_DIM = 384                # размерность векторов (по умолчанию для MiniLM)
 USE_EMBEDDINGS = True
 GLOBAL_FACT_CONFIDENCE_THRESHOLD = 0.75
 
