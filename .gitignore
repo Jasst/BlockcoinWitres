@@ -1,1 +1,53 @@
-Nothing should be ignored since only a Python source file (`routes/ai_assistant.py`) was modified and there are no build artifacts, dependencies, or temporary files in the changes.
+```
+# Compiled and build artifacts
+*.pyc
+__pycache__/
+
+# Dependencies
+.venv/
+venv/
+node_modules/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Python specific
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Pytest
+.pytest_cache/
+```
