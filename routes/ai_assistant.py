@@ -437,7 +437,8 @@ class CognitiveController:
             scope = args.get("scope", "private")
             result = await self.memory_service.remember(fact, scope)
             if result.get("id"):
-                return f"Запомнил: {result['fact']} (скоуп: {scope})"
+                returned_fact = result.get("fact") or fact
+                return f"Запомнил: {returned_fact} (скоуп: {scope})"
             return "Не удалось запомнить."
 
         async def _internal_add_goal(args: Dict) -> str:
@@ -2237,6 +2238,7 @@ class CognitiveController:
                 facts.append(s[:300])
         return facts[:20]
 
+
     # ===== КОМАНДЫ ПАМЯТИ (расширенный список команд) =====
     async def _handle_memory_command(self, message: str) -> Optional[Tuple[str, Dict]]:
         lower_msg = message.lower()
@@ -2279,14 +2281,17 @@ class CognitiveController:
                         },
                         {
                             "role": "user",
-                            "content": f"Запомни: {result['fact']} (скоуп: {scope})"
+                            "content": f"Запомни: {result.get('fact', clean_rest)} (скоуп: {scope})"
                         }
                     ]
                     response = await call_llm(messages, temp=0.5, max_tokens=150)
                     if response:
                         return response, {"memory": "stored", "scope": scope, "id": gcn_id}
                     else:
-                        return f"Запомнил ({scope}): {result['fact']}", {"memory": "stored", "scope": scope, "id": gcn_id}
+                        return (
+                            f"Запомнил ({scope}): {result.get('fact', clean_rest)}",
+                            {"memory": "stored", "scope": scope, "id": gcn_id},
+                        )
 
                 elif action == "forget":
                     # ИЗМЕНЕНИЕ: через сервис (удаляем из private)

@@ -111,6 +111,7 @@ class MemoryService:
                     except Exception as e:
                         logger.debug(f"[remember] не удалось обновить дубль {ex_id}: {e}")
                 return {"id": ex_id, "scope": ex.get("scope", "private"),
+                        "fact": ex.get("text", fact),  # ← добавлено
                         "action": "updated_existing", "similarity": ex["score"]}
         # ── конец проверки дубля ──────────────────────────────────────────
         

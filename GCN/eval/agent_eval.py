@@ -51,7 +51,7 @@ class TestCase:
 class TestResult:
     """Результат выполнения одного тестового кейса."""
     test_id: str
-    success: bool
+    success: bool = False
     tools_called: List[str] = field(default_factory=list)
     actual_outcome: str = ""
     criteria_met: Dict[str, bool] = field(default_factory=dict)
