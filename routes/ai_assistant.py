@@ -996,11 +996,25 @@ class CognitiveController:
 
     def _save_history(self):
         history_path = self.user_dir / "history.json"
+        # Атомарная запись: сначала во временный файл в той же директории
+        # (чтобы os.replace был атомарным на одной ФС), затем os.replace().
+        # Раньше писали сразу в history_path — конкурентный _save_history()
+        # (например из _finalize_answer и /chat/attach одновременно) мог
+        # оставить наполовину записанный JSON, который при следующем
+        # _load_history() не распарсится и история потеряется.
+        tmp_path = f"{history_path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
         try:
-            with open(history_path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.history[-self.max_history:], f, ensure_ascii=False)
-        except Exception:
-            pass
+            os.replace(tmp_path, history_path)
+        except Exception as e:
+            logger.warning(f"history save failed: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def _start_background_tasks(self):
         loop = asyncio.get_event_loop()
