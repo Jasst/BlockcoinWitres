@@ -1,46 +1,52 @@
 ```
-# Python
-__pycache__/
+# Compiled Python files
 *.pyc
-*.pyo
-*.pyd
-.Python
-env/
+__pycache__/
+
+# Virtual environments
 venv/
 .venv/
-.ENV
-.ENV.local
-
-# Generated coverage testing files
-.coverage
-htmlcov/
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
-
-# Environment
 .env
 .env.local
-.env.dev
-.env.prod
-.env.*
+*.env.*
 
-# IDE
+# IDE and editor files
 .vscode/
 .idea/
 *.swp
 *.swo
 *.tmp
 
-# OS
-.DS_Store
-Thumbs.db
+# Logs
+*.log
 
 # Build artifacts
 build/
 dist/
-*.egg-info/
+target/
+
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
+
+# Package management
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Python specific
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Testing
+.pytest_cache/
+.mypy_cache/
 ```
