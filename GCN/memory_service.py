@@ -173,6 +173,9 @@ class MemoryService:
         """
         Удаляет факты, содержащие query, из указанного слоя.
         Если dry_run=True – только возвращает кандидаты.
+        
+        ИСПРАВЛЕНИЕ: если query выглядит как gcn_id (начинается с 'fct_'),
+        удаляем строго по ID, а не по подстроке текста.
         """
         self.refresh()
         scope_map = {
@@ -184,6 +187,25 @@ class MemoryService:
         if memory is None:
             return {"status": "error", "message": f"Неизвестный scope: {scope}"}
         memory.reload_if_stale()
+        
+        # ИСПРАВЛЕНИЕ: удаление по gcn_id вместо поиска по подстроке
+        if query.startswith("fct_"):
+            ko = memory.store.get(query)
+            if not ko:
+                return {"status": "ok", "removed": 0, "scope": scope.lower(), "message": "Факт не найден."}
+            if dry_run:
+                return {
+                    "status": "dry_run",
+                    "would_remove": 1,
+                    "scope": scope.lower(),
+                    "candidates": [{"id": ko.id, "text": ko.text[:200]}],
+                    "message": "Ничего не удалено. Повторите вызов с dry_run=False, чтобы удалить этот факт.",
+                }
+            memory.store.retract(query, self.user_id, reason="forget_by_id")
+            await memory._schedule_save()
+            return {"status": "ok", "removed": 1, "scope": scope.lower()}
+        
+        # Старое поведение: поиск по подстроке текста
         to_remove = [f for f in memory.semantic_facts if query.lower() in f.text.lower()]
         if not to_remove:
             return {"status": "ok", "removed": 0, "scope": scope.lower(), "message": "Ничего не найдено."}
