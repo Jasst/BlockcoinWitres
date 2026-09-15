@@ -48,6 +48,12 @@ from GCN.config_ai import *
 
 logger = logging.getLogger(__name__)
 
+# Точные имена инструментов веб-поиска в tool_trace (см. использования
+# в process_input/_stream_response_worker). Проверка по подстроке
+# "web_search" ложно срабатывала бы на "web_search_failed" и не
+# срабатывала при префиксе "internal__".
+_SEARCH_TOOL_NAMES = frozenset({"internal__web_search", "web_search"})
+
 # ===== Глобальный MCP-менеджер =====
 _global_mcp_manager: Optional[MCPToolManager] = None
 _global_mcp_initialized = False
@@ -387,7 +393,10 @@ class CognitiveController:
             # Создаём локальный (для обратной совместимости)
             self.mcp_manager = MCPToolManager()
             logger.info(f"MCP config path: {self.mcp_manager.config_path}")
-            self._mcp_task = asyncio.create_task(self.mcp_manager.initialize())
+            self._mcp_task = self._spawn_background_task(
+                self.mcp_manager.initialize(),
+                name=f"mcp-init:{user_id[:16]}",
+            )
         # ===== КОНЕЦ ИЗМЕНЕНИЙ =====
 
         # ===== Реестр инструментов = только внешние MCP =====
@@ -2014,7 +2023,11 @@ class CognitiveController:
             # (например, web_search нашёл данные). Проверяем снова.
             post_react_uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
             # Если были использованы инструменты поиска, снижаем порог неопределённости
-            if tool_trace and any("web_search" in str(t.get("tool", "")) for t in tool_trace):
+            search_was_run = any(
+                (t.get("tool") or "") in _SEARCH_TOOL_NAMES
+                for t in tool_trace
+            )
+            if search_was_run:
                 post_react_uncertainty *= 0.7  # Поиск дал результаты — уверенность выросла
             if post_react_uncertainty > 0.7:
                 clarification = await self._ask_clarification(message, post_react_uncertainty)
@@ -2089,6 +2102,7 @@ class CognitiveController:
 
         response = await call_llm(messages)
         response = await self._finalize_answer(message, response, search_meta, tool_trace)
+        search_meta["tool_trace"] = tool_trace
         return response, search_meta
 
     # ===== ИЗВЛЕЧЕНИЕ ФАКТОВ (без изменений) =====
@@ -2824,7 +2838,11 @@ class CognitiveController:
                     # === ИСПРАВЛЕНИЕ: активное уточнение ПОСЛЕ ReAct-цикла (для stream) ===
                     if not skip_clarification_before_react:
                         post_react_uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
-                        if tool_trace and any("web_search" in str(t.get("tool", "")) for t in tool_trace):
+                        search_was_run = any(
+                            (t.get("tool") or "") in _SEARCH_TOOL_NAMES
+                            for t in tool_trace
+                        )
+                        if search_was_run:
                             post_react_uncertainty *= 0.7
                         if post_react_uncertainty > 0.7:
                             clarification = await self._ask_clarification(message, post_react_uncertainty)
