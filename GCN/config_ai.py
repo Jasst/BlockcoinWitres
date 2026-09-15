@@ -506,3 +506,15 @@ QUIET_HOURS_END = 8
 FEEDBACK_WINDOW_SECONDS = 3600
 FEEDBACK_POSITIVE_BONUS = 0.15
 FEEDBACK_NEGATIVE_DECAY = 0.05
+
+# =====================================================================
+# Делегирование субагентам (GCN/subagent.py)
+# =====================================================================
+# Если True — ToolRouter для "coder"-запросов (маркеры: .py/.js/traceback/
+# read_code/search_code/github.com) делегирует обработку SubAgent-у роли
+# CODER вместо обычного ReAct-цикла. Это ДАЁТ специализированный промпт
+# и изолированный контекст, но ЗАБИРАЕТ plan_critic, scratchpad,
+# verify_tool_result, трекинг плана и дедуп seen_calls/seen_errors —
+# поэтому по умолчанию False. Включать только после проверки через
+# agent_eval, что качество не падает.
+SUBAGENT_DELEGATION_ENABLED = False

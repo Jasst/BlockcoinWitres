@@ -152,6 +152,7 @@ try:
         TOOL_PLANNING_MIN_LEN,
         MAX_SUBTASKS,
         MCP_TOOL_TIMEOUT_OVERRIDES,
+        SUBAGENT_DELEGATION_ENABLED,
     )
 except ImportError:
     TOOL_CALL_TIMEOUT_SECONDS = 45
@@ -160,6 +161,7 @@ except ImportError:
     TOOL_PLANNING_MIN_LEN = 140
     MAX_SUBTASKS = 4
     MCP_TOOL_TIMEOUT_OVERRIDES = {}
+    SUBAGENT_DELEGATION_ENABLED = False
 
 
 # ИСПРАВЛЕНИЕ (генерация изображений в чате "не всегда работает"): тяжёлые
@@ -698,7 +700,8 @@ class ToolRouter:
         # _web_search_results_this_turn для фронта, _verify_response.
         # Субагент все эти шаги пропускает, и его tool_trace приходил в
         # ai_assistant.py без заземления/валидации.
-        if self._subagent_orchestrator is not None:
+        if (self._subagent_orchestrator is not None
+                and SUBAGENT_DELEGATION_ENABLED):
             try:
                 coder_markers = (
                     ".py", ".js", ".ts", ".tsx", ".jsx",
