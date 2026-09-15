@@ -9,7 +9,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal, Tuple
 import os
 import base64
 import re
@@ -60,7 +60,15 @@ _ENV_DEFAULT_USER = os.getenv("BLOCKCOIN_USER_ID", "").strip()
 # т.к. хостед-вариант решается заголовком X-User-Id на шлюзе.)
 _VERIFIED_USER: "Optional[str]" = None   # адрес, подтверждённый подписью
 _VERIFIED_SIGNER: "Optional[str]" = None  # ключ, которым подписан вход (для 64-hex user_id)
-_LOGIN_NONCE: "Optional[str]" = None     # одноразовый вызов подписи
+_LOGIN_NONCES: Dict[str, Tuple[str, float]] = {}  # nonce -> (canon_user_id, expires_at)
+
+
+def _cleanup_expired_nonces(now: Optional[float] = None) -> None:
+    """Удаляет просроченные nonce из словаря."""
+    now = now or time.time()
+    expired = [n for n, (_, exp) in _LOGIN_NONCES.items() if exp <= now]
+    for n in expired:
+        _LOGIN_NONCES.pop(n, None)
 
 
 def _user_from_ctx(ctx: "Optional[Context]") -> "Optional[str]":
@@ -108,7 +116,7 @@ def _is_eth_address(uid: str) -> bool:
     return uid.startswith("0x") and len(uid) == 42
 
 
-def _resolve_user(user_id: "Optional[str]", ctx: "Optional[Context]" = None) -> str:
+def _resolve_user(user_id: "Optional[str]", ctx: "Optional[Context]" = None) -> Optional[str]:
     """Порядок приоритета:
     1) идентификатор, верифицированный через verify_login (высший приоритет
        для этого процесса; явный user_id, ему не соответствующий, отклоняется);
@@ -117,15 +125,14 @@ def _resolve_user(user_id: "Optional[str]", ctx: "Optional[Context]" = None) -> 
     3) заголовок X-User-Id из HTTP-запроса (доверенный шлюз платформы);
     4) env BLOCKCOIN_USER_ID (локальный stdio-клиент);
     5) DEFAULT_USER — последний резорт.
+    
+    Возвращает None при попытке обратиться к чужому user_id (PermissionError).
     """
     if _VERIFIED_USER:
         if user_id:
             declared = _canon_user_id(user_id) or user_id.strip().lower()
             if declared != _VERIFIED_USER:
-                raise PermissionError(
-                    f"Этот MCP-сервер привязан к идентификатору {_VERIFIED_USER} (вход "
-                    f"подтверждён подписью). Вызов от имени '{user_id}' запрещён."
-                )
+                return None  # PermissionError будет сгенерирован вызывающим кодом
         return _VERIFIED_USER
     if user_id:
         return _canon_user_id(user_id) or user_id.strip()
@@ -135,6 +142,19 @@ def _resolve_user(user_id: "Optional[str]", ctx: "Optional[Context]" = None) -> 
     if _ENV_DEFAULT_USER:
         return _ENV_DEFAULT_USER
     return DEFAULT_USER
+
+
+def _safe_resolve_user(user_id: "Optional[str]", ctx: "Optional[Context]" = None) -> tuple:
+    """Безопасная обёртка над _resolve_user: возвращает (user_id, error).
+    Если пользователь не может быть разрешён, error содержит сообщение ошибки.
+    """
+    try:
+        uid = _resolve_user(user_id, ctx)
+        if uid is None:
+            return None, "Этот MCP-сервер привязан к другому идентификатору (вход подтверждён подписью). Вызов от имени указанного user_id запрещён."
+        return uid, None
+    except Exception as e:
+        return None, str(e)
 
 
 # Таймауты для инструментов
@@ -230,7 +250,6 @@ async def request_login(
     """Начало входа: возвращает текст, который нужно подписать кошельком.
     Подпиши его (MetaMask -> Sign message / personal_sign, EIP-191) и передай
     подпись в verify_login. После этого все операции пойдут под твоим id."""
-    global _LOGIN_NONCE
     canon = _canon_user_id(address)
     if canon is None:
         return {
@@ -240,8 +259,12 @@ async def request_login(
                 f"(0x + 40 hex) или user_id приложения (64 hex, как в папках ai_memory_v3)."
             ),
         }
-    _LOGIN_NONCE = secrets.token_hex(16)
-    message = f"BlockcoinWitres MCP login\nUser: {canon}\nNonce: {_LOGIN_NONCE}"
+    # ИСПРАВЛЕНИЕ: используем словарь nonce вместо глобальной переменной для поддержки multi-session
+    _cleanup_expired_nonces()
+    nonce = secrets.token_hex(16)
+    expires_at = time.time() + 300  # 5 минут
+    _LOGIN_NONCES[nonce] = (canon, expires_at)
+    message = f"BlockcoinWitres MCP login\nUser: {canon}\nNonce: {nonce}"
     return {
         "status": "ok",
         "user_id": canon,
@@ -264,22 +287,37 @@ async def verify_login(
     Для адресов 0x... подпись должна восстанавливаться строго в этот адрес.
     Для 64-hex user_id сервер привязывает id к подписавшему ключу: при повторном
     входе с этим id подписавший должен совпадать (защита от перехвата id)."""
-    global _VERIFIED_USER, _VERIFIED_SIGNER, _LOGIN_NONCE
+    global _VERIFIED_USER, _VERIFIED_SIGNER
     canon = _canon_user_id(address)
     if not ETH_ACCOUNT_AVAILABLE:
         return {"status": "error", "message": "Сервер без eth-account: pip install eth-account"}
     if canon is None:
         return {"status": "error", "message": f"Некорректный идентификатор: {address!r}"}
-    if not _LOGIN_NONCE:
-        return {"status": "error", "message": "Сначала вызови request_login(address)."}
-    message = f"BlockcoinWitres MCP login\nUser: {canon}\nNonce: {_LOGIN_NONCE}"
-    try:
-        recovered = Account.recover_message(
-            encode_defunct(text=message), signature=signature
-        ).lower()
-    except Exception as e:
-        return {"status": "error", "message": f"Не удалось проверить подпись: {e}"}
-    _LOGIN_NONCE = None  # nonce одноразовый
+    
+    # ИСПРАВЛЕНИЕ: используем словарь nonce вместо глобальной переменной
+    _cleanup_expired_nonces()
+    # Находим nonce по подписанному сообщению — перебираем все активные nonce
+    # и проверяем, подходит ли подпись под любое из них
+    found_nonce = None
+    recovered = None
+    for nonce, (expected_canon, _) in list(_LOGIN_NONCES.items()):
+        if expected_canon != canon:
+            continue
+        message = f"BlockcoinWitres MCP login\nUser: {canon}\nNonce: {nonce}"
+        try:
+            recovered = Account.recover_message(
+                encode_defunct(text=message), signature=signature
+            ).lower()
+            found_nonce = nonce
+            break
+        except Exception:
+            continue
+    
+    if found_nonce is None:
+        return {"status": "error", "message": "Сначала вызови request_login(address) или истёк срок действия nonce."}
+    
+    # Удаляем использованный nonce
+    _LOGIN_NONCES.pop(found_nonce, None)
 
     if _is_eth_address(canon):
         # Строгий режим: подпись обязана восстанавливаться именно в этот адрес.
@@ -319,7 +357,12 @@ async def execute_command(
 ) -> Dict[str, Any]:
     """Выполняет любую команду через тот же пайплайн, что и обычный чат."""
     # === ИСПРАВЛЕНИЕ: дедупликация быстрых повторных вызовов ===
-    key = f"{_resolve_user(user_id, ctx)}:{command}"
+    # === ИСПРАВЛЕНИЕ: используем _safe_resolve_user для обработки PermissionError ===
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    
+    key = f"{uid}:{command}"
     now = time.time()
     _prune_last_commands(now)
     if key in _last_commands and now - _last_commands[key] < _DEDUP_WINDOW_SECONDS:
@@ -330,7 +373,7 @@ async def execute_command(
         }
     _last_commands[key] = now
 
-    assistant = await get_assistant(_resolve_user(user_id, ctx))
+    assistant = await get_assistant(uid)
     async def _run():
         return await assistant.process_input(command, web_search=allow_web_search)
     result = await _with_timeout(_run(), "execute_command")
@@ -352,7 +395,7 @@ async def execute_command(
             "error": "empty_response",
             "message": "Модель не вернула ответ (возможно, сбой локальной LLM).",
             "meta": meta,
-            "user_id": _resolve_user(user_id, ctx),
+            "user_id": uid,
             "timestamp": time.time()
         }
 
@@ -362,7 +405,7 @@ async def execute_command(
             "status": "error",
             "message": response,
             "meta": meta,
-            "user_id": _resolve_user(user_id, ctx),
+            "user_id": uid,
             "timestamp": time.time()
         }
 
@@ -370,7 +413,7 @@ async def execute_command(
         "status": "ok",
         "result": response,
         "meta": meta,
-        "user_id": _resolve_user(user_id, ctx),
+        "user_id": uid,
         "timestamp": time.time()
     }
 
@@ -787,21 +830,34 @@ async def remember_batch(
     """Сохраняет несколько фактов за один вызов вместо последовательных
     remember(). Факты сохраняются параллельно; ошибка одного не блокирует
     остальные.
+    
+    ИСПРАВЛЕНИЕ: раньше использовался batch[i] для сопоставления результатов,
+    но gather пропускал пустые строки в comprehension, из-за чего индексы
+    рассинхронизировались и факты терялись/подменялись. Теперь сначала
+    фильтруем batch в clean, затем используем enumerate(clean).
     """
     if not facts:
         return {"status": "error", "message": "Список фактов пуст."}
 
-    service = await get_memory_service(_resolve_user(user_id, ctx))
-    batch = facts[:10]  # hard cap
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    
+    service = await get_memory_service(uid)
+    
+    # ИСПРАВЛЕНИЕ: сначала чистим список, потом работаем только с ним
+    clean = [f.strip() for f in (facts or []) if f and f.strip()][:10]
+    if not clean:
+        return {"status": "error", "message": "После фильтрации пустых строк не осталось фактов."}
 
     results = await asyncio.gather(
-        *[service.remember(f.strip(), scope) for f in batch if f and f.strip()],
+        *[service.remember(f, scope) for f in clean],
         return_exceptions=True,
     )
 
-    saved = [batch[i] for i, r in enumerate(results) if not isinstance(r, Exception)]
+    saved = [clean[i] for i, r in enumerate(results) if not isinstance(r, Exception)]
     failed = [
-        {"fact": batch[i], "error": str(r)}
+        {"fact": clean[i], "error": str(r)}
         for i, r in enumerate(results) if isinstance(r, Exception)
     ]
 
@@ -822,14 +878,17 @@ async def update_fact(
     user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
     ctx: Context = None
 ) -> Dict[str, Any]:
-    """Атомарно заменяет текст существующего факта: сначала объясняет
-    происхождение старого (explain_fact), затем удаляет его и сохраняет
-    новый с тем же скоупом.
-
-    Удобнее пары forget(dry_run=False) + remember() — один вызов, скоуп
-    подхватывается автоматически.
+    """Атомарно заменяет текст существующего факта по gcn_id.
+    
+    ИСПРАВЛЕНИЕ: раньше удаление шло по первым 6 словам текста, что могло
+    удалить несколько фактов с одинаковым началом. Теперь используется
+    forget(gcn_id), который удаляет строго по ID.
     """
-    service = await get_memory_service(_resolve_user(user_id, ctx))
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    
+    service = await get_memory_service(uid)
 
     # Получаем старый факт, чтобы знать его скоуп и текст
     old_info = await service.explain_fact(gcn_id)
@@ -842,11 +901,8 @@ async def update_fact(
     old_text = old_info.get("subject") or old_info.get("text", "")
     old_scope = old_info.get("scope", "private")
 
-    # Удаляем старый факт по его тексту (forget ищет по ключевым словам)
-    if old_text:
-        # Берём первые 6 слов как ключ удаления — достаточно уникально
-        keyword = " ".join(old_text.split()[:6])
-        await service.forget(keyword, scope=old_scope, dry_run=False)
+    # ИСПРАВЛЕНИЕ: удаляем строго по gcn_id, а не по подстроке текста
+    await service.forget(gcn_id, scope=old_scope, dry_run=False)
 
     # Сохраняем новый факт в том же скоупе
     save_result = await service.remember(new_text.strip(), scope=old_scope)

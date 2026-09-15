@@ -60,7 +60,7 @@ import re
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # === НОВОЕ: Thompson Sampling для тем (пункт 6 — bandit-подход) ===
 import random as random_mod

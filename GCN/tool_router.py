@@ -152,6 +152,7 @@ try:
         TOOL_PLANNING_MIN_LEN,
         MAX_SUBTASKS,
         MCP_TOOL_TIMEOUT_OVERRIDES,
+        SUBAGENT_DELEGATION_ENABLED,
     )
 except ImportError:
     TOOL_CALL_TIMEOUT_SECONDS = 45
@@ -160,6 +161,7 @@ except ImportError:
     TOOL_PLANNING_MIN_LEN = 140
     MAX_SUBTASKS = 4
     MCP_TOOL_TIMEOUT_OVERRIDES = {}
+    SUBAGENT_DELEGATION_ENABLED = False
 
 
 # ИСПРАВЛЕНИЕ (генерация изображений в чате "не всегда работает"): тяжёлые
@@ -344,7 +346,8 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - **Если пользователь просит сгенерировать изображение (например, "нарисуй", "сгенерируй изображение", "создай картинку", "покажи картинку", "визуализируй" и т.п.) — ОБЯЗАТЕЛЬНО вызови инструмент `internal__generate_image`. НЕ ОТВЕЧАЙ ТЕКСТОМ, пока не получишь результат от этого инструмента.**
 - **Если пользователь спрашивает о твоих возможностях, какие инструменты доступны, что ты умеешь, какие команды есть — вызови инструмент `internal__list_tools`.**
 - **Если пользователь просит проанализировать код, найти ошибку, посмотреть структуру проекта или найти что-то в коде — используй инструменты `internal__read_code`, `internal__search_code`, `internal__project_structure`, `internal__analyze_error`.**
-- Если запрос обычный, не требующий обращения к памяти или поиску — отвечай напрямую.
+- Если запрос обычный, не требующий обращения к памяти, поиску или чтению кода — отвечай напрямую.
+- Если пользователь спрашивает про ТВОЙ КОД, файлы, структуру проекта, реализацию, доступные инструменты — ВСЕГДА используй инструменты самоанализа (internal__project_structure / internal__read_code / internal__search_code / internal__analyze_error). НЕ отвечай "нет доступа к исходному коду".
 - Если ниже уже есть результаты вызванных инструментов и их достаточно, чтобы ответить — верни {{"action": "answer_directly"}}, не вызывай инструмент повторно.
 - **Важно: если запрос содержит несколько независимых действий (например, "запомни X и найди Y" или "вспомни мои цели и добавь новую") — ты должен вызывать инструменты последовательно, по одному за раунд. Не считай задачу выполненной, пока не обработаны все части запроса.**
 
@@ -385,6 +388,13 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - Запрос: "найди в коде все упоминания TOOL_CALL_TIMEOUT" -> {{"action": "call_tool", "tool": "internal__search_code", "arguments": {{"pattern": "TOOL_CALL_TIMEOUT", "max_results": 10}}}}
 - Запрос: "прочитай файл GCN/tool_router.py" -> {{"action": "call_tool", "tool": "internal__read_code", "arguments": {{"path": "GCN/tool_router.py"}}}}
 - Запрос: "проанализируй ошибку KeyError: 'user_id'" -> {{"action": "call_tool", "tool": "internal__analyze_error", "arguments": {{"error": "KeyError: 'user_id'", "traceback": "..."}}}}
+# === НОВОЕ: примеры для запросов о собственном коде ===
+- Запрос: "как ты устроен?" -> {{"action": "call_tool", "tool": "internal__project_structure", "arguments": {{"max_depth": 3}}}}
+- Запрос: "покажи свою структуру" -> {{"action": "call_tool", "tool": "internal__project_structure", "arguments": {{"max_depth": 3}}}}
+- Запрос: "что ты знаешь о своём коде?" -> {{"action": "call_tool", "tool": "internal__project_structure", "arguments": {{"max_depth": 2}}}}
+- Запрос: "какие у тебя файлы в проекте?" -> {{"action": "call_tool", "tool": "internal__project_structure", "arguments": {{"max_depth": 2}}}}
+- Запрос: "покажи конфиг проекта" -> {{"action": "call_tool", "tool": "internal__read_code", "arguments": {{"path": "GCN/config_ai.py"}}}}
+- Запрос: "прочитай свой код" -> {{"action": "call_tool", "tool": "internal__project_structure", "arguments": {{"max_depth": 3}}}}
 
 Последние реплики диалога:
 {history_tail}
@@ -698,7 +708,8 @@ class ToolRouter:
         # _web_search_results_this_turn для фронта, _verify_response.
         # Субагент все эти шаги пропускает, и его tool_trace приходил в
         # ai_assistant.py без заземления/валидации.
-        if self._subagent_orchestrator is not None:
+        if (self._subagent_orchestrator is not None
+                and SUBAGENT_DELEGATION_ENABLED):
             try:
                 coder_markers = (
                     ".py", ".js", ".ts", ".tsx", ".jsx",
@@ -751,6 +762,35 @@ class ToolRouter:
             )
             running_messages = running_messages + [{"role": "user", "content": hint}]
             history_tail = f"{hint}\n\n{history_tail}" if history_tail else hint
+
+        # === НОВОЕ: подсказка для запросов о собственном коде / архитектуре ===
+        # Без неё модель на вопрос "как ты устроен?" / "прочитай свой код"
+        # отвечает "нет доступа к исходному коду", хотя code-tools
+        # (read_code/search_code/project_structure/analyze_error)
+        # зарегистрированы в реестре и переданы в as_openai_tools().
+        _CODE_QUERY_MARKERS = (
+            "твой код", "свой код", "твоя архитектура", "свою архитектуру",
+            "твой исходник", "свои файлы", "твои файлы", "свой исходный код",
+            "как ты устроен", "как ты работаешь", "как ты устроена",
+            "прочитай свой", "прочитай код", "покажи свой код", "покажи код",
+            "покажи структуру проекта", "структура проекта", "дерево проекта",
+            "какие файлы у тебя", "какие файлы в проекте", "что у тебя в коде",
+            "исходный код проекта", "проанализируй свой код", "твоя реализация",
+            "как реализован", "как устроена память", "твоя память устроена",
+        )
+        if any(m in message_lower for m in _CODE_QUERY_MARKERS):
+            code_hint = (
+                "[Подсказка: пользователь спрашивает про твой код, файлы или "
+                "архитектуру. У тебя ЕСТЬ инструменты самоанализа: "
+                "internal__project_structure (дерево проекта), "
+                "internal__read_code (прочитать конкретный файл), "
+                "internal__search_code (найти паттерн в коде), "
+                "internal__analyze_error (разобрать traceback). "
+                "Вызови подходящий инструмент ПЕРЕД финальным ответом. "
+                "НЕ отвечай 'нет доступа к исходному коду' — это неверно.]"
+            )
+            running_messages = running_messages + [{"role": "user", "content": code_hint}]
+            history_tail = f"{code_hint}\n\n{history_tail}" if history_tail else code_hint
 
         # ПУНКТ №4: план подзадач
         plan_text = await self._plan_subtasks(message)
