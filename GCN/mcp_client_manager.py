@@ -81,7 +81,7 @@ def _redact_cfg(cfg: Dict) -> Dict:
 
 
 class MCPToolManager:
-    def __init__(self, config_path: Optional[Path] = None):
+    def __init__(self, config_path: Optional[Path] = None, user_id: Optional[str] = None):
         self.config_path = config_path or _default_config_path()
         self.sessions: Dict[str, ClientSession] = {}
         self.tools: Dict[str, List[Dict]] = {}  # server_name -> list of tools
@@ -90,6 +90,8 @@ class MCPToolManager:
         self._failed_servers: Dict[str, float] = {}  # name -> timestamp последней неудачи
         self._fail_counts: Dict[str, int] = {}  # счётчик попыток для экспоненциального backoff (ИСПРАВЛЕНИЕ #11)
         self._initialized = False
+        # ИЗМЕНЕНИЕ: сохраняем user_id для передачи в MCP сервер через заголовок X-User-Id
+        self.user_id = user_id.strip().lower() if user_id else None
         # Кэш результатов вызовов инструментов: (server, tool, args_hash) -> (result, timestamp)
         self._tool_cache: Dict[tuple, tuple] = {}
         self._cache_ttl = int(os.getenv("MCP_TOOL_CACHE_TTL", "300"))  # 5 минут по умолчанию
@@ -134,7 +136,15 @@ class MCPToolManager:
                         "в этой версии — обновите пакет 'mcp' для поддержки удалённых серверов."
                     )
                 url = cfg["url"]
+                # ИЗМЕНЕНИЕ: добавляем заголовок X-User-Id из конфига или из self.user_id для аутентификации
+                # Это позволяет веб-чату передавать свой user_id (64 hex от SHA256(pubkey))
+                # напрямую в MCP сервер через доверенный заголовок
                 headers = {**(cfg.get("headers") or {}), "Accept": "text/event-stream"}
+                # Приоритет: 1) user_id из конфига сервера, 2) user_id менеджера, 3) ничего
+                uid = cfg.get("user_id") or self.user_id
+                if uid:
+                    headers["X-User-Id"] = uid.strip().lower()
+                    logger.debug(f"'{name}': using user_id={uid[:16]}... for X-User-Id header")
                 logger.debug(f"'{name}': SSE connect to {url}")
                 read, write = await stack.enter_async_context(sse_client(url, headers=headers))
             else:

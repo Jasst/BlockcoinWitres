@@ -120,9 +120,10 @@ def _resolve_user(user_id: "Optional[str]", ctx: "Optional[Context]" = None) -> 
     """Порядок приоритета:
     1) идентификатор, верифицированный через verify_login (высший приоритет
        для этого процесса; явный user_id, ему не соответствующий, отклоняется);
-    2) user_id, явно переданный вызывающей моделью (пропускается через
+    2) заголовок X-User-Id из HTTP-запроса (доверенный шлюз платформы) — 
+       ЭТОТ ПУНКТ ТЕПЕРЬ ИСПОЛЬЗУЕТСЯ ДЛЯ ВЕБ-ЧАТА С АУТЕНТИФИКАЦИЕЙ ЧЕРЕЗ КРИПТОПОДПИСЬ;
+    3) user_id, явно переданный вызывающей моделью (пропускается через
        канонизацию: 0xABC...64hex -> abc...64hex, как в папках памяти);
-    3) заголовок X-User-Id из HTTP-запроса (доверенный шлюз платформы);
     4) env BLOCKCOIN_USER_ID (локальный stdio-клиент);
     5) DEFAULT_USER — последний резорт.
     
@@ -134,11 +135,12 @@ def _resolve_user(user_id: "Optional[str]", ctx: "Optional[Context]" = None) -> 
             if declared != _VERIFIED_USER:
                 return None  # PermissionError будет сгенерирован вызывающим кодом
         return _VERIFIED_USER
-    if user_id:
-        return _canon_user_id(user_id) or user_id.strip()
+    # ИЗМЕНЕНИЕ: сначала проверяем заголовок X-User-Id (веб-чат передаёт его при подключении)
     uid = _user_from_ctx(ctx)
     if uid:
-        return uid
+        return _canon_user_id(uid) or uid.strip()
+    if user_id:
+        return _canon_user_id(user_id) or user_id.strip()
     if _ENV_DEFAULT_USER:
         return _ENV_DEFAULT_USER
     return DEFAULT_USER
