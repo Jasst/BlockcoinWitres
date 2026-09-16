@@ -2830,7 +2830,32 @@ async def get_assistant(user_id: str):
         await _evict_stale_assistants(exclude_uid=user_id)
         if user_id not in _assistants:
             mcp_mgr = get_global_mcp_manager()  # получаем глобальный (может быть None)
-            _assistants[user_id] = CognitiveController(user_id, mcp_manager=mcp_mgr)
+            # ИЗМЕНЕНИЕ: если используется глобальный MCP менеджер, создаём новый экземпляр
+            # с user_id текущего пользователя для передачи заголовка X-User-Id в MCP сервер
+            if mcp_mgr is not None:
+                # Создаём копию менеджера с user_id текущего пользователя
+                # Копируем конфиг, добавляя user_id
+                from copy import deepcopy
+                mcp_cfg_copy = deepcopy(mcp_mgr._server_configs)
+                for server_name in mcp_cfg_copy:
+                    if isinstance(mcp_cfg_copy[server_name], dict):
+                        mcp_cfg_copy[server_name]["user_id"] = user_id
+                logger.debug(f"Создан MCP менеджер для user_id={user_id[:16]}...")
+            else:
+                mcp_cfg_copy = None
+            _assistants[user_id] = CognitiveController(user_id, mcp_manager=None)
+            # Инициализируем MCP менеджер ассистента с правильным user_id
+            if mcp_cfg_copy is not None:
+                _assistants[user_id].mcp_manager = MCPToolManager(
+                    config_path=mcp_mgr.config_path,
+                    user_id=user_id
+                )
+                _assistants[user_id].mcp_manager._server_configs = mcp_cfg_copy
+                # Запускаем инициализацию MCP в фоне
+                _assistants[user_id]._spawn_background_task(
+                    _assistants[user_id].mcp_manager.initialize(),
+                    name=f"mcp-init:{user_id[:16]}"
+                )
             logger.info(f"Создан когнитивный ассистент для {user_id[:16]}")
         _assistants.move_to_end(user_id)
         _assistant_last_used[user_id] = time.time()
