@@ -13,7 +13,7 @@ from starlette.websockets import WebSocketState
 from database import get_db_cursor
 from services.notifier import message_notifier
 from setup import load_public_key_from_b64
-from cache import get_cached_public_key, get_pubkey_cache_version  # <--- добавлен импорт
+from cache import get_cached_public_key, get_pubkey_cache_version
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
@@ -31,12 +31,32 @@ class ConnectionManager:
         self._conn_lock = asyncio.Lock()
         self._calls_lock = asyncio.Lock()
         self.calls: Dict[str, Dict] = {}
-        self._cleanup_task = None
-        asyncio.create_task(self.start_cleanup())
+        self._cleanup_task: Optional[asyncio.Task] = None
+        # ИЗМЕНЕНО: НЕ запускаем фоновый task здесь.
+        # Конструктор вызывается на уровне модуля (см. `manager = ConnectionManager()`
+        # в конце файла), то есть ДО того, как uvicorn создаст event loop.
+        # asyncio.create_task() в этот момент падает с RuntimeError:
+        # "no running event loop". Запуск cleanup перенесён в FastAPI lifespan
+        # (см. main.py) — там loop гарантированно живой.
 
-    async def start_cleanup(self):
-        if self._cleanup_task is None:
+    def start_cleanup_task(self) -> None:
+        """Синхронный запуск фонового cleanup. Вызывать ТОЛЬКО из живого
+        event loop (например, из FastAPI lifespan). Идемпотентно: повторный
+        вызов, когда task уже работает, ничего не делает."""
+        if self._cleanup_task is None or self._cleanup_task.done():
             self._cleanup_task = asyncio.create_task(self._cleanup_old_calls())
+            logger.info("ConnectionManager: cleanup task started")
+
+    async def stop_cleanup_task(self) -> None:
+        """Аккуратно останавливает cleanup. Вызывать при shutdown приложения."""
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        self._cleanup_task = None
+        logger.info("ConnectionManager: cleanup task stopped")
 
     async def connect(self, user_id: str, websocket: WebSocket):
         await websocket.accept()
@@ -95,20 +115,30 @@ class ConnectionManager:
             }
 
     async def _cleanup_old_calls(self):
+        """Фоновая очистка просроченных звонков.
+        ИЗМЕНЕНО: обёрнуто в try/except, чтобы неожиданное исключение
+        внутри цикла не убивало task молча."""
         while True:
-            await asyncio.sleep(30)
-            now = time.time()
-            expired = []
-            async with self._calls_lock:
-                for call_id, info in self.calls.items():
-                    if now - info.get('created_at', 0) > 60:
-                        expired.append(call_id)
-                for call_id in expired:
-                    del self.calls[call_id]
-                    logger.info(f"Removed expired call {call_id}")
+            try:
+                await asyncio.sleep(30)
+                now = time.time()
+                expired = []
+                async with self._calls_lock:
+                    for call_id, info in self.calls.items():
+                        if now - info.get('created_at', 0) > 60:
+                            expired.append(call_id)
+                    for call_id in expired:
+                        del self.calls[call_id]
+                        logger.info(f"Removed expired call {call_id}")
+            except asyncio.CancelledError:
+                raise  # штатная остановка — пробрасываем
+            except Exception as e:
+                logger.error(f"cleanup_old_calls error: {e}\n{traceback.format_exc()}")
+                await asyncio.sleep(5)  # короткая пауза перед следующей итерацией
 
 
 manager = ConnectionManager()
+
 
 async def authenticate_websocket(websocket: WebSocket, address: str, signature: str, nonce: str) -> Optional[str]:
     logger.info(f"🔐 WS auth: address={address[:16]}..., nonce={nonce[:16]}..., sig_len={len(signature)}")
@@ -118,7 +148,6 @@ async def authenticate_websocket(websocket: WebSocket, address: str, signature: 
         return None
 
     try:
-        # Получаем актуальную версию кеша
         cache_version = await get_pubkey_cache_version()
         pubkey, verified = await get_cached_public_key(address, cache_version=cache_version)
 
@@ -170,7 +199,6 @@ async def websocket_endpoint(
                     await websocket.send_json(msg)
                 except Exception as e:
                     logger.error(f"Failed to send missed message: {e}")
-            # ИСПРАВЛЕНИЕ: удаляем отправленные сообщения из очереди
             await message_notifier.clear_offline_messages(user_id)
         except Exception as e:
             logger.error(f"Failed to fetch missed messages: {e}")

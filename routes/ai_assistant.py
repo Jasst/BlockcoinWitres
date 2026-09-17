@@ -493,6 +493,12 @@ class CognitiveController:
         Дополнительно оживлён мёртвый код: rewrite_query() и MAX_SEARCH_ATTEMPTS
         раньше объявлялись, но нигде не вызывались. Если DDG вернул пусто,
         делаем до MAX_SEARCH_ATTEMPTS повторов с переписанной формулировкой.
+
+        === ВОССТАНОВЛЕНО ===
+        Метод был потерян при одном из рефакторингов, но вызовы в
+        process_input/_stream_response_worker остались — отсюда
+        AttributeError: 'CognitiveController' object has no attribute
+        '_force_search_if_requested'. Возвращён без изменений логики.
         """
         if self._web_search_results_this_turn:
             return
@@ -524,6 +530,61 @@ class CognitiveController:
             # Пользователю нужны данные, которых нет — ставим тему в очередь
             # фонового доисследования (источник 'search_failure' имеет высокий буст).
             self.autonomy.on_search_failed(message)
+
+
+    async def _force_code_tool_if_requested(self, message: str,
+                                            tool_trace: List[Dict[str, Any]]) -> None:
+        """
+        Детерминированный вызов code-tools (аналог _force_search_if_requested).
+
+        Логи 2026-09-15 показали: used_native=False, trace_len=0 — локальная
+        LLM в fallback-режиме получает TOOL_DECISION_PROMPT с примерами
+        'покажи структуру → project_structure', получает hint про code-tools
+        в history_tail, и ВСЁ РАВНО отвечает action=answer_directly. Модель
+        'узнаёт' тему, но не связывает её с действием.
+
+        Решение: для явных code-запросов вызываем project_structure
+        НАПРЯМУЮ, до финальной генерации, и подкладываем результат в
+        tool_trace. Модель получит реальное дерево в промпте и не сможет
+        выдумать структуру 'memory/ tools/ config/'.
+        """
+        _CODE_MARKERS = (
+            "твой код", "свой код", "твоя архитектура", "свою архитектуру",
+            "твой исходник", "свои файлы", "твои файлы", "свой исходный код",
+            "как ты устроен", "как ты работаешь", "как ты устроена",
+            "прочитай свой", "прочитай код", "покажи свой код", "покажи код",
+            "покажи структуру", "структура проекта", "дерево проекта",
+            "посмотри свой", "посмотри код", "посмотри структуру",
+            "какие файлы у тебя", "какие файлы в проекте", "что у тебя в коде",
+            "исходный код проекта", "проанализируй свой код",
+        )
+        if not any(m in message.lower() for m in _CODE_MARKERS):
+            return
+
+        # Не дублировать, если модель всё-таки вызвала сама
+        if any((t.get("tool") or "") == "internal__project_structure"
+               for t in tool_trace):
+            return
+
+        try:
+            from GCN.code_analyzer import get_analyzer
+            analyzer = get_analyzer()
+            tree = await analyzer.get_project_structure(max_depth=3)
+            if not tree or tree.startswith("Ошибка"):
+                logger.warning(f"[ForceCodeTool] project_structure вернул: {tree[:200]}")
+                return
+            tool_trace.append({
+                "tool": "internal__project_structure",
+                "arguments": {"max_depth": 3},
+                "result": tree,
+                "verification": "sufficient",
+            })
+            logger.info(
+                f"[ForceCodeTool] вложено дерево проекта "
+                f"({len(tree)} симв.) для запроса: {message[:80]!r}"
+            )
+        except Exception as e:
+            logger.warning(f"[ForceCodeTool] не удалось вызвать project_structure: {e}")
 
     async def _ensure_external_tools_registered(self):
         """Регистрирует внешние MCP-инструменты в ToolRegistry, если они ещё не зарегистрированы."""
@@ -1576,7 +1637,18 @@ class CognitiveController:
         # и только потом спрашиваем уточняющий вопрос если всё ещё не уверены.
         # Исключение: если в сообщении есть URL или явный запрос поиска — не уточняем.
         has_url = bool(re.search(r'https?://', message))
-        skip_clarification_before_react = web_search or reasoning or has_url or search_meta.get("search_requested")
+        # Code-запросы не уточняем — если пользователь явно спросил про код/структуру,
+        # отвечаем по факту, а не задаём уточняющий вопрос.
+        _CODE_MARKERS_FOR_SKIP = (
+            "твой код", "свой код", "структура проекта", "покажи структуру",
+            "как ты устроен", "прочитай свой", "прочитай код",
+            "какие файлы у тебя", "какие файлы в проекте",
+        )
+        _is_code_query = any(m in message.lower() for m in _CODE_MARKERS_FOR_SKIP)
+        skip_clarification_before_react = (
+                web_search or reasoning or has_url
+                or search_meta.get("search_requested") or _is_code_query
+        )
         
         # РЕШЕНИЕ (нужен ли инструмент) через ToolRouter
         history_tail = "\n".join(
@@ -1620,9 +1692,13 @@ class CognitiveController:
                     return response, {"metacognition_blocked": True, "confidence": conf}
             except Exception as e:
                 logger.warning(f"[Metacognition] ошибка проверки: {e}")
-        
+
         tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
         tool_trace = tool_run.get("tool_trace", [])
+        # Детерминированный вызов code-tools для явных code-запросов
+        # (см. docstring метода — локи 2026-09-15 показали, что LLM не
+        # выбирает project_structure сама, хотя hint и примеры есть).
+        await self._force_code_tool_if_requested(message, tool_trace)
 
         # === ИСПРАВЛЕНИЕ: активное уточнение ПОСЛЕ ReAct-цикла ===
         # Теперь, после того как инструменты отработали, пересчитываем уверенность
@@ -2441,7 +2517,18 @@ class CognitiveController:
 
             # === ИСПРАВЛЕНИЕ: активное уточнение перемещено ПОСЛЕ ReAct-цикла ===
             has_url = bool(re.search(r'https?://', message))
-            skip_clarification_before_react = web_search or reasoning or has_url or search_meta.get("search_requested")
+            # Code-запросы не уточняем — если пользователь явно спросил про код/структуру,
+            # отвечаем по факту, а не задаём уточняющий вопрос.
+            _CODE_MARKERS_FOR_SKIP = (
+                "твой код", "свой код", "структура проекта", "покажи структуру",
+                "как ты устроен", "прочитай свой", "прочитай код",
+                "какие файлы у тебя", "какие файлы в проекте",
+            )
+            _is_code_query = any(m in message.lower() for m in _CODE_MARKERS_FOR_SKIP)
+            skip_clarification_before_react = (
+                    web_search or reasoning or has_url
+                    or search_meta.get("search_requested") or _is_code_query
+            )
 
             full_response = ""
             tool_trace: List[Dict[str, Any]] = []
@@ -2459,6 +2546,8 @@ class CognitiveController:
                         )
                     tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
                     tool_trace = tool_run.get("tool_trace", [])
+                    # Детерминированный вызов code-tools (см. _force_code_tool_if_requested)
+                    await self._force_code_tool_if_requested(message, tool_trace)
                     
                     # === ИСПРАВЛЕНИЕ: активное уточнение ПОСЛЕ ReAct-цикла (для stream) ===
                     if not skip_clarification_before_react:
@@ -2741,7 +2830,32 @@ async def get_assistant(user_id: str):
         await _evict_stale_assistants(exclude_uid=user_id)
         if user_id not in _assistants:
             mcp_mgr = get_global_mcp_manager()  # получаем глобальный (может быть None)
-            _assistants[user_id] = CognitiveController(user_id, mcp_manager=mcp_mgr)
+            # ИЗМЕНЕНИЕ: если используется глобальный MCP менеджер, создаём новый экземпляр
+            # с user_id текущего пользователя для передачи заголовка X-User-Id в MCP сервер
+            if mcp_mgr is not None:
+                # Создаём копию менеджера с user_id текущего пользователя
+                # Копируем конфиг, добавляя user_id
+                from copy import deepcopy
+                mcp_cfg_copy = deepcopy(mcp_mgr._server_configs)
+                for server_name in mcp_cfg_copy:
+                    if isinstance(mcp_cfg_copy[server_name], dict):
+                        mcp_cfg_copy[server_name]["user_id"] = user_id
+                logger.debug(f"Создан MCP менеджер для user_id={user_id[:16]}...")
+            else:
+                mcp_cfg_copy = None
+            _assistants[user_id] = CognitiveController(user_id, mcp_manager=None)
+            # Инициализируем MCP менеджер ассистента с правильным user_id
+            if mcp_cfg_copy is not None:
+                _assistants[user_id].mcp_manager = MCPToolManager(
+                    config_path=mcp_mgr.config_path,
+                    user_id=user_id
+                )
+                _assistants[user_id].mcp_manager._server_configs = mcp_cfg_copy
+                # Запускаем инициализацию MCP в фоне
+                _assistants[user_id]._spawn_background_task(
+                    _assistants[user_id].mcp_manager.initialize(),
+                    name=f"mcp-init:{user_id[:16]}"
+                )
             logger.info(f"Создан когнитивный ассистент для {user_id[:16]}")
         _assistants.move_to_end(user_id)
         _assistant_last_used[user_id] = time.time()

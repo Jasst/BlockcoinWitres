@@ -5,8 +5,10 @@ MCP Client Manager — управление подключениями к MCP-с
 - Конфиг ищется рядом с этим модулем / GCN.config_ai.MEMORY_BASE_DIR (не от
   cwd процесса — важно при запуске под systemd), с переопределением через
   переменную окружения MCP_SERVERS_CONFIG.
-- Поддержаны локальные stdio-серверы и удалённые MCP по SSE (cfg с полем
-  "url" и опциональным "headers").
+- Поддержаны локальные stdio-серверы, удалённые MCP по SSE (cfg с полем
+  "url" и опциональным "headers") и удалённые MCP по Streamable HTTP
+  (транспорт определяется полем "transport" либо автоматически по URL:
+  "…/sse" → SSE, иначе → Streamable HTTP).
 - Каждый вызов инструмента ограничен по времени (TOOL_CALL_TIMEOUT_SECONDS,
   с точечными переопределениями per-tool), чтобы зависший внешний сервер не
   вешал весь ответ чата.
@@ -28,11 +30,28 @@ from contextlib import AsyncExitStack
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# ---------------------------------------------------------------------------
+# Транспорты. Импортируем отдельно, потому что mcp-версии различаются:
+# в одних есть только SSE, в других — только Streamable HTTP, в третьих оба.
+# ---------------------------------------------------------------------------
 try:
     from mcp.client.sse import sse_client
     SSE_AVAILABLE = True
 except ImportError:
     SSE_AVAILABLE = False
+
+try:
+    from mcp.client.streamable_http import streamablehttp_client
+    STREAMABLE_HTTP_AVAILABLE = True
+except ImportError:
+    # В mcp < 1.8 модуль назывался по-другому; на всякий случай пробуем
+    # известный старый путь — если и его нет, считаем, что транспорта нет.
+    try:
+        from mcp.client.streamable_http import streamablehttp_client  # noqa: F811
+        STREAMABLE_HTTP_AVAILABLE = True
+    except ImportError:
+        streamablehttp_client = None  # type: ignore
+        STREAMABLE_HTTP_AVAILABLE = False
 
 try:
     from GCN.config_ai import (
@@ -80,16 +99,38 @@ def _redact_cfg(cfg: Dict) -> Dict:
     return safe
 
 
+def _detect_transport(url: str, cfg_transport: Optional[str] = None) -> str:
+    """
+    Возвращает "sse" или "streamable-http".
+
+    Приоритеты:
+      1) явное поле "transport" в конфиге сервера (может быть "sse",
+         "http", "streamable-http", "streamable_http");
+      2) эвристика по URL: заканчивается на "/sse" → SSE, иначе → Streamable HTTP.
+    """
+    if cfg_transport:
+        t = cfg_transport.strip().lower().replace("_", "-")
+        if t in ("sse",):
+            return "sse"
+        if t in ("http", "streamable-http", "streamable", "streamablehttp"):
+            return "streamable-http"
+    if url.rstrip("/").endswith("/sse"):
+        return "sse"
+    return "streamable-http"
+
+
 class MCPToolManager:
-    def __init__(self, config_path: Optional[Path] = None):
+    def __init__(self, config_path: Optional[Path] = None, user_id: Optional[str] = None):
         self.config_path = config_path or _default_config_path()
         self.sessions: Dict[str, ClientSession] = {}
         self.tools: Dict[str, List[Dict]] = {}  # server_name -> list of tools
         self._server_configs: Dict[str, Dict] = {}
         self._server_stacks: Dict[str, AsyncExitStack] = {}
         self._failed_servers: Dict[str, float] = {}  # name -> timestamp последней неудачи
-        self._fail_counts: Dict[str, int] = {}  # счётчик попыток для экспоненциального backoff (ИСПРАВЛЕНИЕ #11)
+        self._fail_counts: Dict[str, int] = {}  # счётчик попыток для экспоненциального backoff
         self._initialized = False
+        # ИЗМЕНЕНИЕ: сохраняем user_id для передачи в MCP сервер через заголовок X-User-Id
+        self.user_id = user_id.strip().lower() if user_id else None
         # Кэш результатов вызовов инструментов: (server, tool, args_hash) -> (result, timestamp)
         self._tool_cache: Dict[tuple, tuple] = {}
         self._cache_ttl = int(os.getenv("MCP_TOOL_CACHE_TTL", "300"))  # 5 минут по умолчанию
@@ -97,7 +138,7 @@ class MCPToolManager:
         self._rate_limits: Dict[tuple, List[float]] = {}
         self._rate_limit_calls = int(os.getenv("MCP_RATE_LIMIT_CALLS", "10"))  # вызовов
         self._rate_limit_window = int(os.getenv("MCP_RATE_LIMIT_WINDOW", "60"))  # секунд
-        # ИСПРАВЛЕНИЕ #2: write-инструменты не кешируются, их вызов инвалидирует кеш
+        # write-инструменты не кешируются, их вызов инвалидирует кеш
         self._write_tools = {
             "remember", "forget", "add_goal", "resolve_contradiction",
             "update_fact", "record_action",
@@ -128,15 +169,49 @@ class MCPToolManager:
         stack = AsyncExitStack()
         try:
             if cfg.get("url"):
-                if not SSE_AVAILABLE:
-                    raise RuntimeError(
-                        "cfg содержит 'url', но пакет mcp не предоставляет mcp.client.sse "
-                        "в этой версии — обновите пакет 'mcp' для поддержки удалённых серверов."
-                    )
                 url = cfg["url"]
-                headers = {**(cfg.get("headers") or {}), "Accept": "text/event-stream"}
-                logger.debug(f"'{name}': SSE connect to {url}")
-                read, write = await stack.enter_async_context(sse_client(url, headers=headers))
+
+                # Заголовки: сначала собственные заголовки сервера из конфига,
+                # затем принудительно — X-User-Id (доверенный идентификатор
+                # текущей сессии) и корректный Accept.
+                headers: Dict[str, str] = dict(cfg.get("headers") or {})
+                uid = cfg.get("user_id") or self.user_id
+                if uid:
+                    headers["X-User-Id"] = uid.strip().lower()
+                    logger.debug(f"'{name}': using user_id={uid[:16]}... for X-User-Id header")
+
+                transport = _detect_transport(url, cfg.get("transport"))
+
+                if transport == "sse":
+                    if not SSE_AVAILABLE:
+                        raise RuntimeError(
+                            "Конфиг сервера '{n}' задаёт SSE ({u}), но установленный "
+                            "пакет 'mcp' не предоставляет mcp.client.sse — обновите "
+                            "'mcp' или укажите transport=\"streamable-http\"."
+                            .format(n=name, u=url)
+                        )
+                    headers.setdefault("Accept", "text/event-stream")
+                    logger.debug(f"'{name}': SSE connect to {url}")
+                    read, write = await stack.enter_async_context(
+                        sse_client(url, headers=headers)
+                    )
+                else:  # streamable-http
+                    if not STREAMABLE_HTTP_AVAILABLE:
+                        raise RuntimeError(
+                            "Конфиг сервера '{n}' задаёт Streamable HTTP ({u}), но "
+                            "установленный пакет 'mcp' не предоставляет "
+                            "mcp.client.streamable_http — обновите 'mcp' "
+                            "(`pip install -U 'mcp>=1.8'`).".format(n=name, u=url)
+                        )
+                    # Streamable HTTP принимает оба типа контента; по умолчанию
+                    # SDK сам ставит корректный Accept, но подстрахуемся.
+                    headers.setdefault("Accept", "application/json, text/event-stream")
+                    logger.debug(f"'{name}': Streamable HTTP connect to {url}")
+                    # Важно: streamablehttp_client отдаёт ТРИ значения —
+                    # read, write и функцию получения mcp-session-id.
+                    read, write, _get_session_id = await stack.enter_async_context(
+                        streamablehttp_client(url, headers=headers)
+                    )
             else:
                 command = cfg.get("command")
                 args = cfg.get("args", [])
@@ -154,6 +229,7 @@ class MCPToolManager:
             self.tools[name] = tools
             self._server_stacks[name] = stack
             self._failed_servers.pop(name, None)
+            self._fail_counts.pop(name, None)
             logger.info(f"MCP сервер '{name}' загружен, инструментов: {len(tools)}")
             return True
         except Exception as e:
@@ -167,13 +243,12 @@ class MCPToolManager:
 
     async def ensure_connected(self):
         """Повторяет попытку подключения к серверам, которые не удалось поднять
-        при старте (или отвалились позже) — с экспоненциальным backoff (ИСПРАВЛЕНИЕ #11).
+        при старте (или отвалились позже) — с экспоненциальным backoff.
         Безопасно вызывать часто — сама решает, нужна ли попытка."""
         if not self._failed_servers:
             return
         now = time.time()
         for name, failed_at in list(self._failed_servers.items()):
-            # Экспоненциальный backoff: 2^attempt * base_interval, max 1 hour
             fail_count = self._fail_counts.get(name, 0)
             wait = min(MCP_RECONNECT_INTERVAL * (2 ** fail_count), 3600)
             if now - failed_at < wait:
@@ -181,7 +256,7 @@ class MCPToolManager:
             cfg = self._server_configs.get(name)
             if not cfg:
                 continue
-            logger.info(f"Reconnect attempt #{fail_count+1} for '{name}' (wait was {wait}s)")
+            logger.info(f"Reconnect attempt #{fail_count + 1} for '{name}' (wait was {wait}s)")
             success = await self._connect_one(name, cfg)
             if success:
                 self._fail_counts.pop(name, None)
@@ -203,8 +278,7 @@ class MCPToolManager:
         """Проверяет rate limit для инструмента. Возвращает True, если вызов разрешён."""
         key = (server_name, tool_name)
         now = time.time()
-        
-        # Очищаем старые записи за пределами окна
+
         if key in self._rate_limits:
             self._rate_limits[key] = [
                 ts for ts in self._rate_limits[key]
@@ -212,12 +286,10 @@ class MCPToolManager:
             ]
         else:
             self._rate_limits[key] = []
-        
-        # Проверяем лимит
+
         if len(self._rate_limits[key]) >= self._rate_limit_calls:
             return False
-        
-        # Записываем текущий вызов
+
         self._rate_limits[key].append(now)
         return True
 
@@ -240,9 +312,9 @@ class MCPToolManager:
     def _cache_result(self, cache_key: tuple, result: str):
         """Кэширует результат вызова инструмента."""
         self._tool_cache[cache_key] = (result, time.time())
-        # Очистка старого кэша при переполнении
         if len(self._tool_cache) > 1000:
-            oldest_keys = sorted(self._tool_cache.keys(), key=lambda k: self._tool_cache[k][1])[:100]
+            oldest_keys = sorted(self._tool_cache.keys(),
+                                 key=lambda k: self._tool_cache[k][1])[:100]
             for k in oldest_keys:
                 del self._tool_cache[k]
 
@@ -253,15 +325,13 @@ class MCPToolManager:
     async def call_tool(self, server_name: str, tool_name: str, arguments: Dict) -> str:
         """Вызвать инструмент на указанном сервере — с ограничением по времени,
         кэшированием результатов и rate limiting, чтобы зависший внешний сервер
-        не вешал весь ответ чата навсегда, а частые одинаковые вызовы не перегружали сервер.
-        
-        ИСПРАВЛЕНИЕ #2: write-инструменты не кешируются, их вызов инвалидирует кеш сервера.
+        не вешал весь ответ чата навсегда, а частые одинаковые вызовы не
+        перегружали сервер.
         """
         session = self.sessions.get(server_name)
         if not session:
             raise ValueError(f"Сервер '{server_name}' не найден")
-        
-        # Проверка rate limit
+
         if not self._check_rate_limit(server_name, tool_name):
             logger.warning(
                 f"Rate limit превышен для {server_name}.{tool_name} "
@@ -271,35 +341,30 @@ class MCPToolManager:
                 f"Rate limit для инструмента '{server_name}.{tool_name}': "
                 f"не более {self._rate_limit_calls} вызовов за {self._rate_limit_window}с"
             )
-        
-        # ИСПРАВЛЕНИЕ #2: Для write-инструментов: не кешировать + инвалидировать кеш сервера
+
         if self._is_write_tool(tool_name):
-            # Удалить все кешированные результаты этого сервера
             stale = [k for k in self._tool_cache if k[0] == server_name]
             for k in stale:
                 del self._tool_cache[k]
             logger.debug(f"Write-инструмент {tool_name}: инвалидация кеша для {server_name}")
-            # Выполнить без кэша
             return await self._execute_tool(server_name, tool_name, arguments)
-        
-        # read-инструменты: обычный cache lookup
+
         cache_key = self._get_cache_key(server_name, tool_name, arguments)
         cached = self._get_cached_result(cache_key)
         if cached is not None:
             logger.debug(f"Кэш-хит для {server_name}.{tool_name}")
             return cached
-        
+
         result = await self._execute_tool(server_name, tool_name, arguments)
-        
-        # Кэшируем только успешные результаты (без ошибок в тексте)
+
         response_lower = result.lower()
         if "error" not in response_lower and "exception" not in response_lower:
             self._cache_result(cache_key, result)
-        
+
         return result
 
     async def _execute_tool(self, server_name: str, tool_name: str, arguments: Dict) -> str:
-        """Вынести прямой вызов session.call_tool сюда (рефакторинг для ИСПРАВЛЕНИЯ #2)."""
+        """Прямой вызов session.call_tool с per-tool таймаутом."""
         session = self.sessions.get(server_name)
         if not session:
             raise ValueError(f"Сервер '{server_name}' не найден")
