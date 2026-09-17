@@ -255,7 +255,14 @@ class MemoryService:
         GCN-стор, поэтому находка одного видна другому.
         """
         self.refresh()
-        return await self.private_memory.get_pending_notifications(mark_delivered=mark_delivered)
+        items = await self.private_memory.get_pending_notifications(
+            mark_delivered=mark_delivered)
+        # keywords — чтобы фронт мог послать их обратно в /notifications/feedback,
+        # а AutonomyEngine — в bandit_update_for_topic как категориальный арм.
+        from GCN.autonomy import _keywords
+        for it in items:
+            it["keywords"] = sorted(_keywords(it.get("text", "")))[:10]
+        return items
 
     async def semantic_search(self, query: str, top_k: int = 5,
                               scope: Optional[str] = None) -> List[Dict]:

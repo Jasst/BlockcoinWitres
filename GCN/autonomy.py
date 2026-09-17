@@ -226,6 +226,15 @@ class ResearchQueue:
         self._bandit_arms[topic_key] = (alpha, beta)
         self._save_bandits()
 
+    def bandit_update_for_topic(self, topic_text: str, source: str, success: bool) -> None:
+        """Публичный метод для обновления bandit по теме.
+        
+        Генерирует ключ темы из текста и источника, чтобы разные источники
+        (goal, refresh, reflection) имели отдельные армы для одной темы.
+        """
+        topic_key = f"{source}:{re.sub(r'\\s+', ' ', topic_text.lower()).strip()[:120]}"
+        self._bandit_update(topic_key, success)
+
     def __len__(self) -> int:
         return len(self._items)
 
@@ -399,6 +408,8 @@ class AutonomyEngine:
     # ---------------- внешние хуки (вызываются контроллером) ----------------
     def on_user_message(self, message: str) -> None:
         """Каждое сообщение пользователя — сигнал активности и возможная реакция на уведомления."""
+        self._last_user_message_at_prev = self._last_user_message_at
+        self._last_user_message_at = time.time()
         self._register_feedback(message or "")
 
     def on_search_failed(self, query: str) -> None:
@@ -542,9 +553,15 @@ class AutonomyEngine:
             # удаляем её после успешного исследования.
             if topic.source in ("goal", "goal_subtask") and topic.related_goal:
                 self._bump_goal_confidence(topic.related_goal, +0.10)
-                # Также пробуем удалить из SelfModel.active_goals (для целей от motivation)
+                # Удаляем из SelfModel только если уверенность в памяти
+                # реально достигла порога — иначе одна удачная (и часто
+                # shallow) итерация research() закрывает недостигнутую цель.
                 if hasattr(self, 'self_model') and self.self_model is not None:
-                    self.self_model.remove_goal(topic.related_goal)
+                    for mem_goal in self.ctl.memory.goals:
+                        if mem_goal.description == topic.related_goal:
+                            if mem_goal.confidence >= 0.85:
+                                self.self_model.remove_goal(topic.related_goal)
+                            break
 
     def _bump_goal_confidence(self, goal_description: str, delta: float) -> None:
         try:
@@ -669,6 +686,34 @@ class AutonomyEngine:
             self._digest_day = today
             self._digest_count_today = 0
 
+    @staticmethod
+    def _cluster_findings(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Склеивает находки с пересечением ключевых слов >= 0.5 в одну
+        запись — DIGEST_MAX_ITEMS начнёт честно измерять темы, а не факты."""
+        clusters: List[Dict[str, Any]] = []
+        for item in batch:
+            item_kw = _keywords(item.get("text", ""))
+            if not item_kw:
+                clusters.append({**item, "_kw": set(), "merged": [item["text"]]})
+                continue
+            best_cluster = None
+            best_overlap = 0.0
+            for cl in clusters:
+                overlap = len(item_kw & cl["_kw"]) / max(1, len(item_kw | cl["_kw"]))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_cluster = cl
+            if best_cluster is not None and best_overlap >= 0.5:
+                best_cluster["merged"].append(item["text"])
+                best_cluster["_kw"] |= item_kw
+            else:
+                clusters.append({**item, "_kw": item_kw, "merged": [item["text"]]})
+        return [
+            {**{k: v for k, v in cl.items() if k != "_kw"},
+             "text": "\n".join(cl["merged"][:3])}
+            for cl in clusters
+        ]
+
     async def _maybe_flush_digest(self, force: bool = False) -> None:
         if not DIGEST_ENABLED or not PROACTIVE_NOTIFICATIONS_ENABLED:
             return
@@ -692,6 +737,7 @@ class AutonomyEngine:
         self._pending_findings = self._pending_findings[DIGEST_MAX_ITEMS:]
         if not batch:
             return
+        batch = self._cluster_findings(batch)
         if not self._consume_budget(_BUDGET_WEIGHT_DIGEST):
             self._pending_findings = batch + self._pending_findings
             return
@@ -700,7 +746,7 @@ class AutonomyEngine:
         self._last_digest_at = time.time()
         for idx, text in texts[:2]:
             try:
-                topic_key = batch[idx].get("topic_key") if 0 <= idx < len(batch) else None
+                topic_text = batch[idx].get("topic_text") if 0 <= idx < len(batch) else None
                 await self.ctl.memory_service.push_notification(
                     text, source="autonomy_digest"
                 )
@@ -709,7 +755,8 @@ class AutonomyEngine:
                     "keywords": _keywords(text),
                     "ts": time.time(),
                     "source": "autonomy_digest",
-                    "topic_key": topic_key,
+                    "topic_text": topic_text,
+                    "reacted": False,
                 })
                 logger.info(
                     f"[Autonomy] дайджест для {self.user_id[:16]}: {text[:80]}"
@@ -725,6 +772,29 @@ class AutonomyEngine:
         чтобы topic_key привязывался к исходной находке, а не к переписанному тексту.
         LLM обязана отвечать с указанием индекса: {"notify": [{"idx": 0, "text": "..."}]}.
         """
+        # Сводка реакций: LLM должна видеть, что юзер проигнорировал в
+        # прошлый раз, иначе каждые 45 минут будет предлагать одно и то же.
+        reacted = [it for it in self._notified[-8:] if it.get("reacted")]
+        ignored = [it for it in self._notified[-8:] if not it.get("reacted")]
+        feedback_lines = []
+        if reacted:
+            reacted_topics = [
+                (sorted(it.get("keywords", []), key=len, reverse=True) or ["?"])[0]
+                for it in reacted[:3]
+            ]
+            feedback_lines.append(
+                "Пользователь ОТРЕАГИРОВАЛ на темы: " + ", ".join(reacted_topics))
+        if ignored:
+            ignored_topics = [
+                (sorted(it.get("keywords", []), key=len, reverse=True) or ["?"])[0]
+                for it in ignored[:3]
+            ]
+            feedback_lines.append(
+                "Пользователь ПРОИГНОРИРОВАЛ темы: " + ", ".join(ignored_topics))
+        feedback_summary = (
+            "\n\nИстория реакций пользователя:\n" + "\n".join(feedback_lines)
+            if feedback_lines else ""
+        )
         listing = "\n".join(
             f"[{i}] ({item['source']}) {item['text'][:400]}"
             for i, item in enumerate(batch)
@@ -740,6 +810,7 @@ class AutonomyEngine:
             "Ответь ТОЛЬКО JSON-объектом вида {\"notify\": [{\"idx\": 0, \"text\": \"...\"}, {\"idx\": 3, \"text\": \"...\"}]}; "
             "где idx — индекс исходной находки из списка выше. "
             "если ничего не достойно — {\"notify\": []}."
+            f"{feedback_summary}"
         )
         try:
             raw = await call_llm([{"role": "user", "content": prompt}], temp=0.3, max_tokens=400)
@@ -782,7 +853,7 @@ class AutonomyEngine:
             age = now - item["ts"]
             overlap = msg_kw & item["keywords"]
             if overlap and age < FEEDBACK_WINDOW_SECONDS:
-                # Пользователь продолжил тему уведомления — проактивность попала в цель.
+                item["reacted"] = True
                 w = min(1.5, self._source_weight.get(item["source"], 1.0) + FEEDBACK_POSITIVE_BONUS)
                 self._source_weight[item["source"]] = w
                 logger.info(
@@ -790,23 +861,42 @@ class AutonomyEngine:
                     f"(источник {item['source']} → x{w:.2f})"
                 )
                 self._save_state()
-                # === ИСПРАВЛЕНИЕ: обучаем bandit при успехе ===
-                topic_key = item.get("topic_key")
-                if topic_key:
-                    self.queue._bandit_update(topic_key, success=True)
+                topic_text = item.get("topic_text")
+                if topic_text:
+                    self.queue.bandit_update_for_topic(
+                        topic_text, item["source"], success=True)
                 continue  # обработано, из списка убираем
             if age < FEEDBACK_WINDOW_SECONDS:
                 still_pending.append(item)
             else:
-                # Окно истекло, реакции не было — лёгкое притухание источника.
                 w = max(0.5, self._source_weight.get(item["source"], 1.0) - FEEDBACK_NEGATIVE_DECAY)
                 self._source_weight[item["source"]] = w
                 self._save_state()
-                # === ИСПРАВЛЕНИЕ: обучаем bandit при неудаче ===
-                topic_key = item.get("topic_key")
-                if topic_key:
-                    self.queue._bandit_update(topic_key, success=False)
+                topic_text = item.get("topic_text")
+                if topic_text:
+                    self.queue.bandit_update_for_topic(
+                        topic_text, item["source"], success=False)
         self._notified = still_pending[-20:]
+
+    def register_explicit_feedback(self, notification_keywords: List[str],
+                                    source: str, positive: bool) -> None:
+        """Вызывается из роутера /ai/notifications/feedback. Позволяет
+        фронтенду сообщить 'полезно / не интересно' независимо от того,
+        написал ли юзер что-то в чат с пересечением ключевых слов.
+        Работает мгновенно, не ждёт FEEDBACK_WINDOW."""
+        if positive:
+            w = min(1.5, self._source_weight.get(source, 1.0) + FEEDBACK_POSITIVE_BONUS)
+        else:
+            w = max(0.5, self._source_weight.get(source, 1.0) - FEEDBACK_NEGATIVE_DECAY * 2)
+        self._source_weight[source] = w
+        self._save_state()
+        if notification_keywords:
+            self.queue.bandit_update_for_topic(
+                " ".join(notification_keywords), source, success=positive)
+        logger.info(
+            f"[Autonomy] явный feedback: source={source} "
+            f"{'positive' if positive else 'negative'} → x{w:.2f}"
+        )
 
     # ---------------- персистентность обучения ----------------
     def _load_state(self) -> None:
