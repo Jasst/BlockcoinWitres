@@ -1,16 +1,21 @@
 """
-run.py — Production runner using Uvicorn (replaces Waitress)
-Supports graceful shutdown and PID file for process managers.
+run.py — Production runner для FastAPI (self-hosted).
 
-Usage:
-    python run.py                     # auto mode
-    UVICORN_MODE=dev python run.py    # 1 worker, reload
-    UVICORN_MODE=stable python run.py # conservative workers
-    UVICORN_MODE=max python run.py    # maximum workers
+ВАЖНО: принудительно 1 воркер. Причина:
+  - routes/mcp_auth._sessions — in-memory
+  - ai_assistant._assistants — in-memory (CognitiveController)
+  - memory_service._services — in-memory
+  - MCPToolManager._tool_cache/_rate_limits — in-memory
+  - каждый CognitiveController держит свой SSE к MCP под X-User-Id
+
+Multi-worker ломает сессии (401 через раз) и создаёт дубли MCP-подключений
+под одним user_id. Масштабирование — отдельная задача (Redis + sticky),
+а не подъём workers.
+
+Наружу пускает только nginx — host всегда 127.0.0.1.
 """
 import atexit
 import logging
-import multiprocessing
 import os
 import signal
 import sys
@@ -46,65 +51,62 @@ def graceful_shutdown(signum, frame):
 if __name__ == '__main__':
     import uvicorn
 
-    signal.signal(signal.SIGINT,  graceful_shutdown)
+    signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
     atexit.register(remove_pid)
     save_pid()
 
-    cpu_count = multiprocessing.cpu_count()
-    mode      = os.getenv('UVICORN_MODE', 'auto')
-    port      = int(os.getenv('PORT', 8000))
-    host      = os.getenv('HOST', '0.0.0.0')
-    is_prod   = os.getenv('FLASK_ENV') == 'production'
+    mode = os.getenv('UVICORN_MODE', 'auto')
 
-    # Worker / thread counts
-    if mode == 'dev':
-        workers = 1
-        reload  = True
-    elif mode == 'stable':
-        workers = max(2, cpu_count // 2)
-        reload  = False
-    elif mode == 'max':
-        workers = min(cpu_count * 2, 16)
-        reload  = False
-    else:  # auto
-        workers = min(max(cpu_count, 2), 8)
-        reload  = not is_prod
+    # === ИЗМЕНЕНИЕ 1: читаем SERVER_HOST/SERVER_PORT, не HOST/PORT ===
+    # В .env уже есть SERVER_HOST=127.0.0.1 — используем его.
+    # Если SERVER_HOST не задан — всё равно 127.0.0.1 (наружу пускает nginx).
+    host = os.getenv('SERVER_HOST') or os.getenv('HOST') or '127.0.0.1'
+    port = int(os.getenv('SERVER_PORT') or os.getenv('PORT', 8000))
+
+    is_prod = os.getenv('FLASK_ENV') == 'production'
+
+    # === ИЗМЕНЕНИЕ 2: workers всегда 1 ===
+    # Не читаем SERVER_WORKERS — она тут не применима.
+    workers = 1
+    reload = (mode == 'dev')
+
+    # === ИЗМЕНЕНИЕ 3: uvloop только если реально установлен ===
+    try:
+        import uvloop  # noqa: F401
+        loop_impl = 'uvloop'
+    except ImportError:
+        loop_impl = 'asyncio'
+
+    # === ИЗМЕНЕНИЕ 4: страховка от случайного 0.0.0.0 ===
+    if host == '0.0.0.0' and not os.getenv('ALLOW_PUBLIC_BIND'):
+        print("!! WARNING: SERVER_HOST=0.0.0.0 отключён, ставлю 127.0.0.1.")
+        print("!! Если это осознанно — запусти с ALLOW_PUBLIC_BIND=1")
+        host = '127.0.0.1'
 
     print("=" * 60)
     print("🚀  BiChat Messenger Server (FastAPI + Uvicorn)")
     print("=" * 60)
     print(f"   Mode:    {mode}")
-    print(f"   Host:    {host}:{port}")
-    print(f"   Workers: {workers}")
+    print(f"   Host:    {host}:{port}   (behind nginx)")
+    print(f"   Workers: {workers}  (forced 1: in-memory state)")
+    print(f"   Loop:    {loop_impl}")
     print(f"   Reload:  {reload}")
     print(f"   Docs:    http://{host}:{port}/api/docs")
     print(f"   PID:     {os.getpid()}")
     print("=" * 60)
 
-    if workers > 1 and not reload:
-        # Multi-process mode (production)
-        uvicorn.run(
-            'main:app',
-            host=host,
-            port=port,
-            workers=workers,
-            loop='uvloop',
-            http='httptools',
-            access_log=not is_prod,
-            server_header=False,
-            date_header=False,
-        )
-    else:
-        # Single-process mode (dev / reload)
-        uvicorn.run(
-            'main:app',
-            host=host,
-            port=port,
-            reload=reload,
-            loop='asyncio',
-            access_log=True,
-            server_header=False,
-            timeout_keep_alive=300,  # добавьте
-            timeout_graceful_shutdown=30,  # добавьте
-        )
+    uvicorn.run(
+        'main:app',
+        host=host,
+        port=port,
+        workers=workers,
+        reload=reload,
+        loop=loop_impl,
+        http='httptools',
+        access_log=not is_prod,
+        server_header=False,
+        date_header=False,
+        timeout_keep_alive=300,
+        timeout_graceful_shutdown=30,
+    )
