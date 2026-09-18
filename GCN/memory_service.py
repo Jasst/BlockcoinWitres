@@ -216,7 +216,7 @@ class MemoryService:
 
         # ИСПРАВЛЕНИЕ: удаление по gcn_id вместо поиска по подстроке
         # Поддерживаем все форматы ID: fct_, concept_, goal_, episode_
-        is_gcn_id = any(query.startswith(p) for p in ("fct_", "concept_", "goal_", "episode_"))
+        is_gcn_id = any(query.startswith(p) for p in ("fact_", "fct_", "concept_", "goal_", "episode_"))
         if is_gcn_id:
             ko = memory.store.get(query)
             if not ko:
