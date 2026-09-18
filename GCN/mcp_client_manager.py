@@ -167,6 +167,16 @@ class MCPToolManager:
     async def _connect_one(self, name: str, cfg: Dict) -> bool:
         logger.info(f"Connecting to MCP server '{name}': {_redact_cfg(cfg)}")
         stack = AsyncExitStack()
+
+        # Таймаут на каждую сетевую операцию подключения. Без него
+        # streamablehttp_client/sse_client/stdio_client могут висеть
+        # бесконечно, если удалённый сервер недоступен (нет DNS, TCP
+        # не отвечает, TLS-хендшейк завис) — и блокировать startup
+        # приложения (см. init_global_mcp в routes/ai_assistant.py,
+        # который делает await _global_mcp_manager.initialize()).
+        # Переопределяется через MCP_CONNECT_TIMEOUT.
+        CONNECT_TIMEOUT = float(os.getenv("MCP_CONNECT_TIMEOUT", "10"))
+
         try:
             if cfg.get("url"):
                 url = cfg["url"]
@@ -192,8 +202,9 @@ class MCPToolManager:
                         )
                     headers.setdefault("Accept", "text/event-stream")
                     logger.debug(f"'{name}': SSE connect to {url}")
-                    read, write = await stack.enter_async_context(
-                        sse_client(url, headers=headers)
+                    read, write = await asyncio.wait_for(
+                        stack.enter_async_context(sse_client(url, headers=headers)),
+                        timeout=CONNECT_TIMEOUT,
                     )
                 else:  # streamable-http
                     if not STREAMABLE_HTTP_AVAILABLE:
@@ -209,8 +220,11 @@ class MCPToolManager:
                     logger.debug(f"'{name}': Streamable HTTP connect to {url}")
                     # Важно: streamablehttp_client отдаёт ТРИ значения —
                     # read, write и функцию получения mcp-session-id.
-                    read, write, _get_session_id = await stack.enter_async_context(
-                        streamablehttp_client(url, headers=headers)
+                    read, write, _get_session_id = await asyncio.wait_for(
+                        stack.enter_async_context(
+                            streamablehttp_client(url, headers=headers)
+                        ),
+                        timeout=CONNECT_TIMEOUT,
                     )
             else:
                 command = cfg.get("command")
@@ -218,11 +232,19 @@ class MCPToolManager:
                 env = cfg.get("env", {})
                 logger.debug(f"'{name}': stdio connect, command={command}, args={args}")
                 server_params = StdioServerParameters(command=command, args=args, env=env)
-                read, write = await stack.enter_async_context(stdio_client(server_params))
+                read, write = await asyncio.wait_for(
+                    stack.enter_async_context(stdio_client(server_params)),
+                    timeout=CONNECT_TIMEOUT,
+                )
 
-            session = await stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
-            response = await session.list_tools()
+            session = await asyncio.wait_for(
+                stack.enter_async_context(ClientSession(read, write)),
+                timeout=CONNECT_TIMEOUT,
+            )
+            await asyncio.wait_for(session.initialize(), timeout=CONNECT_TIMEOUT)
+            response = await asyncio.wait_for(
+                session.list_tools(), timeout=CONNECT_TIMEOUT
+            )
             tools = [tool.model_dump() for tool in response.tools]
 
             self.sessions[name] = session
@@ -232,6 +254,22 @@ class MCPToolManager:
             self._fail_counts.pop(name, None)
             logger.info(f"MCP сервер '{name}' загружен, инструментов: {len(tools)}")
             return True
+
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Таймаут подключения к MCP серверу '{name}' "
+                f"({CONNECT_TIMEOUT}с) — сервер помечен как недоступный, "
+                f"повторная попытка через MCP_RECONNECT_INTERVAL."
+            )
+            self._failed_servers[name] = time.time()
+            # Пытаемся закрыть всё, что успело зарегистрироваться в стеке,
+            # чтобы не течь сокетами/тасками до повторного подключения.
+            try:
+                await stack.aclose()
+            except Exception as close_err:
+                logger.debug(f"Ошибка закрытия stack после таймаута '{name}': {close_err}")
+            return False
+
         except Exception as e:
             logger.exception(f"Ошибка подключения к MCP серверу '{name}': {e}")
             self._failed_servers[name] = time.time()

@@ -583,6 +583,8 @@ async def remember(
         fact: str = Field(..., description="Факт для запоминания"),
         scope: Optional[str] = Field(None,
                                      description="Скоуп: 'private', 'shared', 'global'. Если не указан – автоопределение."),
+        force_new: bool = Field(False,
+                                description="Если True — обходит дедупликацию и создаёт новый факт даже при наличии семантически близких."),
         user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
         ctx: Context = None
 ) -> Dict[str, Any]:
@@ -591,9 +593,8 @@ async def remember(
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
-    result = await service.remember(fact, scope)
+    result = await service.remember(fact, scope, force_new=force_new)
     return {"status": "ok", **result}
-
 
 @mcp.tool()
 async def forget(
@@ -1040,29 +1041,53 @@ async def update_fact(
         user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
         ctx: Context = None
 ) -> Dict[str, Any]:
-    """Атомарно заменяет текст существующего факта по gcn_id."""
+    """Атомарно заменяет текст существующего факта по gcn_id (RETRACT + CREATE)."""
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
 
     service = await get_memory_service(uid)
 
+    # 1. Получаем информацию о старом факте
     old_info = await service.explain_fact(gcn_id)
-    if old_info.get("status") == "error" or "not found" in str(old_info.get("error", "")).lower():
+    if "error" in old_info:
         return {
             "status": "error",
-            "message": f"Факт с gcn_id='{gcn_id}' не найден: {old_info}",
+            "message": f"Факт не найден: {old_info['error']}",
         }
 
     old_text = old_info.get("subject") or old_info.get("text", "")
     old_scope = old_info.get("scope", "private")
 
+    # 2. RETRACT: удаляем старый факт
     await service.forget(gcn_id, scope=old_scope, dry_run=False)
-    save_result = await service.remember(new_text.strip(), scope=old_scope)
+
+    # 3. CREATE: создаём новый факт с force_new=True (обходим дедупликацию)
+    save_result = await service.remember(
+        new_text.strip(),
+        scope=old_scope,
+        force_new=True,
+    )
+
+    # 4. ПЕРЕСТРОЙКА FAISS-ИНДЕКСА (исправление бага: recall не находил новый факт сразу)
+    memory_layer = {
+        "private": service.private_memory,
+        "shared": service.shared_memory,
+        "global": service.global_memory,
+    }.get(old_scope, service.private_memory)
+
+    # Помечаем как "грязный" (для консистентности с остальным кодом)
+    memory_layer.store._faiss_dirty = True
+
+    # Если индекс уже построен — перестраиваем немедленно
+    # Это быстро (не строим с нуля) и гарантирует, что следующий recall найдёт факт
+    if memory_layer.store.faiss_index is not None:
+        memory_layer.store.build_faiss_index(force=True)
 
     comment = f" Причина: {reason}" if reason else ""
     return {
         "status": "ok",
+        "gcn_id": save_result.get("id"),  # ← новый gcn_id для клиента
         "old_text": old_text,
         "new_text": new_text,
         "scope": old_scope,

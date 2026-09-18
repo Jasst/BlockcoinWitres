@@ -42,6 +42,7 @@ class MemoryService:
     - explain_fact, get_memory_stats
     - управление эпизодами (add_episode, get_episodes)
     """
+
     def __init__(self, user_id: str):
         self.user_id = user_id
         self.router = GCNMemoryRouter(user_id, MEMORY_BASE_DIR)
@@ -70,54 +71,73 @@ class MemoryService:
             results = [r for r in results if r.get('scope') == scope_lower]
         return results[:top_k]
 
-    async def remember(self, fact: str, scope: Optional[str] = None,
-                       confidence: float = 0.9) -> Dict[str, Any]:
+    async def remember(
+            self,
+            fact: str,
+            scope: Optional[str] = None,
+            confidence: float = 0.9,
+            force_new: bool = False,
+    ) -> Dict[str, Any]:
         """
         Сохраняет факт в указанный скоуп (автоопределение, если scope не задан).
         Возвращает id и скоуп.
-        
+
         ИСПРАВЛЕНИЕ #3: проверка дублей перед созданием нового факта.
+
+        force_new=True — обходит дедупликацию и гарантированно создаёт новую
+        запись с новым gcn_id даже при наличии семантически близких фактов.
+        Используется внутри update_fact(), чтобы «удалить старый + создать новый»
+        работало корректно без ложного слияния с другим существующим фактом.
         """
         self.refresh()
-        
-        # ── ИСПРАВЛЕНИЕ #3: проверка дубля ──────────────────────────────────────────
-        DEDUP_THRESHOLD = 0.88   # косинусное сходство
-        existing = await self.recall(fact, top_k=3, scope=scope)
-        for ex in existing:
-            if ex.get("score", 0) >= DEDUP_THRESHOLD:
-                ex_id = ex.get("gcn_id") or ex.get("id")
-                logger.info(f"[remember] дубль обнаружен (score={ex['score']:.2f}), "
-                            f"обновляю confidence вместо создания нового факта")
-                # Повысить confidence существующего факта
-                if ex_id:
-                    try:
-                        # Определяем правильный слой памяти по scope найденного факта
-                        scope_name = ex.get("scope", "private")
-                        memory_layer = {
-                            "private": self.router.private_memory,
-                            "shared": self.router.shared_memory,
-                            "global": self.router.global_memory,
-                        }.get(scope_name, self.router.private_memory)
-                        
-                        # Используем корректные методы MemoryStore: get() и update()
-                        ko = memory_layer.store.get(ex_id)
-                        if ko:
-                            new_confidence = min(1.0, max(ko.confidence, confidence))
-                            memory_layer.store.update(
-                                ex_id,
-                                {"confidence": new_confidence},
-                                actor=self.user_id
-                            )
-                    except Exception as e:
-                        logger.debug(f"[remember] не удалось обновить дубль {ex_id}: {e}")
-                return {"id": ex_id, "scope": ex.get("scope", "private"),
-                        "fact": ex.get("text", fact),  # ← добавлено
-                        "action": "updated_existing", "similarity": ex["score"]}
-        # ── конец проверки дубля ──────────────────────────────────────────
-        
+
+        # ── ИСПРАВЛЕНИЕ #3: проверка дубля (пропускаем если force_new=True) ─────────
+        if not force_new:
+            DEDUP_THRESHOLD = 0.88  # косинусное сходство
+            existing = await self.recall(fact, top_k=3, scope=scope)
+            for ex in existing:
+                if ex.get("score", 0) >= DEDUP_THRESHOLD:
+                    ex_id = ex.get("gcn_id") or ex.get("id")
+                    logger.info(f"[remember] дубль обнаружен (score={ex['score']:.2f}), "
+                                f"обновляю confidence вместо создания нового факта")
+                    # Повысить confidence существующего факта
+                    if ex_id:
+                        try:
+                            scope_name = ex.get("scope", "private")
+                            memory_layer = {
+                                "private": self.router.private_memory,
+                                "shared": self.router.shared_memory,
+                                "global": self.router.global_memory,
+                            }.get(scope_name, self.router.private_memory)
+
+                            ko = memory_layer.store.get(ex_id)
+                            if ko:
+                                new_confidence = min(1.0, max(ko.confidence, confidence))
+                                memory_layer.store.update(
+                                    ex_id,
+                                    {"confidence": new_confidence},
+                                    actor=self.user_id
+                                )
+                        except Exception as e:
+                            logger.debug(f"[remember] не удалось обновить дубль {ex_id}: {e}")
+                    return {
+                        "id": ex_id,
+                        "scope": ex.get("scope", "private"),
+                        "action": "deduplicated",
+                        "stored_fact": ex.get("text", fact),    # что реально хранится
+                        "requested_fact": fact,                  # что хотел пользователь
+                        "similarity": ex["score"],
+                    }
+        # ── конец проверки дубля ─────────────────────────────────────────────────────
+
         if scope is None:
-            if "глобально" in fact.lower() or "global" in fact.lower():
+            # Автодетекция scope: GLOBAL если есть ключевые слова, иначе PRIVATE
+            # SHARED недостижим через автодетекцию — требует явного указания
+            fact_lower = fact.lower()
+            if "глобально" in fact_lower or "global" in fact_lower:
                 scope_enum = MemoryScope.GLOBAL
+            elif "shared" in fact_lower or "общий" in fact_lower or "команд" in fact_lower:
+                scope_enum = MemoryScope.SHARED
             else:
                 scope_enum = MemoryScope.PRIVATE
         else:
@@ -135,9 +155,14 @@ class MemoryService:
             author=self.user_id,
             source_type="memory_service"
         )
-        # Добавляем в рабочую память
+        # Добавляем в рабочую память соответствующего слоя
         if obj_id:
-            self.private_memory.hierarchy.add_to_working(obj_id)
+            scope_memory = {
+                MemoryScope.GLOBAL: self.global_memory,
+                MemoryScope.SHARED: self.shared_memory,
+                MemoryScope.PRIVATE: self.private_memory,
+            }[scope_enum]
+            scope_memory.hierarchy.add_to_working(obj_id)
 
         # Сохраняем соответствующий слой
         await self._save_scope(scope_enum)
@@ -174,7 +199,7 @@ class MemoryService:
         """
         Удаляет факты, содержащие query, из указанного слоя.
         Если dry_run=True – только возвращает кандидаты.
-        
+
         ИСПРАВЛЕНИЕ: если query выглядит как gcn_id (начинается с 'fct_'),
         удаляем строго по ID, а не по подстроке текста.
         """
@@ -188,9 +213,11 @@ class MemoryService:
         if memory is None:
             return {"status": "error", "message": f"Неизвестный scope: {scope}"}
         memory.reload_if_stale()
-        
+
         # ИСПРАВЛЕНИЕ: удаление по gcn_id вместо поиска по подстроке
-        if query.startswith("fct_"):
+        # Поддерживаем все форматы ID: fct_, concept_, goal_, episode_
+        is_gcn_id = any(query.startswith(p) for p in ("fact_", "fct_", "concept_", "goal_", "episode_"))
+        if is_gcn_id:
             ko = memory.store.get(query)
             if not ko:
                 return {"status": "ok", "removed": 0, "scope": scope.lower(), "message": "Факт не найден."}
@@ -205,7 +232,7 @@ class MemoryService:
             memory.store.retract(query, self.user_id, reason="forget_by_id")
             await memory._schedule_save()
             return {"status": "ok", "removed": 1, "scope": scope.lower()}
-        
+
         # Старое поведение: поиск по подстроке текста
         to_remove = [f for f in memory.semantic_facts if query.lower() in f.text.lower()]
         if not to_remove:
@@ -520,6 +547,7 @@ _services: Dict[str, MemoryService] = {}
 _services_last_used: Dict[str, float] = {}
 _SERVICE_MAX_IDLE = 1800  # 30 минут
 _SERVICE_MAX_COUNT = 50
+
 
 async def get_memory_service(user_id: str) -> MemoryService:
     """Возвращает экземпляр MemoryService для пользователя, с выгрузкой неактивных."""

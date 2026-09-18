@@ -718,7 +718,9 @@ class CognitiveController:
                 await self._verify_pending_contradictions()
             except Exception as e:
                 logger.error(f"Contradiction verification error: {e}")
-            await asyncio.sleep(DEEP_CONSOLIDATION_INTERVAL - CONSOLIDATION_INTERVAL)
+            # Защита от отрицательного интервала, если DEEP < LIGHT
+            extra_sleep = max(0, DEEP_CONSOLIDATION_INTERVAL - CONSOLIDATION_INTERVAL)
+            await asyncio.sleep(extra_sleep)
             try:
                 await self.memory_service.private_memory.deep_consolidation()
             except Exception as e:
@@ -3119,7 +3121,9 @@ async def _global_merge_loop():
             await shared_mem.light_consolidation()
         except Exception as e:
             logger.error(f"Global light consolidation error: {e}")
-        await asyncio.sleep(DEEP_CONSOLIDATION_INTERVAL - CONSOLIDATION_INTERVAL)
+        # Защита от отрицательного интервала, если DEEP < LIGHT
+        extra_sleep = max(0, DEEP_CONSOLIDATION_INTERVAL - CONSOLIDATION_INTERVAL)
+        await asyncio.sleep(extra_sleep)
         try:
             await global_mem.deep_consolidation()
             await shared_mem.deep_consolidation()
