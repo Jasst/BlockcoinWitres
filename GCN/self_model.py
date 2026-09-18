@@ -39,7 +39,9 @@ class SelfState:
                load_factor: float = 0.0) -> None:
         """Обновляет состояние на основе результата действия."""
         now = time.time()
-        decay = 0.05 * (now - self.last_update)  # медленный распад
+        # Медленный распад: коэффициент нормирован на минуты (не секунды)
+        # 0.001 × минуты: стресс спадает до 0 за ~17 минут бездействия
+        decay = 0.001 * ((now - self.last_update) / 60)
         
         if success is True:
             self.confidence = min(1.0, self.confidence + 0.05)
@@ -173,14 +175,18 @@ class SelfModel:
         self._update_self_concept(action_type, success)
         
         # === НОВОЕ: Калибровка уверенности (Brier score buckets) ===
-        self._record_calibration(confidence, success)
+        self._record_calibration(confidence, success, action_type)
         
         self.save()
     
-    def _record_calibration(self, predicted_confidence: float, actual_success: bool) -> None:
-        """Записывает результат в бакет калибровки для последующей коррекции уверенности."""
+    def _record_calibration(self, predicted_confidence: float, actual_success: bool, action_type: str = None) -> None:
+        """Записывает результат в бакет калибровки для последующей коррекции уверенности.
+        
+        ИСПРАВЛЕНИЕ: ключ включает action_type для разделения статистики по типам действий.
+        """
         bucket = round(predicted_confidence * 10) / 10  # 0.0, 0.1, ..., 1.0
-        bucket_key = f"calibration_bucket_{bucket}"
+        action_prefix = action_type if action_type else "generic"
+        bucket_key = f"calib_{action_prefix}_bucket_{bucket}"
         
         if bucket_key not in self.self_concept:
             self.self_concept[bucket_key] = {"n": 0, "success": 0}
@@ -189,7 +195,7 @@ class SelfModel:
         b["n"] += 1
         b["success"] += int(actual_success)
     
-    def get_calibrated_confidence(self, predicted: float) -> float:
+    def get_calibrated_confidence(self, predicted: float, action_type: str = None) -> float:
         """
         Возвращает калиброванную вероятность успеха для заявленной уверенности.
         
@@ -197,9 +203,12 @@ class SelfModel:
         вернёт 0.6. Это радикально улучшает метакогницию.
         
         Использует Bayesian-сглаживание для плавного перехода при малом количестве данных.
+        
+        ИСПРАВЛЕНИЕ: использует отдельные бакеты для каждого типа действия.
         """
         bucket = round(predicted * 10) / 10
-        bucket_key = f"calibration_bucket_{bucket}"
+        action_prefix = action_type if action_type else "generic"
+        bucket_key = f"calib_{action_prefix}_bucket_{bucket}"
         
         b = self.self_concept.get(bucket_key, {"n": 0, "success": 0})
         
@@ -312,8 +321,8 @@ class SelfModel:
         raw_confidence = (base * 0.4 + skill_level * 0.6)
         
         # === НОВОЕ: Применяем калибровку ===
-        # Вместо сырой уверенности используем калиброванную
-        return self.get_calibrated_confidence(raw_confidence)
+        # Вместо сырой уверенности используем калиброванную (теперь с учётом типа действия)
+        return self.get_calibrated_confidence(raw_confidence, action_type)
     
     def is_overloaded(self) -> bool:
         """Проверяет, перегружена ли система."""

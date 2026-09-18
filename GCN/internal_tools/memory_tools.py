@@ -30,17 +30,17 @@ def register(registry: ToolRegistry, controller) -> None:
         if not results:
             return "Ничего не найдено."
         lines = []
-        for f in results[:5]:
+        for f in results[:top_k]:
             lines.append(f"- {f['text']} (уверенность: {f.get('confidence', 0.5):.2f})")
         return "\n".join(lines)
 
     async def _internal_remember(args: Dict) -> str:
         fact = args.get("fact", "")
-        scope = args.get("scope", "private")
+        scope = args.get("scope")  # None = автодетекция
         result = await controller.memory_service.remember(fact, scope)
         if result.get("id"):
             returned_fact = result.get("fact") or fact
-            return f"Запомнил: {returned_fact} (скоуп: {scope})"
+            return f"Запомнил: {returned_fact} (скоуп: {result.get('scope', 'unknown')})"
         return "Не удалось запомнить."
 
     async def _internal_add_goal(args: Dict) -> str:
