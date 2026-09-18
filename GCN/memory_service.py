@@ -149,9 +149,14 @@ class MemoryService:
             author=self.user_id,
             source_type="memory_service"
         )
-        # Добавляем в рабочую память
+        # Добавляем в рабочую память соответствующего слоя
         if obj_id:
-            self.private_memory.hierarchy.add_to_working(obj_id)
+            scope_memory = {
+                MemoryScope.GLOBAL: self.global_memory,
+                MemoryScope.SHARED: self.shared_memory,
+                MemoryScope.PRIVATE: self.private_memory,
+            }[scope_enum]
+            scope_memory.hierarchy.add_to_working(obj_id)
 
         # Сохраняем соответствующий слой
         await self._save_scope(scope_enum)
@@ -204,7 +209,9 @@ class MemoryService:
         memory.reload_if_stale()
 
         # ИСПРАВЛЕНИЕ: удаление по gcn_id вместо поиска по подстроке
-        if query.startswith("fct_"):
+        # Поддерживаем все форматы ID: fct_, concept_, goal_, episode_
+        is_gcn_id = any(query.startswith(p) for p in ("fct_", "concept_", "goal_", "episode_"))
+        if is_gcn_id:
             ko = memory.store.get(query)
             if not ko:
                 return {"status": "ok", "removed": 0, "scope": scope.lower(), "message": "Факт не найден."}

@@ -1048,10 +1048,10 @@ async def update_fact(
     service = await get_memory_service(uid)
 
     old_info = await service.explain_fact(gcn_id)
-    if old_info.get("status") == "error" or "not found" in str(old_info.get("error", "")).lower():
+    if "error" in old_info:
         return {
             "status": "error",
-            "message": f"Факт с gcn_id='{gcn_id}' не найден: {old_info}",
+            "message": f"Факт не найден: {old_info['error']}",
         }
 
     old_text = old_info.get("subject") or old_info.get("text", "")
