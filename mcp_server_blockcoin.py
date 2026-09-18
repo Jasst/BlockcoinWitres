@@ -1058,11 +1058,19 @@ async def update_fact(
     old_scope = old_info.get("scope", "private")
 
     await service.forget(gcn_id, scope=old_scope, dry_run=False)
-    save_result = await service.remember(new_text.strip(), scope=old_scope)
+
+    # force_new=True обходит дедупликацию: гарантированно создаём НОВЫЙ факт
+    # с новым gcn_id, не сливаясь с семантически близким существующим.
+    save_result = await service.remember(
+        new_text.strip(),
+        scope=old_scope,
+        force_new=True,
+    )
 
     comment = f" Причина: {reason}" if reason else ""
     return {
         "status": "ok",
+        "gcn_id": save_result.get("id"),      # ← новый gcn_id для клиента
         "old_text": old_text,
         "new_text": new_text,
         "scope": old_scope,
