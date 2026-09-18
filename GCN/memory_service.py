@@ -123,15 +123,21 @@ class MemoryService:
                     return {
                         "id": ex_id,
                         "scope": ex.get("scope", "private"),
-                        "fact": ex.get("text", fact),
-                        "action": "updated_existing",
+                        "action": "deduplicated",
+                        "stored_fact": ex.get("text", fact),    # что реально хранится
+                        "requested_fact": fact,                  # что хотел пользователь
                         "similarity": ex["score"],
                     }
         # ── конец проверки дубля ─────────────────────────────────────────────────────
 
         if scope is None:
-            if "глобально" in fact.lower() or "global" in fact.lower():
+            # Автодетекция scope: GLOBAL если есть ключевые слова, иначе PRIVATE
+            # SHARED недостижим через автодетекцию — требует явного указания
+            fact_lower = fact.lower()
+            if "глобально" in fact_lower or "global" in fact_lower:
                 scope_enum = MemoryScope.GLOBAL
+            elif "shared" in fact_lower or "общий" in fact_lower or "команд" in fact_lower:
+                scope_enum = MemoryScope.SHARED
             else:
                 scope_enum = MemoryScope.PRIVATE
         else:
