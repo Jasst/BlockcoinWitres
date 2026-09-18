@@ -1,7 +1,12 @@
 {
   "mcpServers": {
     "blockcoin-memory": {
-      "url": "https://blockcoin.ru/mcp/"
+      "command": "mcp-remote",
+      "args": [
+        "https://blockcoin.ru/mcp/",
+        "--header",
+        "X-User-Id: e9a751094d1740e4c68233e16fbe8a92317cdd2e73154c5a39cd850f9e809828"
+      ]
     }
   }
 }
