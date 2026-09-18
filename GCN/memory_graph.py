@@ -170,7 +170,10 @@ class CognitiveMemory:
         if self.use_embeddings:
             try:
                 self.embedder = self._get_shared_embedder(EMBEDDING_MODEL)
-                self.embedding_dim = self.embedder.get_sentence_embedding_dimension()
+                # стало (с fallback для старых версий)
+                get_dim = getattr(self.embedder, "get_embedding_dimension", None) \
+                          or self.embedder.get_sentence_embedding_dimension
+                self.embedding_dim = get_dim()
             except Exception as e:
                 logger.error(f"Embeddings init failed: {e}. Disabling.")
                 self.use_embeddings = False
