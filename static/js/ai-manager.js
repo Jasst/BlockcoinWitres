@@ -497,7 +497,7 @@ function _clearAiHistory() {
         if (!text) return '';
         try {
             // ИСПРАВЛЕНИЕ v2: модель может генерировать рассуждение без маркеров.
-            // Распознаём по ключевым фразам в начале ответа и разделяем по двойному переносу строки.
+            // Распознаём по ключевым фразам в начале ответа, XML-тегам <thought> и разделяем по двойному переносу строки.
             const reasoningStartPatterns = [
                 /^сначала я подумаю/i,
                 /^рассужда[ею]м/i,
@@ -518,10 +518,25 @@ function _clearAiHistory() {
             let reasoningHtml = '';
             let mainText = text;
             
-            // Проверяем, начинается ли текст с рассуждения
-            const hasReasoningStart = reasoningStartPatterns.some(pat => pat.test(text));
-            
-            if (hasReasoningStart) {
+            // Сначала проверяем наличие тегов <thought>...</thought> (новый формат)
+            const thoughtMatch = text.match(/<thought>([\s\S]*?)<\/thought>\s*\n\s*\n([\s\S]*)/i);
+            if (thoughtMatch) {
+                const reasoningContent = thoughtMatch[1].trim();
+                mainText = thoughtMatch[2].trim();
+                
+                if (reasoningContent.length > 0) {
+                    reasoningHtml = `
+                        <div class="reasoning-block">
+                            <details>
+                                <summary>💭 Reasoning</summary>
+                                <div class="reasoning-content">${marked.parse(reasoningContent)}</div>
+                            </details>
+                        </div>
+                    `;
+                }
+            }
+            // Если теги не найдены, проверяем старый формат с ключевыми фразами
+            else if (reasoningStartPatterns.some(pat => pat.test(text))) {
                 // Ищем двойной перенос строки как разделитель между рассуждением и ответом
                 // Важно: разбиваем только по первому вхождению \n\n, чтобы не ломать ответ внутри
                 const doubleNewlineIndex = text.indexOf('\n\n');
