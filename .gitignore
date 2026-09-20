@@ -1,1 +1,1 @@
-Nothing needs to be added to .gitignore since only a Python source file (`routes/ai_assistant.py`) was modified and no build artifacts, dependencies, or temporary files were detected in the changes.
+(routes/ai_assistant.py, static/js/ai-manager.js)
