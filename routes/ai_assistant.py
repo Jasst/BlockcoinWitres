@@ -2711,7 +2711,9 @@ class CognitiveController:
                             "content": build_tool_trace_context(tool_trace) + "\n\nТеперь дай финальный ответ пользователю."
                         })
 
-                    async for token in call_llm_stream(messages, max_tokens=DEFAULT_MAX_TOKENS):
+                    # Для reasoning mode добавляем stop-токены, чтобы модель не уходила в бесконечные рассуждения
+                    stream_stop_tokens = ["\n\n\n", "USER:", "Human:"] if reasoning else None
+                    async for token in call_llm_stream(messages, max_tokens=DEFAULT_MAX_TOKENS, stop=stream_stop_tokens):
                         full_response += token
                         await push(f"data: {json.dumps({'token': token})}\n\n")
                 else:
