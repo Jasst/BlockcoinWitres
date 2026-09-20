@@ -103,7 +103,8 @@ async def call_llm(
 async def call_llm_stream(
     messages: List[Dict[str, str]],
     temp: float = 0.7,
-    max_tokens: int = DEFAULT_MAX_TOKENS
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    stop: Optional[List[str]] = None
 ):
     """Потоковый вызов LLM (LM Studio) с теми же параметрами, что и call_llm."""
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
@@ -114,8 +115,11 @@ async def call_llm_stream(
         "max_tokens": max_tokens,
         "stream": True,
     }
+    if stop:
+        payload["stop"] = stop
     timeout = aiohttp.ClientTimeout(total=LM_STUDIO_STREAM_TIMEOUT)
     stream_did_complete = False
+    finish_reason = None
     try:
         session = await _get_session()
         async with session.post(LM_STUDIO_URL, json=payload, headers=headers, timeout=timeout) as resp:
@@ -125,7 +129,7 @@ async def call_llm_stream(
                 yield "[Ошибка LLM]"
                 return
             # Используем readline() для корректного чтения SSE-строк
-            async for line in resp.content.readline():
+            async for line in resp.content:
                 if not line:
                     # Пустая строка — конец потока (бэкенд мог закрыть соединение без [DONE])
                     break
@@ -140,12 +144,18 @@ async def call_llm_stream(
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                content = chunk.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                delta = chunk.get('choices', [{}])[0].get('delta', {})
+                content = delta.get('content', '')
+                # Сохраняем finish_reason из последнего чанка
+                if 'finish_reason' in chunk.get('choices', [{}])[0]:
+                    finish_reason = chunk['choices'][0]['finish_reason']
                 if content:
                     yield content
             # Если поток завершился без [DONE], логируем предупреждение
             if not stream_did_complete:
-                logger.warning("LLM stream ended without [DONE] marker — possible truncation")
+                logger.warning(f"LLM stream ended without [DONE] marker — possible truncation (finish_reason={finish_reason})")
+            elif finish_reason:
+                logger.debug(f"LLM stream completed with finish_reason: {finish_reason}")
     except asyncio.CancelledError:
         logger.debug("Stream cancelled")
         raise

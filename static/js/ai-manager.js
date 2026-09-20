@@ -523,20 +523,34 @@ function _clearAiHistory() {
             
             if (hasReasoningStart) {
                 // Ищем двойной перенос строки как разделитель между рассуждением и ответом
-                const parts = text.split(/\n\s*\n/);
-                if (parts.length >= 2) {
+                // Важно: разбиваем только по первому вхождению \n\n, чтобы не ломать ответ внутри
+                const doubleNewlineIndex = text.indexOf('\n\n');
+                if (doubleNewlineIndex !== -1 && doubleNewlineIndex > 0) {
                     // Первая часть — рассуждение, остальное — ответ
-                    const reasoningContent = parts[0].trim();
-                    mainText = parts.slice(1).join('\n\n').trim();
+                    const reasoningContent = text.substring(0, doubleNewlineIndex).trim();
+                    mainText = text.substring(doubleNewlineIndex + 2).trim();
                     
-                    reasoningHtml = `
-                        <div class="reasoning-block">
-                            <details>
-                                <summary>💭 Reasoning</summary>
-                                <div class="reasoning-content">${marked.parse(reasoningContent)}</div>
-                            </details>
-                        </div>
-                    `;
+                    if (mainText.length > 0) {
+                        reasoningHtml = `
+                            <div class="reasoning-block">
+                                <details>
+                                    <summary>💭 Reasoning</summary>
+                                    <div class="reasoning-content">${marked.parse(reasoningContent)}</div>
+                                </details>
+                            </div>
+                        `;
+                    } else {
+                        // Если после \n\n нет текста, считаем весь текст рассуждением
+                        reasoningHtml = `
+                            <div class="reasoning-block">
+                                <details>
+                                    <summary>💭 Reasoning</summary>
+                                    <div class="reasoning-content">${marked.parse(text)}</div>
+                                </details>
+                            </div>
+                        `;
+                        mainText = '';
+                    }
                 } else {
                     // Если нет явного разделения, считаем весь текст рассуждением + добавляем подсказку
                     reasoningHtml = `
