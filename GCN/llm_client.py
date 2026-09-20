@@ -115,6 +115,7 @@ async def call_llm_stream(
         "stream": True,
     }
     timeout = aiohttp.ClientTimeout(total=LM_STUDIO_STREAM_TIMEOUT)
+    stream_did_complete = False
     try:
         session = await _get_session()
         async with session.post(LM_STUDIO_URL, json=payload, headers=headers, timeout=timeout) as resp:
@@ -123,12 +124,17 @@ async def call_llm_stream(
                 logger.error(f"Stream error {resp.status}: {error_text[:200]}")
                 yield "[Ошибка LLM]"
                 return
-            async for line in resp.content:
+            # Используем readline() для корректного чтения SSE-строк
+            async for line in resp.content.readline():
+                if not line:
+                    # Пустая строка — конец потока (бэкенд мог закрыть соединение без [DONE])
+                    break
                 line = line.decode('utf-8').strip()
                 if not line or not line.startswith('data: '):
                     continue
                 data = line[6:]
                 if data == '[DONE]':
+                    stream_did_complete = True
                     break
                 try:
                     chunk = json.loads(data)
@@ -137,6 +143,9 @@ async def call_llm_stream(
                 content = chunk.get('choices', [{}])[0].get('delta', {}).get('content', '')
                 if content:
                     yield content
+            # Если поток завершился без [DONE], логируем предупреждение
+            if not stream_did_complete:
+                logger.warning("LLM stream ended without [DONE] marker — possible truncation")
     except asyncio.CancelledError:
         logger.debug("Stream cancelled")
         raise
