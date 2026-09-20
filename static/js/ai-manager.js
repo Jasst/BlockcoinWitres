@@ -505,6 +505,14 @@ function _clearAiHistory() {
                 /^анализ/i,
                 /^подума[ею]м/i,
                 /^сначала разбер[уё]м/i,
+                // English patterns for reasoning mode
+                /^first let me think/i,
+                /^let me think/i,
+                /^my reasoning/i,
+                /^my thought/i,
+                /^reasoning:/i,
+                /^thought process/i,
+                /^analysis:/i,
             ];
             
             let reasoningHtml = '';
@@ -529,6 +537,17 @@ function _clearAiHistory() {
                             </details>
                         </div>
                     `;
+                } else {
+                    // Если нет явного разделения, считаем весь текст рассуждением + добавляем подсказку
+                    reasoningHtml = `
+                        <div class="reasoning-block">
+                            <details>
+                                <summary>💭 Reasoning</summary>
+                                <div class="reasoning-content">${marked.parse(text)}</div>
+                            </details>
+                        </div>
+                    `;
+                    mainText = '';
                 }
             } else {
                 // Старый формат с "---" разделителем (для обратной совместимости)
@@ -547,7 +566,9 @@ function _clearAiHistory() {
                     mainText = text.replace(match[0], '').trim();
                 }
             }
-            let html = marked.parse(mainText);
+            
+            // Если mainText пуст, но есть reasoningHtml, показываем только рассуждение
+            let html = mainText ? marked.parse(mainText) : '';
             // ИСПРАВЛЕНИЕ: marked оборачивает голые URL в <a href="URL">URL</a>.
             // Ссылки на сгенерированные изображения (не-stream ответы, текст
             // результатов инструментов) превращаем в <img>, иначе картинка
