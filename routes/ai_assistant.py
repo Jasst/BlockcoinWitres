@@ -917,7 +917,15 @@ class CognitiveController:
         if not plan:
             return response
         try:
-            missed = await intellect_mod.plan_critic(message, plan, response)
+            missed = await asyncio.wait_for(
+                intellect_mod.plan_critic(message, plan, response),
+                timeout=PLAN_CRITIC_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.debug(
+                f"[PlanCritic] plan_critic timed out after {PLAN_CRITIC_TIMEOUT}s, skipping"
+            )
+            return response
         except Exception as e:
             logger.debug(f"plan_critic failed: {e}")
             return response
@@ -925,17 +933,25 @@ class CognitiveController:
             return response
         logger.info(f"[PlanCritic] Пропущены пункты плана: {missed}")
         try:
-            extra = await call_llm(
-                [{"role": "user", "content": (
-                    f"Твой предыдущий ответ пользователю не раскрыл части его запроса.\n"
-                    f"Запрос: {message}\nПлан подзадач: {plan}\n"
-                    f"Пропущено: {missed}\n\n"
-                    "Дополни ответ, закрыв пропущенные пункты. Пиши ТОЛЬКО "
-                    "дополнение, не повторяй уже сказанное. Если для пункта нет "
-                    "данных — прямо скажи об этом."
-                )}],
-                temp=0.5, max_tokens=700
+            extra = await asyncio.wait_for(
+                call_llm(
+                    [{"role": "user", "content": (
+                        f"Твой предыдущий ответ пользователю не раскрыл части его запроса.\n"
+                        f"Запрос: {message}\nПлан подзадач: {plan}\n"
+                        f"Пропущено: {missed}\n\n"
+                        "Дополни ответ, закрыв пропущенные пункты. Пиши ТОЛЬКО "
+                        "дополнение, не повторяй уже сказанное. Если для пункта нет "
+                        "данных — прямо скажи об этом."
+                    )}],
+                    temp=0.5, max_tokens=700
+                ),
+                timeout=PLAN_CRITIC_TIMEOUT * 2,  # добор может быть длиннее одной проверки
             )
+        except asyncio.TimeoutError:
+            logger.debug(
+                f"[PlanCritic] LLM-добор timed out after {PLAN_CRITIC_TIMEOUT * 2}s, skipping"
+            )
+            return response
         except Exception as e:
             logger.debug(f"PlanCritic добор не удался: {e}")
             return response
@@ -1056,8 +1072,16 @@ class CognitiveController:
             response=response[:4000],
         )
         try:
-            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.0,
-                                 max_tokens=VERIFICATION_MAX_TOKENS)
+            raw = await asyncio.wait_for(
+                call_llm([{"role": "user", "content": prompt}], temp=0.0,
+                         max_tokens=VERIFICATION_MAX_TOKENS),
+                timeout=VERIFY_RESPONSE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.debug(
+                f"[VerifyResponse] LLM timed out after {VERIFY_RESPONSE_TIMEOUT}s, skipping"
+            )
+            return None
         except Exception as e:
             logger.debug(f"Response verification step failed, skipping: {e}")
             return None
@@ -1354,7 +1378,7 @@ class CognitiveController:
         goal_hint = ""
         if active_goals:
             goal_hint = "Активные цели: " + ", ".join([g["description"] for g in active_goals[:2]])
-        
+
         # УЛУЧШЕНИЕ №3: Goal-directed retrieval bias — дополнительный поиск по активным целям
         relevant_with_boost = list(relevant)  # копируем базовый результат
         if active_goals and len(active_goals) > 0:
@@ -1368,7 +1392,7 @@ class CognitiveController:
                         item_copy["_goal_boosted"] = True
                         item_copy["_score"] = item_copy.get("_score", item_copy.get("score", 0.5)) + 0.15
                         goal_relevant.append(item_copy)
-                
+
                 # Merge с dedup по gcn_id или text
                 seen_ids = {f.get("gcn_id") or f["text"][:100]: i for i, f in enumerate(relevant_with_boost)}
                 for item in goal_relevant:
@@ -1385,7 +1409,7 @@ class CognitiveController:
                     else:
                         relevant_with_boost.append(item)
                         seen_ids[key] = len(relevant_with_boost) - 1
-                
+
                 # Сортируем по score с учётом буста
                 relevant_with_boost.sort(key=lambda x: x.get("_score", x.get("score", 0)), reverse=True)
                 relevant_with_boost = relevant_with_boost[:7]  # ограничиваем размер
@@ -1569,7 +1593,7 @@ class CognitiveController:
             })
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
-            
+
             # УЛУЧШЕНИЕ №4: Немедленный Hebbian update при высокой ошибке предсказания
             if error > 0.65 and self.current_working_memory:
                 try:
@@ -1586,7 +1610,7 @@ class CognitiveController:
                         )
                 except Exception as e:
                     logger.debug(f"[Hebbian] spread_activation on error failed: {e}")
-            
+
             if (error > 0.85
                     and len(response) > 50
                     and not response.strip().lower().startswith(("привет", "здравствуйте", "hello"))
@@ -1603,7 +1627,7 @@ class CognitiveController:
                 tool_success = bool(tool_trace) and len(response) > 20 and not response.startswith("[Ошибка")
                 reasoning_success = len(response) > 20 and not response.startswith("[Ошибка")
                 action_type = "tool_call" if tool_trace else "reasoning"
-                
+
                 self.self_model.record_action(
                     action_type=action_type,
                     description=message[:100],  # описание запроса, не ответа
@@ -1618,7 +1642,7 @@ class CognitiveController:
                 )
             except Exception as e:
                 logger.debug(f"[SelfModel] ошибка записи действия: {e}")
-        
+
         return response
 
     # ===== ПРОЦЕССИНГ ВХОДА (изменён: добавлена классификация и автоизвлечение) =====
@@ -1669,7 +1693,7 @@ class CognitiveController:
                 web_search or reasoning or has_url
                 or search_meta.get("search_requested") or _is_code_query
         )
-        
+
         # РЕШЕНИЕ (нужен ли инструмент) через ToolRouter
         history_tail = "\n".join(
             f"{m.get('role')}: {str(m.get('content'))[:200]}" for m in self.history[-6:]
@@ -1680,7 +1704,7 @@ class CognitiveController:
                 f"internal__web_search]\n{history_tail}" if history_tail else
                 "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри вызов internal__web_search]"
             )
-        
+
         # УЛУЧШЕНИЕ №2: Metacognitive gate перед выполнением инструмента
         if hasattr(self, 'self_model') and self.self_model is not None:
             try:
@@ -2554,6 +2578,11 @@ class CognitiveController:
             full_response = ""
             tool_trace: List[Dict[str, Any]] = []
             already_verified = False
+            # Флаг ошибки внутреннего стрима. Раньше inner except делал `return`,
+            # из-за чего await push("[DONE]") никогда не достигался и frontend
+            # оставался в _isSending=true с заблокированным полем ввода.
+            # Теперь: флаг выставляется вместо return, [DONE] уходит всегда.
+            _stream_error = False
             try:
                 if LM_STUDIO_USE_STREAM:
                     history_tail = "\n".join(
@@ -2569,7 +2598,7 @@ class CognitiveController:
                     tool_trace = tool_run.get("tool_trace", [])
                     # Детерминированный вызов code-tools (см. _force_code_tool_if_requested)
                     await self._force_code_tool_if_requested(message, tool_trace)
-                    
+
                     # === ИСПРАВЛЕНИЕ: активное уточнение ПОСЛЕ ReAct-цикла (для stream) ===
                     if not skip_clarification_before_react:
                         post_react_uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
@@ -2588,7 +2617,7 @@ class CognitiveController:
                                 self.history.append({"role": "assistant", "content": clarification})
                                 self._save_history()
                                 return
-                    
+
                     logger.info(
                         f"ToolRouter decisions for '{message[:50]}': used_native={tool_run.get('used_native')}, trace_len={len(tool_trace)}")
                     logger.info(f"Tool trace: {tool_trace}")
@@ -2703,14 +2732,62 @@ class CognitiveController:
                             await push(f"data: {json.dumps({'token': word + ' '})}\n\n")
             except Exception as e:
                 logger.error(f"Stream error: {e}")
+                _stream_error = True
                 await push(f"data: {json.dumps({'error': str(e)})}\n\n")
-                return
+                # НЕ делаем return — [DONE] должен уйти в любом случае,
+                # иначе frontend остаётся с _isSending=true навсегда.
 
-            if full_response and not already_verified:
+            if not _stream_error and full_response and not already_verified:
                 # Единый хвост обработки (история, память, верификация,
                 # цели, prediction error) — см. _finalize_answer.
-                full_response = await self._finalize_answer(
-                    message, full_response, search_meta, tool_trace, push=push)
+                # asyncio.wait_for гарантирует, что зависший LLM-вызов
+                # внутри (plan_critic / verify_response) не задержит [DONE]:
+                # при превышении FINALIZE_ANSWER_TIMEOUT вся постобработка
+                # переносится в фоновую задачу (push=None → токены не пушатся
+                # после [DONE]), а ввод разблокируется немедленно.
+                try:
+                    full_response = await asyncio.wait_for(
+                        self._finalize_answer(
+                            message, full_response, search_meta, tool_trace, push=push),
+                        timeout=FINALIZE_ANSWER_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[stream] _finalize_answer timeout ({FINALIZE_ANSWER_TIMEOUT}s) — "
+                        "история/память сохраняются в фоне, [DONE] отправляется немедленно"
+                    )
+                    # push=None: фоновая задача не пушит токены после [DONE]
+                    self._spawn_background_task(
+                        self._finalize_answer(
+                            message, full_response, search_meta, tool_trace, push=None),
+                        name="finalize-timeout-bg",
+                    )
+                except Exception as _fe:
+                    logger.error(f"_finalize_answer error in stream: {_fe}")
+                    # Минимальное синхронное сохранение, чтобы история не потерялась
+                    try:
+                        self.history.append({"role": "user", "content": message})
+                        self.history.append({"role": "assistant", "content": full_response})
+                        self._save_history()
+                        self._last_exchange = {
+                            "user": message, "assistant": full_response,
+                            "timestamp": time.time(),
+                        }
+                    except Exception:
+                        pass
+            elif _stream_error and full_response:
+                # Стрим упал с ошибкой, но часть ответа уже накоплена —
+                # минимально сохраняем её в историю, чтобы контекст не терялся.
+                try:
+                    self.history.append({"role": "user", "content": message})
+                    self.history.append({"role": "assistant", "content": full_response})
+                    self._save_history()
+                    self._last_exchange = {
+                        "user": message, "assistant": full_response,
+                        "timestamp": time.time(),
+                    }
+                except Exception:
+                    pass
 
             await push("data: [DONE]\n\n")
         except asyncio.CancelledError:
