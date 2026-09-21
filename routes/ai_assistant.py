@@ -17,6 +17,41 @@ import asyncio
 import time
 import re
 from typing import Dict, Optional, Any, List, Tuple
+
+def _split_reasoning(text: str) -> Tuple[str, str]:
+    """
+    Разделяет сырой ответ модели на рассуждение и финальный ответ.
+    Возвращает (reasoning, answer). Если теги <thought> не найдены —
+    reasoning будет пустой строкой, answer = весь текст.
+    """
+    if not text:
+        return "", ""
+    # Пробуем найти XML-теги <thought>...</thought> с любым количеством whitespace между ними и ответом
+    thought_match = re.search(r'<thought>([\s\S]*?)</thought>\s*(?:\n\s*)*\n(.+)', text, re.IGNORECASE)
+    if thought_match:
+        return thought_match.group(1).strip(), thought_match.group(2).strip()
+    # Старый формат без тегов: рассуждение начинается с ключевых фраз
+    reasoning_start_patterns = [
+        r'^сначала я подумаю',
+        r'^рассужда[ею]м',
+        r'^ход мыслей',
+        r'^анализ',
+        r'^подума[ею]м',
+        r'^сначала разбер[уё]м',
+    ]
+    pattern = '|'.join(reasoning_start_patterns)
+    match = re.match(f'({pattern})[^\\n]*\\s*\\n\\s*\\n', text, re.IGNORECASE)
+    if match:
+        # Удаляем всё до первого \n\n
+        rest = re.sub(f'({pattern})[^\\n]*\\s*\\n\\s*\\n', '', text, flags=re.IGNORECASE).strip()
+        return text[:match.end()].strip(), rest or text
+    # Для обратной совместимости со старым форматом "---"
+    if '---' in text and ('РАССУЖДЕНИЕ' in text or '💭' in text):
+        parts = re.split(r'\\s*---\\s*', text, maxsplit=1)
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip()
+    return "", text
+
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
@@ -1531,32 +1566,32 @@ class CognitiveController:
             # ИСПРАВЛЕНИЕ v3: парсинг рассуждения в формате <thought>...</thought>.
             # Модель генерирует: <thought>рассуждение</thought>\n\nфинальный ответ
             # Нужно извлечь только финальный ответ для сохранения в историю.
-            stored_response = response
-            # Сначала пробуем найти XML-теги <thought>
-            thought_match = re.search(r'<thought>[\s\S]*?</thought>\s*\n\s*\n(.+)', response)
-            if thought_match:
-                stored_response = thought_match.group(1).strip()
-            else:
-                # Старый формат без тегов: рассуждение начинается с ключевых фраз
-                reasoning_start_patterns = [
-                    r'^сначала я подумаю',
-                    r'^рассужда[ею]м',
-                    r'^ход мыслей',
-                    r'^анализ',
-                    r'^подума[ею]м',
-                    r'^сначала разбер[уё]м',
-                ]
-                pattern = '|'.join(reasoning_start_patterns)
-                # Если текст начинается с рассуждения, удаляем всё до первого \n\n
-                stored_response = re.sub(
-                    f'({pattern})[^\\n]*\\s*\\n\\s*\\n',
-                    '',
-                    response,
-                    flags=re.IGNORECASE
-                ).strip() or response
-                # Для обратной совместимости со старым форматом "---"
-                stored_response = re.sub(r'(?:💭\s*)?РАССУЖДЕНИЕ:\s*[\s\S]*?---\s*', '', stored_response).strip() or stored_response
-            self.history.append({"role": "assistant", "content": stored_response})
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
+            _, stored_response = _split_reasoning(response)
         self._save_history()
 
         if response:
@@ -2316,7 +2351,7 @@ class CognitiveController:
             system_parts.append(f"Возможное продолжение темы: {', '.join(predictions[:3])}.")
         if goal_hint:
             system_parts.append(f"Учитывай активные цели: {goal_hint}.")
-        if reasoning:
+        if reasoning and REASONING_FORCE_TAGS:
             # ИСПРАВЛЕНИЕ v6: Критически важная инструкция для режима рассуждений.
             # Модель ОБЯЗАНА начать ответ с тега <thought> и завершить его </thought>,
             # затем два перевода строки и финальный ответ.
@@ -2337,6 +2372,19 @@ class CognitiveController:
                 "- Используй ТОЛЬКО XML-теги <thought> и </thought>\n"
                 "- Убедись, что после </thought> есть ДВА перевода строки перед ответом"
             )
+            # Добавляем few-shot примеры если включено
+            if REASONING_FEW_SHOT:
+                system_parts.append(
+                    "\n=== ПРИМЕРЫ (few-shot) ===\n"
+                    "Вопрос: Сколько будет 2+2?\n"
+                    "<thought>Пользователь спрашивает простую арифметику. 2+2=4.\n"
+                    "</thought>\n\n"
+                    "Ответ: 4\n\n"
+                    "Вопрос: Кто написал Войну и мир?\n"
+                    "<thought>Нужно вспомнить автора романа. Это Лев Толстой.\n"
+                    "</thought>\n\n"
+                    "Ответ: Лев Толстой"
+                )
         if search_context:
             system_parts.append(
                 "Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
@@ -2729,7 +2777,7 @@ class CognitiveController:
                     # рассуждения и ответа. Три переноса строки могли возникнуть после
                     # рассуждения, и поток обрывался ДО финального ответа.
                     # Теперь модель генерирует полный ответ согласно инструкции в промпте.
-                    stream_stop_tokens = ["USER:", "Human:"] if reasoning else None
+                    stream_stop_tokens = REASONING_STOP_TOKENS if reasoning and REASONING_STOP_TOKENS else None
                     async for token in call_llm_stream(messages, max_tokens=DEFAULT_MAX_TOKENS, stop=stream_stop_tokens):
                         full_response += token
                         await push(f"data: {json.dumps({'token': token})}\n\n")

@@ -22,6 +22,16 @@ LM_STUDIO_VISION_SUPPORTED = True
 DEFAULT_MAX_TOKENS = 4096         # увеличенная длина ответа по умолчанию (было 2048)
 
 # -------------------------------
+# Reasoning / теги <thought>
+# -------------------------------
+# Переключатели для принудительного формирования рассуждений моделью.
+# Вынесены в конфиг, чтобы можно было настраивать без правки кода.
+REASONING_FORCE_TAGS = True       # обязывать модель писать <thought>...</thought>
+REASONING_FEW_SHOT = True         # добавлять few-shot примеры формата
+# stop-токены для reasoning-режима (пустой tuple = не использовать)
+REASONING_STOP_TOKENS: tuple = ()
+
+# -------------------------------
 # Параметры памяти (GCN)
 # -------------------------------
 WORKING_MEMORY_SIZE = 40
@@ -182,7 +192,7 @@ MCP_TOOL_TIMEOUT_OVERRIDES = {
 # переносится в фоновую задачу (без push), а [DONE] уходит немедленно.
 PLAN_CRITIC_TIMEOUT = 15.0       # сек на один вызов plan_critic + LLM-добор
 VERIFY_RESPONSE_TIMEOUT = 10.0   # сек на верификационный LLM-вызов
-FINALIZE_ANSWER_TIMEOUT = 35.0   # сек на весь _finalize_answer в streaming-пути
+FINALIZE_ANSWER_TIMEOUT = 90.0   # увеличено с 35.0 до 90 сек — суммарный бюджет на все этапы финализации
 
 # -------------------------------
 # Прочее
