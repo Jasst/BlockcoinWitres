@@ -370,6 +370,10 @@ class CognitiveController:
         # Текущая фоновая генерация ответа (см. stream_response) — не привязана
         # к конкретному HTTP-соединению, живёт пока не допишется целиком.
         self._active_stream: Optional[Dict] = None
+        # Лок на мутации _active_stream state (subscribers/done/buffer):
+        # гарантирует атомарность «подписаться → снять снимок буфера» и
+        # «пометить done → разослать None → очистить subscribers».
+        self._stream_state_lock = asyncio.Lock()
 
         self._consolidation_task = None
         self._planner_task = None
@@ -450,7 +454,7 @@ class CognitiveController:
         except ImportError as e:
             logger.warning(f"[CognitiveController] не удалось загрузить SelfModel: {e}")
             self.self_model = None
-        
+
         # AutonomyEngine теперь сам берёт self_model из контроллера
 
         # Регистрация внутренних инструментов
@@ -1563,34 +1567,7 @@ class CognitiveController:
         self.history.append({"role": "user", "content": message})
         stored_response = response
         if response:
-            # ИСПРАВЛЕНИЕ v3: парсинг рассуждения в формате <thought>...</thought>.
-            # Модель генерирует: <thought>рассуждение</thought>\n\nфинальный ответ
-            # Нужно извлечь только финальный ответ для сохранения в историю.
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
-            _, stored_response = _split_reasoning(response)
+            # Извлекаем только финальный ответ, отбрасывая блок <thought>...</thought>.
             _, stored_response = _split_reasoning(response)
         self._save_history()
 
@@ -2522,16 +2499,37 @@ class CognitiveController:
             logger.info(f"stream_response: подключаюсь к уже идущей генерации {gen_id} вместо новой")
 
         queue: asyncio.Queue = asyncio.Queue()
-        for chunk in list(state["buffer"]):
-            await queue.put(chunk)
-        if state["done"]:
-            await queue.put(None)
-        else:
+        # ИСПРАВЛЕНИЕ race condition:
+        # Порядок «подписаться → снять снимок буфера» (под локом) совпадает
+        # с attach_to_active_stream и гарантирует, что ни один чанк,
+        # отправленный между снятием снимка и подпиской, не будет потерян.
+        # Обратный порядок («снять снимок → подписаться») приводил к тому,
+        # что если воркер завершался между этими операциями, клиент навсегда
+        # зависал в queue.get(), не получив сентинел None.
+        async with self._stream_state_lock:
             state["subscribers"].add(queue)
+            for chunk in list(state["buffer"]):
+                await queue.put(chunk)
+            if state["done"]:
+                state["subscribers"].discard(queue)
+                await queue.put(None)
+
+        # SSE_HEARTBEAT_INTERVAL: каждые 15 секунд шлём SSE-комментарий
+        # ": keep-alive", пока воркер молчит (постобработка, verify, plan_critic).
+        # Комментарий невидим клиенту, но держит TCP-соединение живым и не даёт
+        # прокси (nginx proxy_read_timeout=60s, Cloudflare 100s) убить его
+        # во время тихого этапа _finalize_answer (до 90 сек).
+        _SSE_HEARTBEAT_INTERVAL = 15.0
 
         try:
             while True:
-                chunk = await queue.get()
+                try:
+                    chunk = await asyncio.wait_for(
+                        queue.get(), timeout=_SSE_HEARTBEAT_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
                 if chunk is None:
                     break
                 yield chunk
@@ -2546,25 +2544,40 @@ class CognitiveController:
         подключившимся позже слушателям) и рассылает его всем текущим
         подписчикам. Молча становится no-op, если генерация с этим gen_id
         уже завершена/подменена — на случай гонок при повторном подключении.
+        Лок гарантирует, что buffer.append и notify-подписчиков неделимы:
+        новый подписчик из stream_response не пропустит чанк, опубликованный
+        между снятием снимка буфера и добавлением в subscribers.
         """
         async def push(chunk: str):
             state = self._active_stream
             if state is None or state.get("gen_id") != gen_id:
                 return
-            state["buffer"].append(chunk)
-            for q in list(state["subscribers"]):
-                await q.put(chunk)
+            async with self._stream_state_lock:
+                if state is not self._active_stream or state.get("gen_id") != gen_id:
+                    return  # state подменилась пока ждали лок
+                state["buffer"].append(chunk)
+                for q in list(state["subscribers"]):
+                    await q.put(chunk)
         return push
 
     async def _finish_generation(self, gen_id: str):
-        """Помечает генерацию завершённой и будит всех подписчиков сентинелом None."""
+        """
+        Помечает генерацию завершённой и будит всех подписчиков сентинелом None.
+        Лок гарантирует, что done=True, рассылка None и clear() неделимы —
+        подписчик из stream_response, который добавился к subscribers под тем же
+        локом, либо застанет done=True сразу при снятии снимка буфера,
+        либо получит None от _finish_generation, но никак не оба раза.
+        """
         state = self._active_stream
         if state is None or state.get("gen_id") != gen_id:
             return
-        state["done"] = True
-        for q in list(state["subscribers"]):
-            await q.put(None)
-        state["subscribers"].clear()
+        async with self._stream_state_lock:
+            if state is not self._active_stream or state.get("gen_id") != gen_id:
+                return
+            state["done"] = True
+            for q in list(state["subscribers"]):
+                await q.put(None)
+            state["subscribers"].clear()
         if self._active_stream is state:
             self._active_stream = None
 
@@ -2778,7 +2791,20 @@ class CognitiveController:
                     # рассуждения, и поток обрывался ДО финального ответа.
                     # Теперь модель генерирует полный ответ согласно инструкции в промпте.
                     stream_stop_tokens = REASONING_STOP_TOKENS if reasoning and REASONING_STOP_TOKENS else None
+                    _LLM_TRUNCATED = "\x00__LLM_TRUNCATED__\x00"
                     async for token in call_llm_stream(messages, max_tokens=DEFAULT_MAX_TOKENS, stop=stream_stop_tokens):
+                        if token == _LLM_TRUNCATED:
+                            # Модель остановилась по лимиту токенов — сигнализируем
+                            # фронтенду, но не включаем в full_response (чтобы не
+                            # портить текст и историю).
+                            logger.warning(
+                                f"[stream] LLM stream truncated by token limit "
+                                f"(len={len(full_response)})"
+                            )
+                            await push(
+                                f"data: {json.dumps({'warning': 'Ответ обрезан: достигнут лимит токенов'})}\n\n"
+                            )
+                            break
                         full_response += token
                         await push(f"data: {json.dumps({'token': token})}\n\n")
                 else:
@@ -2864,6 +2890,12 @@ class CognitiveController:
             logger.exception(f"_stream_response_worker: необработанная ошибка: {e}")
             try:
                 await push(f"data: {json.dumps({'error': str(e)})}\n\n")
+            except Exception:
+                pass
+            # Гарантируем [DONE] даже при необработанных исключениях —
+            # иначе фронтенд навсегда остаётся в _isSending=true.
+            try:
+                await push("data: [DONE]\n\n")
             except Exception:
                 pass
         finally:
@@ -3115,11 +3147,17 @@ async def attach_to_active_stream(address: str = Depends(require_auth)):
             if state.get("done"):
                 yield "data: [DONE]\n\n"
                 return
+            _SSE_HEARTBEAT_INTERVAL = 15.0
             while True:
                 try:
-                    chunk = await asyncio.wait_for(queue.get(), timeout=900)
+                    chunk = await asyncio.wait_for(
+                        queue.get(), timeout=_SSE_HEARTBEAT_INTERVAL
+                    )
                 except asyncio.TimeoutError:
-                    break
+                    # Воркер ещё работает (постобработка, verify, plan_critic) —
+                    # шлём SSE-комментарий, чтобы прокси не обрезал соединение.
+                    yield ": keep-alive\n\n"
+                    continue
                 if chunk is None:
                     break
                 yield chunk
