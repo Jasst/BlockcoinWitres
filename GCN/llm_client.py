@@ -49,6 +49,7 @@ async def call_llm_raw(
     Возвращает сырой объект message от LLM целиком (не только content), чтобы
     вызывающий код (GCN.tool_router) мог прочитать tool_calls при нативном
     function calling — тем же механизмом, что использует внешний MCP-клиент.
+    При исчерпании retry возвращает {"_error": "..."} вместо {}.
     """
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
     payload = {
@@ -60,6 +61,7 @@ async def call_llm_raw(
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
+    last_error = None
     for attempt in range(retries):
         try:
             session = await _get_session()
@@ -79,14 +81,17 @@ async def call_llm_raw(
                 if resp.status in _RETRYABLE_STATUSES and attempt < retries - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue
-                return {}
+                last_error = f"LLM returned status {resp.status}: {error_text[:100]}"
+                break
         except Exception as e:
             logger.error(f"LLM call failed: {e}")
+            last_error = str(e)
             if attempt < retries - 1:
                 await asyncio.sleep(2 ** attempt)
                 continue
-            return {}
-    return {}
+            break
+    # Все retry исчерпаны — возвращаем ошибку явно
+    return {"_error": last_error or "LLM call failed after all retries"}
 
 
 async def call_llm(
@@ -103,9 +108,11 @@ async def call_llm(
 async def call_llm_stream(
     messages: List[Dict[str, str]],
     temp: float = 0.7,
-    max_tokens: int = DEFAULT_MAX_TOKENS
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    stop: Optional[List[str]] = None
 ):
-    """Потоковый вызов LLM (LM Studio) с теми же параметрами, что и call_llm."""
+    """Потоковый вызов LLM (LM Studio) с теми же параметрами, что и call_llm.
+    При обрыве без [DONE] или finish_reason==\"length\" yield-ит sentinel-маркер."""
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
     payload = {
         "model": "local-model",
@@ -114,7 +121,11 @@ async def call_llm_stream(
         "max_tokens": max_tokens,
         "stream": True,
     }
+    if stop:
+        payload["stop"] = stop
     timeout = aiohttp.ClientTimeout(total=LM_STUDIO_STREAM_TIMEOUT)
+    stream_did_complete = False
+    finish_reason = None
     try:
         session = await _get_session()
         async with session.post(LM_STUDIO_URL, json=payload, headers=headers, timeout=timeout) as resp:
@@ -123,20 +134,40 @@ async def call_llm_stream(
                 logger.error(f"Stream error {resp.status}: {error_text[:200]}")
                 yield "[Ошибка LLM]"
                 return
+            # Используем readline() для корректного чтения SSE-строк
             async for line in resp.content:
+                if not line:
+                    # Пустая строка — конец потока (бэкенд мог закрыть соединение без [DONE])
+                    break
                 line = line.decode('utf-8').strip()
                 if not line or not line.startswith('data: '):
                     continue
                 data = line[6:]
                 if data == '[DONE]':
+                    stream_did_complete = True
                     break
                 try:
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                content = chunk.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                delta = chunk.get('choices', [{}])[0].get('delta', {})
+                content = delta.get('content', '')
+                # Сохраняем finish_reason из последнего чанка
+                if 'finish_reason' in chunk.get('choices', [{}])[0]:
+                    finish_reason = chunk['choices'][0]['finish_reason']
                 if content:
                     yield content
+            # Если поток завершился без [DONE], логируем предупреждение и выдаём sentinel
+            if not stream_did_complete:
+                logger.warning(f"LLM stream ended without [DONE] marker — possible truncation (finish_reason={finish_reason})")
+                yield "\u0000__LLM_TRUNCATED__\u0000"
+                return
+            # Если finish_reason == "length" — ответ обрезан по лимиту токенов
+            if finish_reason == "length":
+                logger.warning(f"LLM stream truncated by token limit (finish_reason=length)")
+                yield "\u0000__LLM_TRUNCATED__\u0000"
+                return
+            logger.debug(f"LLM stream completed with finish_reason: {finish_reason}")
     except asyncio.CancelledError:
         logger.debug("Stream cancelled")
         raise

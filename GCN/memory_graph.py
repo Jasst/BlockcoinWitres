@@ -1024,6 +1024,40 @@ class CognitiveMemory:
             logger.info(f"[Prune] Removed {len(dead)} dead synapses for {self.user_id[:16]}")
         return len(dead)
 
+    async def identify_core(self, top_k: int = None) -> List[str]:
+        """
+        Возвращает gcn_id фактов, образующих топологическое ядро памяти.
+        Ядро — это узлы с максимальной суммарной весомостью синапсов
+        (in-degree + out-degree), то есть "несущие стены" графа.
+        """
+        if top_k is None:
+            from GCN.config_ai import IDENTITY_CORE_SIZE
+            top_k = IDENTITY_CORE_SIZE
+
+        if not self.synapses:
+            return []
+
+        # 1. Считаем "вес" каждого локального узла в графе синапсов
+        node_weights = defaultdict(float)
+        for (src, tgt), syn in self.synapses.items():
+            # Суммируем вес как для входящих, так и для исходящих связей
+            node_weights[src] += syn.weight
+            node_weights[tgt] += syn.weight
+
+        # 2. Сортируем факты по их "несущей способности" и уверенности
+        # (чтобы случайный шум с высоким весом, но низкой уверенностью не попал в ядро)
+        scored_facts = []
+        for local_id, weight in node_weights.items():
+            fact = self.facts_by_id.get(local_id)
+            if fact and fact.gcn_id:
+                # Итоговый скор = топологический вес * уверенность
+                scored_facts.append((fact.gcn_id, weight * fact.confidence))
+
+        scored_facts.sort(key=lambda x: x[1], reverse=True)
+
+        # 3. Возвращаем gcn_id самых "несущих" фактов
+        return [gcn_id for gcn_id, _ in scored_facts[:top_k]]
+
     # ==================== ГИБРИДНЫЙ ПОИСК ====================
     async def retrieve_hybrid(self, query: str, top_k: int = 5, use_graph: bool = True) -> List[Dict]:
         """

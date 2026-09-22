@@ -17,6 +17,41 @@ import asyncio
 import time
 import re
 from typing import Dict, Optional, Any, List, Tuple
+
+def _split_reasoning(text: str) -> Tuple[str, str]:
+    """
+    Разделяет сырой ответ модели на рассуждение и финальный ответ.
+    Возвращает (reasoning, answer). Если теги <thought> не найдены —
+    reasoning будет пустой строкой, answer = весь текст.
+    """
+    if not text:
+        return "", ""
+    # Пробуем найти XML-теги <thought>...</thought> с любым количеством whitespace между ними и ответом
+    thought_match = re.search(r'<thought>([\s\S]*?)</thought>\s*(?:\n\s*)*\n(.+)', text, re.IGNORECASE)
+    if thought_match:
+        return thought_match.group(1).strip(), thought_match.group(2).strip()
+    # Старый формат без тегов: рассуждение начинается с ключевых фраз
+    reasoning_start_patterns = [
+        r'^сначала я подумаю',
+        r'^рассужда[ею]м',
+        r'^ход мыслей',
+        r'^анализ',
+        r'^подума[ею]м',
+        r'^сначала разбер[уё]м',
+    ]
+    pattern = '|'.join(reasoning_start_patterns)
+    match = re.match(f'({pattern})[^\\n]*\\s*\\n\\s*\\n', text, re.IGNORECASE)
+    if match:
+        # Удаляем всё до первого \n\n
+        rest = re.sub(f'({pattern})[^\\n]*\\s*\\n\\s*\\n', '', text, flags=re.IGNORECASE).strip()
+        return text[:match.end()].strip(), rest or text
+    # Для обратной совместимости со старым форматом "---"
+    if '---' in text and ('РАССУЖДЕНИЕ' in text or '💭' in text):
+        parts = re.split(r'\\s*---\\s*', text, maxsplit=1)
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip()
+    return "", text
+
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
@@ -335,6 +370,10 @@ class CognitiveController:
         # Текущая фоновая генерация ответа (см. stream_response) — не привязана
         # к конкретному HTTP-соединению, живёт пока не допишется целиком.
         self._active_stream: Optional[Dict] = None
+        # Лок на мутации _active_stream state (subscribers/done/buffer):
+        # гарантирует атомарность «подписаться → снять снимок буфера» и
+        # «пометить done → разослать None → очистить subscribers».
+        self._stream_state_lock = asyncio.Lock()
 
         self._consolidation_task = None
         self._planner_task = None
@@ -415,7 +454,7 @@ class CognitiveController:
         except ImportError as e:
             logger.warning(f"[CognitiveController] не удалось загрузить SelfModel: {e}")
             self.self_model = None
-        
+
         # AutonomyEngine теперь сам берёт self_model из контроллера
 
         # Регистрация внутренних инструментов
@@ -917,7 +956,15 @@ class CognitiveController:
         if not plan:
             return response
         try:
-            missed = await intellect_mod.plan_critic(message, plan, response)
+            missed = await asyncio.wait_for(
+                intellect_mod.plan_critic(message, plan, response),
+                timeout=PLAN_CRITIC_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.debug(
+                f"[PlanCritic] plan_critic timed out after {PLAN_CRITIC_TIMEOUT}s, skipping"
+            )
+            return response
         except Exception as e:
             logger.debug(f"plan_critic failed: {e}")
             return response
@@ -925,17 +972,25 @@ class CognitiveController:
             return response
         logger.info(f"[PlanCritic] Пропущены пункты плана: {missed}")
         try:
-            extra = await call_llm(
-                [{"role": "user", "content": (
-                    f"Твой предыдущий ответ пользователю не раскрыл части его запроса.\n"
-                    f"Запрос: {message}\nПлан подзадач: {plan}\n"
-                    f"Пропущено: {missed}\n\n"
-                    "Дополни ответ, закрыв пропущенные пункты. Пиши ТОЛЬКО "
-                    "дополнение, не повторяй уже сказанное. Если для пункта нет "
-                    "данных — прямо скажи об этом."
-                )}],
-                temp=0.5, max_tokens=700
+            extra = await asyncio.wait_for(
+                call_llm(
+                    [{"role": "user", "content": (
+                        f"Твой предыдущий ответ пользователю не раскрыл части его запроса.\n"
+                        f"Запрос: {message}\nПлан подзадач: {plan}\n"
+                        f"Пропущено: {missed}\n\n"
+                        "Дополни ответ, закрыв пропущенные пункты. Пиши ТОЛЬКО "
+                        "дополнение, не повторяй уже сказанное. Если для пункта нет "
+                        "данных — прямо скажи об этом."
+                    )}],
+                    temp=0.5, max_tokens=700
+                ),
+                timeout=PLAN_CRITIC_TIMEOUT * 2,  # добор может быть длиннее одной проверки
             )
+        except asyncio.TimeoutError:
+            logger.debug(
+                f"[PlanCritic] LLM-добор timed out after {PLAN_CRITIC_TIMEOUT * 2}s, skipping"
+            )
+            return response
         except Exception as e:
             logger.debug(f"PlanCritic добор не удался: {e}")
             return response
@@ -1056,8 +1111,16 @@ class CognitiveController:
             response=response[:4000],
         )
         try:
-            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.0,
-                                 max_tokens=VERIFICATION_MAX_TOKENS)
+            raw = await asyncio.wait_for(
+                call_llm([{"role": "user", "content": prompt}], temp=0.0,
+                         max_tokens=VERIFICATION_MAX_TOKENS),
+                timeout=VERIFY_RESPONSE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.debug(
+                f"[VerifyResponse] LLM timed out after {VERIFY_RESPONSE_TIMEOUT}s, skipping"
+            )
+            return None
         except Exception as e:
             logger.debug(f"Response verification step failed, skipping: {e}")
             return None
@@ -1065,6 +1128,60 @@ class CognitiveController:
         if not note or note.upper().startswith("OK"):
             return None
         return note[:400]
+
+    async def _verify_identity_consistency(self, response: str) -> Optional[str]:
+        """
+        ПУНКТ №4 (Совесть): Проверяет, не происходит ли смыслового дрейфа.
+        Считает косинусную близость между вектором ответа и векторами Ядра памяти.
+        """
+        from GCN.config_ai import IDENTITY_CONSISTENCY_THRESHOLD
+        if not response or len(response.split()) < 15:
+            return None
+
+        try:
+            # 1. Получаем Ядро (gcn_id самых важных фактов)
+            core_gcn_ids = await self.memory.identify_core(top_k=5)
+            if not core_gcn_ids:
+                return None  # Память пуста, ядра нет, проверять нечего
+
+            # 2. Собираем тексты ядра и их эмбеддинги
+            core_texts = []
+            for gid in core_gcn_ids:
+                obj = self.memory.store.get(gid)
+                if obj:
+                    core_texts.append(obj.subject)
+
+            if not core_texts:
+                return None
+
+            # 3. Считаем центроид (средний вектор) Ядра
+            core_embeddings = [self.memory.embed_text(t) for t in core_texts if self.memory.embed_text(t)]
+            if not core_embeddings:
+                return None
+
+            import numpy as np
+            core_centroid = np.mean(core_embeddings, axis=0)
+
+            # 4. Эмбеддим ответ и считаем близость к центроиду
+            response_emb = np.array(self.memory.embed_text(response))
+            core_norm = np.linalg.norm(core_centroid)
+            resp_norm = np.linalg.norm(response_emb)
+
+            if core_norm == 0 or resp_norm == 0:
+                return None
+
+            similarity = float(np.dot(response_emb, core_centroid) / (core_norm * resp_norm))
+
+            # 5. Если ответ слишком далек от Ядра — помечаем как дрейф
+            if similarity < IDENTITY_CONSISTENCY_THRESHOLD:
+                logger.warning(f"[IdentityCritic] Смысловой дрейф! Similarity to core: {similarity:.2f}")
+                return f"ответ слабо связан с моим базовым ядром идентичности (сходство {similarity:.2f}) — возможна потеря контекста или пустая болтовня."
+
+        except Exception as e:
+            logger.debug(f"Identity consistency check failed: {e}")
+            return None
+
+        return None
 
     def _compute_prediction_error(self, predicted: List[str], actual: str) -> float:
         if not predicted or not actual:
@@ -1354,7 +1471,7 @@ class CognitiveController:
         goal_hint = ""
         if active_goals:
             goal_hint = "Активные цели: " + ", ".join([g["description"] for g in active_goals[:2]])
-        
+
         # УЛУЧШЕНИЕ №3: Goal-directed retrieval bias — дополнительный поиск по активным целям
         relevant_with_boost = list(relevant)  # копируем базовый результат
         if active_goals and len(active_goals) > 0:
@@ -1368,7 +1485,7 @@ class CognitiveController:
                         item_copy["_goal_boosted"] = True
                         item_copy["_score"] = item_copy.get("_score", item_copy.get("score", 0.5)) + 0.15
                         goal_relevant.append(item_copy)
-                
+
                 # Merge с dedup по gcn_id или text
                 seen_ids = {f.get("gcn_id") or f["text"][:100]: i for i, f in enumerate(relevant_with_boost)}
                 for item in goal_relevant:
@@ -1385,7 +1502,7 @@ class CognitiveController:
                     else:
                         relevant_with_boost.append(item)
                         seen_ids[key] = len(relevant_with_boost) - 1
-                
+
                 # Сортируем по score с учётом буста
                 relevant_with_boost.sort(key=lambda x: x.get("_score", x.get("score", 0)), reverse=True)
                 relevant_with_boost = relevant_with_boost[:7]  # ограничиваем размер
@@ -1470,6 +1587,11 @@ class CognitiveController:
                                            tool_trace=tool_trace)
         if note:
             response = f"{response}\n\n⚠️ Уточнение: {note}"
+            # 3. НОВОЕ: Критик Ядра (Совесть)
+        identity_note = await self._verify_identity_consistency(response)
+        if identity_note:
+            response = f"{response}\n\n🧭 {identity_note}"
+
         response = intellect_mod.ensure_citations(response, sources or [])
         return response
 
@@ -1504,11 +1626,8 @@ class CognitiveController:
         self.history.append({"role": "user", "content": message})
         stored_response = response
         if response:
-            # Блок 💭 РАССУЖДЕНИЕ: ... --- не сохраняем в историю и память —
-            # иначе он уходит в контекст КАЖДОГО следующего запроса (съедает
-            # токены) и смешивается с реальными ответами при извлечении фактов.
-            stored_response = re.sub(r'💭\s*РАССУЖДЕНИЕ:\s*[\s\S]*?---\s*', '', response).strip() or response
-            self.history.append({"role": "assistant", "content": stored_response})
+            # Извлекаем только финальный ответ, отбрасывая блок <thought>...</thought>.
+            _, stored_response = _split_reasoning(response)
         self._save_history()
 
         if response:
@@ -1551,7 +1670,7 @@ class CognitiveController:
             })
             if len(self.prediction_history) > REFLECTION_HISTORY_SIZE:
                 self.prediction_history.pop(0)
-            
+
             # УЛУЧШЕНИЕ №4: Немедленный Hebbian update при высокой ошибке предсказания
             if error > 0.65 and self.current_working_memory:
                 try:
@@ -1568,7 +1687,7 @@ class CognitiveController:
                         )
                 except Exception as e:
                     logger.debug(f"[Hebbian] spread_activation on error failed: {e}")
-            
+
             if (error > 0.85
                     and len(response) > 50
                     and not response.strip().lower().startswith(("привет", "здравствуйте", "hello"))
@@ -1585,7 +1704,7 @@ class CognitiveController:
                 tool_success = bool(tool_trace) and len(response) > 20 and not response.startswith("[Ошибка")
                 reasoning_success = len(response) > 20 and not response.startswith("[Ошибка")
                 action_type = "tool_call" if tool_trace else "reasoning"
-                
+
                 self.self_model.record_action(
                     action_type=action_type,
                     description=message[:100],  # описание запроса, не ответа
@@ -1600,7 +1719,7 @@ class CognitiveController:
                 )
             except Exception as e:
                 logger.debug(f"[SelfModel] ошибка записи действия: {e}")
-        
+
         return response
 
     # ===== ПРОЦЕССИНГ ВХОДА (изменён: добавлена классификация и автоизвлечение) =====
@@ -1651,7 +1770,7 @@ class CognitiveController:
                 web_search or reasoning or has_url
                 or search_meta.get("search_requested") or _is_code_query
         )
-        
+
         # РЕШЕНИЕ (нужен ли инструмент) через ToolRouter
         history_tail = "\n".join(
             f"{m.get('role')}: {str(m.get('content'))[:200]}" for m in self.history[-6:]
@@ -1662,7 +1781,7 @@ class CognitiveController:
                 f"internal__web_search]\n{history_tail}" if history_tail else
                 "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри вызов internal__web_search]"
             )
-        
+
         # УЛУЧШЕНИЕ №2: Metacognitive gate перед выполнением инструмента
         if hasattr(self, 'self_model') and self.self_model is not None:
             try:
@@ -1924,7 +2043,7 @@ class CognitiveController:
                 facts.append(s[:300])
         return facts[:20]
 
-
+    # ===== КОМАНДЫ ПАМЯТИ (расширенный список команд) =====
     # ===== КОМАНДЫ ПАМЯТИ (расширенный список команд) =====
     async def _handle_memory_command(self, message: str) -> Optional[Tuple[str, Dict]]:
         lower_msg = message.lower()
@@ -1934,27 +2053,90 @@ class CognitiveController:
                 if not rest:
                     continue
 
-                if action == "store":
+                # ===== НОВОЕ: Обработка store_shared =====
+                if action == "store_shared":
+                    # Запомнить в shared scope (для эстафеты между ИИ)
+                    scope = "shared"
+                    clean_rest = rest
+                    result = await self.memory_service.remember(clean_rest, scope=scope)
+                    gcn_id = result.get("id")
+                    if gcn_id:
+                        self.memory.hierarchy.add_to_working(gcn_id)
+                    await self.memory_service._save_scope(MemoryScope.SHARED)
+
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию в общий слой (shared). "
+                                "Подтверди, что ты запомнил, кратко и естественно."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Запомни в shared: {result.get('fact', clean_rest)}"
+                        }
+                    ]
+                    response = await call_llm(messages, temp=0.5, max_tokens=150)
+                    if response:
+                        return response, {"memory": "stored", "scope": scope, "id": gcn_id}
+                    else:
+                        return (
+                            f"Запомнил в общий слой ({scope}): {result.get('fact', clean_rest)}",
+                            {"memory": "stored", "scope": scope, "id": gcn_id},
+                        )
+
+                # ===== НОВОЕ: Обработка store_global =====
+                elif action == "store_global":
+                    # Запомнить в global scope
+                    scope = "global"
+                    clean_rest = rest
+                    result = await self.memory_service.remember(clean_rest, scope=scope)
+                    gcn_id = result.get("id")
+                    if gcn_id:
+                        self.memory.hierarchy.add_to_working(gcn_id)
+                    await self.memory_service._save_scope(MemoryScope.GLOBAL)
+
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию в глобальный слой. "
+                                "Подтверди, что ты запомнил, кратко и естественно."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Запомни глобально: {result.get('fact', clean_rest)}"
+                        }
+                    ]
+                    response = await call_llm(messages, temp=0.5, max_tokens=150)
+                    if response:
+                        return response, {"memory": "stored", "scope": scope, "id": gcn_id}
+                    else:
+                        return (
+                            f"Запомнил глобально ({scope}): {result.get('fact', clean_rest)}",
+                            {"memory": "stored", "scope": scope, "id": gcn_id},
+                        )
+
+                # ===== Оригинальная обработка store =====
+                elif action == "store":
                     # Определяем скоуп (как в MCP)
                     is_global = any(w in rest.lower() for w in ("глобально", "global"))
                     scope = "global" if is_global else "private"
-
                     # Очищаем текст от флагов "глобально"/"global"
                     clean_rest = rest
                     for word in ("глобально", "global"):
                         clean_rest = clean_rest.replace(word, "").strip()
                     clean_rest = " ".join(clean_rest.split())
-
                     # ИЗМЕНЕНИЕ: используем сервис для сохранения
                     result = await self.memory_service.remember(clean_rest, scope=scope)
                     gcn_id = result.get("id")
                     if gcn_id:
                         self.memory.hierarchy.add_to_working(gcn_id)
-
                     # Сохраняем соответствующий слой
                     scope_enum = MemoryScope.GLOBAL if is_global else MemoryScope.PRIVATE
                     await self.memory_service._save_scope(scope_enum)
-
                     # Формируем ответ (можно через LLM для красоты)
                     messages = [
                         {
@@ -1979,6 +2161,7 @@ class CognitiveController:
                             {"memory": "stored", "scope": scope, "id": gcn_id},
                         )
 
+                # ===== Обработка forget =====
                 elif action == "forget":
                     # ИЗМЕНЕНИЕ: через сервис (удаляем из private)
                     result = await self.memory_service.forget(rest, scope="private", dry_run=False)
@@ -2005,12 +2188,12 @@ class CognitiveController:
                     else:
                         return "Ничего не найдено для удаления.", {"memory": "no_match"}
 
+                # ===== Обработка recall =====
                 elif action == "recall":
                     # ИЗМЕНЕНИЕ: через сервис
                     facts = await self.memory_service.recall(rest, top_k=7)
                     if not facts:
                         return "Ничего не найдено по вашему запросу.", {"memory": "no_recall"}
-
                     scope_labels = {"private": "личный", "shared": "общий", "global": "глобальный"}
                     context_lines = []
                     for f in facts[:5]:
@@ -2019,7 +2202,6 @@ class CognitiveController:
                         context_lines.append(
                             f"- [{scope_label}] {f['text']} (уверенность: {f.get('confidence', 0.5):.2f})")
                     context = "\n".join(context_lines)
-
                     messages = [
                         {
                             "role": "system",
@@ -2034,7 +2216,6 @@ class CognitiveController:
                             "content": f"Вопрос: {rest}\n\nФакты из памяти:\n{context}"
                         }
                     ]
-
                     response = await call_llm(messages, temp=0.6, max_tokens=500)
                     if not response:
                         answer = "Вот что я знаю:\n" + "\n".join(
@@ -2268,19 +2449,40 @@ class CognitiveController:
             system_parts.append(f"Возможное продолжение темы: {', '.join(predictions[:3])}.")
         if goal_hint:
             system_parts.append(f"Учитывай активные цели: {goal_hint}.")
-        if reasoning:
-            # ИСПРАВЛЕНИЕ: раньше инструкция была одной размытой строкой, и локальные
-            # модели часто игнорировали формат (писали "Рассуждение:" без эмодзи,
-            # без разделителя "---") — фронтенд такое не распознавал, и режим
-            # "рассуждения" выглядел сломанным. Теперь формат задан строго и по шагам.
+        if reasoning and REASONING_FORCE_TAGS:
+            # ИСПРАВЛЕНИЕ v6: Критически важная инструкция для режима рассуждений.
+            # Модель ОБЯЗАНА начать ответ с тега <thought> и завершить его </thought>,
+            # затем два перевода строки и финальный ответ.
             system_parts.append(
-                "Включён режим рассуждений. Строго следуй формату (без изменений):\n"
-                "1. Первая строка ответа — ровно: 💭 РАССУЖДЕНИЕ:\n"
-                "2. Далее — твои рассуждения по делу (несколько предложений или пунктов).\n"
-                "3. Затем отдельная строка, ровно: ---\n"
-                "4. Затем — финальный ответ пользователю.\n"
-                "Если режим рассуждений не включён — не используй этот формат."
+                "=== РЕЖИМ РАССУЖДЕНИЙ ВКЛЮЧЁН ===\n"
+                "Ты ОБЯЗАН строго следовать этому формату ответа:\n"
+                "1. ПЕРВЫМИ символами твоего ответа должны быть <thought>\n"
+                "2. Внутри тега напиши свои размышления шаг за шагом\n"
+                "3. Закрой тег </thought>\n"
+                "4. Сделай РОВНО ДВА перевода строки (\\n\\n)\n"
+                "5. После пустой строки напиши полный финальный ответ пользователю\n\n"
+                "ПРИМЕР ПРАВИЛЬНОГО ОТВЕТА:\n"
+                "<thought>Сначала я анализирую вопрос... затем проверяю факты... делаю вывод...</thought>\n\n"
+                "Теперь мой полный ответ пользователю: ...\n\n"
+                "⚠️ КРИТИЧЕСКИ ВАЖНО:\n"
+                "- Не пиши НИЧЕГО перед тегом <thought>\n"
+                "- Не используй маркеры '---', '💭', '**РАССУЖДЕНИЕ**', 'My thought:'\n"
+                "- Используй ТОЛЬКО XML-теги <thought> и </thought>\n"
+                "- Убедись, что после </thought> есть ДВА перевода строки перед ответом"
             )
+            # Добавляем few-shot примеры если включено
+            if REASONING_FEW_SHOT:
+                system_parts.append(
+                    "\n=== ПРИМЕРЫ (few-shot) ===\n"
+                    "Вопрос: Сколько будет 2+2?\n"
+                    "<thought>Пользователь спрашивает простую арифметику. 2+2=4.\n"
+                    "</thought>\n\n"
+                    "Ответ: 4\n\n"
+                    "Вопрос: Кто написал Войну и мир?\n"
+                    "<thought>Нужно вспомнить автора романа. Это Лев Толстой.\n"
+                    "</thought>\n\n"
+                    "Ответ: Лев Толстой"
+                )
         if search_context:
             system_parts.append(
                 "Ты выполнил поиск в интернете, используй полученные данные как основной источник фактов.")
@@ -2418,16 +2620,37 @@ class CognitiveController:
             logger.info(f"stream_response: подключаюсь к уже идущей генерации {gen_id} вместо новой")
 
         queue: asyncio.Queue = asyncio.Queue()
-        for chunk in list(state["buffer"]):
-            await queue.put(chunk)
-        if state["done"]:
-            await queue.put(None)
-        else:
+        # ИСПРАВЛЕНИЕ race condition:
+        # Порядок «подписаться → снять снимок буфера» (под локом) совпадает
+        # с attach_to_active_stream и гарантирует, что ни один чанк,
+        # отправленный между снятием снимка и подпиской, не будет потерян.
+        # Обратный порядок («снять снимок → подписаться») приводил к тому,
+        # что если воркер завершался между этими операциями, клиент навсегда
+        # зависал в queue.get(), не получив сентинел None.
+        async with self._stream_state_lock:
             state["subscribers"].add(queue)
+            for chunk in list(state["buffer"]):
+                await queue.put(chunk)
+            if state["done"]:
+                state["subscribers"].discard(queue)
+                await queue.put(None)
+
+        # SSE_HEARTBEAT_INTERVAL: каждые 15 секунд шлём SSE-комментарий
+        # ": keep-alive", пока воркер молчит (постобработка, verify, plan_critic).
+        # Комментарий невидим клиенту, но держит TCP-соединение живым и не даёт
+        # прокси (nginx proxy_read_timeout=60s, Cloudflare 100s) убить его
+        # во время тихого этапа _finalize_answer (до 90 сек).
+        _SSE_HEARTBEAT_INTERVAL = 15.0
 
         try:
             while True:
-                chunk = await queue.get()
+                try:
+                    chunk = await asyncio.wait_for(
+                        queue.get(), timeout=_SSE_HEARTBEAT_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
                 if chunk is None:
                     break
                 yield chunk
@@ -2442,25 +2665,40 @@ class CognitiveController:
         подключившимся позже слушателям) и рассылает его всем текущим
         подписчикам. Молча становится no-op, если генерация с этим gen_id
         уже завершена/подменена — на случай гонок при повторном подключении.
+        Лок гарантирует, что buffer.append и notify-подписчиков неделимы:
+        новый подписчик из stream_response не пропустит чанк, опубликованный
+        между снятием снимка буфера и добавлением в subscribers.
         """
         async def push(chunk: str):
             state = self._active_stream
             if state is None or state.get("gen_id") != gen_id:
                 return
-            state["buffer"].append(chunk)
-            for q in list(state["subscribers"]):
-                await q.put(chunk)
+            async with self._stream_state_lock:
+                if state is not self._active_stream or state.get("gen_id") != gen_id:
+                    return  # state подменилась пока ждали лок
+                state["buffer"].append(chunk)
+                for q in list(state["subscribers"]):
+                    await q.put(chunk)
         return push
 
     async def _finish_generation(self, gen_id: str):
-        """Помечает генерацию завершённой и будит всех подписчиков сентинелом None."""
+        """
+        Помечает генерацию завершённой и будит всех подписчиков сентинелом None.
+        Лок гарантирует, что done=True, рассылка None и clear() неделимы —
+        подписчик из stream_response, который добавился к subscribers под тем же
+        локом, либо застанет done=True сразу при снятии снимка буфера,
+        либо получит None от _finish_generation, но никак не оба раза.
+        """
         state = self._active_stream
         if state is None or state.get("gen_id") != gen_id:
             return
-        state["done"] = True
-        for q in list(state["subscribers"]):
-            await q.put(None)
-        state["subscribers"].clear()
+        async with self._stream_state_lock:
+            if state is not self._active_stream or state.get("gen_id") != gen_id:
+                return
+            state["done"] = True
+            for q in list(state["subscribers"]):
+                await q.put(None)
+            state["subscribers"].clear()
         if self._active_stream is state:
             self._active_stream = None
 
@@ -2535,6 +2773,11 @@ class CognitiveController:
             full_response = ""
             tool_trace: List[Dict[str, Any]] = []
             already_verified = False
+            # Флаг ошибки внутреннего стрима. Раньше inner except делал `return`,
+            # из-за чего await push("[DONE]") никогда не достигался и frontend
+            # оставался в _isSending=true с заблокированным полем ввода.
+            # Теперь: флаг выставляется вместо return, [DONE] уходит всегда.
+            _stream_error = False
             try:
                 if LM_STUDIO_USE_STREAM:
                     history_tail = "\n".join(
@@ -2550,7 +2793,7 @@ class CognitiveController:
                     tool_trace = tool_run.get("tool_trace", [])
                     # Детерминированный вызов code-tools (см. _force_code_tool_if_requested)
                     await self._force_code_tool_if_requested(message, tool_trace)
-                    
+
                     # === ИСПРАВЛЕНИЕ: активное уточнение ПОСЛЕ ReAct-цикла (для stream) ===
                     if not skip_clarification_before_react:
                         post_react_uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
@@ -2569,7 +2812,7 @@ class CognitiveController:
                                 self.history.append({"role": "assistant", "content": clarification})
                                 self._save_history()
                                 return
-                    
+
                     logger.info(
                         f"ToolRouter decisions for '{message[:50]}': used_native={tool_run.get('used_native')}, trace_len={len(tool_trace)}")
                     logger.info(f"Tool trace: {tool_trace}")
@@ -2662,7 +2905,27 @@ class CognitiveController:
                             "content": build_tool_trace_context(tool_trace) + "\n\nТеперь дай финальный ответ пользователю."
                         })
 
-                    async for token in call_llm_stream(messages, max_tokens=DEFAULT_MAX_TOKENS):
+                    # ИСПРАВЛЕНИЕ: убраны stop-токены для reasoning mode.
+                    # Ранее использовался ["\\n\\n\\n", "USER:", "Human:"], но он преждевременно
+                    # обрывал генерацию, так как модель использует \\n\\n для разделения
+                    # рассуждения и ответа. Три переноса строки могли возникнуть после
+                    # рассуждения, и поток обрывался ДО финального ответа.
+                    # Теперь модель генерирует полный ответ согласно инструкции в промпте.
+                    stream_stop_tokens = REASONING_STOP_TOKENS if reasoning and REASONING_STOP_TOKENS else None
+                    _LLM_TRUNCATED = "\x00__LLM_TRUNCATED__\x00"
+                    async for token in call_llm_stream(messages, max_tokens=DEFAULT_MAX_TOKENS, stop=stream_stop_tokens):
+                        if token == _LLM_TRUNCATED:
+                            # Модель остановилась по лимиту токенов — сигнализируем
+                            # фронтенду, но не включаем в full_response (чтобы не
+                            # портить текст и историю).
+                            logger.warning(
+                                f"[stream] LLM stream truncated by token limit "
+                                f"(len={len(full_response)})"
+                            )
+                            await push(
+                                f"data: {json.dumps({'warning': 'Ответ обрезан: достигнут лимит токенов'})}\n\n"
+                            )
+                            break
                         full_response += token
                         await push(f"data: {json.dumps({'token': token})}\n\n")
                 else:
@@ -2684,14 +2947,62 @@ class CognitiveController:
                             await push(f"data: {json.dumps({'token': word + ' '})}\n\n")
             except Exception as e:
                 logger.error(f"Stream error: {e}")
+                _stream_error = True
                 await push(f"data: {json.dumps({'error': str(e)})}\n\n")
-                return
+                # НЕ делаем return — [DONE] должен уйти в любом случае,
+                # иначе frontend остаётся с _isSending=true навсегда.
 
-            if full_response and not already_verified:
+            if not _stream_error and full_response and not already_verified:
                 # Единый хвост обработки (история, память, верификация,
                 # цели, prediction error) — см. _finalize_answer.
-                full_response = await self._finalize_answer(
-                    message, full_response, search_meta, tool_trace, push=push)
+                # asyncio.wait_for гарантирует, что зависший LLM-вызов
+                # внутри (plan_critic / verify_response) не задержит [DONE]:
+                # при превышении FINALIZE_ANSWER_TIMEOUT вся постобработка
+                # переносится в фоновую задачу (push=None → токены не пушатся
+                # после [DONE]), а ввод разблокируется немедленно.
+                try:
+                    full_response = await asyncio.wait_for(
+                        self._finalize_answer(
+                            message, full_response, search_meta, tool_trace, push=push),
+                        timeout=FINALIZE_ANSWER_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[stream] _finalize_answer timeout ({FINALIZE_ANSWER_TIMEOUT}s) — "
+                        "история/память сохраняются в фоне, [DONE] отправляется немедленно"
+                    )
+                    # push=None: фоновая задача не пушит токены после [DONE]
+                    self._spawn_background_task(
+                        self._finalize_answer(
+                            message, full_response, search_meta, tool_trace, push=None),
+                        name="finalize-timeout-bg",
+                    )
+                except Exception as _fe:
+                    logger.error(f"_finalize_answer error in stream: {_fe}")
+                    # Минимальное синхронное сохранение, чтобы история не потерялась
+                    try:
+                        self.history.append({"role": "user", "content": message})
+                        self.history.append({"role": "assistant", "content": full_response})
+                        self._save_history()
+                        self._last_exchange = {
+                            "user": message, "assistant": full_response,
+                            "timestamp": time.time(),
+                        }
+                    except Exception:
+                        pass
+            elif _stream_error and full_response:
+                # Стрим упал с ошибкой, но часть ответа уже накоплена —
+                # минимально сохраняем её в историю, чтобы контекст не терялся.
+                try:
+                    self.history.append({"role": "user", "content": message})
+                    self.history.append({"role": "assistant", "content": full_response})
+                    self._save_history()
+                    self._last_exchange = {
+                        "user": message, "assistant": full_response,
+                        "timestamp": time.time(),
+                    }
+                except Exception:
+                    pass
 
             await push("data: [DONE]\n\n")
         except asyncio.CancelledError:
@@ -2700,6 +3011,12 @@ class CognitiveController:
             logger.exception(f"_stream_response_worker: необработанная ошибка: {e}")
             try:
                 await push(f"data: {json.dumps({'error': str(e)})}\n\n")
+            except Exception:
+                pass
+            # Гарантируем [DONE] даже при необработанных исключениях —
+            # иначе фронтенд навсегда остаётся в _isSending=true.
+            try:
+                await push("data: [DONE]\n\n")
             except Exception:
                 pass
         finally:
@@ -2951,11 +3268,17 @@ async def attach_to_active_stream(address: str = Depends(require_auth)):
             if state.get("done"):
                 yield "data: [DONE]\n\n"
                 return
+            _SSE_HEARTBEAT_INTERVAL = 15.0
             while True:
                 try:
-                    chunk = await asyncio.wait_for(queue.get(), timeout=900)
+                    chunk = await asyncio.wait_for(
+                        queue.get(), timeout=_SSE_HEARTBEAT_INTERVAL
+                    )
                 except asyncio.TimeoutError:
-                    break
+                    # Воркер ещё работает (постобработка, verify, plan_critic) —
+                    # шлём SSE-комментарий, чтобы прокси не обрезал соединение.
+                    yield ": keep-alive\n\n"
+                    continue
                 if chunk is None:
                     break
                 yield chunk

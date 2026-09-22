@@ -496,27 +496,108 @@ function _clearAiHistory() {
     function _renderMarkdown(text) {
         if (!text) return '';
         try {
-            // ИСПРАВЛЕНИЕ: старый регекс требовал точное "💭 РАССУЖДЕНИЕ:", поэтому
-            // рассуждения, которые модель написала как "Рассуждение:", "**Рассуждение:**"
-            // или без эмодзи, не сворачивались в блок — режим выглядел сломанным.
-            // Теперь эмодзи и markdown-жирность опциональны, регистр любой.
-            const reasoningRegex = /(?:💭\s*)?\**\s*РАССУЖДЕНИЯ?\s*:?\s*\**\s*([\s\S]*?)\s*---/i;
-            let mainText = text;
+            // ИСПРАВЛЕНИЕ v2: модель может генерировать рассуждение без маркеров.
+            // Распознаём по ключевым фразам в начале ответа, XML-тегам <thought> и разделяем по двойному переносу строки.
+            const reasoningStartPatterns = [
+                /^сначала я подумаю/i,
+                /^рассужда[ею]м/i,
+                /^ход мыслей/i,
+                /^анализ/i,
+                /^подума[ею]м/i,
+                /^сначала разбер[уё]м/i,
+                // English patterns for reasoning mode
+                /^first let me think/i,
+                /^let me think/i,
+                /^my reasoning/i,
+                /^my thought/i,
+                /^reasoning:/i,
+                /^thought process/i,
+                /^analysis:/i,
+            ];
+            
             let reasoningHtml = '';
-            const match = reasoningRegex.exec(text);
-            if (match) {
-                const reasoningContent = match[1].trim();
-                reasoningHtml = `
-                    <div class="reasoning-block">
-                        <details>
-                            <summary>💭 Reasoning</summary>
-                            <div class="reasoning-content">${marked.parse(reasoningContent)}</div>
-                        </details>
-                    </div>
-                `;
-                mainText = text.replace(match[0], '').trim();
+            let mainText = text;
+            
+            // Сначала проверяем наличие тегов <thought>...</thought> (новый формат)
+            const thoughtMatch = text.match(/<thought>([\s\S]*?)<\/thought>\s*\n\s*\n([\s\S]*)/i);
+            if (thoughtMatch) {
+                const reasoningContent = thoughtMatch[1].trim();
+                mainText = thoughtMatch[2].trim();
+                
+                if (reasoningContent.length > 0) {
+                    reasoningHtml = `
+                        <div class="reasoning-block">
+                            <details>
+                                <summary>💭 Reasoning</summary>
+                                <div class="reasoning-content">${marked.parse(reasoningContent)}</div>
+                            </details>
+                        </div>
+                    `;
+                }
             }
-            let html = marked.parse(mainText);
+            // Если теги не найдены, проверяем старый формат с ключевыми фразами
+            else if (reasoningStartPatterns.some(pat => pat.test(text))) {
+                // Ищем двойной перенос строки как разделитель между рассуждением и ответом
+                // Важно: разбиваем только по первому вхождению \n\n, чтобы не ломать ответ внутри
+                const doubleNewlineIndex = text.indexOf('\n\n');
+                if (doubleNewlineIndex !== -1 && doubleNewlineIndex > 0) {
+                    // Первая часть — рассуждение, остальное — ответ
+                    const reasoningContent = text.substring(0, doubleNewlineIndex).trim();
+                    mainText = text.substring(doubleNewlineIndex + 2).trim();
+                    
+                    if (mainText.length > 0) {
+                        reasoningHtml = `
+                            <div class="reasoning-block">
+                                <details>
+                                    <summary>💭 Reasoning</summary>
+                                    <div class="reasoning-content">${marked.parse(reasoningContent)}</div>
+                                </details>
+                            </div>
+                        `;
+                    } else {
+                        // Если после \n\n нет текста, считаем весь текст рассуждением
+                        reasoningHtml = `
+                            <div class="reasoning-block">
+                                <details>
+                                    <summary>💭 Reasoning</summary>
+                                    <div class="reasoning-content">${marked.parse(text)}</div>
+                                </details>
+                            </div>
+                        `;
+                        mainText = '';
+                    }
+                } else {
+                    // Если нет явного разделения, считаем весь текст рассуждением + добавляем подсказку
+                    reasoningHtml = `
+                        <div class="reasoning-block">
+                            <details>
+                                <summary>💭 Reasoning</summary>
+                                <div class="reasoning-content">${marked.parse(text)}</div>
+                            </details>
+                        </div>
+                    `;
+                    mainText = '';
+                }
+            } else {
+                // Старый формат с "---" разделителем (для обратной совместимости)
+                const reasoningRegex = /(?:💭\s*)?\**\s*РАССУЖДЕНИЯ?\s*:?\s*\**\s*([\s\S]*?)\s*---/i;
+                const match = reasoningRegex.exec(text);
+                if (match) {
+                    const reasoningContent = match[1].trim();
+                    reasoningHtml = `
+                        <div class="reasoning-block">
+                            <details>
+                                <summary>💭 Reasoning</summary>
+                                <div class="reasoning-content">${marked.parse(reasoningContent)}</div>
+                            </details>
+                        </div>
+                    `;
+                    mainText = text.replace(match[0], '').trim();
+                }
+            }
+            
+            // Если mainText пуст, но есть reasoningHtml, показываем только рассуждение
+            let html = mainText ? marked.parse(mainText) : '';
             // ИСПРАВЛЕНИЕ: marked оборачивает голые URL в <a href="URL">URL</a>.
             // Ссылки на сгенерированные изображения (не-stream ответы, текст
             // результатов инструментов) превращаем в <img>, иначе картинка
