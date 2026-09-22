@@ -1129,6 +1129,60 @@ class CognitiveController:
             return None
         return note[:400]
 
+    async def _verify_identity_consistency(self, response: str) -> Optional[str]:
+        """
+        ПУНКТ №4 (Совесть): Проверяет, не происходит ли смыслового дрейфа.
+        Считает косинусную близость между вектором ответа и векторами Ядра памяти.
+        """
+        from GCN.config_ai import IDENTITY_CONSISTENCY_THRESHOLD
+        if not response or len(response.split()) < 15:
+            return None
+
+        try:
+            # 1. Получаем Ядро (gcn_id самых важных фактов)
+            core_gcn_ids = await self.memory.identify_core(top_k=5)
+            if not core_gcn_ids:
+                return None  # Память пуста, ядра нет, проверять нечего
+
+            # 2. Собираем тексты ядра и их эмбеддинги
+            core_texts = []
+            for gid in core_gcn_ids:
+                obj = self.memory.store.get(gid)
+                if obj:
+                    core_texts.append(obj.subject)
+
+            if not core_texts:
+                return None
+
+            # 3. Считаем центроид (средний вектор) Ядра
+            core_embeddings = [self.memory.embed_text(t) for t in core_texts if self.memory.embed_text(t)]
+            if not core_embeddings:
+                return None
+
+            import numpy as np
+            core_centroid = np.mean(core_embeddings, axis=0)
+
+            # 4. Эмбеддим ответ и считаем близость к центроиду
+            response_emb = np.array(self.memory.embed_text(response))
+            core_norm = np.linalg.norm(core_centroid)
+            resp_norm = np.linalg.norm(response_emb)
+
+            if core_norm == 0 or resp_norm == 0:
+                return None
+
+            similarity = float(np.dot(response_emb, core_centroid) / (core_norm * resp_norm))
+
+            # 5. Если ответ слишком далек от Ядра — помечаем как дрейф
+            if similarity < IDENTITY_CONSISTENCY_THRESHOLD:
+                logger.warning(f"[IdentityCritic] Смысловой дрейф! Similarity to core: {similarity:.2f}")
+                return f"ответ слабо связан с моим базовым ядром идентичности (сходство {similarity:.2f}) — возможна потеря контекста или пустая болтовня."
+
+        except Exception as e:
+            logger.debug(f"Identity consistency check failed: {e}")
+            return None
+
+        return None
+
     def _compute_prediction_error(self, predicted: List[str], actual: str) -> float:
         if not predicted or not actual:
             return 1.0
@@ -1533,6 +1587,11 @@ class CognitiveController:
                                            tool_trace=tool_trace)
         if note:
             response = f"{response}\n\n⚠️ Уточнение: {note}"
+            # 3. НОВОЕ: Критик Ядра (Совесть)
+        identity_note = await self._verify_identity_consistency(response)
+        if identity_note:
+            response = f"{response}\n\n🧭 {identity_note}"
+
         response = intellect_mod.ensure_citations(response, sources or [])
         return response
 
@@ -1984,7 +2043,7 @@ class CognitiveController:
                 facts.append(s[:300])
         return facts[:20]
 
-
+    # ===== КОМАНДЫ ПАМЯТИ (расширенный список команд) =====
     # ===== КОМАНДЫ ПАМЯТИ (расширенный список команд) =====
     async def _handle_memory_command(self, message: str) -> Optional[Tuple[str, Dict]]:
         lower_msg = message.lower()
@@ -1994,27 +2053,90 @@ class CognitiveController:
                 if not rest:
                     continue
 
-                if action == "store":
+                # ===== НОВОЕ: Обработка store_shared =====
+                if action == "store_shared":
+                    # Запомнить в shared scope (для эстафеты между ИИ)
+                    scope = "shared"
+                    clean_rest = rest
+                    result = await self.memory_service.remember(clean_rest, scope=scope)
+                    gcn_id = result.get("id")
+                    if gcn_id:
+                        self.memory.hierarchy.add_to_working(gcn_id)
+                    await self.memory_service._save_scope(MemoryScope.SHARED)
+
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию в общий слой (shared). "
+                                "Подтверди, что ты запомнил, кратко и естественно."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Запомни в shared: {result.get('fact', clean_rest)}"
+                        }
+                    ]
+                    response = await call_llm(messages, temp=0.5, max_tokens=150)
+                    if response:
+                        return response, {"memory": "stored", "scope": scope, "id": gcn_id}
+                    else:
+                        return (
+                            f"Запомнил в общий слой ({scope}): {result.get('fact', clean_rest)}",
+                            {"memory": "stored", "scope": scope, "id": gcn_id},
+                        )
+
+                # ===== НОВОЕ: Обработка store_global =====
+                elif action == "store_global":
+                    # Запомнить в global scope
+                    scope = "global"
+                    clean_rest = rest
+                    result = await self.memory_service.remember(clean_rest, scope=scope)
+                    gcn_id = result.get("id")
+                    if gcn_id:
+                        self.memory.hierarchy.add_to_working(gcn_id)
+                    await self.memory_service._save_scope(MemoryScope.GLOBAL)
+
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию в глобальный слой. "
+                                "Подтверди, что ты запомнил, кратко и естественно."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Запомни глобально: {result.get('fact', clean_rest)}"
+                        }
+                    ]
+                    response = await call_llm(messages, temp=0.5, max_tokens=150)
+                    if response:
+                        return response, {"memory": "stored", "scope": scope, "id": gcn_id}
+                    else:
+                        return (
+                            f"Запомнил глобально ({scope}): {result.get('fact', clean_rest)}",
+                            {"memory": "stored", "scope": scope, "id": gcn_id},
+                        )
+
+                # ===== Оригинальная обработка store =====
+                elif action == "store":
                     # Определяем скоуп (как в MCP)
                     is_global = any(w in rest.lower() for w in ("глобально", "global"))
                     scope = "global" if is_global else "private"
-
                     # Очищаем текст от флагов "глобально"/"global"
                     clean_rest = rest
                     for word in ("глобально", "global"):
                         clean_rest = clean_rest.replace(word, "").strip()
                     clean_rest = " ".join(clean_rest.split())
-
                     # ИЗМЕНЕНИЕ: используем сервис для сохранения
                     result = await self.memory_service.remember(clean_rest, scope=scope)
                     gcn_id = result.get("id")
                     if gcn_id:
                         self.memory.hierarchy.add_to_working(gcn_id)
-
                     # Сохраняем соответствующий слой
                     scope_enum = MemoryScope.GLOBAL if is_global else MemoryScope.PRIVATE
                     await self.memory_service._save_scope(scope_enum)
-
                     # Формируем ответ (можно через LLM для красоты)
                     messages = [
                         {
@@ -2039,6 +2161,7 @@ class CognitiveController:
                             {"memory": "stored", "scope": scope, "id": gcn_id},
                         )
 
+                # ===== Обработка forget =====
                 elif action == "forget":
                     # ИЗМЕНЕНИЕ: через сервис (удаляем из private)
                     result = await self.memory_service.forget(rest, scope="private", dry_run=False)
@@ -2065,12 +2188,12 @@ class CognitiveController:
                     else:
                         return "Ничего не найдено для удаления.", {"memory": "no_match"}
 
+                # ===== Обработка recall =====
                 elif action == "recall":
                     # ИЗМЕНЕНИЕ: через сервис
                     facts = await self.memory_service.recall(rest, top_k=7)
                     if not facts:
                         return "Ничего не найдено по вашему запросу.", {"memory": "no_recall"}
-
                     scope_labels = {"private": "личный", "shared": "общий", "global": "глобальный"}
                     context_lines = []
                     for f in facts[:5]:
@@ -2079,7 +2202,6 @@ class CognitiveController:
                         context_lines.append(
                             f"- [{scope_label}] {f['text']} (уверенность: {f.get('confidence', 0.5):.2f})")
                     context = "\n".join(context_lines)
-
                     messages = [
                         {
                             "role": "system",
@@ -2094,7 +2216,6 @@ class CognitiveController:
                             "content": f"Вопрос: {rest}\n\nФакты из памяти:\n{context}"
                         }
                     ]
-
                     response = await call_llm(messages, temp=0.6, max_tokens=500)
                     if not response:
                         answer = "Вот что я знаю:\n" + "\n".join(

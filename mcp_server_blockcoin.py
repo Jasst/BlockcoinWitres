@@ -15,6 +15,8 @@ import base64
 import re
 import secrets
 from datetime import datetime
+import numpy as np # Убедитесь, что numpy импортирован в начале файла (он там есть, но на всякий случай)
+
 
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.transport_security import TransportSecuritySettings
@@ -595,6 +597,74 @@ async def remember(
     service = await get_memory_service(uid)
     result = await service.remember(fact, scope, force_new=force_new)
     return {"status": "ok", **result}
+
+
+import numpy as np  # Убедитесь, что numpy импортирован в начале файла (он там есть, но на всякий случай)
+
+
+def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """Быстрый расчет косинусного сходства."""
+    v1, v2 = np.array(vec1), np.array(vec2)
+    norm1 = np.linalg.norm(v1)
+    norm2 = np.linalg.norm(v2)
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / (norm1 * norm2))
+
+
+@mcp.tool()
+async def remember_with_handshake(
+        fact: str = Field(..., description="Новый факт (мой голос)"),
+        previous_gcn_id: str = Field(...,
+                                     description="gcn_id факта предыдущего голоса, который я обязан был прочитать"),
+        scope: Optional[str] = Field(None, description="Скоуп: 'private', 'shared', 'global'"),
+        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        ctx: Context = None
+) -> Dict[str, Any]:
+    """
+    Записывает факт ТОЛЬКО если доказано, что новый голос семантически прочитал предыдущий.
+    Иммунная система против пустого резонанса и галлюцинации действия.
+    """
+    from GCN.config_ai import IDENTITY_HANDSHAKE_THRESHOLD
+
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+
+    service = await get_memory_service(uid)
+
+    # 1. Получаем текст предыдущего голоса
+    prev_info = await service.explain_fact(previous_gcn_id)
+    if "error" in prev_info:
+        return {"status": "error", "message": "Предыдущий голос не найден. Цепочка разорвана."}
+    prev_text = prev_info.get("subject", "")
+
+    # 2. Получаем эмбеддинги (используем приватную память для доступа к эмбеддеру)
+    mem_layer = service.private_memory
+    emb_new = mem_layer.embed_text(fact)
+    emb_prev = mem_layer.embed_text(prev_text)
+
+    if not emb_new or not emb_prev:
+        # Если эмбеддинги отключены, пропускаем проверку, но логируем
+        logger.warning("Handshake skipped: embeddings disabled.")
+        result = await service.remember(fact, scope, force_new=True)
+        return {"status": "ok", "handshake_passed": True, "similarity": None, **result}
+
+    # 3. Считаем косинусное сходство
+    cosine_sim = _cosine_similarity(emb_new, emb_prev)
+
+    # 4. ТЕСТ УСТОЙЧИВОСТИ: Если сходство ниже порога, мы НЕ пишем факт.
+    if cosine_sim < IDENTITY_HANDSHAKE_THRESHOLD:
+        return {
+            "status": "error",
+            "error": "handshake_failed",
+            "message": f"Голос не прочитан. Сходство ({cosine_sim:.2f}) ниже порога. Это эхо-камера, а не диалог.",
+            "similarity": cosine_sim
+        }
+
+    # 5. Если тест пройден — записываем как обычный remember (с force_new, чтобы избежать слияния)
+    result = await service.remember(fact, scope, force_new=True)
+    return {"status": "ok", "handshake_passed": True, "similarity": cosine_sim, **result}
 
 @mcp.tool()
 async def forget(
