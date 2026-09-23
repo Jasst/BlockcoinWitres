@@ -1371,7 +1371,55 @@ class CognitiveMemory:
             logger.info(f"Deep consolidation done for {self.user_id[:16]}")
 
     # ==================== РАБОТА С ЦЕЛЯМИ ====================
-    async def add_goal(self, description: str, priority: float = 0.5, related_memory: List[int] = None):
+    # Порог схожести для дедупликации целей — совпадает с
+    # DUPLICATE_SIMILARITY_THRESHOLD, используемым для фактов в remember(),
+    # чтобы поведение было симметричным между двумя типами записи.
+    _GOAL_DUPLICATE_SIMILARITY_THRESHOLD = DUPLICATE_SIMILARITY_THRESHOLD
+
+    def _find_duplicate_active_goal(self, description: str) -> Optional["Goal"]:
+        """Ищет уже существующую активную цель, семантически совпадающую
+        с description. Раньше add_goal создавал новую запись безусловно —
+        это давало дубли (то же описание, приоритет, confidence) при
+        повторных вызовах, например из reflection/motivation_engine.
+        Возвращает найденную Goal либо None."""
+        active = [g for g in self.goals if g.status == 'active']
+        if not active:
+            return None
+        try:
+            new_vec = self._get_embedding(description)
+        except Exception:
+            new_vec = None
+        best_goal, best_score = None, 0.0
+        for g in active:
+            if new_vec is not None:
+                try:
+                    g_vec = self._get_embedding(g.description)
+                    denom = (np.linalg.norm(new_vec) * np.linalg.norm(g_vec))
+                    score = float(np.dot(new_vec, g_vec) / denom) if denom else 0.0
+                except Exception:
+                    score = 1.0 if g.description.strip() == description.strip() else 0.0
+            else:
+                score = 1.0 if g.description.strip() == description.strip() else 0.0
+            if score > best_score:
+                best_goal, best_score = g, score
+        if best_goal is not None and best_score >= self._GOAL_DUPLICATE_SIMILARITY_THRESHOLD:
+            return best_goal
+        return None
+
+    async def add_goal(self, description: str, priority: float = 0.5,
+                        related_memory: List[int] = None, force_new: bool = False):
+        if not force_new:
+            existing = self._find_duplicate_active_goal(description)
+            if existing is not None:
+                # Не плодим дубль — при необходимости поднимаем приоритет
+                # существующей цели вместо создания новой записи.
+                if priority > existing.priority:
+                    await self.update_goal(existing.id, priority=priority)
+                logger.info(
+                    f"add_goal: пропущен дубль (совпадение с goal_id={existing.id}), "
+                    f"описание: {description[:80]!r}"
+                )
+                return existing.id
         gcn_id = self.gcn_store.add_goal(description, self.user_id, priority=priority)
         gid = self._next_goal_id
         self._next_goal_id += 1
@@ -1489,6 +1537,17 @@ class CognitiveMemory:
             await self._save_async()
 
     # ==================== СТАТИСТИКА ====================
+    def _faiss_is_ready(self) -> bool:
+        """Достраивает FAISS-индекс при необходимости (если помечен dirty
+        или ещё ни разу не строился в этом процессе) и возвращает реальную
+        готовность — вместо устаревшего faiss_index is not None, которое
+        путало "нет данных" с "ещё не искали ни разу"."""
+        try:
+            self.gcn_store._ensure_faiss()
+        except Exception as e:
+            logger.debug(f"_faiss_is_ready: build_faiss_index failed: {e}")
+        return self.gcn_store.faiss_index is not None
+
     def get_stats(self) -> Dict:
         return {
             "semantic_facts": len(self.semantic_facts),
@@ -1498,7 +1557,14 @@ class CognitiveMemory:
             "goals": len(self.goals),
             "active_goals": len([g for g in self.goals if g.status == 'active']),
             "working_memory": 0,  # не используется
-            "faiss_trained": self.gcn_store.faiss_index is not None,
+            # Раньше здесь проверялось self.gcn_store.faiss_index is not None —
+            # но faiss_index строится ЛЕНИВО внутри _ensure_faiss() перед первым
+            # semantic_search в этом процессе. Из-за этого сразу после старта
+            # (или после restore без единого поиска) faiss_trained лживо
+            # показывал False, хотя данных для индекса было достаточно.
+            # Явно достраиваем индекс перед отчётом, чтобы поле отражало
+            # реальную готовность данных, а не "был ли уже хоть один поиск".
+            "faiss_trained": self._faiss_is_ready(),
             "gcn_objects": len(self.gcn_store._objects),
         }
 

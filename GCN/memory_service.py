@@ -251,9 +251,10 @@ class MemoryService:
         await memory._schedule_save()
         return {"status": "ok", "removed": removed, "scope": scope.lower()}
 
-    async def add_goal(self, description: str, priority: float = 0.5) -> Dict[str, Any]:
+    async def add_goal(self, description: str, priority: float = 0.5,
+                        force_new: bool = False) -> Dict[str, Any]:
         self.refresh()
-        gid = await self.private_memory.add_goal(description, priority)
+        gid = await self.private_memory.add_goal(description, priority, force_new=force_new)
         return {"id": gid, "description": description, "priority": priority}
 
     async def get_goals(self) -> List[Dict]:

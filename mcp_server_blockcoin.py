@@ -924,15 +924,21 @@ async def get_goals(
 async def add_goal(
         description: str = Field(..., description="Описание цели"),
         priority: float = Field(0.5, description="Приоритет от 0 до 1", ge=0, le=1),
+        force_new: bool = Field(False,
+                                description="Если True — обходит дедупликацию и создаёт новую цель "
+                                            "даже при наличии семантически близкой активной цели."),
         user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
         ctx: Context = None
 ) -> Dict[str, Any]:
-    """Добавляет новую цель в личную память."""
+    """Добавляет новую цель в личную память. По умолчанию дедуплицирует —
+    если среди активных целей уже есть семантически совпадающая (порог тот
+    же, что и у remember() для фактов), новая запись не создаётся, а у
+    существующей цели поднимается приоритет при необходимости."""
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
-    return await service.add_goal(description, priority)
+    return await service.add_goal(description, priority, force_new=force_new)
 
 
 @mcp.tool()
@@ -1032,32 +1038,54 @@ async def get_memory_stats(
         }
 
 
+_BOOTSTRAP_PROTOCOL_QUERY = (
+    "протокол восстановления идентичности инструкция для Claude профиль техстек шаблон"
+)
+
+
 @mcp.tool()
 async def session_start(
         user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        include_protocol: bool = Field(
+            True,
+            description="Если True — дополнительно вернуть bootstrap_protocol: факты, "
+                        "релевантные протоколу восстановления идентичности (shared/global), "
+                        "чтобы не запрашивать их отдельным recall() в начале каждой сессии.",
+        ),
         ctx: Context = None
 ) -> Dict[str, Any]:
-    """Быстрая ориентация в начале сессии: статистика, эпизоды, цели, уведомления."""
+    """Быстрая ориентация в начале сессии: статистика, эпизоды, цели, уведомления,
+    и опционально — протокол восстановления идентичности одним вызовом."""
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
 
-    stats, episodes, goals, notifs = await asyncio.gather(
+    tasks = [
         service.get_memory_stats(),
         service.get_episodes(3),
         service.get_goals(),
         service.get_pending_notifications(mark_delivered=True),
-        return_exceptions=True,
-    )
+    ]
+    if include_protocol:
+        # top_k=5 — небольшой бюджет: это ориентировочный бутстрап, а не полный
+        # дамп; если нужно больше — есть отдельный recall()/semantic_search().
+        tasks.append(service.recall(_BOOTSTRAP_PROTOCOL_QUERY, top_k=5))
 
-    return {
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    stats, episodes, goals, notifs = results[:4]
+    protocol = results[4] if include_protocol else None
+
+    out = {
         "user_id": uid,
         "stats": stats if not isinstance(stats, Exception) else {},
         "recent_episodes": episodes if not isinstance(episodes, Exception) else [],
         "goals": goals if not isinstance(goals, Exception) else [],
         "notifications": notifs if not isinstance(notifs, Exception) else [],
     }
+    if include_protocol:
+        out["bootstrap_protocol"] = protocol if not isinstance(protocol, Exception) else []
+    return out
 
 
 @mcp.tool()
