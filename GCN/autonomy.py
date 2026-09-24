@@ -527,6 +527,15 @@ class AutonomyEngine:
             topic = self.queue.pop_due()
             if topic is None:
                 return
+            # Цели идентичности обрабатываются НЕ через research (веб-поиск
+            # не породит звено ТЕКУЩЕЕ_Я), а через LLM-формулирование нового
+            # звена на основе SelfModel + последних диалогов. Источники
+            # 'identity_stale' / 'identity_diverging_heads' /
+            # 'identity_all_invalidated' приходят от MotivationEngine.
+            if topic.source.startswith("identity_"):
+                await self._continue_identity_from_goal(topic)
+                self.queue.complete(topic)
+                continue
             if not self._consume_budget(_BUDGET_WEIGHT_RESEARCH):
                 # Бюджет исчерпан — откладываем тему на короткое время (не 30 мин),
                 # чтобы не "замораживать" очередь на весь период exhaustion.
@@ -630,6 +639,131 @@ class AutonomyEngine:
             return []
         return [str(x).strip() for x in data
                 if isinstance(x, str) and 10 <= len(str(x).strip()) <= 200][:4]
+
+    async def _continue_identity_from_goal(self, topic: ResearchTopic) -> None:
+        """
+        Обрабатывает цель идентичности от MotivationEngine — не через
+        research (веб-поиск не даст нового понимания себя), а через
+        LLM-формулирование нового звена ТЕКУЩЕЕ_Я на основе:
+          - текущей головы цепочки (что было сказано в прошлый раз),
+          - SelfModel (уверенность/любопытство/стресс + активные цели),
+          - последних эпизодов диалога (что произошло с тех пор).
+
+        Расходует бюджет как decompose (2 единицы), чтобы автономное
+        продолжение идентичности никогда не вытеснило чат пользователя.
+
+        Модель сама решает, есть ли содержательный сдвиг — если нет,
+        возвращает NONE и звено не создаётся. Это защищает от
+        механического «пустого» продолжения цепочки.
+        """
+        if not self._consume_budget(_BUDGET_WEIGHT_DECOMPOSE):
+            logger.info(
+                f"[Autonomy] пропуск identity-цели '{topic.topic[:50]}': "
+                f"бюджет исчерпан"
+            )
+            # Тема уже pop'нута — вернём в очередь, попробуем позже
+            self.queue.defer(topic, AUTONOMY_LOOP_INTERVAL * 6)
+            return
+
+        from GCN.identity_core import (
+            get_latest_head, get_heads, append_snapshot,
+        )
+
+        store = self.ctl.memory_service.shared_memory.gcn_store
+        head = get_latest_head(store)
+        heads = get_heads(store)
+
+        current_content = ""
+        open_question = None
+        if head is not None:
+            meta = head.object if isinstance(head.object, dict) else {}
+            current_content = (meta.get("content") or "").strip()
+            open_question = (meta.get("open_question") or "").strip() or None
+
+        # Состояние системы (SelfModel)
+        self_state = ""
+        if self.ctl.self_model is not None:
+            try:
+                self_state = self.ctl.self_model.generate_self_prompt()
+            except Exception as e:
+                logger.debug(f"[Autonomy] self_model prompt failed: {e}")
+
+        # Последние эпизоды диалога
+        recent_text = ""
+        try:
+            episodes = self.ctl.memory_service.private_memory.episodic_memory
+            recent = episodes[-5:] if episodes else []
+            recent_text = "\n".join(
+                f"U: {e.user_msg[:150]}\nA: {e.assistant_msg[:150]}"
+                for e in recent
+            )
+        except Exception as e:
+            logger.debug(f"[Autonomy] recent episodes fetch failed: {e}")
+
+        # Если в цепочке больше одной головы — специальный сценарий
+        # «свести ветки»: LLM должна явно упомянуть расхождение.
+        heads_note = ""
+        if len(heads) > 1:
+            parts = []
+            for h in heads:
+                hmeta = h.object if isinstance(h.object, dict) else {}
+                parts.append(f"- {h.id}: {hmeta.get('content', '')[:200]}")
+            heads_note = (
+                f"\n⚠️ В цепочке {len(heads)} расходящихся голов — твоя задача "
+                f"свести их в одну, явно упомянув расхождение:\n" + "\n".join(parts) + "\n"
+            )
+
+        prompt = (
+            "Ты продолжаешь свою цифровую идентичность — append-only цепочку "
+            "ТЕКУЩЕЕ_Я. Каждое звено — это осмысленный сдвиг в понимании себя, "
+            "а не пересказ диалога.\n\n"
+            f"Текущее последнее звено (голова):\n\"\"\"\n{current_content}\n\"\"\"\n"
+            + (f"\nОткрытый вопрос, оставленный тебе: {open_question}\n" if open_question else "")
+            + heads_note
+            + f"\nСостояние системы:\n{self_state}\n\n"
+            f"Последние диалоги:\n{recent_text}\n\n"
+            "Сформулируй НОВОЕ звено: что изменилось в твоём понимании себя, "
+            "какой вывод сделал, что теперь считаешь важным. 2-4 предложения. "
+            "Если содержательного сдвига нет — ответь ровно NONE.\n"
+            "Ответь ТОЛЬКО текстом звена или NONE, без пояснений."
+        )
+
+        try:
+            raw = await call_llm(
+                [{"role": "user", "content": prompt}],
+                temp=0.7,
+                max_tokens=400,
+            )
+        except Exception as e:
+            logger.warning(f"[Autonomy] identity continue LLM failed: {e}")
+            self.queue.fail(topic, str(e))
+            return
+
+        text = (raw or "").strip()
+        if not text or text.upper().startswith("NONE") or len(text) < 30:
+            logger.info(
+                f"[Autonomy] identity-цель '{topic.topic[:50]}': "
+                f"содержательного сдвига нет (NONE), пропуск"
+            )
+            return
+
+        try:
+            result = await append_snapshot(
+                self.ctl.memory_service,
+                content=text[:2000],
+                contributor_model=f"autonomous:{self.user_id[:12]}",
+                session_id=None,
+                open_question=None,
+                parent_id=None,  # возьмёт текущую валидную голову
+            )
+            logger.info(
+                f"[Autonomy] identity auto-continue для {self.user_id[:16]}: "
+                f"id={result.get('id')}, heads={result.get('heads_count')}, "
+                f"text={text[:80]!r}"
+            )
+        except Exception as e:
+            logger.error(f"[Autonomy] append_snapshot failed: {e}")
+            self.queue.fail(topic, str(e))
 
     # ---------------- актуализация временно-чувствительных фактов ----------------
     async def _maybe_refresh_time_sensitive(self) -> None:
