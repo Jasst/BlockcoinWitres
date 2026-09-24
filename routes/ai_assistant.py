@@ -474,6 +474,10 @@ class CognitiveController:
         from GCN.internal_tools import code_tools
         code_tools.register(self.tool_registry, self)
 
+        # >>> НОВОЕ: identity-цепочка ТЕКУЩЕЕ_Я <<<
+        from GCN.internal_tools import identity_tools
+        identity_tools.register(self.tool_registry, self)
+
         self._external_tools_registered = False
 
 

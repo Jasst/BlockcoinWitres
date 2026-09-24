@@ -354,9 +354,16 @@ class AutonomyEngine:
                 # Передаём обратно в контроллер
                 controller.self_model = self.self_model
             
+            # ВАЖНО: передаём memory_service (MemoryService, доступ ко всем
+            # трём слоям), а не controller.memory (это private_memory —
+            # одна CognitiveMemory). identity_core живёт в shared-слое
+            # (singleton GCNMemoryRouter._shared_instance), и
+            # generate_identity_consolidation_goal() читает его через
+            # self.memory.shared_memory — с private_memory это тихо не
+            # находило бы цепочку вообще, без явной ошибки.
             self.motivation = MotivationEngine(
                 self.self_model,
-                getattr(controller, 'memory', None)
+                getattr(controller, 'memory_service', None)
             )
         except ImportError as e:
             logger.warning(f"[Autonomy] не удалось загрузить модули сознания: {e}")

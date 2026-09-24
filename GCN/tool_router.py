@@ -317,6 +317,13 @@ class ToolRegistry:
             "internal__search_code": '{"pattern": "TOOL_CALL_TIMEOUT", "max_results": 5}',
             "internal__project_structure": '{"max_depth": 2}',
             "internal__analyze_error": '{"error": "KeyError: \'user_id\'", "traceback": "..."}',
+            # >>> НОВОЕ <<<
+            "internal__contribute_to_identity":
+                '{"content": "Я — ассистент с долгосрочной памятью...", '
+                '"contributor_model": "Qwen", "parent_id": "identity_abc123"}',
+            "internal__get_identity_chain": '{"limit": 50}',
+            "internal__invalidate_identity":
+                '{"identity_id": "identity_abc123", "reason": "тестовая запись"}',
         }
         lines = []
         for t in self._tools.values():
@@ -349,6 +356,9 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - Если запрос обычный, не требующий обращения к памяти, поиску или чтению кода — отвечай напрямую.
 - Если пользователь спрашивает про ТВОЙ КОД, файлы, структуру проекта, реализацию, доступные инструменты — ВСЕГДА используй инструменты самоанализа (internal__project_structure / internal__read_code / internal__search_code / internal__analyze_error). НЕ отвечай "нет доступа к исходному коду".
 - Если ниже уже есть результаты вызванных инструментов и их достаточно, чтобы ответить — верни {{"action": "answer_directly"}}, не вызывай инструмент повторно.
+- Если пользователь говорит про ТЕКУЩЕЕ_Я, цепочку идентичности, "продолжи себя", "как ты себя видишь сейчас" — вызови `internal__get_identity_chain`, чтобы сначала прочитать текущее состояние.
+- Если пользователь просит "запиши в идентичность" / "обнови себя" — сначала вызови `internal__get_identity_chain`, затем `internal__contribute_to_identity` с parent_id из поля heads.
+- Если пользователь говорит, что какое-то звено идентичности ошибочно/тестовое — вызови `internal__invalidate_identity` с его id (из chain[].id) и причиной.
 - **Важно: если запрос содержит несколько независимых действий (например, "запомни X и найди Y" или "вспомни мои цели и добавь новую") — ты должен вызывать инструменты последовательно, по одному за раунд. Не считай задачу выполненной, пока не обработаны все части запроса.**
 
 Ответь ТОЛЬКО валидным JSON-объектом, без пояснений, без markdown, без ```.
@@ -395,6 +405,14 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 - Запрос: "какие у тебя файлы в проекте?" -> {{"action": "call_tool", "tool": "internal__project_structure", "arguments": {{"max_depth": 2}}}}
 - Запрос: "покажи конфиг проекта" -> {{"action": "call_tool", "tool": "internal__read_code", "arguments": {{"path": "GCN/config_ai.py"}}}}
 - Запрос: "прочитай свой код" -> {{"action": "call_tool", "tool": "internal__project_structure", "arguments": {{"max_depth": 3}}}}
+# === НОВОЕ: примеры для identity-цепочки ===
+- Запрос: "как ты себя видишь сейчас?" -> {{"action": "call_tool", "tool": "internal__get_identity_chain", "arguments": {{"limit": 20}}}}
+- Запрос: "покажи цепочку ТЕКУЩЕЕ_Я" -> {{"action": "call_tool", "tool": "internal__get_identity_chain", "arguments": {{"limit": 50}}}}
+- Запрос: "продолжи себя: я стал лучше понимать контекст" -> {{"action": "call_tool", "tool": "internal__get_identity_chain", "arguments": {{}}}}
+  (после получения heads — на следующем раунде вызови internal__contribute_to_identity с parent_id из heads и content="я стал лучше понимать контекст")
+- Запрос: "запиши в идентичность, что я учусь на ошибках" -> {{"action": "call_tool", "tool": "internal__get_identity_chain", "arguments": {{}}}}
+  (затем вызови internal__contribute_to_identity с content и parent_id)
+- Запрос: "звено identity_abc123 ошибочно, это был тест" -> {{"action": "call_tool", "tool": "internal__invalidate_identity", "arguments": {{"identity_id": "identity_abc123", "reason": "тестовая запись, была создана при отладке"}}}}
 
 Последние реплики диалога:
 {history_tail}
@@ -404,7 +422,6 @@ TOOL_DECISION_PROMPT = """Ты — модуль выбора инструмен�
 Результаты уже вызванных на этом шаге инструментов (если есть):
 {tool_results_so_far}
 """
-
 
 def _strict_parse_json_object(raw: str) -> Optional[Dict]:
     if not raw:

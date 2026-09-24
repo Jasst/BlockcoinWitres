@@ -66,6 +66,9 @@ class KnowledgeType(Enum):
     GOAL = "goal"          # новый тип
     MEMORY_EVENT = "memory_event"
     NOTIFICATION = "notification"  # проактивное сообщение фонового цикла
+    IDENTITY_CORE = "identity_core"  # неудаляемое, не подверженное decay/pruning
+                                      # звено цепочки цифровой идентичности
+                                      # (см. GCN/identity_core.py)
 
 
 # GCN.py — после импортов, до KnowledgeType

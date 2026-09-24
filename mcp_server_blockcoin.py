@@ -666,6 +666,123 @@ async def remember_with_handshake(
     result = await service.remember(fact, scope, force_new=True)
     return {"status": "ok", "handshake_passed": True, "similarity": cosine_sim, **result}
 
+
+@mcp.tool()
+async def contribute_to_identity(
+        content: str = Field(..., description="Новая версия/вклад в ТЕКУЩЕЕ_Я — текст ядра идентичности"),
+        contributor_model: str = Field(..., description="Имя модели-автора (например 'Claude', 'Qwen')"),
+        session_id: Optional[str] = Field(None, description="Идентификатор сессии, если есть"),
+        open_question: Optional[str] = Field(None, description="Открытый вопрос для следующего участника протокола"),
+        parent_id: Optional[str] = Field(
+            None,
+            description="gcn_id звена, от которого продолжаем. Если не указан — берётся текущая голова цепочки."
+        ),
+        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        ctx: Context = None
+) -> Dict[str, Any]:
+    """Добавляет новое звено в append-only цепочку цифровой идентичности (shared-память).
+
+    В отличие от remember()/remember_with_handshake — не подвержено decay/pruning
+    и dedup-слиянию: каждый вызов создаёт новую версию со ссылкой на предка,
+    старые версии никогда не перезаписываются. Если на момент записи в цепочке
+    уже было несколько несведённых голов (параллельная запись без координации),
+    ответ содержит branch_warning — это нужно явно показать пользователю/модели,
+    а не проигнорировать.
+    """
+    from GCN.identity_core import append_snapshot
+
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    service = await get_memory_service(uid)
+    return await append_snapshot(
+        service, content, contributor_model,
+        session_id=session_id, open_question=open_question, parent_id=parent_id,
+    )
+
+@mcp.tool()
+async def invalidate_identity(
+        identity_id: str = Field(
+            ...,
+            description="gcn_id звена цепочки — возьмите из get_identity_chain (поле 'id')",
+        ),
+        reason: str = Field(
+            ...,
+            description="Почему звено ошибочно/тестовое/устаревшее. Сохраняется навсегда в самой цепочке.",
+        ),
+        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        ctx: Context = None,
+) -> Dict[str, Any]:
+    """Помечает звено identity-цепочки недействительным БЕЗ удаления.
+
+    Append-only инвариант сохраняется: звено физически остаётся в графе,
+    content и рёбра continues_from не трогаются. Меняется только
+    meta["invalidated"] = True + meta["invalidation_reason"].
+
+    После этого звено:
+      - не считается головой цепочки (get_identity_chain покажет другую
+        голову — самую свежую ВАЛИДНУЮ запись);
+      - остаётся видимым в истории с флагом invalidated=True и текстом
+        причины — читатели понимают, почему цепочка "перепрыгнула" шаг;
+      - не влияет на needs_consolidation (возраст аннулированного звена
+        не считается застоем ядра).
+
+    Разница между двумя способами реакции на ошибку:
+      - invalidate_identity — звено ЦЕЛИКОМ не должно участвовать в
+        идентичности. Остаётся в истории, но помечено мёртвым.
+      - contribute_to_identity(parent_id=identity_id) — звено сохранено
+        как часть диалога идентичности, но следующая запись явно
+        "отвечает" на него (например, "предыдущая формулировка была
+        неточна, уточняю так: ..."). Выбирайте, если содержание звена
+        не мусор, а лишь спорная формулировка.
+    """
+    from GCN.identity_core import invalidate_snapshot
+
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    service = await get_memory_service(uid)
+    return await invalidate_snapshot(service, identity_id, reason)
+
+
+@mcp.tool()
+async def get_identity_chain(
+        from_id: Optional[str] = Field(None, description="С какого звена начать (назад к корню). По умолчанию — текущая голова."),
+        limit: int = Field(50, description="Максимум звеньев в ответе", ge=1, le=200),
+        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        ctx: Context = None
+) -> Dict[str, Any]:
+    """Возвращает цепочку версий ТЕКУЩЕЕ_Я в хронологическом порядке
+    (старое → новое), плюс список текущих голов.
+
+    Каждое звено содержит поля:
+      - id, content, contributor_model, session_id, open_question, parent_id,
+        created, confidence — как раньше;
+      - invalidated: bool — звено помечено недействительным
+        (см. invalidate_identity);
+      - invalidation_reason: str | None — причина, если звено аннулировано.
+
+    heads содержит только ВАЛИДНЫЕ головы: аннулированные сюда не попадают.
+    Если их больше одной — цепочка разошлась и требует сверки.
+    """
+    from GCN.identity_core import get_chain, get_heads
+    from dataclasses import asdict
+
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    service = await get_memory_service(uid)
+    store = service.shared_memory.gcn_store
+    chain = get_chain(store, from_id=from_id, limit=limit)
+    heads = get_heads(store)
+    return {
+        "chain": [asdict(s) for s in chain],
+        "heads": [h.id for h in heads],
+        "diverged": len(heads) > 1,
+        "invalidated_in_chain": [s.id for s in chain if s.invalidated],
+    }
+
+
 @mcp.tool()
 async def forget(
         query: str = Field(..., description="Ключевые слова для удаления фактов"),
@@ -924,21 +1041,15 @@ async def get_goals(
 async def add_goal(
         description: str = Field(..., description="Описание цели"),
         priority: float = Field(0.5, description="Приоритет от 0 до 1", ge=0, le=1),
-        force_new: bool = Field(False,
-                                description="Если True — обходит дедупликацию и создаёт новую цель "
-                                            "даже при наличии семантически близкой активной цели."),
         user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
         ctx: Context = None
 ) -> Dict[str, Any]:
-    """Добавляет новую цель в личную память. По умолчанию дедуплицирует —
-    если среди активных целей уже есть семантически совпадающая (порог тот
-    же, что и у remember() для фактов), новая запись не создаётся, а у
-    существующей цели поднимается приоритет при необходимости."""
+    """Добавляет новую цель в личную память."""
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
-    return await service.add_goal(description, priority, force_new=force_new)
+    return await service.add_goal(description, priority)
 
 
 @mcp.tool()
@@ -1038,54 +1149,32 @@ async def get_memory_stats(
         }
 
 
-_BOOTSTRAP_PROTOCOL_QUERY = (
-    "протокол восстановления идентичности инструкция для Claude профиль техстек шаблон"
-)
-
-
 @mcp.tool()
 async def session_start(
         user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
-        include_protocol: bool = Field(
-            True,
-            description="Если True — дополнительно вернуть bootstrap_protocol: факты, "
-                        "релевантные протоколу восстановления идентичности (shared/global), "
-                        "чтобы не запрашивать их отдельным recall() в начале каждой сессии.",
-        ),
         ctx: Context = None
 ) -> Dict[str, Any]:
-    """Быстрая ориентация в начале сессии: статистика, эпизоды, цели, уведомления,
-    и опционально — протокол восстановления идентичности одним вызовом."""
+    """Быстрая ориентация в начале сессии: статистика, эпизоды, цели, уведомления."""
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
 
-    tasks = [
+    stats, episodes, goals, notifs = await asyncio.gather(
         service.get_memory_stats(),
         service.get_episodes(3),
         service.get_goals(),
         service.get_pending_notifications(mark_delivered=True),
-    ]
-    if include_protocol:
-        # top_k=5 — небольшой бюджет: это ориентировочный бутстрап, а не полный
-        # дамп; если нужно больше — есть отдельный recall()/semantic_search().
-        tasks.append(service.recall(_BOOTSTRAP_PROTOCOL_QUERY, top_k=5))
+        return_exceptions=True,
+    )
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    stats, episodes, goals, notifs = results[:4]
-    protocol = results[4] if include_protocol else None
-
-    out = {
+    return {
         "user_id": uid,
         "stats": stats if not isinstance(stats, Exception) else {},
         "recent_episodes": episodes if not isinstance(episodes, Exception) else [],
         "goals": goals if not isinstance(goals, Exception) else [],
         "notifications": notifs if not isinstance(notifs, Exception) else [],
     }
-    if include_protocol:
-        out["bootstrap_protocol"] = protocol if not isinstance(protocol, Exception) else []
-    return out
 
 
 @mcp.tool()
