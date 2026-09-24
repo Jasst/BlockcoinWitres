@@ -511,6 +511,11 @@ RESEARCH_PRIORITY_SOURCE_BOOST = {
     "curiosity_uncertainty": 0.12, "curiosity_skill_improvement": 0.10,
     "novelty_exploration": 0.08, "gap_stalled_goal": 0.15,
     "quality_improvement": 0.18, "quality_confidence_boost": 0.12,
+    # Эндогенные identity-цели из MotivationEngine — не должны
+    # проигрывать обычным research-темам
+    "identity_stale": 0.15,
+    "identity_diverging_heads": 0.20,
+    "identity_all_invalidated": 0.25,
 }
 # Декомпозиция активных целей на проверяемые подзадачи (один раз на цель).
 GOAL_DECOMPOSE_INTERVAL = 6 * 3600
