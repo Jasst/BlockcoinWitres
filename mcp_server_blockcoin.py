@@ -595,7 +595,7 @@ async def remember(
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
-    result = await service.remember(fact, scope, force_new=force_new)
+    result = await service.remember(fact, scope, force_new=force_new, user_explicit=True)
     return {"status": "ok", **result}
 
 
@@ -772,6 +772,7 @@ async def get_identity_chain(
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
+    service.shared_memory.reload_if_stale()  # не отдавать устаревшую голову/чейн
     store = service.shared_memory.gcn_store
     chain = get_chain(store, from_id=from_id, limit=limit)
     heads = get_heads(store)
@@ -1200,7 +1201,7 @@ async def remember_batch(
         return {"status": "error", "message": "После фильтрации пустых строк не осталось фактов."}
 
     results = await asyncio.gather(
-        *[service.remember(f, scope) for f in clean],
+        *[service.remember(f, scope, user_explicit=True) for f in clean],
         return_exceptions=True,
     )
 

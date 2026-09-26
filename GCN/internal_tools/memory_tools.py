@@ -37,11 +37,22 @@ def register(registry: ToolRegistry, controller) -> None:
     async def _internal_remember(args: Dict) -> str:
         fact = args.get("fact", "")
         scope = args.get("scope")  # None = автодетекция
-        result = await controller.memory_service.remember(fact, scope)
+        # ИСПРАВЛЕНИЕ: внутренний инструмент вызывается по решению LLM в ответ
+        # на явную просьбу пользователя «запомни ...». Это осознанный запрос,
+        # а не автоизвлечение из web-поиска — пропускаем фильтр фактологичности
+        # (см. user_explicit в MemoryService.remember). Без этого флага простые
+        # пользовательские факты без цифр/факт-глаголов («мой любимый цвет
+        # синий», «меня зовут Иван») молча отклонялись бы с reason=not_factual.
+        result = await controller.memory_service.remember(
+            fact, scope, user_explicit=True)
         if result.get("id"):
             returned_fact = result.get("fact") or fact
             return f"Запомнил: {returned_fact} (скоуп: {result.get('scope', 'unknown')})"
-        return "Не удалось запомнить."
+        # Сюда попадаем только если remember() вернул rejected/error —
+        # отдаём модели причину вместо «Не удалось запомнить», чтобы она
+        # могла переформулировать и попробовать снова.
+        reason = result.get("reason", "unknown")
+        return f"Не удалось запомнить: {reason}"
 
     async def _internal_add_goal(args: Dict) -> str:
         description = args.get("description", "")

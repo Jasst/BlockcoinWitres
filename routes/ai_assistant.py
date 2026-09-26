@@ -1632,6 +1632,13 @@ class CognitiveController:
         if response:
             # Извлекаем только финальный ответ, отбрасывая блок <thought>...</thought>.
             _, stored_response = _split_reasoning(response)
+        # ИСПРАВЛЕНИЕ: раньше в успешном пути (в отличие от exception-веток
+        # ниже по файлу) сюда никогда не писался реальный ответ ассистента —
+        # self.history оставался без "assistant"-реплики для ходов с
+        # инструментами. Пишем именно stored_response (без <thought>-блока),
+        # чтобы будущий контекст модели не содержал служебный reasoning.
+        if stored_response:
+            self.history.append({"role": "assistant", "content": stored_response})
         self._save_history()
 
         if response:
@@ -1885,11 +1892,16 @@ class CognitiveController:
                     logger.warning(f"Fact extraction error: {e}")
 
         if tool_trace:
-            for t in tool_trace:
-                self.history.append({
-                    "role": "assistant",
-                    "content": f"[инструмент {t['tool']}] {str(t['result'])[:500]}"
-                })
+            # ИСПРАВЛЕНИЕ (role-confusion + дублирование):
+            #  1) Раньше результаты инструментов клались с role="assistant" —
+            #     для модели это выглядело как ЕЁ СОБСТВЕННЫЙ предыдущий ответ,
+            #     и она продолжала его вместо ответа пользователю (эхо-баг
+            #     "[инструмент internal__recall] ..." в чат). Здесь и в
+            #     _stream_response_worker это убрано: tool-вывод идёт ТОЛЬКО
+            #     как user-сообщение.
+            #  2) Тот же вывод раньше попадал в промпт ДВАЖДЫ — сначала как
+            #     assistant, потом внутри финального user-блока через
+            #     build_tool_trace_context. Оставлен только второй (полный).
             messages = self._build_messages(
                 message=message,
                 web_search=web_search,
@@ -1907,8 +1919,15 @@ class CognitiveController:
             )
             messages.append({
                 "role": "user",
-                "content": build_tool_trace_context(tool_trace) + "\n\nТеперь дай финальный ответ пользователю."
+                "content": (
+                        build_tool_trace_context(tool_trace)
+                        + "\n\nНа основе этих результатов дай финальный ответ пользователю. "
+                          "НЕ повторяй содержимое блока «РЕЗУЛЬТАТЫ ВЫЗОВА ИНСТРУМЕНТОВ» "
+                          "дословно и не пересказывай его как свой ответ — используй его "
+                          "как источник данных, а пользователю напиши обычный ответ."
+                )
             })
+
 
         response = await call_llm(messages)
         response = await self._finalize_answer(message, response, search_meta, tool_trace)
@@ -2062,7 +2081,7 @@ class CognitiveController:
                     # Запомнить в shared scope (для эстафеты между ИИ)
                     scope = "shared"
                     clean_rest = rest
-                    result = await self.memory_service.remember(clean_rest, scope=scope)
+                    result = await self.memory_service.remember(clean_rest, scope=scope, user_explicit=True)
                     gcn_id = result.get("id")
                     if gcn_id:
                         self.memory.hierarchy.add_to_working(gcn_id)
@@ -2095,7 +2114,7 @@ class CognitiveController:
                     # Запомнить в global scope
                     scope = "global"
                     clean_rest = rest
-                    result = await self.memory_service.remember(clean_rest, scope=scope)
+                    result = await self.memory_service.remember(clean_rest, scope=scope, user_explicit=True)
                     gcn_id = result.get("id")
                     if gcn_id:
                         self.memory.hierarchy.add_to_working(gcn_id)
@@ -2134,7 +2153,7 @@ class CognitiveController:
                         clean_rest = clean_rest.replace(word, "").strip()
                     clean_rest = " ".join(clean_rest.split())
                     # ИЗМЕНЕНИЕ: используем сервис для сохранения
-                    result = await self.memory_service.remember(clean_rest, scope=scope)
+                    result = await self.memory_service.remember(clean_rest, scope=scope, user_explicit=True)
                     gcn_id = result.get("id")
                     if gcn_id:
                         self.memory.hierarchy.add_to_working(gcn_id)
@@ -2940,12 +2959,17 @@ class CognitiveController:
                                 logger.warning("generate_image result does not contain image_url")
 
                     if tool_trace:
+                        # SSE-уведомление фронтенду о факте вызова инструмента —
+                        # НЕ идёт в промпт LLM, только в UI.
                         for t in tool_trace:
-                            await push(f"data: {json.dumps({'tool_call': t['tool'], 'result_preview': str(t['result'])[:200]})}\n\n")
-                            self.history.append({
-                                "role": "assistant",
-                                "content": f"[инструмент {t['tool']}] {str(t['result'])[:500]}"
-                            })
+                            await push(
+                                f"data: {json.dumps({'tool_call': t['tool'], 'result_preview': str(t['result'])[:200]})}\n\n")
+
+                        # ИСПРАВЛЕНИЕ (role-confusion + дублирование):
+                        # убраны assistant-сообщения с дампом инструмента — модель
+                        # принимала их за свои предыдущие ответы и продолжала
+                        # (эхо-баг "[инструмент internal__recall] ..." в чате).
+                        # Оставлен единственный user-блок с результатами.
                         messages = self._build_messages(
                             message=message,
                             web_search=web_search,
@@ -2963,7 +2987,13 @@ class CognitiveController:
                         )
                         messages.append({
                             "role": "user",
-                            "content": build_tool_trace_context(tool_trace) + "\n\nТеперь дай финальный ответ пользователю."
+                            "content": (
+                                    build_tool_trace_context(tool_trace)
+                                    + "\n\nНа основе этих результатов дай финальный ответ пользователю. "
+                                      "НЕ повторяй содержимое блока «РЕЗУЛЬТАТЫ ВЫЗОВА ИНСТРУМЕНТОВ» "
+                                      "дословно и не пересказывай его как свой ответ — используй его "
+                                      "как источник данных, а пользователю напиши обычный ответ."
+                            )
                         })
 
                     # ИСПРАВЛЕНИЕ: убраны stop-токены для reasoning mode.

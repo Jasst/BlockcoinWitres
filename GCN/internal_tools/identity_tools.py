@@ -39,6 +39,7 @@ def register(registry, controller):
         )
 
     async def _get_chain(args):
+        service.shared_memory.reload_if_stale()  # не отдавать устаревшую голову/чейн
         store = service.shared_memory.gcn_store
         chain = get_chain(
             store,

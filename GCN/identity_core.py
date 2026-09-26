@@ -266,6 +266,9 @@ async def append_snapshot(
         новая запись формально "продолжит мусор", обычно это не то, что нужно.
     """
     memory = service.shared_memory
+    memory.reload_if_stale()  # см. модульный докстринг: критично не читать
+                               # устаревшую голову перед append — иначе
+                               # словим divergence, который сами же детектируем
     store = memory.gcn_store
 
     heads_before = get_heads(store)
@@ -373,6 +376,7 @@ async def invalidate_snapshot(
                         "почему звено ошибочно и что вместо него считать верным."),
         }
 
+    service.shared_memory.reload_if_stale()  # та же причина, что в append_snapshot
     store = service.shared_memory.gcn_store
     obj = store.get(identity_id)
     if obj is None:
