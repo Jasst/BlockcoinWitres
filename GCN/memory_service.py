@@ -16,6 +16,7 @@
 """
 
 import logging
+import re
 import time
 from typing import List, Dict, Optional, Any, Tuple
 from pathlib import Path
@@ -24,10 +25,67 @@ from GCN.memory_graph import GCNMemoryRouter, MemoryScope, CognitiveMemory
 from GCN.llm_client import call_llm
 from GCN.config_ai import MEMORY_BASE_DIR
 
+# =====================================================================
+# Фильтр «фактовости» перед записью в долговременную память
+# =====================================================================
+# Проблема: remember() проверял только дубли по эмбеддингу, но НЕ проверял,
+# является ли переданный текст вообще фактом о мире. В результате в память
+# попадали оценочные суждения и мета-высказывания о системе/ассистенте
+# (типа «У пользователя нет внутреннего механизма для запоминания...» с
+# confidence=0.9) — они потом всплывали в recall и отравляли ответы.
+
+# Маркеры утверждений О СИСТЕМЕ/АССИСТЕНТЕ — это не факты о мире.
+# Высказывания самого пользователя о себе («я не умею готовить») НЕ блокируем.
+_META_ABOUT_SYSTEM_MARKERS = (
+    "пользователь не может", "у пользователя нет", "пользователю недоступно",
+    "ассистент не может", "у ассистента нет", "ассистенту недоступно",
+    "у тебя нет", "ты не можешь", "ты не умеешь",
+    "модель не может", "модель не умеет",
+    "внутренний механизм", "внутреннего механизма",
+    "система не может", "система не умеет",
+)
+
+# Копия списка из GCN/intellect.py (_OPINION_MARKERS). Импортировать
+# приватное имя из соседнего модуля некрасиво; при желании — вынести
+# в общий helper-модуль.
+_OPINION_MARKERS = (
+    "возможно", "наверное", "вероятно", "по словам", "считает", "считают",
+    "мнение", "полагают", "как сообщает", "утверждает", "утверждают",
+    "прогноз", "ожидается", "может вырасти", "может упасть", "по оценкам",
+    "эксперты полагают", "как полагают",
+)
+
+_FACT_VERB_RE = re.compile(
+    r"\b(является|составляет|равен|равна|находится|имеет|имеют|был|была|было|"
+    r"стал|стала|выпущен|выпущена|основан|основана|родился|открыт|запущен|"
+    r"зовут|называется|живёт|живет|живу|работает|работаю|учится|учусь|"
+    r"любит|люблю|предпочитает|предпочитаю)\b"
+)
+
+def _is_storable_fact(text: str) -> Tuple[bool, str]:
+    """
+    Возвращает (True, "") если text — факт о мире, пригодный для хранения
+    в долговременной памяти. Иначе — (False, reason).
+    """
+    if not text or len(text.strip()) < 10:
+        return False, "too_short"
+    low = text.lower()
+    if any(m in low for m in _META_ABOUT_SYSTEM_MARKERS):
+        return False, "meta_statement"
+    if any(m in low for m in _OPINION_MARKERS):
+        return False, "opinion_marker"
+    # Фактологичность: число/дата/факт-глагол. Если ничего из этого — это
+    # скорее оценка или общая фраза, не знание.
+    if not (re.search(r"\b\d", text) or _FACT_VERB_RE.search(text)):
+        return False, "not_factual"
+    return True, ""
+
 logger = logging.getLogger(__name__)
 
 # Веса слоёв для semantic_search — зеркалят логику GCNMemoryRouter.retrieve
 _SCOPE_WEIGHTS = {"private": 1.2, "shared": 1.0, "global": 0.9}
+
+
 
 
 class MemoryService:
@@ -77,6 +135,7 @@ class MemoryService:
             scope: Optional[str] = None,
             confidence: float = 0.9,
             force_new: bool = False,
+            user_explicit: bool = False,
     ) -> Dict[str, Any]:
         """
         Сохраняет факт в указанный скоуп (автоопределение, если scope не задан).
@@ -84,14 +143,39 @@ class MemoryService:
 
         ИСПРАВЛЕНИЕ #3: проверка дублей перед созданием нового факта.
 
-        force_new=True — обходит дедупликацию и гарантированно создаёт новую
-        запись с новым gcn_id даже при наличии семантически близких фактов.
-        Используется внутри update_fact(), чтобы «удалить старый + создать новый»
-        работало корректно без ложного слияния с другим существующим фактом.
+        force_new=True — обходит дедупликацию и фильтр фактологичности и
+        гарантированно создаёт новую запись с новым gcn_id даже при наличии
+        семантически близких фактов. Используется внутри update_fact(), чтобы
+        «удалить старый + создать новый» работало корректно без ложного
+        слияния с другим существующим фактом, и в remember_with_handshake,
+        где контроль качества уже выполнен вызывающим кодом.
+
+        user_explicit=True — вызывающий код уже знает, что это осознанный
+        запрос на сохранение (команда «запомни ...» в чате, MCP-инструмент
+        remember от внешнего клиента). Фильтр _is_storable_fact НЕ применяется:
+        отсекать простые пользовательские факты без цифр/факт-глаголов
+        («мой любимый цвет синий», «меня зовут Иван») — это ложная экономия,
+        которая молча ломает ожидание пользователя. Санитайзер из intellect
+        по-прежнему прогоняет факты из web-поиска/автоизвлечения — там
+        user_explicit остаётся False (дефолт), и фильтр работает.
         """
         self.refresh()
 
-        # ── ИСПРАВЛЕНИЕ #3: проверка дубля (пропускаем если force_new=True) ─────────
+        # ── Фильтр фактологичности ─────────────────────────────────────────
+        # Пропускается при force_new (осознанная замена) и user_explicit
+        # (осознанное «запомни» от пользователя/MCP-клиента).
+        if not force_new and not user_explicit:
+            ok, reason = _is_storable_fact(fact)
+            if not ok:
+                logger.info(f"[remember] отклонён нефакт ({reason}): {fact[:120]!r}")
+                return {
+                    "status": "rejected",
+                    "action": "rejected",
+                    "reason": reason,
+                    "requested_fact": fact,
+                }
+
+        # ── ИСПРАВЛЕНИЕ #3: проверка дубля (пропускаем если force_new=True) ──
         if not force_new:
             DEDUP_THRESHOLD = 0.88  # косинусное сходство
             existing = await self.recall(fact, top_k=3, scope=scope)
@@ -128,7 +212,7 @@ class MemoryService:
                         "requested_fact": fact,                  # что хотел пользователь
                         "similarity": ex["score"],
                     }
-        # ── конец проверки дубля ─────────────────────────────────────────────────────
+        # ── конец проверки дубля ─────────────────────────────────────────────
 
         if scope is None:
             # Автодетекция scope: GLOBAL если есть ключевые слова, иначе PRIVATE
@@ -226,7 +310,14 @@ class MemoryService:
                     "status": "dry_run",
                     "would_remove": 1,
                     "scope": scope.lower(),
-                    "candidates": [{"id": ko.id, "text": ko.text[:200]}],
+                    # ИСПРАВЛЕНИЕ: у KnowledgeObject нет поля .text — оно называется
+                    # .subject (см. GCN/GCN.py:KnowledgeObject). Раньше forget(gcn_id,
+                    # dry_run=True) — а это ДЕФОЛТ MCP-инструмента forget — падал с
+                    # AttributeError сразу при попытке показать кандидата. В non-ID
+                    # ветке ниже используется f.text[:200], там f — локальный
+                    # memory_graph.Fact, у него поле .text действительно есть;
+                    # здесь же ko — это KnowledgeObject из GCN, и .text у него нет.
+                    "candidates": [{"id": ko.id, "text": ko.subject[:200]}],
                     "message": "Ничего не удалено. Повторите вызов с dry_run=False, чтобы удалить этот факт.",
                 }
             memory.store.retract(query, self.user_id, reason="forget_by_id")
@@ -251,9 +342,10 @@ class MemoryService:
         await memory._schedule_save()
         return {"status": "ok", "removed": removed, "scope": scope.lower()}
 
-    async def add_goal(self, description: str, priority: float = 0.5) -> Dict[str, Any]:
+    async def add_goal(self, description: str, priority: float = 0.5,
+                        force_new: bool = False) -> Dict[str, Any]:
         self.refresh()
-        gid = await self.private_memory.add_goal(description, priority)
+        gid = await self.private_memory.add_goal(description, priority, force_new=force_new)
         return {"id": gid, "description": description, "priority": priority}
 
     async def get_goals(self) -> List[Dict]:

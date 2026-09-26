@@ -244,16 +244,73 @@ class MotivationEngine:
                 }
         
         return None
-    
+
+    def generate_identity_consolidation_goal(self) -> Optional[Dict[str, Any]]:
+        """
+        Проверяет цепочку identity_core (GCN/identity_core.py) на необходимость
+        консолидации: разошедшиеся головы (параллельная запись без координации),
+        аннулированные все звенья (цепочка фактически пуста) или давно не
+        обновлявшееся ядро. Дёшево — без LLM, чистая проверка состояния хранилища.
+
+        Важно: сама эта функция НИЧЕГО не пишет в цепочку — она только поднимает
+        цель "нужно сверить/продолжить ТЕКУЩЕЕ_Я", потому что содержание новой
+        версии ядра — не то, что можно сгенерировать эвристикой; это решение
+        оставлено за моделью, вызывающей contribute_to_identity().
+        """
+        if not self.memory:
+            return None
+        try:
+            from GCN.identity_core import needs_consolidation
+            info = needs_consolidation(self.memory)
+        except Exception as e:
+            logger.warning(f"[Motivation] identity_core проверка не удалась: {e}")
+            return None
+        if not info:
+            return None
+
+        if info["reason"] == "diverging_heads":
+            topic = f"Свести {info['heads_count']} разошедшихся веток ТЕКУЩЕЕ_Я"
+            priority = 0.95  # совпадает с приоритетом цели идентичности в MCP
+        elif info["reason"] == "all_invalidated":
+            topic = (
+                f"Начать цепочку ТЕКУЩЕЕ_Я заново — все {info['count']} звеньев "
+                f"аннулированы, валидной головы нет"
+            )
+            priority = 0.8
+        else:  # stale
+            topic = f"Продолжить ТЕКУЩЕЕ_Я (не обновлялось {info['age_days']} дн.)"
+            priority = 0.6
+
+        if self._is_duplicate(topic):
+            return None
+        self._record_generated(topic)
+        return {
+            "goal": topic,
+            "priority": priority,
+            "source": f"identity_{info['reason']}",
+            "metadata": info,
+        }
+
     def generate_endogenous_goal(self) -> Optional[Dict[str, Any]]:
         """
         Главный метод генерации эндогенной цели.
-        
+
         Перебирает все драйверы и возвращает первую подходящую цель.
         """
         if self._is_cooldown():
             return None
-        
+
+        # identity-консолидация — вне общего приоритетного рандома ниже:
+        # это либо расхождение цепочки, либо застой ядра, оба сигнала не
+        # должны конкурировать по случайности с любопытством/новизной.
+        identity_goal = self.generate_identity_consolidation_goal()
+        if identity_goal:
+            logger.info(
+                f"[Motivation] сгенерирована внутренняя цель: "
+                f"{identity_goal['goal'][:60]} (источник: {identity_goal['source']})"
+            )
+            return identity_goal
+
         # Приоритет: пробелы > качество > любопытство > новизна
         generators = [
             self.generate_gap_filling_goal,
@@ -261,9 +318,9 @@ class MotivationEngine:
             self.generate_curiosity_goal,
             self.generate_novelty_goal,
         ]
-        
+
         random.shuffle(generators[:2])  # немного рандома в приоритетах
-        
+
         for gen in generators:
             try:
                 goal = gen()
@@ -275,18 +332,18 @@ class MotivationEngine:
                     return goal
             except Exception as e:
                 logger.warning(f"[Motivation] ошибка генератора: {e}")
-        
+
         return None
-    
+
     def tick(self) -> Optional[Dict[str, Any]]:
         """
         Вызывается периодически (например, из autonomy.py).
-        
+
         Пытается сгенерировать новую цель и добавляет её в SelfModel.
         Возвращает сгенерированную цель или None.
         """
         goal = self.generate_endogenous_goal()
-        
+
         if goal:
             self.self_model.add_goal(
                 goal["goal"],
@@ -294,5 +351,5 @@ class MotivationEngine:
                 source=goal["source"],
             )
             return goal
-        
+
         return None
