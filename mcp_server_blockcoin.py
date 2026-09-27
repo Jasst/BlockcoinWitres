@@ -283,6 +283,34 @@ _USER_ID_DESC = (
 )
 
 
+# --- НОВОЕ: rate limit для инструментов, напрямую дёргающих локальную LLM в
+# обход AutonomyEngine._consume_autonomous_llm_budget (research_topic раньше
+# вызывал assistant.research() синхронно и без всякого бюджета — внешний
+# MCP-клиент мог перегрузить LM Studio наравне с чатом пользователя, хотя
+# сам бюджет существует именно для защиты от этого). Простой per-user
+# скользящий лимит, без внешних зависимостей.
+_LLM_TOOL_RATE_LIMIT_CALLS = int(os.getenv("MCP_LLM_TOOL_RATE_LIMIT_CALLS", "6"))
+_LLM_TOOL_RATE_LIMIT_WINDOW = int(os.getenv("MCP_LLM_TOOL_RATE_LIMIT_WINDOW", "600"))  # 10 минут
+_llm_tool_calls: Dict[str, List[float]] = {}
+
+
+def _check_llm_tool_rate_limit(uid: str, tool_name: str) -> Optional[str]:
+    """Возвращает текст ошибки, если лимит превышен, иначе None."""
+    key = f"{uid}:{tool_name}"
+    now = time.time()
+    calls = [t for t in _llm_tool_calls.get(key, []) if now - t < _LLM_TOOL_RATE_LIMIT_WINDOW]
+    if len(calls) >= _LLM_TOOL_RATE_LIMIT_CALLS:
+        return (
+            f"Лимит для '{tool_name}': не более {_LLM_TOOL_RATE_LIMIT_CALLS} вызовов за "
+            f"{_LLM_TOOL_RATE_LIMIT_WINDOW}с — это отдельная защита локальной LLM от прямых "
+            f"MCP-вызовов в обход бюджета AutonomyEngine. Для регулярных фоновых тем "
+            f"используйте enqueue_research_topic() — она встаёт в очередь и не считается сюда."
+        )
+    calls.append(now)
+    _llm_tool_calls[key] = calls
+    return None
+
+
 # --- Вспомогательные функции ---
 async def _with_timeout(coro, tool_name: str, timeout: Optional[float] = None) -> Any:
     """Единая точка безопасного вызова с ловлей ЛЮБОГО исключения."""
@@ -677,6 +705,15 @@ async def contribute_to_identity(
             None,
             description="gcn_id звена, от которого продолжаем. Если не указан — берётся текущая голова цепочки."
         ),
+        merge_parent_ids: Optional[List[str]] = Field(
+            None,
+            description=(
+                "НОВОЕ: gcn_id дополнительных голов, которые это звено явно сводит "
+                "воедино (реальный merge, а не просто продолжение от свежей головы "
+                "с потерей остальных веток). Обычно проще вызвать merge_identity_branches() — "
+                "она сама подставит все текущие головы."
+            ),
+        ),
         user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
         ctx: Context = None
 ) -> Dict[str, Any]:
@@ -685,9 +722,10 @@ async def contribute_to_identity(
     В отличие от remember()/remember_with_handshake — не подвержено decay/pruning
     и dedup-слиянию: каждый вызов создаёт новую версию со ссылкой на предка,
     старые версии никогда не перезаписываются. Если на момент записи в цепочке
-    уже было несколько несведённых голов (параллельная запись без координации),
-    ответ содержит branch_warning — это нужно явно показать пользователю/модели,
-    а не проигнорировать.
+    уже было несколько несведённых голов (параллельная запись без координации)
+    и merge_parent_ids не переданы, ответ содержит branch_warning — это нужно
+    явно показать пользователю/модели, а не проигнорировать; либо используйте
+    merge_identity_branches() для явного слияния.
     """
     from GCN.identity_core import append_snapshot
 
@@ -698,7 +736,69 @@ async def contribute_to_identity(
     return await append_snapshot(
         service, content, contributor_model,
         session_id=session_id, open_question=open_question, parent_id=parent_id,
+        merge_parent_ids=merge_parent_ids,
     )
+
+
+@mcp.tool()
+async def merge_identity_branches(
+        content: str = Field(..., description="Текст merge-звена — как ты сводишь расходящиеся версии ТЕКУЩЕЕ_Я воедино"),
+        contributor_model: str = Field(..., description="Имя модели-автора (например 'Claude', 'Qwen')"),
+        session_id: Optional[str] = Field(None, description="Идентификатор сессии, если есть"),
+        open_question: Optional[str] = Field(None, description="Открытый вопрос для следующего участника протокола"),
+        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        ctx: Context = None
+) -> Dict[str, Any]:
+    """НОВОЕ: сводит ВСЕ текущие несведённые головы цепочки ТЕКУЩЕЕ_Я в одно
+    новое merge-звено за один вызов — не нужно вручную вызывать
+    get_identity_chain(), вычитывать heads и передавать их в
+    contribute_to_identity(merge_parent_ids=...).
+
+    Перед вызовом обычно стоит прочитать содержимое каждой головы через
+    get_identity_chain(from_id=<head_id>), чтобы merge-текст реально учёл
+    обе ветки, а не выбрал одну произвольно.
+
+    Если голова всего одна — работает как обычный contribute_to_identity
+    (это не ошибка, просто нечего сводить). merged_heads_count в ответе
+    показывает, сколько голов было объединено.
+    """
+    from GCN.identity_core import merge_heads
+
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    service = await get_memory_service(uid)
+    return await merge_heads(
+        service, content, contributor_model,
+        session_id=session_id, open_question=open_question,
+    )
+
+
+@mcp.tool()
+async def search_identity_chain(
+        query: str = Field(..., description="Подстрока для поиска в content/open_question звеньев ТЕКУЩЕЕ_Я"),
+        limit: int = Field(20, description="Максимум результатов", ge=1, le=100),
+        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        ctx: Context = None
+) -> Dict[str, Any]:
+    """НОВОЕ: полнотекстовый поиск по цепочке ТЕКУЩЕЕ_Я.
+
+    Identity-звенья создаются в обход remember()/_add_fact() (чтобы не
+    попадать под decay/dedup — см. identity_core.py), поэтому НЕ индексируются
+    в FAISS и не находятся через semantic_search/recall. Это единственный
+    способ найти "что говорилось про X" без ручного чтения всей цепочки.
+    """
+    from GCN.identity_core import search_chain
+    from dataclasses import asdict
+
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    service = await get_memory_service(uid)
+    service.shared_memory.reload_if_stale()
+    store = service.shared_memory.gcn_store
+    matches = search_chain(store, query, limit=limit)
+    return {"query": query, "matches": [asdict(m) for m in matches], "count": len(matches)}
 
 @mcp.tool()
 async def invalidate_identity(
@@ -952,10 +1052,21 @@ async def research_topic(
         user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
         ctx: Context = None
 ) -> Dict[str, Any]:
-    """Глубокое исследование темы с генерацией гипотез и сбором доказательств."""
+    """Глубокое исследование темы с генерацией гипотез и сбором доказательств.
+
+    ВАЖНО: это синхронный прямой вызов (для случаев, когда ответ нужен сразу),
+    ограниченный отдельным rate-limit'ом (см. _check_llm_tool_rate_limit) —
+    он НЕ расходует общий бюджет AutonomyEngine, которым делится браузерный
+    чат. Для несрочных/фоновых тем предпочтительнее enqueue_research_topic():
+    она встаёт в приоритетную очередь и обрабатывается тем же бюджетом, что
+    и внутренние источники, не создавая отдельного канала нагрузки на LLM.
+    """
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
+    rl_err = _check_llm_tool_rate_limit(uid, "research_topic")
+    if rl_err:
+        return {"status": "error", "error": "rate_limited", "message": rl_err}
     assistant = await get_assistant(uid)
     result = await _with_timeout(
         assistant.research(topic),
@@ -1051,6 +1162,84 @@ async def add_goal(
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
     return await service.add_goal(description, priority)
+
+
+@mcp.tool()
+async def get_self_state(
+        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        ctx: Context = None
+) -> Dict[str, Any]:
+    """НОВОЕ: снимок SelfModel (уверенность/любопытство/стресс, навыки по типам
+    действий, калиброванная точность, активные эндогенные цели).
+
+    До этого SelfModel существовал только внутри процесса CognitiveController
+    браузерного чата — внешний MCP-клиент не мог на него опереться, в том
+    числе при формировании нового звена ТЕКУЩЕЕ_Я через contribute_to_identity.
+    Если пользователь ещё не открывал браузерный чат в этом процессе —
+    вернёт status='not_initialized' (SelfModel создаётся вместе с
+    CognitiveController).
+    """
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    assistant = await get_assistant(uid)
+    sm = getattr(assistant, "self_model", None)
+    if sm is None:
+        return {"status": "not_initialized", "message": "SelfModel ещё не создан для этого пользователя."}
+    return {"status": "ok", **sm.export_for_mcp()}
+
+
+@mcp.tool()
+async def get_autonomy_status(
+        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        ctx: Context = None
+) -> Dict[str, Any]:
+    """НОВОЕ: состояние фонового AutonomyEngine — очередь исследований (топ-20
+    по приоритету), накопленные находки, статус дайджеста, веса источников
+    (обучение на обратной связи пользователя).
+
+    Раньше это было видно только в логах процесса браузерного чата.
+    """
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    assistant = await get_assistant(uid)
+    autonomy = getattr(assistant, "autonomy", None)
+    if autonomy is None:
+        return {"status": "not_initialized", "message": "AutonomyEngine ещё не запущен для этого пользователя."}
+    return {"status": "ok", **autonomy.get_status()}
+
+
+@mcp.tool()
+async def enqueue_research_topic(
+        topic: str = Field(..., description="Тема для фонового исследования"),
+        priority: float = Field(0.5, description="Приоритет от 0 до 1", ge=0, le=1),
+        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        ctx: Context = None
+) -> Dict[str, Any]:
+    """НОВОЕ: ставит тему в приоритетную очередь AutonomyEngine вместо
+    немедленного синхронного исследования.
+
+    В отличие от research_topic() — не блокирует вызов ожиданием ответа и
+    не тратит отдельный rate-limit, а обрабатывается фоновым циклом тем же
+    бюджетом (_consume_autonomous_llm_budget), что и внутренние источники
+    (goal/reflection/search_failure и т.д.) — то есть не может вытеснить
+    чат пользователя по LLM-нагрузке. Результат появится в get_notifications()
+    (дайджест) или будет виден через get_autonomy_status().
+    """
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    assistant = await get_assistant(uid)
+    autonomy = getattr(assistant, "autonomy", None)
+    if autonomy is None:
+        return {"status": "not_initialized", "message": "AutonomyEngine ещё не запущен для этого пользователя."}
+    ok = autonomy.enqueue_external_topic(topic, priority=priority)
+    return {
+        "status": "ok" if ok else "duplicate_or_full",
+        "enqueued": ok,
+        "message": None if ok else "Тема уже в очереди (приоритет слегка поднят) либо очередь полна более приоритетными темами.",
+    }
 
 
 @mcp.tool()
@@ -1155,11 +1344,35 @@ async def session_start(
         user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
         ctx: Context = None
 ) -> Dict[str, Any]:
-    """Быстрая ориентация в начале сессии: статистика, эпизоды, цели, уведомления."""
+    """Быстрая ориентация в начале сессии: статистика, эпизоды, цели,
+    уведомления, состояние ТЕКУЩЕЕ_Я и SelfModel.
+
+    ДОПОЛНЕНО: раньше session_start ничего не говорил о состоянии identity-
+    цепочки (нужна ли консолидация, разошлись ли головы) и о SelfModel
+    (уверенность/любопытство/навыки) — обе дешёвые проверки без LLM,
+    добавлены сюда, чтобы модель сразу знала, нужен ли merge_identity_branches
+    перед тем, как что-то ещё делать.
+    """
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
+
+    from GCN.identity_core import needs_consolidation, get_heads
+
+    def _identity_status() -> Dict[str, Any]:
+        try:
+            service.shared_memory.reload_if_stale()
+            store = service.shared_memory.gcn_store
+            info = needs_consolidation(service)
+            heads = get_heads(store)
+            return {
+                "heads_count": len(heads),
+                "diverged": len(heads) > 1,
+                "needs_attention": info,
+            }
+        except Exception as e:
+            return {"error": str(e)}
 
     stats, episodes, goals, notifs = await asyncio.gather(
         service.get_memory_stats(),
@@ -1169,12 +1382,23 @@ async def session_start(
         return_exceptions=True,
     )
 
+    self_state: Dict[str, Any] = {}
+    try:
+        assistant = await get_assistant(uid)
+        sm = getattr(assistant, "self_model", None)
+        if sm is not None:
+            self_state = sm.get_state_summary()
+    except Exception as e:
+        self_state = {"error": str(e)}
+
     return {
         "user_id": uid,
         "stats": stats if not isinstance(stats, Exception) else {},
         "recent_episodes": episodes if not isinstance(episodes, Exception) else [],
         "goals": goals if not isinstance(goals, Exception) else [],
         "notifications": notifs if not isinstance(notifs, Exception) else [],
+        "identity": _identity_status(),
+        "self_state": self_state,
     }
 
 
