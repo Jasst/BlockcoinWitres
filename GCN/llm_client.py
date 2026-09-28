@@ -98,21 +98,53 @@ async def call_llm(
     messages: List[Dict[str, str]],
     temp: float = 0.7,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    retries: int = 3
+    retries: int = 3,
+    include_reasoning: bool = False,
 ) -> str:
-    """Универсальная функция вызова локальной LLM (LM Studio) — только текст ответа."""
-    msg = await call_llm_raw(messages, temp=temp, max_tokens=max_tokens, tools=None, retries=retries)
-    return msg.get("content", "") or ""
+    """Универсальный вызов локальной LLM (LM Studio) — только текст ответа.
+
+    include_reasoning=True — если модель прислала reasoning_content (нативный
+    thinking Qwen3/DeepSeek-R1 и т.п.), обернуть его в <thought>...</thought>
+    и склеить с content. Используется ТОЛЬКО в главном ответе чата; для
+    служебных вызовов (планирование, верификация, JSON-парсинг) — False,
+    чтобы reasoning не путал парсеры.
+    """
+    msg = await call_llm_raw(messages, temp=temp, max_tokens=max_tokens,
+                             tools=None, retries=retries)
+    content = msg.get("content", "") or ""
+    if not include_reasoning:
+        return content
+
+    reasoning = (
+        msg.get("reasoning_content")
+        or msg.get("reasoning")
+        or ""
+    ).strip()
+
+    if not reasoning:
+        return content
+    if not content:
+        # Модель думала, но не уложилась в лимит токенов.
+        return f"<thought>{reasoning}</thought>"
+    return f"<thought>{reasoning}</thought>\n\n{content}"
 
 
 async def call_llm_stream(
     messages: List[Dict[str, str]],
     temp: float = 0.7,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    stop: Optional[List[str]] = None
+    stop: Optional[List[str]] = None,
+    include_reasoning: bool = True,
 ):
-    """Потоковый вызов LLM (LM Studio) с теми же параметрами, что и call_llm.
-    При обрыве без [DONE] или finish_reason==\"length\" yield-ит sentinel-маркер."""
+    """Потоковый вызов LLM (LM Studio).
+
+    include_reasoning=True — накапливать reasoning_content и эмитить его
+    одним блоком <thought>...</thought>\n\n перед первым content-токеном.
+    Фронтенд (_renderMarkdown в ai-manager.js) уже умеет рендерить такие
+    блоки как collapsible «💭 Reasoning».
+
+    При обрыве без [DONE] или finish_reason=="length" — sentinel-маркер.
+    """
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
     payload = {
         "model": "local-model",
@@ -126,9 +158,12 @@ async def call_llm_stream(
     timeout = aiohttp.ClientTimeout(total=LM_STUDIO_STREAM_TIMEOUT)
     stream_did_complete = False
     finish_reason = None
+    accumulated_reasoning = ""
+    reasoning_emitted = False
     try:
         session = await _get_session()
-        async with session.post(LM_STUDIO_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        async with session.post(LM_STUDIO_URL, json=payload,
+                                headers=headers, timeout=timeout) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
                 logger.error(f"Stream error {resp.status}: {error_text[:200]}")
@@ -150,21 +185,54 @@ async def call_llm_stream(
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                delta = chunk.get('choices', [{}])[0].get('delta', {})
+                choice = chunk.get('choices', [{}])[0]
+                delta = choice.get('delta', {})
+
+                # ── НОВОЕ: нативный reasoning ────────────────────────────
+                if include_reasoning:
+                    r_chunk = (
+                        delta.get('reasoning_content')
+                        or delta.get('reasoning')
+                        or ''
+                    )
+                    if r_chunk:
+                        accumulated_reasoning += r_chunk
+                # ────────────────────────────────────────────────────────
+
                 content = delta.get('content', '')
-                # Сохраняем finish_reason из последнего чанка
-                if 'finish_reason' in chunk.get('choices', [{}])[0]:
-                    finish_reason = chunk['choices'][0]['finish_reason']
+                if 'finish_reason' in choice:
+                    finish_reason = choice['finish_reason']
+
                 if content:
+                    # Перед первым content-токеном отдаём весь thinking разом
+                    if (include_reasoning
+                            and accumulated_reasoning
+                            and not reasoning_emitted):
+                        yield f"<thought>{accumulated_reasoning}</thought>\n\n"
+                        reasoning_emitted = True
                     yield content
+
+            # Если content так и не пришёл — отдаём reasoning отдельным блоком,
+            # чтобы пользователь видел, что модель думала (не молчала).
+            if (include_reasoning
+                    and accumulated_reasoning
+                    and not reasoning_emitted):
+                yield f"<thought>{accumulated_reasoning}</thought>"
+                reasoning_emitted = True
+
             # Если поток завершился без [DONE], логируем предупреждение и выдаём sentinel
             if not stream_did_complete:
-                logger.warning(f"LLM stream ended without [DONE] marker — possible truncation (finish_reason={finish_reason})")
+                logger.warning(
+                    f"LLM stream ended without [DONE] marker — possible "
+                    f"truncation (finish_reason={finish_reason})"
+                )
                 yield "\u0000__LLM_TRUNCATED__\u0000"
                 return
             # Если finish_reason == "length" — ответ обрезан по лимиту токенов
             if finish_reason == "length":
-                logger.warning(f"LLM stream truncated by token limit (finish_reason=length)")
+                logger.warning(
+                    f"LLM stream truncated by token limit (finish_reason=length)"
+                )
                 yield "\u0000__LLM_TRUNCATED__\u0000"
                 return
             logger.debug(f"LLM stream completed with finish_reason: {finish_reason}")
