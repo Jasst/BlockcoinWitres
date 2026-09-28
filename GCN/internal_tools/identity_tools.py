@@ -16,8 +16,10 @@ from dataclasses import asdict
 
 from GCN.identity_core import (
     append_snapshot,
+    merge_heads,
     invalidate_snapshot,
     get_chain,
+    search_chain,
     get_heads,
 )
 
@@ -36,7 +38,24 @@ def register(registry, controller):
             session_id=args.get("session_id"),
             open_question=args.get("open_question"),
             parent_id=args.get("parent_id"),
+            merge_parent_ids=args.get("merge_parent_ids"),
         )
+
+    async def _merge(args):
+        return await merge_heads(
+            service,
+            content=args["content"],
+            contributor_model=args["contributor_model"],
+            session_id=args.get("session_id"),
+            open_question=args.get("open_question"),
+        )
+
+    async def _search(args):
+        from dataclasses import asdict
+        service.shared_memory.reload_if_stale()
+        store = service.shared_memory.gcn_store
+        matches = search_chain(store, args.get("query", ""), limit=int(args.get("limit", 20)))
+        return {"matches": [asdict(m) for m in matches], "count": len(matches)}
 
     async def _get_chain(args):
         service.shared_memory.reload_if_stale()  # не отдавать устаревшую голову/чейн
@@ -101,10 +120,60 @@ def register(registry, controller):
                         "Если не указан — берётся текущая валидная голова."
                     ),
                 },
+                "merge_parent_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "НОВОЕ: gcn_id дополнительных голов, которые это звено явно "
+                        "сводит воедино. Проще вызвать merge_identity_branches()."
+                    ),
+                },
             },
             "required": ["content", "contributor_model"],
         },
         handler=_contribute,
+    )
+
+    # --- merge_identity_branches (НОВОЕ) ---
+    registry.register(
+        name="merge_identity_branches",
+        description=(
+            "Сводит ВСЕ текущие несведённые головы цепочки ТЕКУЩЕЕ_Я в одно новое "
+            "merge-звено за один вызов, вместо ручного вычитывания heads и передачи "
+            "их в contribute_to_identity(merge_parent_ids=...). Перед вызовом стоит "
+            "прочитать содержимое каждой головы через get_identity_chain(from_id=...), "
+            "чтобы merge-текст реально учёл все ветки."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Текст merge-звена"},
+                "contributor_model": {"type": "string", "description": "Имя модели-автора"},
+                "session_id": {"type": "string", "description": "Идентификатор сессии, опционально"},
+                "open_question": {"type": "string", "description": "Открытый вопрос, опционально"},
+            },
+            "required": ["content", "contributor_model"],
+        },
+        handler=_merge,
+    )
+
+    # --- search_identity_chain (НОВОЕ) ---
+    registry.register(
+        name="search_identity_chain",
+        description=(
+            "Полнотекстовый поиск по цепочке ТЕКУЩЕЕ_Я — identity-звенья не "
+            "индексируются в FAISS (создаются в обход remember()), поэтому "
+            "semantic_search/recall их не находят."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Подстрока для поиска"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["query"],
+        },
+        handler=_search,
     )
 
     # --- get_identity_chain ---
@@ -172,5 +241,6 @@ def register(registry, controller):
 
     logger.info(
         "identity_tools: зарегистрированы contribute_to_identity, "
+        "merge_identity_branches, search_identity_chain, "
         "get_identity_chain, invalidate_identity"
     )

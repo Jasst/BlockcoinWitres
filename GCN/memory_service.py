@@ -352,9 +352,66 @@ class MemoryService:
         self.refresh()
         goals = await self.private_memory.get_active_goals()
         return [
-            {"description": g.description, "priority": g.priority, "confidence": g.confidence, "status": g.status}
+            {"id": g.id, "gcn_id": g.gcn_id,
+             "description": g.description, "priority": g.priority, "confidence": g.confidence, "status": g.status}
             for g in goals
         ]
+
+    async def update_goal(self, goal_id: int, **kwargs) -> Dict[str, Any]:
+        """Обновляет поля цели (priority, status, confidence, progress, deadline)."""
+        self.refresh()
+        before = {g.id: (g.status, g.priority) for g in self.private_memory.goals}
+        if goal_id not in before:
+            return {"status": "error", "message": f"Цель id={goal_id} не найдена."}
+        await self.private_memory.update_goal(goal_id, **kwargs)
+        after = {g.id: (g.status, g.priority) for g in self.private_memory.goals}
+        g = next((x for x in self.private_memory.goals if x.id == goal_id), None)
+        return {
+            "status": "ok",
+            "changed": before.get(goal_id) != after.get(goal_id),
+            "goal": None if g is None else {
+                "id": g.id, "gcn_id": g.gcn_id, "description": g.description,
+                "priority": g.priority, "confidence": g.confidence, "status": g.status,
+            },
+        }
+
+    async def delete_goal(self, goal_id: Optional[int] = None,
+                          gcn_id: Optional[str] = None,
+                          reason: str = "") -> Dict[str, Any]:
+        """Удаляет цель полностью (retract в GCN + удаление из локального кэша).
+
+        Принимает либо числовой id цели (из get_goals), либо gcn_id.
+        Для мягкого закрытия вместо удаления используйте
+        update_goal(goal_id, status='completed').
+        """
+        self.refresh()
+        memory = self.private_memory
+        goal = None
+        if goal_id is not None:
+            goal = next((g for g in memory.goals if g.id == goal_id), None)
+        elif gcn_id:
+            goal = next((g for g in memory.goals if g.gcn_id == gcn_id), None)
+        else:
+            return {"status": "error", "message": "Укажите goal_id или gcn_id."}
+        if goal is None:
+            return {"status": "error", "message": "Цель не найдена."}
+
+        retracted = True
+        if goal.gcn_id:
+            try:
+                retracted = memory.gcn_store.retract(
+                    goal.gcn_id, memory.user_id, reason=reason or "delete_goal")
+            except Exception as e:
+                return {"status": "error", "message": f"retract в GCN не удался: {e}"}
+        if not retracted:
+            return {"status": "error", "message": f"Объект {goal.gcn_id} не найден в GCN."}
+
+        memory.goals = [g for g in memory.goals if g.id != goal.id]
+        memory._dirty = True
+        await memory._schedule_save()
+        return {"status": "ok", "removed": 1,
+                "goal_id": goal.id, "gcn_id": goal.gcn_id,
+                "description": goal.description[:200]}
 
     async def push_notification(self, text: str, source: str, importance: float = 0.5) -> str:
         """

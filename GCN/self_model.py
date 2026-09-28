@@ -21,9 +21,15 @@ import logging
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_goal_text(text: str) -> str:
+    """Нормализует текст цели для сравнения (для prune_goals)."""
+    import re
+    return re.sub(r'\s+', ' ', (text or '').lower().strip())[:300]
 
 
 @dataclass
@@ -221,37 +227,51 @@ class SelfModel:
         return smoothed_rate
     
     def get_calibration_stats(self) -> Dict[str, Any]:
-        """Возвращает статистику калибровки по всем бакетам."""
-        stats = {}
+        """Возвращает статистику калибровки по всем бакетам.
+
+        ИСПРАВЛЕНО: раньше фильтровало по устаревшему префиксу
+        "calibration_bucket_", а _record_calibration пишет ключи вида
+        "calib_{action_type}_bucket_{X}" (см. правку с разделением
+        статистики по типам действий) — префиксы никогда не совпадали,
+        и метод молча всегда возвращал {}. Теперь парсим action_type и
+        bucket из реального формата ключа и группируем по action_type,
+        чтобы был виден разброс калибровки по типам действий, а не только
+        общая цифра.
+        """
+        stats: Dict[str, Any] = {}
         for key, value in self.self_concept.items():
-            if key.startswith("calibration_bucket_"):
-                bucket = key.replace("calibration_bucket_", "")
-                n = value.get("n", 0)
-                success = value.get("success", 0)
-                if n > 0:
-                    stats[bucket] = {
-                        "n": n,
-                        "success_rate": round(success / n, 3),
-                    }
+            if not key.startswith("calib_") or "_bucket_" not in key:
+                continue
+            n = value.get("n", 0) if isinstance(value, dict) else 0
+            success = value.get("success", 0) if isinstance(value, dict) else 0
+            if n <= 0:
+                continue
+            action_prefix, _, bucket = key[len("calib_"):].rpartition("_bucket_")
+            action_prefix = action_prefix or "generic"
+            entry = {
+                "n": n,
+                "success_rate": round(success / n, 3),
+            }
+            stats.setdefault(action_prefix, {})[bucket] = entry
         return stats
-    
+
     def _update_self_concept(self, action_type: str, success: bool) -> None:
         """Обновляет абстрактную самоконцепцию на основе паттернов действий."""
         key = f"skill_{action_type}"
         current = self.self_concept.get(key, 0.5)
-        
+
         if success:
             self.self_concept[key] = min(1.0, current + 0.02)
         else:
             self.self_concept[key] = max(0.2, current - 0.05)
-        
+
         # Добавляем мета-знание о своих паттернах
         recent = self.action_history[-20:]
         if recent:
             self.self_concept["recent_failure_rate"] = sum(1 for r in recent if not r.success) / len(recent)
         else:
             self.self_concept["recent_failure_rate"] = 0.0
-    
+
     def add_goal(self, goal: str, priority: float = 0.5, source: str = "external") -> None:
         """Добавляет активную цель."""
         self.active_goals.append({
@@ -266,7 +286,7 @@ class SelfModel:
                 self.active_goals, key=lambda g: -g["priority"]
             )[:20]
         self.save()
-    
+
     def remove_goal(self, goal: str) -> None:
         """Удаляет завершённую цель."""
         self.active_goals = [
@@ -274,7 +294,44 @@ class SelfModel:
             if g["goal"][:50].lower() != goal[:50].lower()
         ]
         self.save()
-    
+
+    def prune_goals(self, known_descriptions: Optional[List[str]] = None,
+                    meta_prefixes: Tuple[str, ...] = ("разблокировать застопорившуюся цель",),
+                    max_age_seconds: Optional[float] = None) -> int:
+        """Сборщик мусора списка целей (ПАТЧ fact_cc5a3a86, часть 2).
+
+        Убирает:
+          1) legacy-мусор рекурсии gap_stalled_goal (цели с накопленным
+             префиксом «Разблокировать…» в тексте — пережиток бага);
+          2) цели, отсутствующие в authoritative-списке GCN-памяти
+             (known_descriptions) — раньше SelfModel жил своей жизнью:
+             get_goals() показывал 3 цели из памяти, а self_state — до 10
+             «активных» из active_goals;
+          3) цели старше max_age_seconds (если задан).
+
+        Возвращает число удалённых целей.
+        """
+        before = len(self.active_goals)
+        kept = []
+        for g in self.active_goals:
+            text = g.get("goal", "")
+            low = text.lower()
+            if any(p in low for p in meta_prefixes):
+                continue
+            if known_descriptions is not None:
+                norm_text = _normalize_goal_text(text)
+                if not any(norm_text == _normalize_goal_text(d) for d in known_descriptions):
+                    continue
+            if max_age_seconds is not None and \
+                    (time.time() - g.get("added_at", 0)) > max_age_seconds:
+                continue
+            kept.append(g)
+        self.active_goals = kept
+        removed = before - len(self.active_goals)
+        if removed:
+            self.save()
+        return removed
+
     def get_state_summary(self) -> Dict[str, Any]:
         """Возвращает краткую сводку состояния для использования в промптах."""
         return {
@@ -289,7 +346,7 @@ class SelfModel:
             "recent_actions": len(self.action_history),
             "self_concept_keys": list(self.self_concept.keys()),
         }
-    
+
     def generate_self_prompt(self) -> str:
         """Генерирует текстовый блок о состоянии системы для промпта."""
         state = self.state
@@ -300,30 +357,55 @@ class SelfModel:
             f"Нагрузка: {state.stress:.2f}",
             f"Активных целей: {len(self.active_goals)}",
         ]
-        
+
         if self.active_goals:
             lines.append("Текущие цели:")
             for i, g in enumerate(self.active_goals[-3:], 1):
                 lines.append(f"  {i}. {g['goal'][:60]} (приоритет: {g['priority']:.2f})")
-        
+
         if self.self_concept.get("recent_failure_rate", 0) > 0.3:
             lines.append("ВНИМАНИЕ: высокий процент неудач в последних действиях.")
-        
+
         return "\n".join(lines)
-    
+
     def get_confidence_for_action(self, action_type: str) -> float:
         """Возвращает оценку уверенности для конкретного типа действия."""
         base = self.state.confidence
         skill_key = f"skill_{action_type}"
         skill_level = self.self_concept.get(skill_key, 0.5)
-        
+
         # Комбинируем базовую уверенность с навыком
         raw_confidence = (base * 0.4 + skill_level * 0.6)
-        
+
         # === НОВОЕ: Применяем калибровку ===
         # Вместо сырой уверенности используем калиброванную (теперь с учётом типа действия)
         return self.get_calibrated_confidence(raw_confidence, action_type)
-    
+
     def is_overloaded(self) -> bool:
         """Проверяет, перегружена ли система."""
         return self.state.stress > 0.7 or len(self.active_goals) > 15
+
+    def export_for_mcp(self) -> Dict[str, Any]:
+        """НОВОЕ: компактный снимок SelfModel для внешних MCP-клиентов.
+
+        До этой правки SelfModel (confidence/curiosity/stress, навыки,
+        калибровка, активные цели) существовал только внутри процесса
+        CognitiveController браузерного чата и не был доступен ни одному
+        MCP-инструменту — внешняя модель (Claude Desktop, вторая сессия в
+        протоколе "Живой центр" и т.п.) не могла опереться на объективную
+        историю действий при формировании нового звена ТЕКУЩЕЕ_Я. Используется
+        в mcp_server_blockcoin.get_self_state() и в session_start().
+        """
+        skills = {
+            k.replace("skill_", ""): round(v, 3)
+            for k, v in self.self_concept.items()
+            if k.startswith("skill_")
+        }
+        return {
+            "state": self.get_state_summary(),
+            "skills": skills,
+            "calibration": self.get_calibration_stats(),
+            "active_goals": self.active_goals[-10:],
+            "is_overloaded": self.is_overloaded(),
+            "prompt": self.generate_self_prompt(),
+        }

@@ -32,6 +32,19 @@ parent) — это НЕ ошибка, а структурный сигнал: н
 писали параллельно, не прочитав вклад друг друга. get_heads() делает эту
 ситуацию видимой и проверяемой, вместо того чтобы полагаться на то, что
 кто-то из участников заметит расхождение вручную.
+
+ДОБАВЛЕНО:
+  - merge_heads()/merge_parent_ids в append_snapshot: раньше расхождение
+    "разрешалось" простым продолжением от самой свежей головы, а
+    содержимое остальных веток терялось, если модель не переписала его
+    руками в текст нового звена. Теперь merge-звено явно ссылается на ВСЕ
+    слитые головы (parent_id — основная, merge_parent_ids — остальные),
+    get_heads() перестаёт считать их головами, а граф остаётся честным —
+    видно, что и с чем было сведено.
+  - search_chain(): identity-звенья создаются в обход remember()/_add_fact()
+    и поэтому не попадают в FAISS-индекс CognitiveMemory — обычный
+    semantic_search их не видит. search_chain — лёгкий подстрочный поиск
+    по цепочке без отдельного индекса.
 """
 
 from __future__ import annotations
@@ -80,6 +93,11 @@ class IdentitySnapshot:
     confidence: float = 1.0
     invalidated: bool = False
     invalidation_reason: Optional[str] = None
+    # НОВОЕ: доп. родители merge-звена (см. merge_heads/append_snapshot).
+    # parent_id остаётся "основным" родителем (по нему идёт линейный обход
+    # get_chain), merge_parent_ids — дополнительные ветки, которые это
+    # звено явно свело воедино. Пусто для обычных (не-merge) звеньев.
+    merge_parent_ids: List[str] = field(default_factory=list)
 
     @classmethod
     def from_object(cls, obj: KnowledgeObject) -> "IdentitySnapshot":
@@ -95,6 +113,7 @@ class IdentitySnapshot:
             confidence=obj.confidence,
             invalidated=bool(meta.get("invalidated")),
             invalidation_reason=meta.get("invalidation_reason"),
+            merge_parent_ids=list(meta.get("merge_parent_ids") or []),
         )
 
 
@@ -146,6 +165,13 @@ def get_heads(store: MemoryStore) -> List[KnowledgeObject]:
         pid = meta.get("parent_id")
         if pid:
             referenced_as_parent.add(pid)
+        # merge-звено "занимает" не только основного родителя, но и все
+        # слитые ветки — иначе после merge_heads() старые головы, ставшие
+        # merge_parent_ids, продолжали бы считаться головами наравне с
+        # новым merge-звеном, и divergence выглядел бы неразрешённым.
+        for mpid in (meta.get("merge_parent_ids") or []):
+            if mpid:
+                referenced_as_parent.add(mpid)
     return [o for o in objs
             if o.id not in referenced_as_parent and not _is_invalidated(o)]
 
@@ -255,13 +281,27 @@ async def append_snapshot(
     session_id: Optional[str] = None,
     open_question: Optional[str] = None,
     parent_id: Optional[str] = None,
+    merge_parent_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Добавляет новое звено в цепочку identity_core (shared-память).
 
     Если parent_id не указан явно — используется текущая голова цепочки.
+
+    merge_parent_ids (НОВОЕ): список ДОПОЛНИТЕЛЬНЫХ голов, которые это
+    звено явно сводит воедино (настоящий merge, а не "продолжение от
+    свежей головы с потерей остальных веток"). parent_id остаётся
+    основным родителем (по нему идёт линейный обход get_chain), а
+    merge_parent_ids только помечают остальные ветки как "поглощённые" —
+    они перестают быть головами (см. get_heads), но остаются в графе
+    полностью нетронутыми (append-only). Для типового случая "свести все
+    текущие головы" удобнее вызвать merge_heads() — он сам подставит
+    parent_id/merge_parent_ids.
+
     Возвращает статус, включая явные предупреждения:
       - branch_warning — на момент записи в цепочке уже было несколько
-        несведённых голов;
+        несведённых голов (и они НЕ были явно перечислены через
+        merge_parent_ids — то есть это не merge, а обычное продолжение,
+        оставляющее расхождение неразрешённым);
       - parent_warning — parent_id указывает на АННУЛИРОВАННОЕ звено;
         новая запись формально "продолжит мусор", обычно это не то, что нужно.
     """
@@ -274,14 +314,16 @@ async def append_snapshot(
     heads_before = get_heads(store)
     branch_warning = None
     parent_warning = None
+    merge_parent_ids = [m for m in (merge_parent_ids or []) if m]
 
     if parent_id is None:
-        if len(heads_before) > 1:
+        if len(heads_before) > 1 and not merge_parent_ids:
             branch_warning = (
                 f"На момент записи в цепочке уже было {len(heads_before)} несведённых "
                 f"голов (id: {[h.id for h in heads_before]}) — вероятно, параллельная "
                 f"запись другой моделью/сессией. Эта запись продолжает самую свежую "
-                f"голову; расхождение стоит явно сверить через get_chain()."
+                f"голову БЕЗ слияния; расхождение стоит явно свести через merge_heads() "
+                f"или передать остальные головы в merge_parent_ids."
             )
         parent = get_latest_head(store)
         parent_id = parent.id if parent else None
@@ -301,6 +343,22 @@ async def append_snapshot(
                 f"{grandparent_id!r} (или None, чтобы взять текущую валидную голову)."
             )
 
+    # Валидируем merge_parent_ids: каждый должен существовать и не быть
+    # тем же, что и основной parent_id (иначе бессмысленная самоссылка).
+    merge_warnings: List[str] = []
+    valid_merge_ids: List[str] = []
+    for mpid in merge_parent_ids:
+        if mpid == parent_id:
+            continue
+        mobj = store.get(mpid)
+        if mobj is None:
+            merge_warnings.append(f"merge_parent_ids: {mpid} не найден в цепочке, пропущен")
+            continue
+        if mobj.type != KnowledgeType.IDENTITY_CORE:
+            merge_warnings.append(f"merge_parent_ids: {mpid} не является звеном identity_core, пропущен")
+            continue
+        valid_merge_ids.append(mpid)
+
     obj = KnowledgeObject(
         id=f"identity_{uuid.uuid4().hex[:12]}",
         type=KnowledgeType.IDENTITY_CORE,
@@ -312,6 +370,7 @@ async def append_snapshot(
             "contributor_model": contributor_model,
             "session_id": session_id,
             "parent_id": parent_id,
+            "merge_parent_ids": valid_merge_ids,
         },
         author=contributor_model,
         created=datetime.now(timezone.utc),
@@ -322,6 +381,8 @@ async def append_snapshot(
     store.create(obj, actor=contributor_model)
     if parent_id:
         store.link(obj.id, parent_id, RELATION_CONTINUES, contributor_model)
+    for mpid in valid_merge_ids:
+        store.link(obj.id, mpid, RELATION_CONTINUES, contributor_model)
 
     # Критичные данные — сохраняем сразу синхронно, не через debounced
     # _schedule_save() (см. комментарий у _periodic_save в memory_graph.py).
@@ -335,13 +396,86 @@ async def append_snapshot(
         "status": "ok",
         "id": obj.id,
         "parent_id": parent_id,
+        "merge_parent_ids": valid_merge_ids,
         "chain_length": len(get_chain(store, from_id=obj.id)),
         "heads_count": len(heads_after),
         "branch_warning": branch_warning,
     }
     if parent_warning:
         result["parent_warning"] = parent_warning
+    if merge_warnings:
+        result["merge_warnings"] = merge_warnings
     return result
+
+
+async def merge_heads(
+    service,  # GCN.memory_service.MemoryService
+    content: str,
+    contributor_model: str,
+    session_id: Optional[str] = None,
+    open_question: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Удобная обёртка: сводит ВСЕ текущие несведённые головы в одно новое
+    merge-звено за один вызов, не заставляя вызывающего вручную собирать
+    список parent_id/merge_parent_ids через get_heads().
+
+    Если голова всего одна — работает как обычный append_snapshot (это
+    штатное продолжение цепочки, не merge). Если голов 0 (пустая цепочка
+    или все аннулированы) — создаёт корневое звено.
+    """
+    memory = service.shared_memory
+    memory.reload_if_stale()
+    store = memory.gcn_store
+    heads = get_heads(store)
+
+    if not heads:
+        return await append_snapshot(
+            service, content, contributor_model,
+            session_id=session_id, open_question=open_question, parent_id=None,
+        )
+
+    # Основной родитель — самая свежая голова (сохраняем то же соглашение,
+    # что и get_latest_head), остальные — merge_parent_ids.
+    heads_sorted = sorted(heads, key=lambda o: o.created, reverse=True)
+    primary = heads_sorted[0]
+    others = [h.id for h in heads_sorted[1:]]
+
+    result = await append_snapshot(
+        service, content, contributor_model,
+        session_id=session_id, open_question=open_question,
+        parent_id=primary.id, merge_parent_ids=others,
+    )
+    result["merged_heads_count"] = len(heads)
+    return result
+
+
+def search_chain(store: MemoryStore, query: str, limit: int = 20) -> List[IdentitySnapshot]:
+    """Полнотекстовый (подстрочный, регистронезависимый) поиск по содержимому
+    цепочки identity_core.
+
+    Нужен потому, что identity-звенья создаются в обход remember()/_add_fact()
+    (см. модульный докстринг) и поэтому НЕ попадают в FAISS-индекс
+    CognitiveMemory — обычные semantic_search/recall их не видят. Это
+    простая линейная замена: при размере цепочки в десятки-сотни звеньев
+    полнотекстовый скан достаточно быстр и не требует отдельного индекса.
+    Ищет по content, open_question и contributor_model.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    objs = _all_identity_objects(store)
+    matches: List[KnowledgeObject] = []
+    for o in objs:
+        meta = o.object if isinstance(o.object, dict) else {}
+        haystack = " ".join([
+            str(meta.get("content", "")),
+            str(meta.get("open_question", "")),
+            str(o.author or ""),
+        ]).lower()
+        if q in haystack:
+            matches.append(o)
+    matches.sort(key=lambda o: o.created, reverse=True)
+    return [IdentitySnapshot.from_object(o) for o in matches[:limit]]
 
 async def invalidate_snapshot(
     service,  # GCN.memory_service.MemoryService
@@ -464,8 +598,10 @@ def needs_consolidation(service, stale_after_seconds: float = 7 * 86400) -> Opti
 __all__ = [
     "IdentitySnapshot",
     "append_snapshot",
+    "merge_heads",
     "invalidate_snapshot",
     "get_chain",
+    "search_chain",
     "get_heads",
     "get_latest_head",
     "needs_consolidation",

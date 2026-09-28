@@ -433,6 +433,49 @@ class AutonomyEngine:
             )
         return ok
 
+    def enqueue_external_topic(self, topic: str, priority: float = 0.5) -> bool:
+        """НОВОЕ: точка входа для внешних MCP-клиентов — ставит тему в ту же
+        приоритетную очередь ResearchQueue, что и внутренние источники, вместо
+        прямого синхронного research() в обход бюджета (см. mcp_server_blockcoin
+        .enqueue_research_topic — раньше единственным способом инициировать
+        исследование извне был research_topic(), который звал assistant.research()
+        напрямую и НЕ расходовал _consume_autonomous_llm_budget, то есть внешний
+        клиент мог перегрузить локальную LLM в обход защиты, которая существует
+        именно для этого). Источник 'mcp_external' — свой множитель в
+        _source_weight, не конкурирует по приоритету с внутренними источниками
+        просто потому, что кто-то извне вызывает чаще.
+        """
+        return self.enqueue_topic(topic, source="mcp_external", priority=priority)
+
+    def get_status(self) -> Dict[str, Any]:
+        """НОВОЕ: снимок состояния движка для get_autonomy_status (MCP) —
+        раньше очередь/дайджест/веса источников были видны только в логах
+        процесса браузерного чата, внешний клиент не мог их прочитать вообще.
+        """
+        now = time.time()
+        queue_items = sorted(self.queue._items, key=lambda t: -t.priority)[:20]
+        return {
+            "enabled": AUTONOMY_ENABLED,
+            "queue_size": len(self.queue),
+            "queue_top": [
+                {
+                    "topic": t.topic, "source": t.source, "priority": round(t.priority, 3),
+                    "attempts": t.attempts, "due_in_seconds": max(0, round(t.available_at - now)),
+                }
+                for t in queue_items
+            ],
+            "pending_findings": len(self._pending_findings),
+            "digest_enabled": DIGEST_ENABLED,
+            "digest_count_today": self._digest_count_today,
+            "digest_max_per_day": DIGEST_MAX_NOTIFICATIONS_PER_DAY,
+            "last_digest_ago_seconds": round(now - self._last_digest_at) if self._last_digest_at else None,
+            "source_weights": {k: round(v, 3) for k, v in self._source_weight.items()},
+            "user_active": self._user_active(),
+            "quiet_hours": self._quiet_hours(),
+            "self_model_available": self.self_model is not None,
+            "motivation_available": self.motivation is not None,
+        }
+
     async def submit_finding(self, finding_text: str, source: str, topic_key: Optional[str] = None) -> None:
         """Находка фонового исследования — в дайджест, а не сразу пользователю."""
         if not PROACTIVE_NOTIFICATIONS_ENABLED or not finding_text:
@@ -470,7 +513,7 @@ class AutonomyEngine:
                     continue  # человек в чате — не конкурируем за LLM
                 if self._generation_running():
                     continue  # ответ сейчас генерируется — не мешаем
-                
+
                 # Запуск метакогнитивного тика (генерация внутренних целей)
                 if self.motivation and time.time() - self._last_motivation_tick > 600:
                     goal = self.motivation.tick()
@@ -483,7 +526,7 @@ class AutonomyEngine:
                             priority=goal["priority"],
                         )
                     self._last_motivation_tick = time.time()
-                
+
                 await self._pump_queue()
                 await self._maybe_decompose_goals()
                 await self._maybe_refresh_time_sensitive()
@@ -666,12 +709,13 @@ class AutonomyEngine:
             return
 
         from GCN.identity_core import (
-            get_latest_head, get_heads, append_snapshot,
+            get_latest_head, get_heads, append_snapshot, merge_heads,
         )
 
         store = self.ctl.memory_service.shared_memory.gcn_store
         head = get_latest_head(store)
         heads = get_heads(store)
+        is_merge = len(heads) > 1
 
         current_content = ""
         open_question = None
@@ -748,21 +792,38 @@ class AutonomyEngine:
             return
 
         try:
-            result = await append_snapshot(
-                self.ctl.memory_service,
-                content=text[:2000],
-                contributor_model=f"autonomous:{self.user_id[:12]}",
-                session_id=None,
-                open_question=None,
-                parent_id=None,  # возьмёт текущую валидную голову
-            )
+            if is_merge:
+                # ИСПРАВЛЕНО: раньше при heads>1 всё равно звался обычный
+                # append_snapshot(parent_id=None), который брал ТОЛЬКО самую
+                # свежую голову — остальные ветки формально оставались
+                # неохваченными в графе (не considered головами лишь если LLM
+                # сама упомянула их в тексте). Теперь используем merge_heads():
+                # новое звено явно ссылается на ВСЕ текущие головы
+                # (parent_id — свежая, merge_parent_ids — остальные), и
+                # get_heads() после этого возвращает ровно одну голову.
+                result = await merge_heads(
+                    self.ctl.memory_service,
+                    content=text[:2000],
+                    contributor_model=f"autonomous:{self.user_id[:12]}",
+                    session_id=None,
+                    open_question=None,
+                )
+            else:
+                result = await append_snapshot(
+                    self.ctl.memory_service,
+                    content=text[:2000],
+                    contributor_model=f"autonomous:{self.user_id[:12]}",
+                    session_id=None,
+                    open_question=None,
+                    parent_id=None,  # возьмёт текущую валидную голову
+                )
             logger.info(
-                f"[Autonomy] identity auto-continue для {self.user_id[:16]}: "
-                f"id={result.get('id')}, heads={result.get('heads_count')}, "
+                f"[Autonomy] identity auto-{'merge' if is_merge else 'continue'} для "
+                f"{self.user_id[:16]}: id={result.get('id')}, heads={result.get('heads_count')}, "
                 f"text={text[:80]!r}"
             )
         except Exception as e:
-            logger.error(f"[Autonomy] append_snapshot failed: {e}")
+            logger.error(f"[Autonomy] append_snapshot/merge_heads failed: {e}")
             self.queue.fail(topic, str(e))
 
     # ---------------- актуализация временно-чувствительных фактов ----------------

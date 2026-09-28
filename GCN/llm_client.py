@@ -98,21 +98,58 @@ async def call_llm(
     messages: List[Dict[str, str]],
     temp: float = 0.7,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    retries: int = 3
+    retries: int = 3,
+    include_reasoning: bool = False,
 ) -> str:
-    """Универсальная функция вызова локальной LLM (LM Studio) — только текст ответа."""
-    msg = await call_llm_raw(messages, temp=temp, max_tokens=max_tokens, tools=None, retries=retries)
-    return msg.get("content", "") or ""
+    """Универсальный вызов локальной LLM (LM Studio) — только текст ответа.
+
+    include_reasoning=True — если модель прислала reasoning_content (нативный
+    thinking Qwen3/DeepSeek-R1 и т.п.), обернуть его в <thought>...</thought>
+    и склеить с content. Используется ТОЛЬКО в главном ответе чата; для
+    служебных вызовов (планирование, верификация, JSON-парсинг) — False,
+    чтобы reasoning не путал парсеры.
+    """
+    msg = await call_llm_raw(messages, temp=temp, max_tokens=max_tokens,
+                             tools=None, retries=retries)
+    content = msg.get("content", "") or ""
+    if not include_reasoning:
+        return content
+
+    reasoning = (
+        msg.get("reasoning_content")
+        or msg.get("reasoning")
+        or ""
+    ).strip()
+
+    if not reasoning:
+        return content
+    if not content:
+        # Модель думала, но не уложилась в лимит токенов.
+        return f"<thought>{reasoning}</thought>"
+    return f"<thought>{reasoning}</thought>\n\n{content}"
 
 
 async def call_llm_stream(
     messages: List[Dict[str, str]],
     temp: float = 0.7,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    stop: Optional[List[str]] = None
+    stop: Optional[List[str]] = None,
+    include_reasoning: bool = True,
 ):
-    """Потоковый вызов LLM (LM Studio) с теми же параметрами, что и call_llm.
-    При обрыве без [DONE] или finish_reason==\"length\" yield-ит sentinel-маркер."""
+    """Потоковый вызов LLM (LM Studio).
+
+    Yield-ит dict-события, чтобы разделить reasoning и content в потоке:
+      {"kind": "reasoning", "text": "..."} — reasoning-токен (нативный thinking)
+      {"kind": "content",   "text": "..."} — токен финального ответа
+      {"kind": "truncated", "reason": "no_done"|"length"} — поток закончился
+                                              без [DONE] или по лимиту токенов.
+
+    include_reasoning=False — reasoning-события не эмитятся (модель может
+    тратить токены на thinking, но UI его не увидит).
+
+    Обратная несовместимость: раньше функция yield-ила строки, теперь dict.
+    Единственный потребитель — _stream_response_worker в ai_assistant.py.
+    """
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
     payload = {
         "model": "local-model",
@@ -128,16 +165,15 @@ async def call_llm_stream(
     finish_reason = None
     try:
         session = await _get_session()
-        async with session.post(LM_STUDIO_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        async with session.post(LM_STUDIO_URL, json=payload,
+                                headers=headers, timeout=timeout) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
                 logger.error(f"Stream error {resp.status}: {error_text[:200]}")
-                yield "[Ошибка LLM]"
+                yield {"kind": "content", "text": "[Ошибка LLM]"}
                 return
-            # Используем readline() для корректного чтения SSE-строк
             async for line in resp.content:
                 if not line:
-                    # Пустая строка — конец потока (бэкенд мог закрыть соединение без [DONE])
                     break
                 line = line.decode('utf-8').strip()
                 if not line or not line.startswith('data: '):
@@ -150,22 +186,37 @@ async def call_llm_stream(
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                delta = chunk.get('choices', [{}])[0].get('delta', {})
+                choice = chunk.get('choices', [{}])[0]
+                delta = choice.get('delta', {})
+
+                if 'finish_reason' in choice:
+                    finish_reason = choice['finish_reason']
+
+                # Reasoning-токен — эмитим сразу, без накопления.
+                if include_reasoning:
+                    r_chunk = (
+                        delta.get('reasoning_content')
+                        or delta.get('reasoning')
+                        or ''
+                    )
+                    if r_chunk:
+                        yield {"kind": "reasoning", "text": r_chunk}
+
+                # Content-токен — тоже сразу.
                 content = delta.get('content', '')
-                # Сохраняем finish_reason из последнего чанка
-                if 'finish_reason' in chunk.get('choices', [{}])[0]:
-                    finish_reason = chunk['choices'][0]['finish_reason']
                 if content:
-                    yield content
-            # Если поток завершился без [DONE], логируем предупреждение и выдаём sentinel
+                    yield {"kind": "content", "text": content}
+
             if not stream_did_complete:
-                logger.warning(f"LLM stream ended without [DONE] marker — possible truncation (finish_reason={finish_reason})")
-                yield "\u0000__LLM_TRUNCATED__\u0000"
+                logger.warning(
+                    f"LLM stream ended without [DONE] marker "
+                    f"(finish_reason={finish_reason})"
+                )
+                yield {"kind": "truncated", "reason": "no_done"}
                 return
-            # Если finish_reason == "length" — ответ обрезан по лимиту токенов
             if finish_reason == "length":
-                logger.warning(f"LLM stream truncated by token limit (finish_reason=length)")
-                yield "\u0000__LLM_TRUNCATED__\u0000"
+                logger.warning("LLM stream truncated by token limit (finish_reason=length)")
+                yield {"kind": "truncated", "reason": "length"}
                 return
             logger.debug(f"LLM stream completed with finish_reason: {finish_reason}")
     except asyncio.CancelledError:
@@ -173,4 +224,4 @@ async def call_llm_stream(
         raise
     except Exception as e:
         logger.error(f"Stream error: {e}")
-        yield f"[Ошибка: {e}]"
+        yield {"kind": "content", "text": f"[Ошибка: {e}]"}
