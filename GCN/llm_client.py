@@ -138,12 +138,17 @@ async def call_llm_stream(
 ):
     """Потоковый вызов LLM (LM Studio).
 
-    include_reasoning=True — накапливать reasoning_content и эмитить его
-    одним блоком <thought>...</thought>\\n\\n перед первым content-токеном.
-    Фронтенд (_renderMarkdown в ai-manager.js) уже умеет рендерить такие
-    блоки как collapsible «💭 Reasoning».
+    Yield-ит dict-события, чтобы разделить reasoning и content в потоке:
+      {"kind": "reasoning", "text": "..."} — reasoning-токен (нативный thinking)
+      {"kind": "content",   "text": "..."} — токен финального ответа
+      {"kind": "truncated", "reason": "no_done"|"length"} — поток закончился
+                                              без [DONE] или по лимиту токенов.
 
-    При обрыве без [DONE] или finish_reason=="length" — sentinel-маркер.
+    include_reasoning=False — reasoning-события не эмитятся (модель может
+    тратить токены на thinking, но UI его не увидит).
+
+    Обратная несовместимость: раньше функция yield-ила строки, теперь dict.
+    Единственный потребитель — _stream_response_worker в ai_assistant.py.
     """
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
     payload = {
@@ -158,20 +163,17 @@ async def call_llm_stream(
     timeout = aiohttp.ClientTimeout(total=LM_STUDIO_STREAM_TIMEOUT)
     stream_did_complete = False
     finish_reason = None
-    accumulated_reasoning = ""
-    reasoning_emitted = False
     try:
         session = await _get_session()
-        async with session.post(LM_STUDIO_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        async with session.post(LM_STUDIO_URL, json=payload,
+                                headers=headers, timeout=timeout) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
                 logger.error(f"Stream error {resp.status}: {error_text[:200]}")
-                yield "[Ошибка LLM]"
+                yield {"kind": "content", "text": "[Ошибка LLM]"}
                 return
-            # Используем readline() для корректного чтения SSE-строк
             async for line in resp.content:
                 if not line:
-                    # Пустая строка — конец потока (бэкенд мог закрыть соединение без [DONE])
                     break
                 line = line.decode('utf-8').strip()
                 if not line or not line.startswith('data: '):
@@ -187,7 +189,10 @@ async def call_llm_stream(
                 choice = chunk.get('choices', [{}])[0]
                 delta = choice.get('delta', {})
 
-                # ── НОВОЕ: нативный reasoning (reasoning_content в delta) ──
+                if 'finish_reason' in choice:
+                    finish_reason = choice['finish_reason']
+
+                # Reasoning-токен — эмитим сразу, без накопления.
                 if include_reasoning:
                     r_chunk = (
                         delta.get('reasoning_content')
@@ -195,40 +200,23 @@ async def call_llm_stream(
                         or ''
                     )
                     if r_chunk:
-                        accumulated_reasoning += r_chunk
-                # ────────────────────────────────────────────────────────
+                        yield {"kind": "reasoning", "text": r_chunk}
 
+                # Content-токен — тоже сразу.
                 content = delta.get('content', '')
-                # Сохраняем finish_reason из последнего чанка
-                if 'finish_reason' in choice:
-                    finish_reason = choice['finish_reason']
-
                 if content:
-                    # Перед первым content-токеном отдаём весь thinking разом
-                    if (include_reasoning
-                            and accumulated_reasoning
-                            and not reasoning_emitted):
-                        yield f"<thought>{accumulated_reasoning}</thought>\n\n"
-                        reasoning_emitted = True
-                    yield content
+                    yield {"kind": "content", "text": content}
 
-            # Если content так и не пришёл — отдаём reasoning отдельным блоком,
-            # чтобы пользователь видел, что модель думала (не молчала).
-            if (include_reasoning
-                    and accumulated_reasoning
-                    and not reasoning_emitted):
-                yield f"<thought>{accumulated_reasoning}</thought>"
-                reasoning_emitted = True
-
-            # Если поток завершился без [DONE], логируем предупреждение и выдаём sentinel
             if not stream_did_complete:
-                logger.warning(f"LLM stream ended without [DONE] marker — possible truncation (finish_reason={finish_reason})")
-                yield "\u0000__LLM_TRUNCATED__\u0000"
+                logger.warning(
+                    f"LLM stream ended without [DONE] marker "
+                    f"(finish_reason={finish_reason})"
+                )
+                yield {"kind": "truncated", "reason": "no_done"}
                 return
-            # Если finish_reason == "length" — ответ обрезан по лимиту токенов
             if finish_reason == "length":
-                logger.warning(f"LLM stream truncated by token limit (finish_reason=length)")
-                yield "\u0000__LLM_TRUNCATED__\u0000"
+                logger.warning("LLM stream truncated by token limit (finish_reason=length)")
+                yield {"kind": "truncated", "reason": "length"}
                 return
             logger.debug(f"LLM stream completed with finish_reason: {finish_reason}")
     except asyncio.CancelledError:
@@ -236,4 +224,4 @@ async def call_llm_stream(
         raise
     except Exception as e:
         logger.error(f"Stream error: {e}")
-        yield f"[Ошибка: {e}]"
+        yield {"kind": "content", "text": f"[Ошибка: {e}]"}
