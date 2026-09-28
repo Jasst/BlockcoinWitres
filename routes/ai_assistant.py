@@ -19,17 +19,24 @@ import re
 from typing import Dict, Optional, Any, List, Tuple
 
 def _split_reasoning(text: str) -> Tuple[str, str]:
-    """
-    Разделяет сырой ответ модели на рассуждение и финальный ответ.
-    Возвращает (reasoning, answer). Если теги <thought> не найдены —
-    reasoning будет пустой строкой, answer = весь текст.
+    """Разделяет ответ модели на рассуждение и финальный ответ.
+
+    Формат вывода call_llm_stream с include_reasoning=True:
+        <thought>REASONING</thought>\n\nCONTENT
+    либо (если content не пришёл):
+        <thought>REASONING</thought>
     """
     if not text:
         return "", ""
-    # Пробуем найти XML-теги <thought>...</thought> с любым количеством whitespace между ними и ответом
-    thought_match = re.search(r'<thought>([\s\S]*?)</thought>\s*(?:\n\s*)*\n(.+)', text, re.IGNORECASE)
-    if thought_match:
-        return thought_match.group(1).strip(), thought_match.group(2).strip()
+
+    m = re.search(r'<thought>([\s\S]*?)</thought>\s*(.*)$',
+                  text, re.IGNORECASE | re.DOTALL)
+    if m:
+        reasoning = (m.group(1) or "").strip()
+        answer = (m.group(2) or "").strip()
+        return reasoning, answer or ""
+
+    # Дальше — старая логика для обратной совместимости (без изменений)
     # Старый формат без тегов: рассуждение начинается с ключевых фраз
     reasoning_start_patterns = [
         r'^сначала я подумаю',
@@ -1929,7 +1936,14 @@ class CognitiveController:
             })
 
 
-        response = await call_llm(messages)
+        _llm_max_tokens = DEFAULT_MAX_TOKENS
+        if reasoning:
+            _llm_max_tokens = DEFAULT_MAX_TOKENS + REASONING_MAX_TOKENS_BOOST
+        response = await call_llm(
+            messages,
+            max_tokens=_llm_max_tokens,
+            include_reasoning=reasoning,
+        )
         response = await self._finalize_answer(message, response, search_meta, tool_trace)
         search_meta["tool_trace"] = tool_trace
         return response, search_meta
@@ -3004,7 +3018,19 @@ class CognitiveController:
                     # Теперь модель генерирует полный ответ согласно инструкции в промпте.
                     stream_stop_tokens = REASONING_STOP_TOKENS if reasoning and REASONING_STOP_TOKENS else None
                     _LLM_TRUNCATED = "\x00__LLM_TRUNCATED__\x00"
-                    async for token in call_llm_stream(messages, max_tokens=DEFAULT_MAX_TOKENS, stop=stream_stop_tokens):
+                    # Reasoning-ходу нужен буст бюджета: thinking съедает сотни токенов
+                    # ДО первого символа ответа, и без буста модель упирается в лимит
+                    # (наблюдалось: content="" пустой при reasoning_content на 3k символов).
+                    _stream_max_tokens = DEFAULT_MAX_TOKENS
+                    if reasoning:
+                        _stream_max_tokens = DEFAULT_MAX_TOKENS + REASONING_MAX_TOKENS_BOOST
+
+                    async for token in call_llm_stream(
+                        messages,
+                        max_tokens=_stream_max_tokens,
+                        stop=stream_stop_tokens,
+                        include_reasoning=reasoning,
+                    ):
                         if token == _LLM_TRUNCATED:
                             # Модель остановилась по лимиту токенов — сигнализируем
                             # фронтенду, но не включаем в full_response (чтобы не
