@@ -179,11 +179,23 @@ class MotivationEngine:
         # (в реальной реализации — вызов memory.detect_contradictions())
         
         # Вариант 2: проверка активных целей на отсутствие прогресса
+        #
+        # ПАТЧ (fact_cc5a3a86): раньше сюда попадали ЛЮБЫЕ застопорившиеся
+        # цели, включая сами мета-цели с source="gap_stalled_goal". В итоге
+        # из «Разблокировать цель X» рождалось «Разблокировать Разблокировать
+        # цель X», затем третьего уровня и т.д. — префиксы накапливались до
+        # обрыва по [:50], а SelfModel.active_goals пух от рекурсивного
+        # мусора (get_goals из GCN-памяти при этом показывал 3 цели, а
+        # self_state — 10 «активных»). Исключаем мета-цели из кандидатов,
+        # в том числе по накопленному префиксу в самом тексте цели.
+        _META_PREFIX = "разблокировать застопорившуюся цель"
         stalled_goals = [
             g for g in self.self_model.active_goals
             if (time.time() - g.get("added_at", 0)) > 3600  # старше 1 часа
+            and g.get("source") != "gap_stalled_goal"       # не рекурсивная мета-цель
+            and _META_PREFIX not in g.get("goal", "").lower()  # защита от legacy-мусора
         ]
-        
+
         if stalled_goals and random.random() < 0.5:
             goal = random.choice(stalled_goals)
             topic = f"Разблокировать застопорившуюся цель: {goal['goal'][:50]}"
@@ -196,6 +208,7 @@ class MotivationEngine:
                     "source": "gap_stalled_goal",
                     "metadata": {
                         "original_goal": goal["goal"],
+                        "original_source": goal.get("source", ""),
                         "stalled_hours": (time.time() - goal["added_at"]) / 3600,
                     }
                 }

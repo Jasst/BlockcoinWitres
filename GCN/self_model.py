@@ -21,9 +21,15 @@ import logging
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_goal_text(text: str) -> str:
+    """Нормализует текст цели для сравнения (для prune_goals)."""
+    import re
+    return re.sub(r'\s+', ' ', (text or '').lower().strip())[:300]
 
 
 @dataclass
@@ -288,6 +294,43 @@ class SelfModel:
             if g["goal"][:50].lower() != goal[:50].lower()
         ]
         self.save()
+
+    def prune_goals(self, known_descriptions: Optional[List[str]] = None,
+                    meta_prefixes: Tuple[str, ...] = ("разблокировать застопорившуюся цель",),
+                    max_age_seconds: Optional[float] = None) -> int:
+        """Сборщик мусора списка целей (ПАТЧ fact_cc5a3a86, часть 2).
+
+        Убирает:
+          1) legacy-мусор рекурсии gap_stalled_goal (цели с накопленным
+             префиксом «Разблокировать…» в тексте — пережиток бага);
+          2) цели, отсутствующие в authoritative-списке GCN-памяти
+             (known_descriptions) — раньше SelfModel жил своей жизнью:
+             get_goals() показывал 3 цели из памяти, а self_state — до 10
+             «активных» из active_goals;
+          3) цели старше max_age_seconds (если задан).
+
+        Возвращает число удалённых целей.
+        """
+        before = len(self.active_goals)
+        kept = []
+        for g in self.active_goals:
+            text = g.get("goal", "")
+            low = text.lower()
+            if any(p in low for p in meta_prefixes):
+                continue
+            if known_descriptions is not None:
+                norm_text = _normalize_goal_text(text)
+                if not any(norm_text == _normalize_goal_text(d) for d in known_descriptions):
+                    continue
+            if max_age_seconds is not None and \
+                    (time.time() - g.get("added_at", 0)) > max_age_seconds:
+                continue
+            kept.append(g)
+        self.active_goals = kept
+        removed = before - len(self.active_goals)
+        if removed:
+            self.save()
+        return removed
 
     def get_state_summary(self) -> Dict[str, Any]:
         """Возвращает краткую сводку состояния для использования в промптах."""
