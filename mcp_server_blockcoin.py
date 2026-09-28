@@ -1161,7 +1161,20 @@ async def add_goal(
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
-    return await service.add_goal(description, priority)
+    result = await service.add_goal(description, priority)
+
+    # Сразу синхронизируем SelfModel, чтобы get_self_state() показывал
+    # свежую цель, не дожидаясь тика AutonomyEngine.
+    try:
+        assistant = await get_assistant(uid)
+        sm = getattr(assistant, "self_model", None)
+        if sm is not None:
+            gcn_goals = await service.get_goals()
+            sm.sync_from_gcn(gcn_goals)
+    except Exception as e:
+        logger.debug(f"sync_from_gcn after add_goal failed: {e}")
+
+    return result
 
 
 @mcp.tool()

@@ -272,20 +272,84 @@ class SelfModel:
         else:
             self.self_concept["recent_failure_rate"] = 0.0
 
-    def add_goal(self, goal: str, priority: float = 0.5, source: str = "external") -> None:
-        """Добавляет активную цель."""
+    def add_goal(self, goal: str, priority: float = 0.5, source: str = "external",
+                 gcn_id: Optional[str] = None) -> None:
+        """Добавляет активную цель.
+
+        gcn_id — необязательная ссылка на объект в GCN-памяти. Если задана,
+        sync_from_gcn() сможет сопоставить запись в active_goals с GCN-целью
+        и не потерять её при следующей синхронизации.
+        """
+        norm = _normalize_goal_text(goal)
+        for existing in self.active_goals:
+            if _normalize_goal_text(existing.get("goal", "")) == norm:
+                existing["priority"] = min(1.0, max(0.0, priority))
+                if gcn_id:
+                    existing["gcn_id"] = gcn_id
+                self.save()
+                return
         self.active_goals.append({
             "goal": goal[:300],
             "priority": min(1.0, max(0.0, priority)),
             "source": source,
             "added_at": time.time(),
+            "gcn_id": gcn_id,
         })
-        # Обрезаем
         if len(self.active_goals) > 20:
             self.active_goals = sorted(
                 self.active_goals, key=lambda g: -g["priority"]
             )[:20]
         self.save()
+
+    def sync_from_gcn(self, gcn_goals: List[Dict[str, Any]]) -> int:
+        """Пересобирает active_goals из GCN-целей.
+
+        GCN — источник истины для целей. SelfModel.active_goals — проекция
+        для быстрого чтения в промптах и в get_self_state(). Возвращает
+        количество записей в active_goals ДО синхронизации.
+        """
+        before = len(self.active_goals)
+
+        # 1. Сохраняем транзиентные эндогенные цели (ещё не в GCN)
+        transient = [
+            g for g in self.active_goals
+            if g.get("source") in ("gap_stalled_goal",)
+            or str(g.get("source", "")).startswith("identity_")
+        ]
+        transient_norms = {_normalize_goal_text(g.get("goal", "")) for g in transient}
+
+        # 2. Строим проекцию из GCN
+        projected: List[Dict[str, Any]] = []
+        now = time.time()
+        for g in gcn_goals:
+            desc = (g.get("description") or "").strip()
+            if not desc:
+                continue
+            norm = _normalize_goal_text(desc)
+            if norm in transient_norms:
+                continue
+            projected.append({
+                "goal": desc[:300],
+                "priority": float(g.get("priority", 0.5)),
+                "source": "gcn",
+                "added_at": now,
+                "gcn_id": g.get("gcn_id") or g.get("id"),
+            })
+
+        self.active_goals = projected + transient
+
+        # 3. Обрезаем
+        if len(self.active_goals) > 20:
+            self.active_goals = sorted(
+                self.active_goals, key=lambda g: -g.get("priority", 0.0)
+            )[:20]
+
+        self.save()
+        logger.info(
+            f"[SelfModel] sync_from_gcn: было {before}, стало {len(self.active_goals)} "
+            f"(GCN: {len(projected)}, transient: {len(transient)})"
+        )
+        return before
 
     def remove_goal(self, goal: str) -> None:
         """Удаляет завершённую цель."""

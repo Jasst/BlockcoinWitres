@@ -514,17 +514,54 @@ class AutonomyEngine:
                 if self._generation_running():
                     continue  # ответ сейчас генерируется — не мешаем
 
-                # Запуск метакогнитивного тика (генерация внутренних целей)
+                # ── Синхронизация целей: GCN → SelfModel ────────────────
+                if self.self_model is not None and self.ctl.memory_service is not None:
+                    try:
+                        gcn_goals = await self.ctl.memory_service.get_goals()
+                        self.self_model.sync_from_gcn(gcn_goals)
+                    except Exception as e:
+                        logger.debug(f"[Autonomy] sync_from_gcn failed: {e}")
+
+                # ── Чистка legacy-мусора ────────────────────────────────
+                if self.self_model is not None:
+                    try:
+                        gcn_goals = await self.ctl.memory_service.get_goals()
+                        known = [g["description"] for g in gcn_goals if g.get("description")]
+                        removed = self.self_model.prune_goals(
+                            known_descriptions=known,
+                            max_age_seconds=7 * 86400,
+                        )
+                        if removed:
+                            logger.info(f"[Autonomy] prune_goals удалил {removed} мусорных целей")
+                    except Exception as e:
+                        logger.debug(f"[Autonomy] prune_goals failed: {e}")
+
+                # ── Метакогнитивный тик ─────────────────────────────────
                 if self.motivation and time.time() - self._last_motivation_tick > 600:
                     goal = self.motivation.tick()
                     if goal:
                         logger.info(f"[Autonomy] эндогенная цель: {goal.get('goal', '')[:60]}")
-                        # Эндогенная цель должна попадать в очередь исследований, а не только в SelfModel
                         self.enqueue_topic(
                             goal["goal"],
                             source=goal["source"],
                             priority=goal["priority"],
                         )
+                        # Записываем эндогенную цель и в GCN, чтобы она
+                        # стала видна через get_goals() и чтобы следующий
+                        # sync_from_gcn не потерял её.
+                        try:
+                            add_result = await self.ctl.memory_service.add_goal(
+                                goal["goal"],
+                                priority=goal.get("priority", 0.5),
+                            )
+                            if isinstance(add_result, dict) and add_result.get("id"):
+                                for g in self.self_model.active_goals:
+                                    if g.get("goal") == goal["goal"][:300]:
+                                        g["gcn_id"] = add_result.get("gcn_id") or str(add_result["id"])
+                                        break
+                                self.self_model.save()
+                        except Exception as e:
+                            logger.warning(f"[Autonomy] не удалось записать эндогенную цель в GCN: {e}")
                     self._last_motivation_tick = time.time()
 
                 await self._pump_queue()
