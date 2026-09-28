@@ -518,7 +518,24 @@ class AutonomyEngine:
                 if self.self_model is not None and self.ctl.memory_service is not None:
                     try:
                         gcn_goals = await self.ctl.memory_service.get_goals()
-                        self.self_model.sync_from_gcn(gcn_goals)
+                        # Если GCN пуст, а в self_model есть нетранзиентные цели —
+                        # не трогаем active_goals (возможно, get_goals() вернул
+                        # пусто из-за временного сбоя, а не потому что целей нет).
+                        # Мигрировать в GCN цели пользователя — задача отдельного
+                        # одноразового скрипта, а не автоматического sync.
+                        has_non_transient = any(
+                            g.get("source") not in ("gap_stalled_goal",)
+                            and not str(g.get("source", "")).startswith("identity_")
+                            for g in self.self_model.active_goals
+                        )
+                        if gcn_goals or not has_non_transient:
+                            self.self_model.sync_from_gcn(gcn_goals)
+                        else:
+                            logger.info(
+                                "[Autonomy] sync_from_gcn пропущен: GCN пуст, "
+                                "а в self_model есть нетранзиентные цели — "
+                                "вероятно, это первый запуск или сбой чтения GCN"
+                            )
                     except Exception as e:
                         logger.debug(f"[Autonomy] sync_from_gcn failed: {e}")
 
@@ -554,12 +571,22 @@ class AutonomyEngine:
                                 goal["goal"],
                                 priority=goal.get("priority", 0.5),
                             )
-                            if isinstance(add_result, dict) and add_result.get("id"):
-                                for g in self.self_model.active_goals:
-                                    if g.get("goal") == goal["goal"][:300]:
-                                        g["gcn_id"] = add_result.get("gcn_id") or str(add_result["id"])
-                                        break
-                                self.self_model.save()
+                            # Backfill gcn_id: ищем в локальном кэше memory.goals
+                            # запись по local id и достаём её gcn_id. Без этого
+                            # self_model.active_goals хранил бы только локальный
+                            # id, а не настоящую ссылку на GCN-объект.
+                            local_gid = add_result.get("id") if isinstance(add_result, dict) else None
+                            if local_gid is not None:
+                                gcn_goal = next(
+                                    (g for g in self.ctl.memory.goals if g.id == local_gid),
+                                    None,
+                                )
+                                if gcn_goal and gcn_goal.gcn_id:
+                                    for sm_g in self.self_model.active_goals:
+                                        if sm_g.get("goal") == goal["goal"][:300]:
+                                            sm_g["gcn_id"] = gcn_goal.gcn_id
+                                            break
+                                    self.self_model.save()
                         except Exception as e:
                             logger.warning(f"[Autonomy] не удалось записать эндогенную цель в GCN: {e}")
                     self._last_motivation_tick = time.time()
