@@ -415,6 +415,58 @@ function _clearAiHistory() {
             }
         });
     }
+
+    // ─── ЖИВОЙ reasoning-блок во время стрима ────────────────────────────
+    // Раньше reasoning приходил одним <thought>-блоком перед первым
+    // content-токеном. Теперь бэкенд шлёт reasoning_token отдельным SSE-полем
+    // по мере генерации, и мы строим блок инкрементально. Тот же .reasoning-block,
+    // что использует _renderMarkdown для старых сообщений — стили общие.
+    function _ensureReasoningBlock(messageDiv) {
+        if (!messageDiv) return null;
+        const content = messageDiv.querySelector('.content');
+        if (!content) return null;
+        let block = content.querySelector('.reasoning-block[data-live="true"]');
+        if (block) return block;
+        const markdownBody = content.querySelector('.markdown-body');
+        block = document.createElement('div');
+        block.className = 'reasoning-block';
+        block.dataset.live = 'true';
+        block.innerHTML = `
+            <details open>
+                <summary>💭 Reasoning <span style="opacity:.55;font-weight:400;">(думает…)</span></summary>
+                <div class="reasoning-content"></div>
+            </details>`;
+        if (markdownBody) content.insertBefore(block, markdownBody);
+        else content.appendChild(block);
+        return block;
+    }
+
+    function _updateReasoningBlock(messageDiv, text) {
+        const block = _ensureReasoningBlock(messageDiv);
+        if (!block) return;
+        const contentEl = block.querySelector('.reasoning-content');
+        if (contentEl) {
+            // textContent — быстро, без парсинга markdown на каждый чанк.
+            // Reasoning обычно plain text, оформление не критично.
+            contentEl.textContent = text;
+        }
+        if (_aiMessagesContainer) {
+            _aiMessagesContainer.scrollTop = _aiMessagesContainer.scrollHeight;
+        }
+    }
+
+    function _finalizeReasoningBlock(messageDiv) {
+        if (!messageDiv) return;
+        const block = messageDiv.querySelector('.reasoning-block[data-live="true"]');
+        if (!block) return;
+        block.removeAttribute('data-live');
+        const summary = block.querySelector('summary');
+        if (summary) summary.textContent = '💭 Reasoning';
+        // Авто-сворачиваем, когда ответ уже пошёл — блок остаётся доступен
+        // кликом, но не отвлекает от чтения ответа.
+        const details = block.querySelector('details');
+        if (details) details.removeAttribute('open');
+    }
     function _enhanceCodeBlocks(container) {
         if (!container || typeof hljs === 'undefined') return;
         container.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
@@ -868,6 +920,7 @@ function _clearAiHistory() {
 
             // Локальный буфер. НЕ трогаем общий _currentStreamingText до самого конца.
             let localText = '';
+            let localReasoningText = '';
 
             let firstTokenReceived = false;
             let streamFinished = false;
@@ -883,6 +936,9 @@ function _clearAiHistory() {
                 _enhanceCodeBlocks(markdownBody);
                 _addImageDownloadButtons(markdownBody);
                 _attachReasoningToggle(markdownBody);
+                if (localReasoningText) {
+                    _updateReasoningBlock(localMessage, localReasoningText);
+                }
                 if (_aiMessagesContainer) {
                     _aiMessagesContainer.scrollTop = _aiMessagesContainer.scrollHeight;
                 }
@@ -904,10 +960,25 @@ function _clearAiHistory() {
                         try {
                             const data = JSON.parse(dataStr);
                             if (data.no_active_generation) { noActiveGeneration = true; continue; }
+                            if (data.reasoning_token) {
+                                localReasoningText += data.reasoning_token;
+                                // flushUI вызывается по таймеру — туда же можно докинуть reasoning.
+                                if (!rafTimer) {
+                                    rafTimer = setTimeout(() => {
+                                        rafTimer = null;
+                                        flushUI();
+                                    }, 50);
+                                }
+                                continue;
+                            }
                             if (data.token) {
                                 if (!firstTokenReceived) {
                                     _showAiTypingIndicator(false);
                                     firstTokenReceived = true;
+                                    if (localReasoningText) {
+                                        _updateReasoningBlock(localMessage, localReasoningText);
+                                        _finalizeReasoningBlock(localMessage);
+                                    }
                                 }
                                 localText += data.token;
                                 if (!rafTimer) {
@@ -1017,6 +1088,14 @@ async function _sendToAi(messageText, imageFile) {
     if (!messageText.trim() && !imageFile) { _showToast('Введите сообщение или выберите изображение', 'warning'); return; }
     try { localStorage.removeItem('ai_stream_partial_' + (_currentAiSessionId || 'default')); } catch (e) {}
     _displayedImageUrls = new Set(); // новый запрос — сброс дедупликации картинок
+
+    // Буфер живого reasoning текущего запроса. Сбрасывается на каждый новый
+    // запрос, иначе reasoning предыдущего сообщения "протечёт" в следующее.
+    let _currentReasoningText = '';
+    if (window._aiReasoningTimer) {
+        clearTimeout(window._aiReasoningTimer);
+        window._aiReasoningTimer = null;
+    }
 
     // === ФИКС ДУБЛИРОВАНИЯ ПОТОКА ===
     // Пока _mainSendActive = true, visibilitychange НЕ будет дёргать attach —
@@ -1174,10 +1253,27 @@ async function _sendToAi(messageText, imageFile) {
                         _showAiTypingIndicator(true, `📖 Читаю ${data.count || 'несколько'} страниц…`);
                         continue;
                     }
+                    if (data.reasoning_token) {
+                        _currentReasoningText += data.reasoning_token;
+                        // Не убираем typing indicator — модель ещё думает. Блок reasoning
+                        // просто появляется над будущим ответом и растёт.
+                        if (!window._aiReasoningTimer) {
+                            window._aiReasoningTimer = setTimeout(() => {
+                                window._aiReasoningTimer = null;
+                                _updateReasoningBlock(_currentStreamingMessage, _currentReasoningText);
+                            }, 50);
+                        }
+                        continue;
+                    }
                     if (data.token) {
                         if (!firstTokenReceived) {
                             _showAiTypingIndicator(false);
                             firstTokenReceived = true;
+                            // Первый content-токен — модель закончила думать, сворачиваем блок.
+                            if (_currentReasoningText) {
+                                _updateReasoningBlock(_currentStreamingMessage, _currentReasoningText);
+                                _finalizeReasoningBlock(_currentStreamingMessage);
+                            }
                         }
                         _currentStreamingText += data.token;
 
@@ -1284,6 +1380,10 @@ async function _sendToAi(messageText, imageFile) {
             }
         }
     } finally {
+        if (window._aiReasoningTimer) {
+            clearTimeout(window._aiReasoningTimer);
+            window._aiReasoningTimer = null;
+        }
         if (_currentStreamReader) {
             try { _currentStreamReader.releaseLock(); } catch(e) {}
             _currentStreamReader = null;

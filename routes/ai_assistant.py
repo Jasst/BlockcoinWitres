@@ -3023,7 +3023,6 @@ class CognitiveController:
                     # рассуждения, и поток обрывался ДО финального ответа.
                     # Теперь модель генерирует полный ответ согласно инструкции в промпте.
                     stream_stop_tokens = REASONING_STOP_TOKENS if reasoning and REASONING_STOP_TOKENS else None
-                    _LLM_TRUNCATED = "\x00__LLM_TRUNCATED__\x00"
                     # Reasoning-ходу нужен буст бюджета: thinking съедает сотни токенов
                     # ДО первого символа ответа, и без буста модель упирается в лимит
                     # (наблюдалось: content="" пустой при reasoning_content на 3k символов).
@@ -3031,26 +3030,37 @@ class CognitiveController:
                     if reasoning:
                         _stream_max_tokens = DEFAULT_MAX_TOKENS + REASONING_MAX_TOKENS_BOOST
 
-                    async for token in call_llm_stream(
+                    # Reasoning-токены идут отдельным SSE-полем reasoning_token и НЕ попадают
+                    # в full_response — это критично: full_response уходит в _finalize_answer
+                    # (verify/plan_critic/postprocess) и потом в history.json. Reasoning там
+                    # не нужен и только испортил бы проверку фактов и следующую генерацию.
+                    # При переподключении (_attachToActiveAiStream) reasoning реплеится из
+                    # буфера генерации на бэкенде — там хранятся все SSE-события как есть.
+                    async for event in call_llm_stream(
                         messages,
                         max_tokens=_stream_max_tokens,
                         stop=stream_stop_tokens,
                         include_reasoning=reasoning,
                     ):
-                        if token == _LLM_TRUNCATED:
-                            # Модель остановилась по лимиту токенов — сигнализируем
-                            # фронтенду, но не включаем в full_response (чтобы не
-                            # портить текст и историю).
-                            logger.warning(
-                                f"[stream] LLM stream truncated by token limit "
-                                f"(len={len(full_response)})"
-                            )
+                        kind = event.get("kind")
+                        if kind == "reasoning":
                             await push(
-                                f"data: {json.dumps({'warning': 'Ответ обрезан: достигнут лимит токенов'})}\n\n"
+                                f"data: {json.dumps({'reasoning_token': event.get('text', '')})}\n\n"
                             )
+                        elif kind == "content":
+                            text = event.get("text", "")
+                            full_response += text
+                            await push(f"data: {json.dumps({'token': text})}\n\n")
+                        elif kind == "truncated":
+                            reason = event.get("reason")
+                            logger.warning(
+                                f"[stream] LLM stream truncated ({reason}), len(full_response)={len(full_response)}"
+                            )
+                            msg = ("Ответ обрезан: достигнут лимит токенов"
+                                   if reason == "length" else
+                                   "Ответ оборвался: соединение с моделью закрылось неожиданно")
+                            await push(f"data: {json.dumps({'warning': msg})}\n\n")
                             break
-                        full_response += token
-                        await push(f"data: {json.dumps({'token': token})}\n\n")
                 else:
                     response, inner_meta = await self.process_input(message, web_search, image_base64, image_mime,
                                                                     reasoning)
