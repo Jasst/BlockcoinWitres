@@ -518,11 +518,15 @@ function _clearAiHistory() {
             let reasoningHtml = '';
             let mainText = text;
             
-            // Сначала проверяем наличие тегов <thought>...</thought> (новый формат)
-            const thoughtMatch = text.match(/<thought>([\s\S]*?)<\/thought>\s*\n\s*\n([\s\S]*)/i);
+            // Сначала проверяем наличие тегов <thought>...</thought> (новый формат).
+            // ИСПРАВЛЕНИЕ: раньше требовался literal \n после \s* — при схлопывании
+            // \n\n в один перенос (или его отсутствии, если модель «думала, но не
+            // уложилась в токены») блок не поймался бы. Теперь ловим любое
+            // количество whitespace (или его отсутствие) между </thought> и ответом.
+            const thoughtMatch = text.match(/<thought>([\s\S]*?)<\/thought>\s*([\s\S]*)/i);
             if (thoughtMatch) {
                 const reasoningContent = thoughtMatch[1].trim();
-                mainText = thoughtMatch[2].trim();
+                mainText = (thoughtMatch[2] || '').trim();
                 
                 if (reasoningContent.length > 0) {
                     reasoningHtml = `
