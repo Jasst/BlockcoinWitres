@@ -1165,6 +1165,56 @@ async def add_goal(
 
 
 @mcp.tool()
+async def update_goal(
+        goal_id: int = Field(..., description="Числовой id цели (см. get_goals)"),
+        status: Optional[str] = Field(None, description="Новый статус: active/completed/failed/paused"),
+        priority: Optional[float] = Field(None, description="Новый приоритет 0..1", ge=0, le=1),
+        confidence: Optional[float] = Field(None, description="Новая уверенность 0..1", ge=0, le=1),
+        progress: Optional[float] = Field(None, description="Прогресс 0..1", ge=0, le=1),
+        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        ctx: Context = None
+) -> Dict[str, Any]:
+    """Обновляет поля существующей цели (статус/приоритет/уверенность/прогресс).
+
+    Изменения зеркалятся в GCN по gcn_id. Мягкое закрытие цели —
+    status='completed'; полное удаление — delete_goal.
+    """
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    kwargs = {k: v for k, v in
+              {"status": status, "priority": priority,
+               "confidence": confidence, "progress": progress}.items()
+              if v is not None}
+    if not kwargs:
+        return {"status": "error", "message": "Не передано ни одно обновляемое поле."}
+    service = await get_memory_service(uid)
+    return await service.update_goal(goal_id, **kwargs)
+
+
+@mcp.tool()
+async def delete_goal(
+        goal_id: Optional[int] = Field(None, description="Числовой id цели (из get_goals)"),
+        gcn_id: Optional[str] = Field(None, description="Либо GCN-идентификатор цели goal_..."),
+        reason: str = Field("", description="Причина удаления (сохраняется в провенанс retract)"),
+        user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
+        ctx: Context = None
+) -> Dict[str, Any]:
+    """Удаляет цель из памяти (RETRACT в GCN + удаление из локального кэша).
+
+    Нужен, чтобы вычищать накопившийся мусор автогенерируемых целей; для
+    штатного завершения используйте update_goal(status='completed').
+    """
+    uid, err = _safe_resolve_user(user_id, ctx)
+    if err:
+        return {"status": "error", "error": "forbidden", "message": err}
+    if goal_id is None and not gcn_id:
+        return {"status": "error", "message": "Укажите goal_id или gcn_id."}
+    service = await get_memory_service(uid)
+    return await service.delete_goal(goal_id=goal_id, gcn_id=gcn_id, reason=reason)
+
+
+@mcp.tool()
 async def get_self_state(
         user_id: Optional[str] = Field(default=None, description=_USER_ID_DESC),
         ctx: Context = None
