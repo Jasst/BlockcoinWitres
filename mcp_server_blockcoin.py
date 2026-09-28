@@ -1166,11 +1166,12 @@ async def add_goal(
     # Сразу синхронизируем SelfModel, чтобы get_self_state() показывал
     # свежую цель, не дожидаясь тика AutonomyEngine.
     try:
-        assistant = await get_assistant(uid)
-        sm = getattr(assistant, "self_model", None)
-        if sm is not None:
-            gcn_goals = await service.get_goals()
-            sm.sync_from_gcn(gcn_goals)
+        gcn_goals = await service.get_goals()
+        if gcn_goals:  # защита от затирания active_goals пустым списком при сбое чтения GCN
+            assistant = await get_assistant(uid)
+            sm = getattr(assistant, "self_model", None)
+            if sm is not None:
+                sm.sync_from_gcn(gcn_goals)
     except Exception as e:
         logger.debug(f"sync_from_gcn after add_goal failed: {e}")
 
