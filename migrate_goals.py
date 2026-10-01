@@ -1,72 +1,80 @@
-# migrate_goals.py — запустить ОДИН РАЗ до применения правок кода, из корня проекта.
-#
-# Переносит активные цели из self_model.json в GCN, чтобы первый же вызов
-# sync_from_gcn() не «схлопнул» active_goals (GCN становится источником истины).
-#
-# ВАЖНО (проверено по коду): get_memory_service() и MemoryService живут в
-# модуле GCN.memory_service (в GCN/__init__.py они не реэкспортируются),
-# поэтому импорт — `from GCN.memory_service import get_memory_service`.
-#
-# Запуск:  python migrate_goals.py [USER_ID]
-# USER_ID можно передать аргументом; иначе используется константа ниже.
-
-import asyncio
+"""Одноразовая чистка self_model.json от мусора автогенерированных целей."""
 import json
-import sys
+import shutil
+from datetime import datetime
 from pathlib import Path
 
-from GCN.config_ai import MEMORY_BASE_DIR
-from GCN.memory_service import get_memory_service
-
-# Целевой пользователь (можно переопределить аргументом командной строки).
 USER_ID = "2a0fe15382ab71ba6a0602049052dd58f0110d73e1d6947d207a816b3365ab8a"
+SM_PATH = Path("ai_memory_v3") / USER_ID / "self_model.json"
+
+# Паттерны мусора. Всё, что совпадает хотя бы с одним — удаляется.
+GARBAGE_SOURCES = {
+    "gap_stalled_goal",
+    "quality_confidence_boost",
+    "quality_improvement",
+    "curiosity_uncertainty",
+    "curiosity_skill_improvement",
+    "novelty_exploration",
+}
+GARBAGE_PREFIXES = (
+    "разблокировать застопорившуюся цель",
+    "восстановить уверенность",
+)
 
 
-def _self_model_path(user_id: str) -> Path:
-    # Layout как в SelfModel: <MEMORY_BASE_DIR>/<user_id>/self_model.json
-    return Path(MEMORY_BASE_DIR) / user_id / "self_model.json"
+def is_garbage(g: dict) -> bool:
+    src = str(g.get("source", "")).lower()
+    text = str(g.get("goal", "")).lower()
+    if src in GARBAGE_SOURCES:
+        return True
+    if src.startswith("identity_"):
+        return True  # identity-цели тоже пересоздаются автоматически
+    if any(text.startswith(p) for p in GARBAGE_PREFIXES):
+        return True
+    if text.count("разблокировать") >= 1:
+        return True
+    return False
 
 
-async def main():
-    user_id = sys.argv[1] if len(sys.argv) > 1 else USER_ID
-
-    sm_path = _self_model_path(user_id)
-    if not sm_path.exists():
-        print(f"Файл не найден: {sm_path} — миграция не требуется")
+def main():
+    if not SM_PATH.exists():
+        print(f"Не найден: {SM_PATH}")
         return
 
-    data = json.loads(sm_path.read_text(encoding="utf-8"))
+    # 1. Бэкап с timestamp
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = SM_PATH.with_suffix(f".json.bak_{ts}")
+    shutil.copy2(SM_PATH, backup_path)
+    print(f"Бэкап: {backup_path}")
+
+    # 2. Читаем
+    data = json.loads(SM_PATH.read_text(encoding="utf-8"))
     goals = data.get("active_goals", [])
-    if not goals:
-        print("Нет целей для миграции")
-        return
+    print(f"Было записей: {len(goals)}")
 
-    svc = await get_memory_service(user_id)
-    svc.refresh()
-    existing_gcn = {
-        g["description"].strip().lower()
-        for g in await svc.get_goals()
-        if g.get("description")
-    }
-
-    migrated = 0
+    # 3. Фильтруем
+    kept, removed = [], []
     for g in goals:
-        text = (g.get("goal") or "").strip()
-        if not text:
-            continue
-        if text.lower() in existing_gcn:
-            continue
-        if "разблокировать застопорившуюся цель" in text.lower():
-            continue  # legacy-мусор не мигрируем
-        try:
-            await svc.add_goal(text, priority=float(g.get("priority", 0.5)))
-            migrated += 1
-            print(f"  + {text[:80]}")
-        except Exception as e:
-            print(f"  ! {text[:60]}: {e}")
+        if is_garbage(g):
+            removed.append(g)
+        else:
+            kept.append(g)
 
-    print(f"\nМигрировано в GCN: {migrated}")
+    print(f"\nУдалено ({len(removed)}):")
+    for g in removed:
+        print(f"  [{g.get('source')}] {g.get('goal', '')[:90]}")
+    print(f"\nОставлено ({len(kept)}):")
+    for g in kept:
+        print(f"  [{g.get('source')}] {g.get('goal', '')[:90]}")
+
+    # 4. Записываем
+    data["active_goals"] = kept
+    SM_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"\nСохранено: {SM_PATH}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
