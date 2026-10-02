@@ -76,6 +76,8 @@ from GCN.llm_client import call_llm, call_llm_raw, call_llm_stream
 from GCN.web_search import deep_search, is_time_sensitive_query
 from GCN.image_utils import enhance_prompt, generate_image
 from GCN.tool_router import ToolRegistry, ToolRouter, build_tool_trace_context
+from GCN.fast_router import (ComplexityRouter, ActivityGate, StageTimer, Route,
+                            make_background_llm, heuristic_only_llm)  # [fast-path-patch]
 # ИНТЕЛЛЕКТ-ПАКЕТ: заземлённые ответы, санитайзер фактов, подзапросный retrieval,
 # критик по плану (см. GCN/intellect.py)
 from GCN import intellect as intellect_mod
@@ -334,6 +336,7 @@ FACT_EXTRACT_CHUNK_OVERLAP = 200
 # =====================================================================
 # 3. КОГНИТИВНЫЙ КОНТРОЛЛЕР (изменён)
 # =====================================================================
+# [fast-path-patch]
 class CognitiveController:
     """
     Управляет когнитивным циклом: восприятие, память, предсказание,
@@ -454,6 +457,16 @@ class CognitiveController:
             registry=self.tool_registry,
             llm_raw_caller=call_llm_raw,
             llm_text_caller=call_llm,
+        )
+
+        # ===== Быстрый / медленный контур [fast-path-patch] =====
+        self.gate = ActivityGate()
+        self._bg_llm = make_background_llm(call_llm, self.gate, BG_LLM_MAX_WAIT, BG_LLM_COOLDOWN)
+        self.fast_router = ComplexityRouter(
+            Path(self.user_dir) / "router_state.json",
+            search_hint=needs_search_heuristic,
+            threshold=FAST_ROUTER_THRESHOLD,
+            explore_rate=FAST_ROUTER_EXPLORE,
         )
 
         # Инициализация SelfModel для CognitiveController
@@ -762,6 +775,7 @@ class CognitiveController:
     async def _periodic_consolidation(self):
         while True:
             await asyncio.sleep(CONSOLIDATION_INTERVAL)
+            await self.gate.wait_idle(BG_LLM_MAX_WAIT, BG_LLM_COOLDOWN)
             try:
                 # ИЗМЕНЕНИЕ: вызываем через сервис
                 await self.memory_service.private_memory.light_consolidation()
@@ -797,6 +811,7 @@ class CognitiveController:
     async def _periodic_planning(self):
         while True:
             await asyncio.sleep(LONG_TERM_PLANNER_INTERVAL)
+            await self.gate.wait_idle(BG_LLM_MAX_WAIT, BG_LLM_COOLDOWN)
             if not self._consume_autonomous_llm_budget():
                 continue
             try:
@@ -807,6 +822,7 @@ class CognitiveController:
     async def _periodic_research(self):
         while True:
             await asyncio.sleep(CURIOSITY_RESEARCH_INTERVAL)
+            await self.gate.wait_idle(BG_LLM_MAX_WAIT, BG_LLM_COOLDOWN)
             # ИСПРАВЛЕНИЕ: AUTO_RESEARCH_ENABLED был объявлен в config_ai.py,
             # но нигде не читался — цикл авто-исследования крутился
             # безусловно, флаг фактически не давал его отключить.
@@ -846,7 +862,7 @@ class CognitiveController:
             f"Диалоги:\n{history_summary}"
         )
         try:
-            goals_text = await call_llm([{"role": "user", "content": prompt}], temp=0.7, max_tokens=200)
+            goals_text = await self._bg_llm([{"role": "user", "content": prompt}], temp=0.7, max_tokens=200)
             goals = [g.strip("-• ").strip() for g in goals_text.split('\n') if g.strip()]
             for g in goals:
                 # ИЗМЕНЕНИЕ: через сервис
@@ -886,11 +902,14 @@ class CognitiveController:
 
     async def _research_and_notify(self, topic: str, source: str) -> None:
         """
+
         Обёртка вокруг research(), которую можно безопасно передать в
         _spawn_background_task: сама доносит результат до пользователя
         через _maybe_surface_proactively и глотает любые исключения — сбой
         фонового доисследования темы не должен ничего ронять.
         """
+        if not AUTO_RESEARCH_ENABLED:
+            return
         try:
             # ПРОВЕРКА БЮДЖЕТА: фоновые исследования из рефлексии/коррекции
             # должны списывать бюджет так же, как автономные research-темы.
@@ -939,7 +958,7 @@ class CognitiveController:
             finding=finding_text.strip()[:2000],
         )
         try:
-            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.6,
+            raw = await self._bg_llm([{"role": "user", "content": prompt}], temp=0.6,
                                   max_tokens=PROACTIVE_NOTIFICATION_MAX_TOKENS)
         except Exception as e:
             logger.debug(f"Proactive surfacing LLM call failed, skipping: {e}")
@@ -1208,6 +1227,7 @@ class CognitiveController:
     async def _periodic_reflection(self):
         while True:
             await asyncio.sleep(self.reflection_interval)
+            await self.gate.wait_idle(BG_LLM_MAX_WAIT, BG_LLM_COOLDOWN)
             if not self._consume_autonomous_llm_budget():
                 continue
             try:
@@ -1234,7 +1254,7 @@ class CognitiveController:
         prompt = REFLECTION_PROMPT.format(threshold=REFLECTION_ERROR_THRESHOLD, topics=topics_str)
 
         try:
-            raw = await call_llm(
+            raw = await self._bg_llm(
                 [{"role": "user", "content": prompt}],
                 temp=REFLECTION_LLM_TEMP,
                 max_tokens=REFLECTION_LLM_MAX_TOKENS
@@ -1412,7 +1432,8 @@ class CognitiveController:
         # ИНТЕЛЛЕКТ-ПАКЕТ (C): составной запрос разбиваем на подзапросы и
         # ищем каждый отдельно (слияние с бустом мультихитов — в
         # GCNMemoryRouter._retrieve_subqueries).
-        subqueries = await intellect_mod.make_subqueries(message)
+        # без LLM: эвристическая декомпозиция вместо отдельного вызова модели
+        subqueries = await intellect_mod.make_subqueries(message, llm_caller=heuristic_only_llm)
         relevant = await self.memory_service.recall(message, top_k=7, subqueries=subqueries or None)
         memory_context = ""
         # ИСПРАВЛЕНИЕ (причина №2 — "путаница" памяти в браузерном чате, которой
@@ -1492,8 +1513,12 @@ class CognitiveController:
             try:
                 goal_texts = [g["description"] for g in active_goals[:3]]
                 goal_relevant = []
-                for g_text in goal_texts:
-                    extra = await self.memory_service.recall(g_text, top_k=3)
+                _extras = await asyncio.gather(
+                    *[self.memory_service.recall(g_text, top_k=3) for g_text in goal_texts],
+                    return_exceptions=True)
+                for extra in _extras:
+                    if isinstance(extra, Exception):
+                        continue
                     for item in extra:
                         item_copy = dict(item)
                         item_copy["_goal_boosted"] = True
@@ -1630,9 +1655,18 @@ class CognitiveController:
                 search_meta.get("context", ""),
                 build_tool_trace_context(tool_trace) if tool_trace else "",
             ]))
-            updated = await self._postprocess_response(
-                message, response, evidence_text, search_meta.get("sources"),
-                tool_trace=tool_trace)
+            if DEFER_POSTPROCESS:
+                # Синхронно — только дешёвое (цитаты). Критик/верификация/идентичность —
+                # после [DONE]; замечания приходят как уведомления, а не блокируют ввод.
+                updated = intellect_mod.ensure_citations(response, search_meta.get("sources") or [])
+                if self._needs_deferred_checks(response, tool_trace, search_meta):
+                    self.gate.register(self._spawn_background_task(
+                        self._deferred_checks(message, updated, evidence_text, tool_trace),
+                        name="deferred-checks"))
+            else:
+                updated = await self._postprocess_response(
+                    message, response, evidence_text, search_meta.get("sources"),
+                    tool_trace=tool_trace)
             if updated != response and push is not None:
                 await push(f"data: {json.dumps({'token': updated[len(response):]})}\n\n")
             response = updated
@@ -1742,6 +1776,41 @@ class CognitiveController:
                 logger.debug(f"[SelfModel] ошибка записи действия: {e}")
 
         return response
+
+
+    def _needs_deferred_checks(self, response: str, tool_trace, search_meta: Dict) -> bool:
+        """Болтовня без фактов/инструментов не проверяется вовсе."""
+        return (bool(tool_trace) or bool(search_meta.get("context"))
+                or len(response) >= DEFER_MIN_RESPONSE_LEN)
+
+    async def _deferred_checks(self, message: str, response: str,
+                               evidence_text: str, tool_trace) -> None:
+        """Проверки ответа ПОСЛЕ отправки. Отменяется (ActivityGate), если пришло новое сообщение."""
+        await self.gate.wait_idle(max_wait=30.0, cooldown=0.5)
+        notes: List[str] = []
+        try:
+            full = await self._run_plan_critic(message, response)
+            if full and full != response and full.startswith(response):
+                extra = full[len(response):].strip()
+                if extra:
+                    notes.append(f"Дополнение к ответу: {extra}")
+            note = await self._verify_response(message, response, evidence_text,
+                                               tool_trace=tool_trace)
+            if note:
+                notes.append(f"⚠️ Уточнение: {note}")
+            identity_note = await self._verify_identity_consistency(response)
+            if identity_note:
+                notes.append(f"🧭 {identity_note}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"[deferred-checks] ошибка: {e}")
+            return
+        for n in notes:
+            try:
+                await self.memory_service.push_notification(n, source="post_check")
+            except Exception as e:
+                logger.debug(f"[deferred-checks] push_notification: {e}")
 
     # ===== ПРОЦЕССИНГ ВХОДА (изменён: добавлена классификация и автоизвлечение) =====
     async def process_input(self, message: str, web_search: bool = False,
@@ -2280,7 +2349,7 @@ class CognitiveController:
         for fact_a, fact_b in pairs:
             prompt = CONTRADICTION_VERIFY_PROMPT.format(text_a=fact_a.text, text_b=fact_b.text)
             try:
-                raw = await call_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=150)
+                raw = await self._bg_llm([{"role": "user", "content": prompt}], temp=0.0, max_tokens=150)
             except Exception as e:
                 logger.warning(f"Contradiction verify LLM call failed ({fact_a.id},{fact_b.id}): {e}")
                 continue
@@ -2828,7 +2897,9 @@ class CognitiveController:
         корутина как asyncio.Task не прерывается закрытием HTTP-соединения
         и всегда дописывает историю/память до конца.
         """
+        timer = StageTimer(f"gen={gen_id[:8]}")
         try:
+            self.gate.begin_user_turn()  # пользователь важнее фона; отменяет отложенные проверки
             # Подтягиваем изменения, сделанные другими процессами (например, MCP)
             self.memory_service.refresh()
 
@@ -2889,8 +2960,23 @@ class CognitiveController:
                             f"вызов internal__web_search]\n{history_tail}" if history_tail else
                             "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри вызов internal__web_search]"
                         )
-                    tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
-                    tool_trace = tool_run.get("tool_trace", [])
+                    timer.mark("prepare")
+                    decision = self.fast_router.classify(
+                        message,
+                        force_slow=bool(web_search or reasoning or image_base64
+                                        or search_meta.get("search_requested")),
+                    ) if FAST_ROUTER_ENABLED else None
+                    if decision is None or decision.route is Route.TOOLS:
+                        tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
+                        tool_trace = tool_run.get("tool_trace", [])
+                        if decision is not None and not decision.hard:
+                            # метка из реальности: понадобились ли инструменты на самом деле
+                            self.fast_router.learn(message, used_tools=bool(tool_trace))
+                    else:
+                        tool_run = {"tool_trace": [], "used_native": False}
+                        tool_trace = []
+                    logger.info(f"[router] {decision}")
+                    timer.mark("route+tools")
                     # Детерминированный вызов code-tools (см. _force_code_tool_if_requested)
                     await self._force_code_tool_if_requested(message, tool_trace)
 
@@ -3049,6 +3135,8 @@ class CognitiveController:
                             )
                         elif kind == "content":
                             text = event.get("text", "")
+                            if not full_response:
+                                timer.mark("ttft")
                             full_response += text
                             await push(f"data: {json.dumps({'token': text})}\n\n")
                         elif kind == "truncated":
@@ -3085,6 +3173,7 @@ class CognitiveController:
                 # НЕ делаем return — [DONE] должен уйти в любом случае,
                 # иначе frontend остаётся с _isSending=true навсегда.
 
+            timer.mark("stream")
             if not _stream_error and full_response and not already_verified:
                 # Единый хвост обработки (история, память, верификация,
                 # цели, prediction error) — см. _finalize_answer.
@@ -3137,6 +3226,7 @@ class CognitiveController:
                 except Exception:
                     pass
 
+            timer.mark("finalize")
             await push("data: [DONE]\n\n")
         except asyncio.CancelledError:
             raise
@@ -3153,6 +3243,8 @@ class CognitiveController:
             except Exception:
                 pass
         finally:
+            self.gate.end_user_turn()
+            logger.info(timer.report())
             await self._finish_generation(gen_id)
 
     # ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====

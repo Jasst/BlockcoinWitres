@@ -93,7 +93,7 @@ try:
         FEEDBACK_WINDOW_SECONDS,
         FEEDBACK_POSITIVE_BONUS,
         FEEDBACK_NEGATIVE_DECAY,
-    )
+)
 except ImportError:
     AUTONOMY_ENABLED = True
     AUTONOMY_LOOP_INTERVAL = 45
@@ -126,6 +126,13 @@ except ImportError:
     FEEDBACK_WINDOW_SECONDS = 3600
     FEEDBACK_POSITIVE_BONUS = 0.15
     FEEDBACK_NEGATIVE_DECAY = 0.05
+
+try:
+    import GCN.config_ai as _cfg_ai
+    AUTO_RESEARCH_ENABLED = getattr(_cfg_ai, "AUTO_RESEARCH_ENABLED", True)
+except ImportError:
+    AUTO_RESEARCH_ENABLED = True
+
 
 logger = logging.getLogger(__name__)
 
@@ -422,6 +429,11 @@ class AutonomyEngine:
                       priority: float = 0.5, related_goal: str = "") -> bool:
         if not AUTONOMY_ENABLED or not topic:
             return False
+
+        if not AUTO_RESEARCH_ENABLED and not source.startswith("identity_"):
+            return False
+
+
         boost = RESEARCH_PRIORITY_SOURCE_BOOST.get(source, 0.0)
         weight = self._source_weight.get(source, 1.0)
         final = max(0.0, min(1.0, (priority + boost) * weight))
@@ -643,6 +655,12 @@ class AutonomyEngine:
                 await self._continue_identity_from_goal(topic)
                 self.queue.complete(topic)
                 continue
+
+            if not AUTO_RESEARCH_ENABLED:
+                self.queue.complete(topic)  # вычищаем темы, уже лежащие в очереди на диске
+                continue
+
+
             if not self._consume_budget(_BUDGET_WEIGHT_RESEARCH):
                 # Бюджет исчерпан — откладываем тему на короткое время (не 30 мин),
                 # чтобы не "замораживать" очередь на весь период exhaustion.

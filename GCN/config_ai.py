@@ -94,7 +94,7 @@ CURIOSITY_UNCERTAINTY_THRESHOLD = 0.7
 CURIOSITY_NOVELTY_THRESHOLD = 0.6
 CURIOSITY_RESEARCH_INTERVAL = 600
 RESOURCE_BUDGET_LLM_CALLS = 100
-AUTO_RESEARCH_ENABLED = True
+AUTO_RESEARCH_ENABLED = False
 
 # -------------------------------
 # Веб-поиск
@@ -429,7 +429,7 @@ VERIFICATION_MAX_TOKENS = 150
 # в tool_router.py), делаем один дешёвый предварительный вызов, который
 # раскладывает запрос на список подзадач, и передаём этот список как
 # ориентир в промпт выбора инструмента на каждом раунде.
-TOOL_PLANNING_ENABLED = True
+TOOL_PLANNING_ENABLED = False  # отключено: 2 доп. LLM-вызова на каждый составной запрос
 TOOL_PLANNING_MIN_LEN = 140
 MAX_SUBTASKS = 4
 
@@ -570,3 +570,14 @@ IDENTITY_CONSISTENCY_THRESHOLD = 0.35
 
 # Сколько фактов составлять "Ядро" (несущие стены графа)
 IDENTITY_CORE_SIZE = 7
+
+
+# [fast-path-patch]
+# ===== Быстрый / медленный контур (fast_router.py) =====
+FAST_ROUTER_ENABLED = True        # False -> всё как раньше (всегда ReAct)
+FAST_ROUTER_THRESHOLD = 0.5       # p >= порога -> ToolRouter; ниже -> сразу стрим
+FAST_ROUTER_EXPLORE = 0.05        # доля пограничных запросов, которые принудительно идут в TOOLS (сбор меток)
+DEFER_POSTPROCESS = True          # plan_critic/verify/identity ПОСЛЕ [DONE], замечания -> уведомления
+DEFER_MIN_RESPONSE_LEN = 400      # короткие ответы без поиска/инструментов вообще не проверяются
+BG_LLM_MAX_WAIT = 300.0           # макс. ожидание «тишины» фоновым LLM-вызовом, сек
+BG_LLM_COOLDOWN = 3.0             # сколько секунд тишины после ответа нужно фону, сек
