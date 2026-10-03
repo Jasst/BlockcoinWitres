@@ -78,10 +78,10 @@ from GCN.image_utils import enhance_prompt, generate_image
 from GCN.tool_router import ToolRegistry, ToolRouter, build_tool_trace_context
 from GCN.fast_router import (ComplexityRouter, ActivityGate, StageTimer, Route,
                             make_background_llm, heuristic_only_llm)  # [fast-path-patch]
-# ИНТЕЛЛЕКТ-ПАКЕТ: заземлённые ответы, санитайзер фактов, подзапросный retrieval,
-# критик по плану (см. GCN/intellect.py)
+# ИНТЕЛЛЕКТ-ПАКЕТ: заземлённые ответы, санитайзер фактов, подзапросный retrieval
+# (см. GCN/intellect.py)
 from GCN import intellect as intellect_mod
-from GCN.config_ai import GROUNDED_ANSWER_ENABLED, PLAN_CRITIC_ENABLED, DEFAULT_MAX_TOKENS
+from GCN.config_ai import GROUNDED_ANSWER_ENABLED, DEFAULT_MAX_TOKENS
 
 # ИЗМЕНЕНИЕ: импорт MemoryService и фабрики
 from GCN.memory_service import MemoryService, get_memory_service
@@ -932,62 +932,6 @@ class CognitiveController:
             logger.error(f"push_notification failed: {e}")
 
 
-    # ===== РЕФЛЕКСИЯ =====
-    async def _run_plan_critic(self, message: str, response: str) -> str:
-        """
-        ИНТЕЛЛЕКТ-ПАКЕТ (E): сверяет готовый ответ с планом подзадач
-        (ToolRouter._last_plan). Если критик нашёл пропущенные пункты —
-        один дополнительный проход генерации с просьбой дополнить ответ.
-        При любом сбое возвращает исходный ответ без изменений.
-        """
-        if not PLAN_CRITIC_ENABLED or not response:
-            return response
-        plan = getattr(self.tool_router, "_last_plan", "") or ""
-        if not plan:
-            return response
-        try:
-            missed = await asyncio.wait_for(
-                intellect_mod.plan_critic(message, plan, response),
-                timeout=PLAN_CRITIC_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.debug(
-                f"[PlanCritic] plan_critic timed out after {PLAN_CRITIC_TIMEOUT}s, skipping"
-            )
-            return response
-        except Exception as e:
-            logger.debug(f"plan_critic failed: {e}")
-            return response
-        if not missed:
-            return response
-        logger.info(f"[PlanCritic] Пропущены пункты плана: {missed}")
-        try:
-            extra = await asyncio.wait_for(
-                call_llm(
-                    [{"role": "user", "content": (
-                        f"Твой предыдущий ответ пользователю не раскрыл части его запроса.\n"
-                        f"Запрос: {message}\nПлан подзадач: {plan}\n"
-                        f"Пропущено: {missed}\n\n"
-                        "Дополни ответ, закрыв пропущенные пункты. Пиши ТОЛЬКО "
-                        "дополнение, не повторяй уже сказанное. Если для пункта нет "
-                        "данных — прямо скажи об этом."
-                    )}],
-                    temp=0.5, max_tokens=700
-                ),
-                timeout=PLAN_CRITIC_TIMEOUT * 2,  # добор может быть длиннее одной проверки
-            )
-        except asyncio.TimeoutError:
-            logger.debug(
-                f"[PlanCritic] LLM-добор timed out after {PLAN_CRITIC_TIMEOUT * 2}s, skipping"
-            )
-            return response
-        except Exception as e:
-            logger.debug(f"PlanCritic добор не удался: {e}")
-            return response
-        if extra and extra.strip():
-            response = f"{response}\n\n{extra.strip()}"
-        return response
-
     async def _save_sanitized_facts(self, sanitized: List[Tuple[str, str, float]]) -> None:
         """
         Сохраняет факты, прошедшие санитайзер (ИНТЕЛЛЕКТ-ПАКЕТ B), и
@@ -1046,8 +990,8 @@ class CognitiveController:
         Дополнительно: если модель вывалила self-referential мусор
         ("уверенность системы", "=== ШАГ 1 ===", "metacognition",
         "Global Workspace", имена инструментов internal__*) — считаем
-        это подозрительным и помечаем. Второй проход здесь не делаем
-        (это работа _run_plan_critic), просто возвращаем краткую
+        это подозрительным и помечаем. Второй проход здесь не делаем,
+        просто возвращаем краткую
         пометку, чтобы пользователь видел, что ответ ушёл не туда.
 
         === НОВОЕ: tool_trace ослабляет ложные срабатывания ===
@@ -1500,20 +1444,10 @@ class CognitiveController:
                                     sources: Optional[List[Dict]],
                                     tool_trace: Optional[List[Dict]] = None) -> str:
         """
-        Три дешёвых пост-прохода над готовым ответом (пункт №3 и
-        ИНТЕЛЛЕКТ-ПАКЕТ A/E): критик по плану подзадач, верификация фактов,
-        гарантия ссылок [N]. Каждый откатывается к исходному ответу при сбое.
+        Два дешёвых пост-прохода над готовым ответом (пункт №3 и
+        ИНТЕЛЛЕКТ-ПАКЕТ A): верификация фактов, гарантия ссылок [N].
+        Каждый откатывается к исходному ответу при сбое.
         Раньше эти вызовы были размазаны по двум копиям пайплайна.
-
-        ИСПРАВЛЕНИЕ ПОРЯДКА: раньше _verify_response вызывалась ДО
-        _run_plan_critic. _run_plan_critic при обнаружении пропущенных
-        пунктов плана делает отдельный сырой LLM-вызов ("дополни ответ") и
-        дописывает результат в конец — то есть ровно тот текст, который
-        _verify_response должна была проверить на выдуманные факты, в
-        момент проверки ещё не существовал. Добавка проходила мимо всей
-        системы заземления (пакет A) и верификации (пункт №3). Теперь план-
-        критик работает первым, а верификация и гарантия цитат применяются
-        уже к полному финальному тексту, включая добавленный кусок.
 
         НОВОЕ: tool_trace передаётся в _verify_response, чтобы упоминание
         internal__* в ответе после реального вызова code-tools не считалось
@@ -1521,7 +1455,6 @@ class CognitiveController:
         """
         if not response:
             return response
-        response = await self._run_plan_critic(message, response)
         note = await self._verify_response(message, response, evidence_text,
                                            tool_trace=tool_trace)
         if note:
@@ -1689,11 +1622,6 @@ class CognitiveController:
         await self.gate.wait_idle(max_wait=30.0, cooldown=0.5)
         notes: List[str] = []
         try:
-            full = await self._run_plan_critic(message, response)
-            if full and full != response and full.startswith(response):
-                extra = full[len(response):].strip()
-                if extra:
-                    notes.append(f"Дополнение к ответу: {extra}")
             note = await self._verify_response(message, response, evidence_text,
                                                tool_trace=tool_trace)
             if note:
@@ -2521,7 +2449,7 @@ class CognitiveController:
                 await queue.put(None)
 
         # SSE_HEARTBEAT_INTERVAL: каждые 15 секунд шлём SSE-комментарий
-        # ": keep-alive", пока воркер молчит (постобработка, verify, plan_critic).
+        # ": keep-alive", пока воркер молчит (постобработка, verify).
         # Комментарий невидим клиенту, но держит TCP-соединение живым и не даёт
         # прокси (nginx proxy_read_timeout=60s, Cloudflare 100s) убить его
         # во время тихого этапа _finalize_answer (до 90 сек).
@@ -2834,7 +2762,7 @@ class CognitiveController:
 
                     # Reasoning-токены идут отдельным SSE-полем reasoning_token и НЕ попадают
                     # в full_response — это критично: full_response уходит в _finalize_answer
-                    # (verify/plan_critic/postprocess) и потом в history.json. Reasoning там
+                    # (verify/postprocess) и потом в history.json. Reasoning там
                     # не нужен и только испортил бы проверку фактов и следующую генерацию.
                     # При переподключении (_attachToActiveAiStream) reasoning реплеится из
                     # буфера генерации на бэкенде — там хранятся все SSE-события как есть.
@@ -2894,7 +2822,7 @@ class CognitiveController:
                 # Единый хвост обработки (история, память, верификация,
                 # цели, prediction error) — см. _finalize_answer.
                 # asyncio.wait_for гарантирует, что зависший LLM-вызов
-                # внутри (plan_critic / verify_response) не задержит [DONE]:
+                # внутри (verify_response) не задержит [DONE]:
                 # при превышении FINALIZE_ANSWER_TIMEOUT вся постобработка
                 # переносится в фоновую задачу (push=None → токены не пушатся
                 # после [DONE]), а ввод разблокируется немедленно.
@@ -3216,7 +3144,7 @@ async def attach_to_active_stream(address: str = Depends(require_auth)):
                         queue.get(), timeout=_SSE_HEARTBEAT_INTERVAL
                     )
                 except asyncio.TimeoutError:
-                    # Воркер ещё работает (постобработка, verify, plan_critic) —
+                    # Воркер ещё работает (постобработка, verify) —
                     # шлём SSE-комментарий, чтобы прокси не обрезал соединение.
                     yield ": keep-alive\n\n"
                     continue

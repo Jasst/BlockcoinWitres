@@ -24,19 +24,12 @@ intellect.py — пакет улучшений "интеллекта" когни
      retrieve(), результаты сливаются с бустом мультихитов (факт, найденный
      по нескольким подзапросам, важнее), затем один общий LLM-реранк.
 
-  D. LLM-верификатор противоречий.
-     Эвристика _is_contradictory (наличие/отсутствие отрицания) даёт много
-     ложных срабатываний и пропускает реальные (разные числа по одному
-     предмету). Теперь при similarity > 0.7 и эвристическом срабатывании
-     противоречие подтверждается коротким LLM-проходом. Синхронный
-     (urllib в ThreadPoolExecutor), т.к. KnowledgeIngestion.submit_candidate
-     — синхронный. При сбое/таймауте (None) — прежнее поведение.
-
-  E. Финальный критик по плану подзадач.
-     ToolRouter теперь отдаёт plan наружу (run()["plan"] и _last_plan).
-     После генерации ответа LLM сверяет его с планом; пропущенные пункты
-     добираются одним дополнительным проходом генерации (не ReAct-циклом,
-     просто "дополни ответ").
+  D. LLM-верификатор противоречий (отключён).
+     Эвристика _is_contradictory (наличие/отсутствие отрицания) давала много
+     ложных срабатываний. LLM-подтверждение противоречий было выключено через
+     config_ai (CONTRADICTION_LLM_VERIFY_ENABLED=False), а его реализация
+     удалена — verify_contradiction_sync() осталась заглушкой, возвращающей
+     None (прежнее поведение эвристики).
 
   F. Метакогнитивный мониторинг (НОВЫЙ механизм).
      Оценка уверенности системы в своих действиях перед выполнением.
@@ -52,26 +45,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from GCN.config_ai import (
-        LM_STUDIO_URL,
-        LM_STUDIO_API_KEY,
         GROUNDED_ANSWER_ENABLED,
-        PLAN_CRITIC_ENABLED,
         SUBQUERY_RETRIEVAL_ENABLED,
         MAX_RETRIEVE_SUBQUERIES,
-        PLAN_CRITIC_MAX_MISSED,
         GROUNDED_MAX_SOURCES,
         GROUNDED_APPEND_SOURCES_FALLBACK,
         METACOGNITION_ENABLED,
         METACOGNITION_CONFIDENCE_THRESHOLD,
     )
 except ImportError:
-    LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
-    LM_STUDIO_API_KEY = "lm-studio"
     GROUNDED_ANSWER_ENABLED = True
-    PLAN_CRITIC_ENABLED = True
     SUBQUERY_RETRIEVAL_ENABLED = True
     MAX_RETRIEVE_SUBQUERIES = 3
-    PLAN_CRITIC_MAX_MISSED = 3
     GROUNDED_MAX_SOURCES = 8
     GROUNDED_APPEND_SOURCES_FALLBACK = False
     METACOGNITION_ENABLED = True
