@@ -759,25 +759,6 @@ class MemoryStore:
             )
             self._events.append(event)
 
-    def add_evidence(self, claim_id: str, evidence_id: str, actor: str):
-        with self._lock:
-            claim = self._objects.get(claim_id)
-            if not claim:
-                raise ValueError("Claim not found")
-            # Добавляем evidence
-            new_evidence = claim.evidence + [evidence_id]
-            self.update(claim_id, {"evidence": new_evidence}, actor)
-            # Событие SUPPORT
-            event = KnowledgeEvent(
-                id=str(uuid.uuid4()),
-                type=EventType.SUPPORT,
-                timestamp=datetime.now(timezone.utc),
-                actor=actor,
-                target_id=claim_id,
-                payload={"evidence_id": evidence_id}
-            )
-            self._events.append(event)
-
     def verify(self, obj_id: str, verifier: str, status: str, actor: str):
         with self._lock:
             obj = self._objects.get(obj_id)
@@ -1562,9 +1543,6 @@ class MemoryHierarchy:
             if obj:
                 result.append(obj)
         return result
-
-    def clear_working(self):
-        self.working_memory.clear()
 
 
 # ==================== Демонстрация ====================

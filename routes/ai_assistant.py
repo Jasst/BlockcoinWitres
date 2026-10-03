@@ -157,17 +157,6 @@ def needs_search_heuristic(message: str) -> bool:
     return is_time_sensitive_query(message)
 
 
-def is_factual_query(message: str) -> bool:
-    patterns = [
-        r'\b\d+[.,]?\d*\s*(?:USD|EUR|RUB|₽|$|€|%|кг|км|г|м|см|мм|MB|GB|TB)\b',
-        r'\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b',
-        r'\b(?:курс|цена|стоимость|тариф|скорость|температура|вес|рост|расстояние)\b'
-    ]
-    for pat in patterns:
-        if re.search(pat, message, re.IGNORECASE):
-            return True
-    return False
-
 async def _search_query_expander(query: str) -> List[str]:
     """
     LLM-расширитель поискового запроса для deep_search (web_search v3):
@@ -225,28 +214,6 @@ async def rewrite_query(llm_caller, original: str) -> str:
 # =====================================================================
 # 2. Промпты для строгого JSON (без изменений)
 # =====================================================================
-ROUTER_PROMPT = """Ты — модуль планирования когнитивного ассистента. Проанализируй запрос пользователя и контекст.
-Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```.
-
-Примеры правильных ответов:
-- Запрос: "Курс доллара сегодня" -> {{"needs_web_search": true, "search_query": "курс доллара сегодня", "is_factual_time_sensitive": true, "answer_strategy": "search_then_answer"}}
-- Запрос: "Что такое теория относительности?" -> {{"needs_web_search": false, "search_query": null, "is_factual_time_sensitive": false, "answer_strategy": "recall_then_answer"}}
-- Запрос: "Как приготовить борщ?" -> {{"needs_web_search": false, "search_query": null, "is_factual_time_sensitive": false, "answer_strategy": "direct"}}
-
-Правила:
-- needs_web_search=true, если для точного ответа нужны свежие/актуальные/числовые данные (курсы, цены, новости, даты, "сейчас", "сегодня"), которых нет в истории диалога.
-- search_query — короткий запрос для поисковика (3-10 слов), а не сам вопрос пользователя дословно.
-- is_factual_time_sensitive=true для вопросов с числами, единицами измерения, курсами, датами, текущими событиями.
-- answer_strategy="clarify" только если вопрос пользователя действительно неоднозначен настолько, что угадать намерение нельзя.
-
-Последние реплики диалога:
-{history_tail}
-
-Активные цели пользователя: {goals}
-
-Запрос пользователя: {message}
-"""
-
 REFLECTION_PROMPT = """Ты — модуль саморефлексии когнитивного ассистента. Ниже темы, где предсказания модели чаще всего ошибались (ошибка > {threshold}).
 Верни ТОЛЬКО валидный JSON, без пояснений, без markdown-разметки, без ```.
 
@@ -353,17 +320,6 @@ class CognitiveController:
         # Для обратной совместимости оставляем ссылки на router и memory
         self.router = self.memory_service.router
         self.memory = self.memory_service.private_memory
-
-        # пункт №1: AIAdapter.retrieve()/.query() эмбеддит именно текст запроса —
-        # используем embed_text(is_query=True), а не сырой self.memory.embedder.encode(),
-        # чтобы асимметричный префикс e5 применялся и здесь, а не только в
-        # retrieve_hybrid().
-        embedder_func = (
-            (lambda text: self.memory.embed_text(text, is_query=True))
-            if self.memory.use_embeddings and self.memory.embedder is not None
-            else None
-        )
-        self.ai_adapter = AIAdapter(self.memory.store, user_id, embedder_func=embedder_func)
 
         self.history: List[Dict] = []
         self.max_history = 20
@@ -1340,63 +1296,6 @@ class CognitiveController:
             return
         await self.research(query)
 
-    # ===== НОВЫЙ МЕТОД: автоматическое извлечение фактов из сообщения =====
-    async def _auto_extract_facts(self, message: str) -> List[str]:
-        """
-        Извлекает факты из сообщения пользователя. ЧИСТЫЙ экстрактор — сохранение
-        через memory_service.remember() делает вызывающий код (см. _run_memory_intent_pipeline).
-
-        ИСПРАВЛЕНИЕ (баг задвоения сохранения): раньше этот метод САМ сохранял
-        первые 3 факта через memory_service.remember() и ВОЗВРАЩАЛ список фактов,
-        а вызывающий код в _run_memory_intent_pipeline заново сохранял ВЕСЬ
-        возвращённый список тем же remember(). Итог: каждый факт из первых
-        трёх сохранялся дважды — а submit_candidate() при почти полном текстовом
-        совпадении (similarity > 0.95) не создаёт дубль-объект, а "усиливает"
-        существующий (_reinforce: +evidence, рост confidence) — то есть один
-        и тот же факт из одного извлечения выглядел в памяти как дважды
-        подтверждённый. Это напрямую искажало HYBRID_WEIGHT_EVIDENCE и
-        GLOBAL_FACT_CONFIDENCE_THRESHOLD (факт казался надёжнее, чем есть на
-        самом деле), плюс впустую тратился второй embed_text+semantic_search на
-        каждое сообщение. Заодно старый код ограничивал внутреннее сохранение
-        facts[:3], а возвращал (и caller дальше сохранял) весь список без
-        среза — несогласованность лимитов. Теперь сохранение только одно,
-        унифицированный лимit задаёт caller.
-        """
-        if not AUTO_EXTRACT_FACTS:
-            return []
-        # Пропускаем, если сообщение является командой (чтобы не дублировать)
-        if any(message.lower().startswith(cmd) for cmd in MEMORY_CONTROL_COMMANDS.keys()):
-            return []
-        prompt = (
-            "Извлеки из сообщения пользователя объективные факты, которые могут быть полезны для запоминания. "
-            "Факты должны быть краткими утверждениями, содержащими конкретную информацию. "
-            "Игнорируй мнения, команды, вопросы, приветствия. "
-            "Если фактов нет, верни пустой ответ. "
-            "Каждый факт с новой строки, без нумерации.\n\n"
-            f"Сообщение: {message}"
-        )
-        try:
-            raw = await call_llm([{"role": "user", "content": prompt}], temp=0.2, max_tokens=200)
-        except Exception as e:
-            logger.debug(f"Auto-extract LLM call failed: {e}")
-            return []
-        if not raw:
-            return []
-        lines = [line.strip().strip('-•*').strip() for line in raw.split('\n') if line.strip()]
-        facts = []
-        for line in lines:
-            if not (20 < len(line) < 400):
-                continue
-            if line[0].lower() in ('я', 'ты', 'мы', 'давайте', 'попробуйте'):
-                continue
-            if not re.search(r'(является|составляет|равен|находится|имеет|был|стал|\d)', line):
-                continue
-            facts.append(line[:300])
-        # Сохранение НЕ выполняется здесь — см. docstring. Ограничиваем на
-        # выходе (тем же порогом, что раньше применялся к сохранению) —
-        # caller сохраняет ровно то, что вернул этот метод, без своего среза.
-        return facts[:3]
-
     # ===== ОСНОВНАЯ ЛОГИКА ПОДГОТОВКИ СООБЩЕНИЙ =====
     async def _prepare_messages(self, message: str, web_search: bool = False,
                                 image_base64: Optional[str] = None,
@@ -2155,190 +2054,6 @@ class CognitiveController:
                 facts.append(s[:300])
         return facts[:20]
 
-    # ===== КОМАНДЫ ПАМЯТИ (расширенный список команд) =====
-    # ===== КОМАНДЫ ПАМЯТИ (расширенный список команд) =====
-    async def _handle_memory_command(self, message: str) -> Optional[Tuple[str, Dict]]:
-        lower_msg = message.lower()
-        for cmd, action in MEMORY_CONTROL_COMMANDS.items():
-            if lower_msg.startswith(cmd):
-                rest = message[len(cmd):].strip()
-                if not rest:
-                    continue
-
-                # ===== НОВОЕ: Обработка store_shared =====
-                if action == "store_shared":
-                    # Запомнить в shared scope (для эстафеты между ИИ)
-                    scope = "shared"
-                    clean_rest = rest
-                    result = await self.memory_service.remember(clean_rest, scope=scope, user_explicit=True)
-                    gcn_id = result.get("id")
-                    if gcn_id:
-                        self.memory.hierarchy.add_to_working(gcn_id)
-                    await self.memory_service._save_scope(MemoryScope.SHARED)
-
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию в общий слой (shared). "
-                                "Подтверди, что ты запомнил, кратко и естественно."
-                            )
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Запомни в shared: {result.get('fact', clean_rest)}"
-                        }
-                    ]
-                    response = await call_llm(messages, temp=0.5, max_tokens=150)
-                    if response:
-                        return response, {"memory": "stored", "scope": scope, "id": gcn_id}
-                    else:
-                        return (
-                            f"Запомнил в общий слой ({scope}): {result.get('fact', clean_rest)}",
-                            {"memory": "stored", "scope": scope, "id": gcn_id},
-                        )
-
-                # ===== НОВОЕ: Обработка store_global =====
-                elif action == "store_global":
-                    # Запомнить в global scope
-                    scope = "global"
-                    clean_rest = rest
-                    result = await self.memory_service.remember(clean_rest, scope=scope, user_explicit=True)
-                    gcn_id = result.get("id")
-                    if gcn_id:
-                        self.memory.hierarchy.add_to_working(gcn_id)
-                    await self.memory_service._save_scope(MemoryScope.GLOBAL)
-
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию в глобальный слой. "
-                                "Подтверди, что ты запомнил, кратко и естественно."
-                            )
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Запомни глобально: {result.get('fact', clean_rest)}"
-                        }
-                    ]
-                    response = await call_llm(messages, temp=0.5, max_tokens=150)
-                    if response:
-                        return response, {"memory": "stored", "scope": scope, "id": gcn_id}
-                    else:
-                        return (
-                            f"Запомнил глобально ({scope}): {result.get('fact', clean_rest)}",
-                            {"memory": "stored", "scope": scope, "id": gcn_id},
-                        )
-
-                # ===== Оригинальная обработка store =====
-                elif action == "store":
-                    # Определяем скоуп (как в MCP)
-                    is_global = any(w in rest.lower() for w in ("глобально", "global"))
-                    scope = "global" if is_global else "private"
-                    # Очищаем текст от флагов "глобально"/"global"
-                    clean_rest = rest
-                    for word in ("глобально", "global"):
-                        clean_rest = clean_rest.replace(word, "").strip()
-                    clean_rest = " ".join(clean_rest.split())
-                    # ИЗМЕНЕНИЕ: используем сервис для сохранения
-                    result = await self.memory_service.remember(clean_rest, scope=scope, user_explicit=True)
-                    gcn_id = result.get("id")
-                    if gcn_id:
-                        self.memory.hierarchy.add_to_working(gcn_id)
-                    # Сохраняем соответствующий слой
-                    scope_enum = MemoryScope.GLOBAL if is_global else MemoryScope.PRIVATE
-                    await self.memory_service._save_scope(scope_enum)
-                    # Формируем ответ (можно через LLM для красоты)
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил запомнить информацию. "
-                                "Подтверди, что ты запомнил, кратко и естественно, возможно, с уточнением или перефразировкой, "
-                                "чтобы показать понимание."
-                            )
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Запомни: {result.get('fact', clean_rest)} (скоуп: {scope})"
-                        }
-                    ]
-                    response = await call_llm(messages, temp=0.5, max_tokens=150)
-                    if response:
-                        return response, {"memory": "stored", "scope": scope, "id": gcn_id}
-                    else:
-                        return (
-                            f"Запомнил ({scope}): {result.get('fact', clean_rest)}",
-                            {"memory": "stored", "scope": scope, "id": gcn_id},
-                        )
-
-                # ===== Обработка forget =====
-                elif action == "forget":
-                    # ИЗМЕНЕНИЕ: через сервис (удаляем из private)
-                    result = await self.memory_service.forget(rest, scope="private", dry_run=False)
-                    removed = result.get("removed", 0)
-                    if removed > 0:
-                        messages = [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "Ты — AI-ассистент с когнитивной памятью. Пользователь попросил забыть информацию. "
-                                    "Подтверди, что ты удалил соответствующие факты, кратко и естественно."
-                                )
-                            },
-                            {
-                                "role": "user",
-                                "content": f"Забудь: {rest} (удалено {removed} фактов)"
-                            }
-                        ]
-                        response = await call_llm(messages, temp=0.5, max_tokens=150)
-                        if response:
-                            return response, {"memory": "forgot", "count": removed}
-                        else:
-                            return f"Удалено {removed} фактов о '{rest}'", {"memory": "forgot"}
-                    else:
-                        return "Ничего не найдено для удаления.", {"memory": "no_match"}
-
-                # ===== Обработка recall =====
-                elif action == "recall":
-                    # ИЗМЕНЕНИЕ: через сервис
-                    facts = await self.memory_service.recall(rest, top_k=7)
-                    if not facts:
-                        return "Ничего не найдено по вашему запросу.", {"memory": "no_recall"}
-                    scope_labels = {"private": "личный", "shared": "общий", "global": "глобальный"}
-                    context_lines = []
-                    for f in facts[:5]:
-                        scope = f.get("scope", "private")
-                        scope_label = scope_labels.get(scope, scope)
-                        context_lines.append(
-                            f"- [{scope_label}] {f['text']} (уверенность: {f.get('confidence', 0.5):.2f})")
-                    context = "\n".join(context_lines)
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Ты — AI-ассистент с когнитивной памятью. На основе предоставленных фактов дай связный, "
-                                "естественный ответ на русском языке. Не перечисляй факты списком, а объедини их в единое "
-                                "объяснение. Если фактов недостаточно или они не относятся к вопросу, честно скажи об этом."
-                            )
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Вопрос: {rest}\n\nФакты из памяти:\n{context}"
-                        }
-                    ]
-                    response = await call_llm(messages, temp=0.6, max_tokens=500)
-                    if not response:
-                        answer = "Вот что я знаю:\n" + "\n".join(
-                            f"- {f['text']} (уверенность: {f.get('confidence', 0.5):.2f})" for f in facts[:5]
-                        )
-                        return answer, {"memory": "recalled_fallback"}
-                    return response, {"memory": "recalled"}
-
-        return None
-
-    # ===== ВЕРИФИКАЦИЯ ПРОТИВОРЕЧИЙ (без изменений) =====
     async def _verify_pending_contradictions(self, max_checks: int = 5):
         pairs = self.memory.get_unverified_contradictions(limit=max_checks)
         if not pairs:
