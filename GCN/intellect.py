@@ -48,7 +48,6 @@ intellect.py — пакет улучшений "интеллекта" когни
 import json
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -57,7 +56,6 @@ try:
         LM_STUDIO_API_KEY,
         GROUNDED_ANSWER_ENABLED,
         PLAN_CRITIC_ENABLED,
-        CONTRADICTION_LLM_VERIFY_ENABLED,
         SUBQUERY_RETRIEVAL_ENABLED,
         MAX_RETRIEVE_SUBQUERIES,
         PLAN_CRITIC_MAX_MISSED,
@@ -71,7 +69,6 @@ except ImportError:
     LM_STUDIO_API_KEY = "lm-studio"
     GROUNDED_ANSWER_ENABLED = True
     PLAN_CRITIC_ENABLED = True
-    CONTRADICTION_LLM_VERIFY_ENABLED = True
     SUBQUERY_RETRIEVAL_ENABLED = True
     MAX_RETRIEVE_SUBQUERIES = 3
     PLAN_CRITIC_MAX_MISSED = 3
@@ -389,67 +386,12 @@ async def make_subqueries(message: str, llm_caller=None) -> List[str]:
 # D. LLM-ВЕРИФИКАТОР ПРОТИВОРЕЧИЙ (синхронный, для KnowledgeIngestion)
 # =====================================================================
 
-_CONTRADICTION_PROMPT = (
-    "Даны два утверждения из памяти AI-ассистента, помеченные как возможно "
-    "противоречащие друг другу.\n"
-    "Утверждение A: {a}\n"
-    "Утверждение B: {b}\n\n"
-    "Ответь ТОЛЬКО JSON-объектом вида {{\"verdict\": true}} или {{\"verdict\": false}}, "
-    "без пояснений.\n"
-    "verdict=true — утверждения действительно противоречат (одно отрицает "
-    "другое, или дают несовместимые значения одного и того же параметра: "
-    "разные числа/даты/статус для одного объекта).\n"
-    "verdict=false — не противоречат (разные объекты, разное время, разный "
-    "контекст, или совместимые утверждения)."
-)
-
-_llm_sync_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="intellect-llm")
-
-
-def _post_json_sync(payload: Dict, timeout: float) -> Dict:
-    import urllib.request
-
-    req = urllib.request.Request(
-        LM_STUDIO_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {LM_STUDIO_API_KEY}",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
 def verify_contradiction_sync(text_a: str, text_b: str) -> Optional[bool]:
-    """
-    True — реально противоречат; False — не противоречат; None — проверить
-    не удалось (вызывающий код откатывается на эвристику). НИКОГДА не бросает
-    исключений наружу.
-    """
-    if not CONTRADICTION_LLM_VERIFY_ENABLED:
-        return None
-    prompt = _CONTRADICTION_PROMPT.format(a=text_a[:500], b=text_b[:500])
-    payload = {
-        "model": "local-model",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-        "max_tokens": 30,
-    }
-    try:
-        fut = _llm_sync_pool.submit(_post_json_sync, payload, 12.0)
-        data = fut.result(timeout=16.0)
-        content = ((data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or "").strip()
-        m = re.search(r"\{.*\}", content, re.DOTALL)
-        if not m:
-            return None
-        verdict = json.loads(m.group(0)).get("verdict")
-        if isinstance(verdict, bool):
-            return verdict
-        if isinstance(verdict, str):
-            return verdict.strip().lower() in ("true", "yes", "да", "1")
-    except Exception as e:
-        logger.debug(f"LLM-верификация противоречия недоступна: {e}")
+    """Заглушка: LLM-верификация противоречий отключена через config_ai
+    (CONTRADICTION_LLM_VERIFY_ENABLED=False). Эвристика
+    KnowledgeIngestion._is_contradictory используется напрямую.
+    Если функционал решат включать обратно — здесь нужно восстановить
+    полную реализацию (см. git tag pre-cleanup-2)."""
     return None
 
 

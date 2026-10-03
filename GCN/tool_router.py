@@ -132,15 +132,6 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # ПУНКТ №5: Импорт субагентов для делегирования
-try:
-    from GCN.subagent import SubAgentOrchestrator, AgentRole, ROLE_TOOLS
-    SUBAGENTS_AVAILABLE = True
-except ImportError:
-    SUBAGENTS_AVAILABLE = False
-    SubAgentOrchestrator = None
-    AgentRole = None
-    ROLE_TOOLS = None
-
 # ИСПРАВЛЕНИЕ #4: путь для персистентного флага native_supported
 _NATIVE_FLAG_PATH = Path(__file__).resolve().parent.parent / "ai_memory_v3" / "_native_flag.json"
 
@@ -148,20 +139,12 @@ try:
     from GCN.config_ai import (
         TOOL_CALL_TIMEOUT_SECONDS,
         TOOL_PARALLEL_EXECUTION,
-        TOOL_PLANNING_ENABLED,
-        TOOL_PLANNING_MIN_LEN,
-        MAX_SUBTASKS,
         MCP_TOOL_TIMEOUT_OVERRIDES,
-        SUBAGENT_DELEGATION_ENABLED,
     )
 except ImportError:
     TOOL_CALL_TIMEOUT_SECONDS = 45
     TOOL_PARALLEL_EXECUTION = True
-    TOOL_PLANNING_ENABLED = True
-    TOOL_PLANNING_MIN_LEN = 140
-    MAX_SUBTASKS = 4
     MCP_TOOL_TIMEOUT_OVERRIDES = {}
-    SUBAGENT_DELEGATION_ENABLED = False
 
 
 # ИСПРАВЛЕНИЕ (генерация изображений в чате "не всегда работает"): тяжёлые
@@ -190,7 +173,7 @@ _COMPOUND_MARKERS = (" и ", " а также ", " затем ", " потом ", 
 
 
 def _looks_compound(message: str) -> bool:
-    if len(message) >= TOOL_PLANNING_MIN_LEN:
+    if len(message) >= 140:
         return True
     if message.count("?") >= 2:
         return True
@@ -450,25 +433,8 @@ class ToolRouter:
         self.llm_text_caller = llm_text_caller
         # ИСПРАВЛЕНИЕ #4: загружаем персистентный флаг native_supported
         self._native_supported: Optional[bool] = self._load_native_flag()
-        # ИНТЕЛЛЕКТ-ПАКЕТ (E): план подзадач текущего запуска — читает
-        # PlanCritic из ai_assistant через этот атрибут или run()["plan"].
-        self._last_plan: str = ""
         # ПУНКТ №10: Scratchpad для persistent reasoning между раундами ReAct
         self._scratchpad: List[str] = []
-        # ПУНКТ №5: Инициализация оркестратора субагентов если доступен
-        self._subagent_orchestrator: Optional[Any] = None
-        if SUBAGENTS_AVAILABLE:
-            try:
-                # Имена аргументов должны совпадать с __init__ SubAgentOrchestrator
-                self._subagent_orchestrator = SubAgentOrchestrator(
-                    llm_raw_caller=llm_raw_caller,
-                    llm_text_caller=llm_text_caller,
-                    tool_registry=registry,
-                )
-                logger.info("SubAgentOrchestrator успешно инициализирован")
-            except Exception as e:
-                logger.warning(f"Не удалось инициализировать SubAgentOrchestrator: {e}. Делегирование отключено.")
-                self._subagent_orchestrator = None
 
     def _load_native_flag(self) -> Optional[bool]:
         """Загружает персистентный флаг поддержки native function calling."""
@@ -607,7 +573,7 @@ class ToolRouter:
         return progress
 
     async def _reflect_on_failure(self, tool: str, args: Dict, error: str,
-                                   plan: str, history_tail: str) -> Dict:
+                                   history_tail: str) -> Dict:
         """
         ПУНКТ №1: После ошибки/пустого результата — короткий LLM-проход для диагностики.
         Возвращает JSON: {"diagnosis": "...", "next_action": "...", "modified_args": {...}, "new_plan": "..."}
@@ -615,7 +581,6 @@ class ToolRouter:
         prompt = f"""Инструмент {tool} с аргументами {args} вернул ошибку/пусто:
 {error}
 
-Текущий план: {plan or "нет плана"}
 Контекст диалога: {history_tail[:500] if history_tail else "пусто"}
 
 Проанализируй почему это произошло и что делать дальше.
@@ -939,7 +904,7 @@ class ToolRouter:
                         # ПУНКТ №1: Рефлексия над неудачей
                         reflection = await self._reflect_on_failure(
                             d["tool"], d.get("arguments", {}), result,
-                            plan_text, history_tail
+                            history_tail
                         )
                         logger.info(f"Рефлексия над ошибкой: {reflection.get('diagnosis', 'неизвестно')}")
 
@@ -975,7 +940,6 @@ class ToolRouter:
                         if reflection.get("new_plan") and replan_count < 2:
                             replan_count += 1
                             max_iterations = min(MAX_TOOL_ITERATIONS_DYNAMIC, max_iterations + 2)
-                            self._last_plan = reflection["new_plan"]
                             running_messages.append({
                                 "role": "user",
                                 "content": f"[Новый план после ошибки]\n{reflection['new_plan']}",
