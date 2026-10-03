@@ -91,30 +91,6 @@ Claude Desktop, к mcp_server_blockcoin.py) всё работает надёжн
    пользовательское сообщение-подсказку, явно указывающее, что нужно
    вызвать `internal__fetch_github_file` с правильным `path`. Это снижает
    нагрузку на LLM и гарантирует, что вызов будет сделан с первого раза.
-
-5) ДЕЛЕГИРОВАНИЕ СУБАГЕНТАМ (переработано).
-   Раньше на КАЖДОЕ нормальное сообщение шёл LLM-классификатор роли
-   (auto_route) и, что хуже, при первом же возвращённом role возвращался
-   из run(), полностью пропуская основной ReAct-цикл: план подзадач,
-   scratchpad, рефлексию над ошибкой, _verify_tool_result, трекинг плана,
-   дедуп seen_calls/seen_errors. Отдельно: delegation передавала роль
-   СТРОКОЙ ("coder"/"researcher"), что работало лишь как побочный эффект
-   str-mixin у AgentRole и ломалось на любой другой версии Python;
-   в одном из мест был SyntaxError из-за лишнего бэкслеша в f-string.
-   ИСПРАВЛЕНО:
-     - делегируется только роль CODER, и только на строгие маркеры
-       (расширения файлов, traceback/exception, github.com, имена
-       coder-инструментов). Убраны широкие "код"/"файл"/"ошибка"/"поиск",
-       матчившие "код города", "прикрепи файл", "типичные ошибки";
-     - роль researcher больше не делегируется: её инструменты
-       (web_search/fetch_github_file) уже есть в основном цикле, а сам
-       цикл дополнительно делает параллельные queries, дедуп источников,
-       sanitize_search_facts, сбор _web_search_results_this_turn для
-       фронта и _verify_response — субагент всего этого не проходит,
-       и его tool_trace попадал в ai_assistant.py без заземления;
-     - роль передаётся как AgentRole.CODER (enum), а не строкой;
-     - в возврате при делегировании честно `used_native: False` и
-       `plan: ""` (native не вызывался, план ещё не строили).
 """
 
 import json
@@ -126,12 +102,9 @@ import asyncio
 from pathlib import Path
 
 # Логгер — до всех условных импортов и до функций, которые могут его
-# использовать (раньше он определялся условно внутри except ImportError,
-# из-за чего любое обращение к logger вне этого except могло упасть с
-# NameError в ветке, где subagent импортировался успешно).
+# использовать.
 logger = logging.getLogger(__name__)
 
-# ПУНКТ №5: Импорт субагентов для делегирования
 # ИСПРАВЛЕНИЕ #4: путь для персистентного флага native_supported
 _NATIVE_FLAG_PATH = Path(__file__).resolve().parent.parent / "ai_memory_v3" / "_native_flag.json"
 
@@ -491,87 +464,6 @@ class ToolRouter:
                 decisions.append({"tool": name, "arguments": args})
         return decisions or None
 
-    async def _plan_subtasks(self, message: str) -> str:
-        if not TOOL_PLANNING_ENABLED or not _looks_compound(message):
-            return ""
-        prompt = (
-            f"Разбей следующий запрос пользователя на список из максимум {MAX_SUBTASKS} "
-            "независимых подзадач, которые нужно выполнить, чтобы дать ПОЛНЫЙ ответ. "
-            "Если запрос на самом деле простой и состоит из одной части — верни всего "
-            "один пункт.\n\n"
-            f"Запрос: {message}\n\n"
-            "Ответь только нумерованным списком подзадач, без пояснений и без markdown."
-        )
-        try:
-            raw = await self.llm_text_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=200)
-            if not raw:
-                return ""
-            lines = [l.strip(" -•\t") for l in raw.split("\n") if l.strip()]
-            return "\n".join(lines[:MAX_SUBTASKS])
-        except Exception as e:
-            logger.debug(f"Planning step failed, continuing without a plan: {e}")
-            return ""
-
-    async def _validate_plan(self, plan_text: str, available_tools: List[str]) -> List[str]:
-        """
-        ПУНКТ №4: Проверяет, что каждый пункт плана реализуем имеющимися инструментами.
-        Возвращает список нереализуемых пунктов.
-        """
-        if not plan_text:
-            return []
-
-        lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
-        unrealizable = []
-
-        # Простая эвристика: если пункт содержит название инструмента — проверяем наличие
-        for line in lines:
-            found_tool = False
-            for tool in available_tools:
-                if tool.lower() in line.lower():
-                    found_tool = True
-                    break
-            # Если инструмент не найден в названии, но есть общие маркеры действий
-            action_markers = ["найди", "поиск", "проверь", "прочти", "открой", "вспомни", "запомни"]
-            has_action = any(m in line.lower() for m in action_markers)
-
-            if not found_tool and not has_action:
-                unrealizable.append(line)
-
-        return unrealizable
-
-    async def _track_plan_progress(self, plan_text: str, tool_trace: List[Dict]) -> Dict[str, bool]:
-        """
-        ПУНКТ №4: Отмечает, какие пункты плана покрыты выполненными инструментами.
-        Возвращает dict {пункт_плана: выполнено}.
-        """
-        if not plan_text:
-            return {}
-
-        lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
-        progress = {}
-
-        for line in lines:
-            # Проверяем, есть ли в tool_trace инструменты, релевантные этому пункту
-            covered = False
-            for entry in tool_trace:
-                tool_name = entry.get("tool", "").lower()
-                result = str(entry.get("result", "")).lower()
-
-                # Ключевые слова из пункта плана
-                plan_words = set(line.lower().split())
-
-                # Если инструмент или результат содержат слова из плана
-                if any(word in tool_name for word in plan_words if len(word) > 3):
-                    covered = True
-                    break
-                if any(word in result for word in plan_words if len(word) > 3):
-                    covered = True
-                    break
-
-            progress[line] = covered
-
-        return progress
-
     async def _reflect_on_failure(self, tool: str, args: Dict, error: str,
                                    history_tail: str) -> Dict:
         """
@@ -676,52 +568,6 @@ class ToolRouter:
 
         message_lower = (message or "").lower()
 
-        # === ПУНКТ №5: Делегирование субагенту ===
-        # Делегируем ТОЛЬКО роль CODER, и только на строгие маркеры анализа кода.
-        # Убраны широкие "код"/"файл"/"ошибка"/"поиск": они матчатся на бытовые
-        # фразы ("код города", "прикрепи файл", "типичные ошибки") и уводили
-        # запрос в субагента в обход всего основного цикла (план, scratchpad,
-        # рефлексия, verify_tool_result, трекинг плана, дедуп).
-        #
-        # Роль RESEARCHER больше не делегируется: её инструменты
-        # (internal__web_search / internal__fetch_github_file) уже доступны
-        # основному ReAct-циклу, а сам цикл делает больше — параллельные
-        # queries, дедуп источников, sanitize_search_facts, сбор
-        # _web_search_results_this_turn для фронта, _verify_response.
-        # Субагент все эти шаги пропускает, и его tool_trace приходил в
-        # ai_assistant.py без заземления/валидации.
-        if (self._subagent_orchestrator is not None
-                and SUBAGENT_DELEGATION_ENABLED):
-            try:
-                coder_markers = (
-                    ".py", ".js", ".ts", ".tsx", ".jsx",
-                    "traceback", "exception",
-                    "github.com",
-                    "read_code", "search_code", "analyze_error",
-                    "project_structure",
-                    "прочитай код", "анализируй код", "структуру проекта",
-                )
-                if any(m in message_lower for m in coder_markers):
-                    logger.info("Делегировано субагенту: coder")
-                    role_result = await self._subagent_orchestrator.execute_task(
-                        task=message,
-                        role=AgentRole.CODER,
-                        context={"history_tail": history_tail[:500] if history_tail else ""},
-                    )
-                    if role_result and role_result.get("result"):
-                        return {
-                            "tool_trace": role_result.get("tool_trace", []),
-                            # Native-режим здесь не вызывался, и план ещё не строили —
-                            # возвращаем честные значения, чтобы ai_assistant не сверял
-                            # ответ с чужим (прошлым) планом.
-                            "used_native": False,
-                            "delegated_to": AgentRole.CODER.value,
-                            "plan": "",
-                        }
-            except Exception as e:
-                logger.debug(f"SubAgent delegation failed, fallback to ToolRouter: {e}")
-                # Продолжаем обычный ReAct-цикл если делегирование не сработало
-
         tool_trace: List[Dict[str, Any]] = []
         used_native = False
         running_messages: List[Dict] = list(base_messages)
@@ -774,19 +620,6 @@ class ToolRouter:
             running_messages = running_messages + [{"role": "user", "content": code_hint}]
             history_tail = f"{code_hint}\n\n{history_tail}" if history_tail else code_hint
 
-        # ПУНКТ №4: план подзадач
-        plan_text = await self._plan_subtasks(message)
-        self._last_plan = plan_text or ""
-        if plan_text:
-            running_messages = running_messages + [{
-                "role": "user",
-                "content": (
-                    "[План подзадач для этого запроса — учитывай ВСЕ пункты при выборе "
-                    f"инструментов и не считай запрос закрытым, пока не покрыт весь план]\n{plan_text}"
-                ),
-            }]
-            history_tail = f"[План подзадач]\n{plan_text}\n\n{history_tail}" if history_tail else f"[План подзадач]\n{plan_text}"
-
         seen_calls: set = set()
         # === ИСПРАВЛЕНИЕ: отслеживаем ошибки, чтобы не повторять их ===
         seen_errors: set = set()   # (tool, frozenset(sorted(args.items())))
@@ -794,13 +627,6 @@ class ToolRouter:
         # ПУНКТ №1: Динамический лимит итераций при активном перепланировании
         max_iterations = MAX_TOOL_ITERATIONS
         replan_count = 0  # счётчик перепланирований
-
-        # ПУНКТ №4: Валидация плана перед выполнением
-        if plan_text:
-            available_tools = list(self.registry._tools.keys())
-            unrealizable = await self._validate_plan(plan_text, available_tools)
-            if unrealizable:
-                logger.warning(f"План содержит нереализуемые пункты: {unrealizable}")
 
         for round_idx in range(max_iterations):
             decisions: Optional[List[Dict]] = None
@@ -1007,22 +833,10 @@ class ToolRouter:
                 ),
             }]
 
-            # ПУНКТ №4: Трекинг прогресса по плану
-            if plan_text:
-                progress = await self._track_plan_progress(plan_text, tool_trace)
-                uncovered = [k for k, v in progress.items() if not v]
-                if uncovered and round_idx < max_iterations - 1:
-                    logger.info(f"Не покрыты пункты плана: {uncovered[:2]}")
-                    # Добавляем напоминание о непокрытых пунктах
-                    running_messages = running_messages + [{
-                        "role": "user",
-                        "content": f"[Напоминание: ещё не выполнены пункты плана: {', '.join(uncovered[:2])}]",
-                    }]
-
             if not used_native and len(tool_trace) >= max_iterations:
                 break
 
-        return {"tool_trace": tool_trace, "used_native": used_native, "plan": getattr(self, "_last_plan", "")}
+        return {"tool_trace": tool_trace, "used_native": used_native}
 
 
 def build_tool_trace_context(tool_trace: List[Dict[str, Any]]) -> str:
