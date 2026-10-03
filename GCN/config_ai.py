@@ -94,7 +94,10 @@ CURIOSITY_UNCERTAINTY_THRESHOLD = 0.7
 CURIOSITY_NOVELTY_THRESHOLD = 0.6
 CURIOSITY_RESEARCH_INTERVAL = 600
 RESOURCE_BUDGET_LLM_CALLS = 100
-AUTO_RESEARCH_ENABLED = False
+# BUGFIX: флаг был False, из-за чего AutonomyEngine (enqueue_topic/_pump_queue)
+# молча отклонял/вычищал все темы — фоновое исследование не работало вообще.
+# Legacy _auto_research по-прежнему гасится этим флагом в ai_assistant._periodic_research.
+AUTO_RESEARCH_ENABLED = True
 
 # -------------------------------
 # Веб-поиск
@@ -482,12 +485,6 @@ SEARCH_FACT_SANITIZER_ENABLED = True
 # C. Подзапросный retrieval для составных вопросов (retrieve по subqueries).
 SUBQUERY_RETRIEVAL_ENABLED = True
 MAX_RETRIEVE_SUBQUERIES = 3
-# D. LLM-подтверждение эвристических противоречий в KnowledgeIngestion.
-#    При сбое/таймауте верификатора система откатывается на эвристику.
-# False: один механизм LLM-проверки противоречий — периодический
-# _verify_pending_contradictions в ai_assistant. Включение сюда
-# дублировало проверку двумя разными промптами (ingestion + controller).
-CONTRADICTION_LLM_VERIFY_ENABLED = False
 # E. Финальный критик: сверка ответа с планом подзадач и добор пропущенного.
 PLAN_CRITIC_ENABLED = True
 PLAN_CRITIC_MAX_MISSED = 3

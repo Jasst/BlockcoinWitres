@@ -69,8 +69,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from GCN.mcp_client_manager import MCPToolManager
 
-from GCN.GCN import AIAdapter, KnowledgeObject, KnowledgeType, MemoryScope
-from GCN.memory_graph import CognitiveMemory, Fact, Episode, Goal, GCNMemoryRouter
+from GCN.GCN import KnowledgeObject, KnowledgeType, MemoryScope
+from GCN.memory_graph import CognitiveMemory, Fact, Goal, GCNMemoryRouter
 
 from GCN.llm_client import call_llm, call_llm_raw, call_llm_stream
 from GCN.web_search import deep_search, is_time_sensitive_query
@@ -779,15 +779,13 @@ class CognitiveController:
         while True:
             await asyncio.sleep(CURIOSITY_RESEARCH_INTERVAL)
             await self.gate.wait_idle(BG_LLM_MAX_WAIT, BG_LLM_COOLDOWN)
-            # ИСПРАВЛЕНИЕ: AUTO_RESEARCH_ENABLED был объявлен в config_ai.py,
-            # но нигде не читался — цикл авто-исследования крутился
-            # безусловно, флаг фактически не давал его отключить.
-            if not AUTO_RESEARCH_ENABLED:
-                continue
             # ИЗМЕНЕНИЕ: цели больше не исследуются напрямую — они ставятся в
             # приоритетную очередь AutonomyEngine (дедуп, ретраи, приоритеты,
             # дайджестная доставка, единый бюджет). Прежний _auto_research
             # остаётся как fallback, если движок не поднялся.
+            # BUGFIX: ветка AutonomyEngine работает независимо от legacy
+            # AUTO_RESEARCH_ENABLED — это две разные подсистемы, флаг управляет
+            # только _auto_research() ниже.
             if self.autonomy is not None:
                 try:
                     active_goals = await self.memory_service.get_goals()
@@ -799,6 +797,9 @@ class CognitiveController:
                                 related_goal=goal_dict["description"])
                 except Exception as e:
                     logger.error(f"Auto research enqueue error: {e}")
+                continue
+            # Legacy-путь — только если AutonomyEngine не поднялся.
+            if not AUTO_RESEARCH_ENABLED:
                 continue
             if not self._consume_autonomous_llm_budget():
                 continue
