@@ -6,7 +6,6 @@
 что устраняет дублирование логики с MCP-сервером.
 """
 import sys
-import os
 import uuid
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -81,10 +80,9 @@ from GCN.fast_router import (ComplexityRouter, ActivityGate, StageTimer, Route,
 # ИНТЕЛЛЕКТ-ПАКЕТ: заземлённые ответы, санитайзер фактов, подзапросный retrieval
 # (см. GCN/intellect.py)
 from GCN import intellect as intellect_mod
-from GCN.config_ai import GROUNDED_ANSWER_ENABLED, DEFAULT_MAX_TOKENS
 
 # ИЗМЕНЕНИЕ: импорт MemoryService и фабрики
-from GCN.memory_service import MemoryService, get_memory_service
+from GCN.memory_service import MemoryService
 
 from GCN.config_ai import ENABLE_CODE_SELF_REFLECTION
 # Импорт инструментов самоанализа кода
