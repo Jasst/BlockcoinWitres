@@ -9,7 +9,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Literal, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 import os
 import base64
 import re
@@ -24,7 +24,7 @@ from pydantic import Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from GCN.config_ai import MEMORY_BASE_DIR, GENERATED_IMAGES_DIR, EASYDIFFUSION_ENABLED
+from GCN.config_ai import GENERATED_IMAGES_DIR, EASYDIFFUSION_ENABLED
 from GCN.memory_service import get_memory_service, MemoryService
 from GCN.web_search import deep_search
 from GCN.image_utils import enhance_prompt, generate_image as gen_image
@@ -69,11 +69,6 @@ _ENV_DEFAULT_USER = os.getenv("BLOCKCOIN_USER_ID", "").strip()
 _STDIO_VERIFIED_USER: "Optional[str]" = None
 _STDIO_VERIFIED_SIGNER: "Optional[str]" = None
 
-# Не используется. Оставлено для обратной совместимости импортов, если где-то
-# в коде есть ссылки на старое имя.
-_VERIFIED_USER: "Optional[str]" = None
-_VERIFIED_SIGNER: "Optional[str]" = None
-
 _LOGIN_NONCES: Dict[str, Tuple[str, float]] = {}  # nonce -> (canon_user_id, expires_at)
 
 
@@ -94,31 +89,6 @@ def _is_http_transport(ctx: "Optional[Context]") -> bool:
         return req is not None
     except Exception:
         return False
-
-
-def _session_id_from_ctx(ctx: "Optional[Context]") -> "Optional[str]":
-    """
-    Возвращает стабильный идентификатор сессии для HTTP-транспорта.
-    (Задел на будущее; сейчас не используется, но полезно для отладки.)
-    """
-    if ctx is None:
-        return None
-    for attr in ("session_id", "client_id"):
-        try:
-            sid = getattr(ctx, attr, None)
-            if sid:
-                return str(sid)
-        except Exception:
-            pass
-    try:
-        req = ctx.request_context.request
-        if req is not None:
-            sid = req.headers.get("mcp-session-id")
-            if sid:
-                return sid
-    except Exception:
-        pass
-    return None
 
 
 def _cleanup_expired_nonces(now: Optional[float] = None) -> None:
@@ -625,9 +595,6 @@ async def remember(
     service = await get_memory_service(uid)
     result = await service.remember(fact, scope, force_new=force_new, user_explicit=True)
     return {"status": "ok", **result}
-
-
-import numpy as np  # Убедитесь, что numpy импортирован в начале файла (он там есть, но на всякий случай)
 
 
 def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:

@@ -26,8 +26,7 @@ import uuid
 # Импорт GCN-компонентов (папка GCN, файл GCN.py)
 from GCN.GCN import (
     KnowledgeObject, KnowledgeType, KnowledgeEvent, EventType,
-    MemoryStore, KnowledgeGraph as GCNKnowledgeGraph,
-    AIAdapter, Provenance, MemoryHierarchy,
+    MemoryStore, Provenance, MemoryHierarchy,
     MemoryScope, KnowledgeIngestion   # добавить эти два
 )
 

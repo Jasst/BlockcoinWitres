@@ -51,7 +51,6 @@ def register(registry, controller):
         )
 
     async def _search(args):
-        from dataclasses import asdict
         service.shared_memory.reload_if_stale()
         store = service.shared_memory.gcn_store
         matches = search_chain(store, args.get("query", ""), limit=int(args.get("limit", 20)))
