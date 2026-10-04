@@ -391,6 +391,7 @@ class CognitiveController:
         self._last_proactive_message_at: float = 0.0
 
         # ===== ИЗМЕНЕНИЕ: создание MCP-менеджера =====
+        self._owns_mcp_manager = mcp_manager is None
         if mcp_manager is not None:
             # Используем переданный (глобальный) менеджер
             self.mcp_manager = mcp_manager
@@ -589,57 +590,86 @@ class CognitiveController:
         except Exception as e:
             logger.warning(f"[ForceCodeTool] не удалось вызвать project_structure: {e}")
 
+    # Инструменты памяти/поиска/генерации живут в mcp_server_blockcoin.py. Веб-чат
+    # вызывает их НАПРЯМУЮ (в том же процессе) от имени своего user_id — адреса
+    # кошелька из require_auth. Ни HTTP, ни X-User-Id, ни mcp-remote здесь не нужны:
+    # у каждого кошелька своя память, а mcp_servers.json на это не влияет.
+    # Внешние ИИ ходят на /mcp по HTTP и входят через login(code) (см. кнопку
+    # «Подключить ИИ» в профиле).
+    _LOCAL_TOOLS_SKIP = {"identify", "request_login", "verify_login", "login", "logout"}
+
+    async def _register_local_memory_tools(self):
+        if getattr(self, "_local_tools_registered", False):
+            return
+        try:
+            # ленивый импорт: mcp_server_blockcoin сам импортирует routes.ai_assistant
+            from mcp_server_blockcoin import mcp as local_mcp
+            from GCN.tool_router import _resolve_timeout
+            tools = await local_mcp.list_tools()
+        except Exception as e:
+            logger.error(f"Локальные инструменты памяти недоступны: {e}", exc_info=True)
+            return
+
+        for t in tools:
+            if t.name in self._LOCAL_TOOLS_SKIP:
+                continue
+
+            async def _handler(args, _n=t.name):
+                # user_id ВСЕГДА свой: LLM не может подставить чужой
+                call_args = {**(args or {}), "user_id": self.user_id}
+                res = await local_mcp.call_tool(_n, call_args)
+                if isinstance(res, tuple):          # новые версии mcp: (content, structured)
+                    res = res[0]
+                if isinstance(res, (list, tuple)):
+                    return "\n".join(getattr(c, "text", str(c)) for c in res)
+                return res if isinstance(res, str) else json.dumps(res, ensure_ascii=False, default=str)
+
+            self.tool_registry.register(
+                name=t.name,
+                description=t.description or "",
+                parameters=t.inputSchema or {"type": "object", "properties": {}},
+                handler=_handler,
+                server="blockcoin-memory",   # те же имена blockcoin-memory__recall, что и раньше
+                timeout_seconds=_resolve_timeout(t.name),
+            )
+        self._local_tools_registered = True
+
     async def _ensure_external_tools_registered(self):
-        """Регистрирует внешние MCP-инструменты в ToolRegistry, если они ещё не зарегистрированы."""
+        """Регистрирует инструменты: локальные (память/поиск/картинки) и внешние MCP."""
         if self._external_tools_registered:
             return
 
-        # Если менеджер уже инициализирован (глобальный) – сразу регистрируем
-        if self.mcp_manager._initialized:
-            await self.mcp_manager.ensure_connected()
-            self.tool_registry.register_mcp_tools(self.mcp_manager, self._handle_mcp_call)
-            self._external_tools_registered = True
-            return
+        await self._register_local_memory_tools()
 
-        # Если менеджер ещё не инициализирован (локальный) – ждём завершения задачи
-        if self._mcp_task is not None:
+        # Внешние MCP-серверы из mcp_servers.json (если они там есть)
+        if not self.mcp_manager._initialized and self._mcp_task is not None:
             try:
                 await self._mcp_task
             except Exception as e:
                 logger.error(f"MCP initialization failed: {e}", exc_info=True)
-                return
 
-        if not self.mcp_manager._initialized:
-            return
+        if self.mcp_manager._initialized:
+            await self.mcp_manager.ensure_connected()
+            self.tool_registry.register_mcp_tools(self.mcp_manager, self._handle_mcp_call)
+            # Если внешние серверы заданы, но ещё не поднялись — повторим на следующем
+            # сообщении (ensure_connected сам решает, пора ли переподключаться).
+            external_ok = bool(self.mcp_manager.get_all_tools()) or not self.mcp_manager._server_configs
+        else:
+            external_ok = False
 
-        await self.mcp_manager.ensure_connected()
-        self.tool_registry.register_mcp_tools(self.mcp_manager, self._handle_mcp_call)
-        self._external_tools_registered = True
+        self._external_tools_registered = (
+            getattr(self, "_local_tools_registered", False) and external_ok
+        )
 
     async def _handle_mcp_call(self, server: str, tool: str, args: Dict) -> str:
-        """
-        Выполняет вызов внешнего MCP-инструмента (используется ToolRegistry как handler).
+        """Вызов ВНЕШНЕГО MCP-инструмента (сторонние серверы из mcp_servers.json).
 
-        ИСПРАВЛЕНИЕ (универсальный сервер памяти для чата и внешних MCP-клиентов —
-        так и было задумано, см. mcp_servers.json/blockcoin-memory): раньше сюда
-        приходили ровно те аргументы, что собрала LLM, и если инструмент на
-        внешнем сервере принимает user_id (recall/remember/forget/add_goal/
-        generate_image/... в mcp_server_blockcoin.py), а LLM его не указала
-        (few-shot примеры её этому не учили) — вызов уходил с user_id=None,
-        сервер подставлял DEFAULT_USER="default_user", и чат читал/писал
-        чужую, несвязанную с кошельком память. Это не повод отказываться от
-        общего сервера — наоборот, раз именно он должен быть единой точкой
-        истины для памяти, чат обязан сам, надёжно (не полагаясь на LLM)
-        подставлять СВОЙ user_id в каждый вызов к нему, если аргумент ещё не
-        задан явно. Явно переданный LLM user_id (например, если пользователь
-        сам просит выполнить что-то от имени другого известного ID) не
-        перезаписывается.
+        user_id кошелька сюда больше не подставляется: он нужен только локальным
+        инструментам памяти (их обслуживает _register_local_memory_tools), а
+        сторонним серверам идентификатор пользователя отдавать незачем.
         """
-        if "user_id" not in args or not args.get("user_id"):
-            args = {**args, "user_id": self.user_id}
         try:
-            result = await self.mcp_manager.call_tool(server, tool, args)
-            return result
+            return await self.mcp_manager.call_tool(server, tool, args)
         except Exception as e:
             logger.error(f"MCP call error: {e}", exc_info=True)
             return f"Ошибка вызова MCP: {str(e)}"
@@ -2946,6 +2976,11 @@ class CognitiveController:
                 await self.autonomy.shutdown()
             except Exception as e:
                 logger.error(f"AutonomyEngine shutdown error: {e}")
+        if getattr(self, "_owns_mcp_manager", False):
+            try:
+                await self.mcp_manager.close()
+            except Exception as e:
+                logger.debug(f"MCP close: {e}")
         await self.memory_service.shutdown()
 
 # =====================================================================
@@ -2998,33 +3033,12 @@ async def get_assistant(user_id: str):
     async with _assistants_lock:
         await _evict_stale_assistants(exclude_uid=user_id)
         if user_id not in _assistants:
-            mcp_mgr = get_global_mcp_manager()  # получаем глобальный (может быть None)
-            # ИЗМЕНЕНИЕ: если используется глобальный MCP менеджер, создаём новый экземпляр
-            # с user_id текущего пользователя для передачи заголовка X-User-Id в MCP сервер
-            if mcp_mgr is not None:
-                # Создаём копию менеджера с user_id текущего пользователя
-                # Копируем конфиг, добавляя user_id
-                from copy import deepcopy
-                mcp_cfg_copy = deepcopy(mcp_mgr._server_configs)
-                for server_name in mcp_cfg_copy:
-                    if isinstance(mcp_cfg_copy[server_name], dict):
-                        mcp_cfg_copy[server_name]["user_id"] = user_id
-                logger.debug(f"Создан MCP менеджер для user_id={user_id[:16]}...")
-            else:
-                mcp_cfg_copy = None
-            _assistants[user_id] = CognitiveController(user_id, mcp_manager=None)
-            # Инициализируем MCP менеджер ассистента с правильным user_id
-            if mcp_cfg_copy is not None:
-                _assistants[user_id].mcp_manager = MCPToolManager(
-                    config_path=mcp_mgr.config_path,
-                    user_id=user_id
-                )
-                _assistants[user_id].mcp_manager._server_configs = mcp_cfg_copy
-                # Запускаем инициализацию MCP в фоне
-                _assistants[user_id]._spawn_background_task(
-                    _assistants[user_id].mcp_manager.initialize(),
-                    name=f"mcp-init:{user_id[:16]}"
-                )
+            # Общий MCP-менеджер для внешних серверов (если инициализирован);
+            # иначе контроллер создаст свой. Память кошелька идёт мимо менеджера —
+            # см. CognitiveController._register_local_memory_tools.
+            _assistants[user_id] = CognitiveController(
+                user_id, mcp_manager=get_global_mcp_manager()
+            )
             logger.info(f"Создан когнитивный ассистент для {user_id[:16]}")
         _assistants.move_to_end(user_id)
         _assistant_last_used[user_id] = time.time()
@@ -3203,6 +3217,14 @@ async def enhance_prompt_endpoint(body: EnhanceRequest, address: str = Depends(r
     except Exception as e:
         logger.error(f"Enhance prompt failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/mcp_code")
+async def create_mcp_login_code(address: str = Depends(require_auth)):
+    """Одноразовый код (10 минут), которым внешний ИИ входит в ПАМЯТЬ ЭТОГО кошелька:
+    скажите ИИ «войди с кодом …» — он вызовет MCP-инструмент login(code)."""
+    from mcp_server_blockcoin import issue_login_code
+    return {"code": issue_login_code(address), "expires_in": 600}
+
 
 @router.get("/notifications/poll")
 async def poll_notifications(address: str = Depends(require_auth)):

@@ -354,6 +354,31 @@
     align-items: center;
   }
 
+  /* Подключение внешнего ИИ */
+  .ai-code-box {
+    margin-top: 16px;
+    padding: 18px;
+    border-radius: 16px;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--glass-border);
+    text-align: center;
+  }
+  .ai-code-value {
+    font-family: monospace;
+    font-size: 30px;
+    font-weight: 700;
+    letter-spacing: 6px;
+    color: var(--text-main);
+    user-select: all;
+  }
+  .ai-code-hint {
+    margin-top: 10px;
+  }
+  .ai-code-timer {
+    color: var(--accent-color);
+    font-weight: 600;
+  }
+
   /* Адаптив */
   @media (max-width: 768px) {
     .profile-row {
@@ -445,6 +470,25 @@
     </div>
     <p class="text-muted form-hint" data-i18n="warning_mnemonic">⚠️ Keep this phrase secret. Never share it with anyone.</p>
     <button class="btn-primary-oval full-width" onclick="exportMnemonicSecure()" data-i18n="export_mnemonic">🔐 Export Mnemonic</button>
+</div>
+
+<!-- Connect external AI Card -->
+<div class="profile-card" id="aiConnectCard">
+    <h3 id="aiConnectTitle">Connect an AI</h3>
+    <p class="text-muted" id="aiConnectDesc">Let an outside assistant (Claude, ChatGPT, Cursor…) work with this wallet's memory. Get a one-time code and tell the assistant: “log in with code …”.</p>
+    <button class="btn-primary-oval full-width" id="aiConnectBtn">Get connection code</button>
+    <div class="ai-code-box hidden" id="aiCodeBox">
+        <div class="ai-code-value" id="aiCodeValue" aria-live="polite"></div>
+        <div class="flex-row" style="justify-content:center; margin-top:14px;">
+            <button class="btn-oval outline" id="aiCodeCopyBtn">Copy</button>
+        </div>
+        <p class="text-muted ai-code-hint">
+            <span id="aiCodeExpiresLabel">Valid for</span>
+            <span class="ai-code-timer" id="aiCodeTimer">10:00</span>.
+            <span id="aiCodeOnceLabel">The code works once.</span>
+        </p>
+    </div>
+    <p id="aiConnectError" class="hidden error"></p>
 </div>
 
 <!-- Security Info Card -->
@@ -697,6 +741,112 @@
   window.exportMnemonicSecure = exportMnemonicSecure;
   window.downloadQR = downloadQR;
   window.shareQR = shareQR;
+})();
+</script>
+
+<!-- Connect external AI script -->
+<script>
+(function() {
+  if (window._aiConnectLoaded) return;
+  window._aiConnectLoaded = true;
+
+  // Тексты берутся из i18next, если ключи есть в локалях; иначе — запасной вариант.
+  function tr(key, fallbackEn, fallbackRu) {
+    const lang = (window.i18next && i18next.language) || localStorage.getItem('app_lang') || 'en';
+    const fallback = lang.startsWith('ru') ? fallbackRu : fallbackEn;
+    try {
+      const v = window.i18next ? i18next.t(key, { defaultValue: fallback }) : fallback;
+      return (!v || v === key) ? fallback : v;
+    } catch (e) { return fallback; }
+  }
+
+  let timerId = null;
+
+  function applyTexts() {
+    const set = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+    set('aiConnectTitle', tr('ai_connect_title', 'Connect an AI', 'Подключить ИИ'));
+    set('aiConnectDesc', tr('ai_connect_desc',
+      'Let an outside assistant (Claude, ChatGPT, Cursor…) work with this wallet\'s memory. Get a one-time code and tell the assistant: “log in with code …”.',
+      'Дайте внешнему ассистенту (Claude, ChatGPT, Cursor…) доступ к памяти этого кошелька. Получите одноразовый код и скажите ассистенту: «войди с кодом …».'));
+    set('aiConnectBtn', tr('ai_connect_get_code', 'Get connection code', 'Получить код подключения'));
+    set('aiCodeCopyBtn', tr('copy', 'Copy', 'Копировать'));
+    set('aiCodeExpiresLabel', tr('ai_connect_valid_for', 'Valid for', 'Действует'));
+    set('aiCodeOnceLabel', tr('ai_connect_once', 'The code works once.', 'Код одноразовый.'));
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('aiConnectError');
+    if (!el) return;
+    el.textContent = msg;
+    el.classList.remove('hidden');
+  }
+
+  function startTimer(seconds) {
+    clearInterval(timerId);
+    const timerEl = document.getElementById('aiCodeTimer');
+    const box = document.getElementById('aiCodeBox');
+    let left = seconds;
+    const render = () => {
+      const m = String(Math.floor(left / 60)).padStart(1, '0');
+      const s = String(left % 60).padStart(2, '0');
+      timerEl.textContent = m + ':' + s;
+    };
+    render();
+    timerId = setInterval(() => {
+      left -= 1;
+      if (left <= 0) {
+        clearInterval(timerId);
+        box.classList.add('hidden');
+        document.getElementById('aiCodeValue').textContent = '';
+        return;
+      }
+      render();
+    }, 1000);
+  }
+
+  async function requestCode() {
+    const btn = document.getElementById('aiConnectBtn');
+    const box = document.getElementById('aiCodeBox');
+    const err = document.getElementById('aiConnectError');
+    err.classList.add('hidden');
+    btn.disabled = true;
+    try {
+      const res = await fetch('/ai/mcp_code', { method: 'POST', credentials: 'same-origin' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!data.code) throw new Error('empty code');
+      document.getElementById('aiCodeValue').textContent = data.code;
+      box.classList.remove('hidden');
+      startTimer(data.expires_in || 600);
+      btn.textContent = tr('ai_connect_new_code', 'Get a new code', 'Получить новый код');
+    } catch (e) {
+      console.error('mcp_code failed', e);
+      showError(tr('ai_connect_failed',
+        'Could not get a code. Check that you are logged in and try again.',
+        'Не удалось получить код. Проверьте, что вы вошли в аккаунт, и повторите.'));
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function copyCode() {
+    const code = document.getElementById('aiCodeValue')?.textContent?.trim();
+    if (!code) return;
+    navigator.clipboard.writeText(code)
+      .then(() => window.NotificationManager?.showToast(tr('copied', 'Copied', 'Скопировано'), 'success'))
+      .catch(() => window.NotificationManager?.showToast(tr('copy_failed', 'Copy failed', 'Не удалось скопировать'), 'error'));
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    applyTexts();
+    // локали i18next подгружаются асинхронно — обновим тексты, когда язык сменится/загрузится
+    if (window.i18next && i18next.on) {
+      i18next.on('languageChanged', applyTexts);
+      i18next.on('loaded', applyTexts);
+    }
+    document.getElementById('aiConnectBtn')?.addEventListener('click', requestCode);
+    document.getElementById('aiCodeCopyBtn')?.addEventListener('click', copyCode);
+  });
 })();
 </script>
 

@@ -30,6 +30,8 @@ from GCN.GCN import (
     MemoryScope, KnowledgeIngestion   # добавить эти два
 )
 
+from GCN.llm_client import call_llm
+
 logger = logging.getLogger(__name__)
 
 from GCN.config_ai import *  # единственный источник конфигурации (fallback-дубль констант удалён)
