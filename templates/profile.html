@@ -481,11 +481,15 @@
         <div class="ai-code-value" id="aiCodeValue" aria-live="polite"></div>
         <div class="flex-row" style="justify-content:center; margin-top:14px;">
             <button class="btn-oval outline" id="aiCodeCopyBtn">Copy</button>
+            <button class="btn-oval outline" id="aiCodeRevokeBtn"
+                    style="border-color: var(--danger-color); color: var(--danger-color);">
+                Revoke
+            </button>
         </div>
         <p class="text-muted ai-code-hint">
-            <span id="aiCodeExpiresLabel">Valid for</span>
-            <span class="ai-code-timer" id="aiCodeTimer">10:00</span>.
-            <span id="aiCodeOnceLabel">The code works once.</span>
+            <span id="aiCodePersistentHint">
+                This code stays valid until you revoke it.
+            </span>
         </p>
     </div>
     <p id="aiConnectError" class="hidden error"></p>
@@ -750,7 +754,6 @@
   if (window._aiConnectLoaded) return;
   window._aiConnectLoaded = true;
 
-  // Тексты берутся из i18next, если ключи есть в локалях; иначе — запасной вариант.
   function tr(key, fallbackEn, fallbackRu) {
     const lang = (window.i18next && i18next.language) || localStorage.getItem('app_lang') || 'en';
     const fallback = lang.startsWith('ru') ? fallbackRu : fallbackEn;
@@ -760,18 +763,18 @@
     } catch (e) { return fallback; }
   }
 
-  let timerId = null;
-
   function applyTexts() {
     const set = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
     set('aiConnectTitle', tr('ai_connect_title', 'Connect an AI', 'Подключить ИИ'));
     set('aiConnectDesc', tr('ai_connect_desc',
-      'Let an outside assistant (Claude, ChatGPT, Cursor…) work with this wallet\'s memory. Get a one-time code and tell the assistant: “log in with code …”.',
-      'Дайте внешнему ассистенту (Claude, ChatGPT, Cursor…) доступ к памяти этого кошелька. Получите одноразовый код и скажите ассистенту: «войди с кодом …».'));
+      'Let an outside assistant (Claude, ChatGPT, Cursor…) work with this wallet\'s memory. Get a code and tell the assistant: “log in with code …”. The code stays valid until you revoke it here.',
+      'Дайте внешнему ассистенту (Claude, ChatGPT, Cursor…) доступ к памяти этого кошелька. Получите код и скажите ассистенту: «войди с кодом …». Код действует, пока вы не отзовёте его здесь.'));
     set('aiConnectBtn', tr('ai_connect_get_code', 'Get connection code', 'Получить код подключения'));
     set('aiCodeCopyBtn', tr('copy', 'Copy', 'Копировать'));
-    set('aiCodeExpiresLabel', tr('ai_connect_valid_for', 'Valid for', 'Действует'));
-    set('aiCodeOnceLabel', tr('ai_connect_once', 'The code works once.', 'Код одноразовый.'));
+    set('aiCodeRevokeBtn', tr('ai_connect_revoke', 'Revoke', 'Отозвать'));
+    set('aiCodePersistentHint', tr('ai_connect_persistent',
+      'This code stays valid until you revoke it.',
+      'Код действует до отмены.'));
   }
 
   function showError(msg) {
@@ -781,49 +784,74 @@
     el.classList.remove('hidden');
   }
 
-  function startTimer(seconds) {
-    clearInterval(timerId);
-    const timerEl = document.getElementById('aiCodeTimer');
+  function showCode(code) {
     const box = document.getElementById('aiCodeBox');
-    let left = seconds;
-    const render = () => {
-      const m = String(Math.floor(left / 60)).padStart(1, '0');
-      const s = String(left % 60).padStart(2, '0');
-      timerEl.textContent = m + ':' + s;
-    };
-    render();
-    timerId = setInterval(() => {
-      left -= 1;
-      if (left <= 0) {
-        clearInterval(timerId);
-        box.classList.add('hidden');
-        document.getElementById('aiCodeValue').textContent = '';
-        return;
-      }
-      render();
-    }, 1000);
+    const val = document.getElementById('aiCodeValue');
+    const btn = document.getElementById('aiConnectBtn');
+    val.textContent = code || '';
+    if (code) {
+      box.classList.remove('hidden');
+      btn.textContent = tr('ai_connect_new_code', 'Get a new code', 'Создать новый код');
+    } else {
+      box.classList.add('hidden');
+      btn.textContent = tr('ai_connect_get_code', 'Get connection code', 'Получить код подключения');
+    }
+  }
+
+  async function loadCode() {
+    try {
+      const res = await fetch('/ai/mcp_code', { method: 'GET', credentials: 'same-origin' });
+      if (!res.ok) return;
+      const data = await res.json();
+      showCode(data.code || null);
+    } catch (e) { /* молча — код просто не показываем */ }
   }
 
   async function requestCode() {
     const btn = document.getElementById('aiConnectBtn');
-    const box = document.getElementById('aiCodeBox');
     const err = document.getElementById('aiConnectError');
     err.classList.add('hidden');
+    const hasCode = !document.getElementById('aiCodeBox').classList.contains('hidden');
+    if (hasCode && !confirm(tr('ai_connect_replace_confirm',
+        'A new code will invalidate the current one and log out all connected assistants. Continue?',
+        'Новый код отменит текущий и разлогинит всех подключённых ассистентов. Продолжить?'))) {
+      return;
+    }
     btn.disabled = true;
     try {
       const res = await fetch('/ai/mcp_code', { method: 'POST', credentials: 'same-origin' });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       if (!data.code) throw new Error('empty code');
-      document.getElementById('aiCodeValue').textContent = data.code;
-      box.classList.remove('hidden');
-      startTimer(data.expires_in || 600);
-      btn.textContent = tr('ai_connect_new_code', 'Get a new code', 'Получить новый код');
+      showCode(data.code);
     } catch (e) {
       console.error('mcp_code failed', e);
       showError(tr('ai_connect_failed',
         'Could not get a code. Check that you are logged in and try again.',
         'Не удалось получить код. Проверьте, что вы вошли в аккаунт, и повторите.'));
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function revokeCode() {
+    if (!confirm(tr('ai_connect_revoke_confirm',
+        'Revoke the code? All connected assistants will lose access immediately.',
+        'Отозвать код? Все подключённые ассистенты немедленно потеряют доступ.'))) {
+      return;
+    }
+    const btn = document.getElementById('aiCodeRevokeBtn');
+    btn.disabled = true;
+    try {
+      const res = await fetch('/ai/mcp_code', { method: 'DELETE', credentials: 'same-origin' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      showCode(null);
+      window.NotificationManager?.showToast(
+        tr('ai_connect_revoked', 'Code revoked', 'Код отозван'), 'success');
+    } catch (e) {
+      showError(tr('ai_connect_revoke_failed',
+        'Could not revoke the code. Try again.',
+        'Не удалось отозвать код. Попробуйте ещё раз.'));
     } finally {
       btn.disabled = false;
     }
@@ -839,13 +867,14 @@
 
   document.addEventListener('DOMContentLoaded', () => {
     applyTexts();
-    // локали i18next подгружаются асинхронно — обновим тексты, когда язык сменится/загрузится
     if (window.i18next && i18next.on) {
       i18next.on('languageChanged', applyTexts);
       i18next.on('loaded', applyTexts);
     }
+    loadCode();  // показать текущий код, если он уже был выдан
     document.getElementById('aiConnectBtn')?.addEventListener('click', requestCode);
     document.getElementById('aiCodeCopyBtn')?.addEventListener('click', copyCode);
+    document.getElementById('aiCodeRevokeBtn')?.addEventListener('click', revokeCode);
   });
 })();
 </script>

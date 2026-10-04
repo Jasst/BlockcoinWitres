@@ -109,15 +109,28 @@ def _cleanup_expired_nonces(now: Optional[float] = None) -> None:
 #   2) говорит внешнему ИИ: «войди с кодом XXXXXXXX»;
 #   3) ИИ вызывает login(code) -> mcp-session-id привязывается к адресу.
 # Состояние в памяти процесса: рассчитано на ОДИН воркер (встроенный /mcp).
-_LOGIN_CODES: Dict[str, Tuple[str, float]] = {}     # код -> (user_id, срок)
+# код -> (user_id, expires_at).
+# expires_at == _CODE_PERSISTENT (float('inf')) → бессрочный код до отзыва.
+# expires_at < now → legacy one-time код с TTL, подчищается _prune_login_state.
+_LOGIN_CODES: Dict[str, Tuple[str, float]] = {}
+_CODE_PERSISTENT = float("inf")
 _HTTP_SESSIONS: Dict[str, Tuple[str, float]] = {}   # mcp-session-id -> (user_id, срок)
+# NEW: резервный индекс ip -> (user_id, срок). Многие облачные MCP-клиенты
+# открывают новую MCP-сессию на КАЖДЫЙ tools/call, и mcp-session-id, выданный
+# при login, в следующий вызов не приходит. Проверяется ВТОРЫМ — после sid.
+_HTTP_IP_SESSIONS: Dict[str, Tuple[str, float]] = {}
 _LOGIN_FAILS: Dict[str, List[float]] = {}           # ip -> времена неудачных попыток
 _LOGIN_CODE_TTL = 600
 _HTTP_SESSION_TTL = int(os.getenv("MCP_HTTP_SESSION_TTL", str(12 * 3600)))
 _HTTP_SESSIONS_MAX = 5000
+_HTTP_IP_SESSIONS_MAX = 500
 _LOGIN_FAIL_LIMIT = 10          # неудачных попыток ...
 _LOGIN_FAIL_WINDOW = 600        # ... за 10 минут с одного IP
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+# 8 знаков = 2^40 ≈ 10^12 вариантов. Для одноразового 10-минутного кода
+# хватало с запасом, для бессрочного ключа поднимаем до 12 знаков (2^60).
+# Длину можно переопределить через env MCP_LOGIN_CODE_LENGTH.
+_CODE_LENGTH = int(os.getenv("MCP_LOGIN_CODE_LENGTH", "12"))
 
 # Старое поведение (HTTP без входа: берётся args.user_id или default_user).
 # Небезопасно — включайте только временно: MCP_ALLOW_LEGACY_HTTP=1.
@@ -144,7 +157,8 @@ def _http_request(ctx: "Optional[Context]"):
 
 def _prune_login_state(now: Optional[float] = None) -> None:
     now = now or time.time()
-    for k in [k for k, (_, exp) in _LOGIN_CODES.items() if exp <= now]:
+    # exp < now (не <=) — persistent-коды с exp == float('inf') никогда не истекают.
+    for k in [k for k, (_, exp) in _LOGIN_CODES.items() if exp < now]:
         _LOGIN_CODES.pop(k, None)
     for k in [k for k, (_, exp) in _HTTP_SESSIONS.items() if exp <= now]:
         _HTTP_SESSIONS.pop(k, None)
@@ -152,22 +166,71 @@ def _prune_login_state(now: Optional[float] = None) -> None:
         oldest = sorted(_HTTP_SESSIONS.items(), key=lambda kv: kv[1][1])
         for k, _ in oldest[: len(_HTTP_SESSIONS) - _HTTP_SESSIONS_MAX]:
             _HTTP_SESSIONS.pop(k, None)
+    # NEW: чистим IP-индекс по TTL и по размеру
+    for k in [k for k, (_, exp) in _HTTP_IP_SESSIONS.items() if exp <= now]:
+        _HTTP_IP_SESSIONS.pop(k, None)
+    if len(_HTTP_IP_SESSIONS) > _HTTP_IP_SESSIONS_MAX:
+        oldest = sorted(_HTTP_IP_SESSIONS.items(), key=lambda kv: kv[1][1])
+        for k, _ in oldest[: len(_HTTP_IP_SESSIONS) - _HTTP_IP_SESSIONS_MAX]:
+            _HTTP_IP_SESSIONS.pop(k, None)
     for ip in list(_LOGIN_FAILS):
         _LOGIN_FAILS[ip] = [t for t in _LOGIN_FAILS[ip] if now - t < _LOGIN_FAIL_WINDOW]
         if not _LOGIN_FAILS[ip]:
             _LOGIN_FAILS.pop(ip, None)
 
 
-def issue_login_code(user_id: str) -> str:
-    """Выдаёт одноразовый код входа для внешнего ИИ. Вызывается из веб-роута
-    /ai/mcp_code за require_auth. Прежние коды этого пользователя аннулируются."""
+def issue_login_code(user_id: str, persistent: bool = True) -> str:
+    """Выдаёт код входа для внешнего ИИ. Прежние коды этого пользователя аннулируются.
+
+    persistent=True (по умолчанию) — код действует бессрочно, пока не будет
+    явно отозван через revoke_login_code() (кнопка «Отозвать» в профиле).
+    persistent=False — legacy one-time код с TTL _LOGIN_CODE_TTL.
+    """
     uid = _canon_user_id(user_id) or user_id.strip().lower()
     _prune_login_state()
     for k in [k for k, (u, _) in _LOGIN_CODES.items() if u == uid]:
         _LOGIN_CODES.pop(k, None)
-    code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(8))
-    _LOGIN_CODES[code] = (uid, time.time() + _LOGIN_CODE_TTL)
+    code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
+    expires = _CODE_PERSISTENT if persistent else time.time() + _LOGIN_CODE_TTL
+    _LOGIN_CODES[code] = (uid, expires)
+    logger.info(f"[auth] issue код для {uid[:16]}… (persistent={persistent})")
     return code
+
+
+def get_login_code_for_user(user_id: str) -> Optional[Tuple[str, float]]:
+    """Возвращает (code, expires_at) текущий активный код пользователя или None."""
+    uid = _canon_user_id(user_id) or user_id.strip().lower()
+    _prune_login_state()
+    for code, (u, exp) in _LOGIN_CODES.items():
+        if u == uid:
+            return code, exp
+    return None
+
+
+def revoke_login_code(user_id: str) -> Dict[str, int]:
+    """Отзывает все коды пользователя + сбрасывает все его активные сессии.
+
+    Без сброса сессий отзыв кода был бы фиктивным: внешний ИИ, уже вошедший
+    по этому коду, продолжил бы читать память через свой mcp-session-id /
+    IP-привязку. Поэтому отзыв кода = немедленный разлогин всех клиентов
+    этого пользователя.
+    """
+    uid = _canon_user_id(user_id) or user_id.strip().lower()
+    _prune_login_state()
+    codes_removed = [k for k, (u, _) in _LOGIN_CODES.items() if u == uid]
+    for k in codes_removed:
+        _LOGIN_CODES.pop(k, None)
+    sids_removed = [s for s, (u, _) in _HTTP_SESSIONS.items() if u == uid]
+    for s in sids_removed:
+        _HTTP_SESSIONS.pop(s, None)
+    ips_removed = [i for i, (u, _) in _HTTP_IP_SESSIONS.items() if u == uid]
+    for i in ips_removed:
+        _HTTP_IP_SESSIONS.pop(i, None)
+    logger.info(
+        f"[auth] revoke для {uid[:16]}…: codes={len(codes_removed)}, "
+        f"sids={len(sids_removed)}, ips={len(ips_removed)}"
+    )
+    return {"codes": len(codes_removed), "sessions": len(sids_removed)}
 
 
 def _user_from_ctx(ctx: "Optional[Context]") -> "Optional[str]":
@@ -175,7 +238,10 @@ def _user_from_ctx(ctx: "Optional[Context]") -> "Optional[str]":
 
     Источники (в порядке приоритета):
       1) X-User-Id — только при MCP_TRUST_X_USER_ID=1 (по умолчанию выкл.);
-      2) привязка mcp-session-id -> user_id, созданная login(code).
+      2) привязка mcp-session-id -> user_id, созданная login(code);
+      3) NEW: привязка ip -> user_id (fallback, если клиент не шлёт стабильный
+         mcp-session-id между вызовами — типично для облачных MCP-клиентов).
+
     Для stdio (нет HTTP-запроса) возвращает None.
     """
     req = _http_request(ctx)
@@ -186,6 +252,7 @@ def _user_from_ctx(ctx: "Optional[Context]") -> "Optional[str]":
             uid = req.headers.get("x-user-id")
             if uid and uid.strip():
                 return uid.strip()
+
         sid = req.headers.get("mcp-session-id")
         if sid:
             entry = _HTTP_SESSIONS.get(sid)
@@ -194,8 +261,25 @@ def _user_from_ctx(ctx: "Optional[Context]") -> "Optional[str]":
                 if exp > time.time():
                     return uid
                 _HTTP_SESSIONS.pop(sid, None)
-    except Exception:
-        pass
+            logger.info(
+                f"[auth] sid={sid[:8]!r} не найден в _HTTP_SESSIONS "
+                f"(known={len(_HTTP_SESSIONS)}) — пробую IP-fallback"
+            )
+
+        # NEW: IP-fallback
+        ip = req.headers.get("x-real-ip") or (
+            req.client.host if getattr(req, "client", None) else None
+        )
+        if ip:
+            entry = _HTTP_IP_SESSIONS.get(ip)
+            if entry:
+                uid, exp = entry
+                if exp > time.time():
+                    logger.info(f"[auth] IP-fallback сработал: ip={ip} uid={uid[:16]}…")
+                    return uid
+                _HTTP_IP_SESSIONS.pop(ip, None)
+    except Exception as e:
+        logger.warning(f"[auth] _user_from_ctx error: {e}")
     return None
 
 
@@ -424,14 +508,25 @@ async def login(
         return {"status": "error", "message": "Слишком много неверных кодов. Повторите через 10 минут."}
 
     normalized = (code or "").strip().upper().replace("-", "").replace(" ", "")
-    entry = _LOGIN_CODES.pop(normalized, None)
-    if not entry or entry[1] <= now:
+    # .get, а не .pop: persistent-код не потребляем — им можно войти много раз.
+    entry = _LOGIN_CODES.get(normalized)
+    if not entry or entry[1] < now:  # < now, не <=: inf-код никогда не истекает
         _LOGIN_FAILS.setdefault(ip, []).append(now)
-        return {"status": "error", "message": "Код неверный или истёк. Получите новый в Профиле."}
+        return {"status": "error", "message": "Код неверный или отозван. Получите новый в Профиле."}
 
-    uid = entry[0]
+    uid, exp = entry
+    # Legacy-код с TTL потребляем (одноразовый). Persistent оставляем в словаре.
+    if exp != _CODE_PERSISTENT:
+        _LOGIN_CODES.pop(normalized, None)
     _HTTP_SESSIONS[sid] = (uid, now + _HTTP_SESSION_TTL)
-    logger.info(f"[login] MCP-сессия {sid[:8]}… привязана к {uid[:16]}…")
+    # NEW: пишем и IP-индекс — резервный путь для клиентов, которые меняют
+    # mcp-session-id между вызовами. Переменная ip уже посчитана выше в login.
+    if ip and ip != "?":
+        _HTTP_IP_SESSIONS[ip] = (uid, now + _HTTP_SESSION_TTL)
+    logger.info(
+        f"[login] MCP-сессия {sid[:8]}… привязана к {uid[:16]}… "
+        f"(ip={ip}, ip_sessions={len(_HTTP_IP_SESSIONS)})"
+    )
     return {"status": "ok", "user_id": uid,
             "message": "Вход выполнен. Дальше user_id передавать не нужно."}
 
@@ -443,6 +538,13 @@ async def logout(ctx: Context = None) -> Dict[str, Any]:
     sid = req.headers.get("mcp-session-id") if req is not None else None
     if sid:
         _HTTP_SESSIONS.pop(sid, None)
+    # NEW: чистим и IP-индекс, иначе после logout старый IP останется валидным
+    if req is not None:
+        ip = req.headers.get("x-real-ip") or (
+            req.client.host if getattr(req, "client", None) else None
+        )
+        if ip:
+            _HTTP_IP_SESSIONS.pop(ip, None)
     return {"status": "ok"}
 
 
