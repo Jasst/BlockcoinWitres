@@ -3220,10 +3220,30 @@ async def enhance_prompt_endpoint(body: EnhanceRequest, address: str = Depends(r
 
 @router.post("/mcp_code")
 async def create_mcp_login_code(address: str = Depends(require_auth)):
-    """Одноразовый код (10 минут), которым внешний ИИ входит в ПАМЯТЬ ЭТОГО кошелька:
-    скажите ИИ «войди с кодом …» — он вызовет MCP-инструмент login(code)."""
-    from mcp_server_blockcoin import issue_login_code
-    return {"code": issue_login_code(address), "expires_in": 600}
+    """Создаёт новый бессрочный код доступа (аннулирует прежний код пользователя
+    и все его активные MCP-сессии). Скажите внешнему ИИ: «войди с кодом …»."""
+    from mcp_server_blockcoin import issue_login_code, revoke_login_code
+    revoke_login_code(address)  # чистим старый код и сессии, чтобы не плодить
+    code = issue_login_code(address, persistent=True)
+    return {"code": code, "persistent": True}
+
+
+@router.get("/mcp_code")
+async def get_mcp_login_code(address: str = Depends(require_auth)):
+    """Возвращает текущий активный код пользователя (для отображения в профиле)."""
+    from mcp_server_blockcoin import get_login_code_for_user
+    result = get_login_code_for_user(address)
+    if result is None:
+        return {"code": None}
+    code, _ = result
+    return {"code": code, "persistent": True}
+
+
+@router.delete("/mcp_code")
+async def revoke_mcp_login_code(address: str = Depends(require_auth)):
+    """Отзывает код доступа пользователя и разлогинивает все его MCP-сессии."""
+    from mcp_server_blockcoin import revoke_login_code
+    return {"revoked": revoke_login_code(address)}
 
 
 @router.get("/notifications/poll")
