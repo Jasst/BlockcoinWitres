@@ -2301,3 +2301,720 @@ class GCNMemoryRouter:
             logger.info(
                 f"[ConceptFormation] scope={scope.value}: обработано {len(formed)} концептов (создано/обновлено)")
         return formed
+
+# ============================================================
+# MEMORY SERVICE — было GCN/memory_service.py
+# ============================================================
+_META_ABOUT_SYSTEM_MARKERS = (
+    "пользователь не может", "у пользователя нет", "пользователю недоступно",
+    "ассистент не может", "у ассистента нет", "ассистенту недоступно",
+    "у тебя нет", "ты не можешь", "ты не умеешь",
+    "модель не может", "модель не умеет",
+    "внутренний механизм", "внутреннего механизма",
+    "система не может", "система не умеет",
+)
+
+# Копия списка из GCN/intellect.py (_OPINION_MARKERS). Импортировать
+# приватное имя из соседнего модуля некрасиво; при желании — вынести
+# в общий helper-модуль.
+_OPINION_MARKERS = (
+    "возможно", "наверное", "вероятно", "по словам", "считает", "считают",
+    "мнение", "полагают", "как сообщает", "утверждает", "утверждают",
+    "прогноз", "ожидается", "может вырасти", "может упасть", "по оценкам",
+    "эксперты полагают", "как полагают",
+)
+
+_FACT_VERB_RE = re.compile(
+    r"\b(является|составляет|равен|равна|находится|имеет|имеют|был|была|было|"
+    r"стал|стала|выпущен|выпущена|основан|основана|родился|открыт|запущен|"
+    r"зовут|называется|живёт|живет|живу|работает|работаю|учится|учусь|"
+    r"любит|люблю|предпочитает|предпочитаю)\b"
+)
+
+def _is_storable_fact(text: str) -> Tuple[bool, str]:
+    """
+    Возвращает (True, "") если text — факт о мире, пригодный для хранения
+    в долговременной памяти. Иначе — (False, reason).
+    """
+    if not text or len(text.strip()) < 10:
+        return False, "too_short"
+    low = text.lower()
+    if any(m in low for m in _META_ABOUT_SYSTEM_MARKERS):
+        return False, "meta_statement"
+    if any(m in low for m in _OPINION_MARKERS):
+        return False, "opinion_marker"
+    # Фактологичность: число/дата/факт-глагол. Если ничего из этого — это
+    # скорее оценка или общая фраза, не знание.
+    if not (re.search(r"\b\d", text) or _FACT_VERB_RE.search(text)):
+        return False, "not_factual"
+    return True, ""
+
+logger = logging.getLogger(__name__)
+
+# Веса слоёв для semantic_search — зеркалят логику GCNMemoryRouter.retrieve
+_SCOPE_WEIGHTS = {"private": 1.2, "shared": 1.0, "global": 0.9}
+
+
+
+
+class MemoryService:
+    """
+    Единый интерфейс для операций с памятью:
+    - recall (поиск)
+    - remember (сохранение)
+    - forget (удаление)
+    - add_goal, get_goals
+    - semantic_search, graph_explore
+    - get_contradictions, resolve_contradiction
+    - explain_fact, get_memory_stats
+    - управление эпизодами (add_episode, get_episodes)
+    """
+
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        self.router = GCNMemoryRouter(user_id, MEMORY_BASE_DIR)
+        self.router.set_llm_caller(call_llm)
+        self.private_memory = self.router.private_memory
+        self.shared_memory = self.router.shared_memory
+        self.global_memory = self.router.global_memory
+
+    def refresh(self):
+        """Подтягивает изменения, сделанные другими процессами."""
+        self.router.refresh(include_private=True)
+
+    async def recall(self, query: str, top_k: int = 5, scope: Optional[str] = None,
+                     subqueries: Optional[List[str]] = None) -> List[Dict]:
+        """
+        Поиск по всем слоям с опциональным фильтром по скоупу.
+        ИНТЕЛЛЕКТ-ПАКЕТ (C): subqueries — декомпозиция составного запроса,
+        пробрасывается в router.retrieve.
+        Возвращает список фактов с метаданными.
+        """
+        self.refresh()
+        results = await self.router.retrieve(query, top_k=top_k * 2, include_private=True,
+                                             subqueries=subqueries)
+        if scope:
+            scope_lower = scope.lower()
+            results = [r for r in results if r.get('scope') == scope_lower]
+        return results[:top_k]
+
+    async def remember(
+            self,
+            fact: str,
+            scope: Optional[str] = None,
+            confidence: float = 0.9,
+            force_new: bool = False,
+            user_explicit: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Сохраняет факт в указанный скоуп (автоопределение, если scope не задан).
+        Возвращает id и скоуп.
+
+        ИСПРАВЛЕНИЕ #3: проверка дублей перед созданием нового факта.
+
+        force_new=True — обходит дедупликацию и фильтр фактологичности и
+        гарантированно создаёт новую запись с новым gcn_id даже при наличии
+        семантически близких фактов. Используется внутри update_fact(), чтобы
+        «удалить старый + создать новый» работало корректно без ложного
+        слияния с другим существующим фактом, и в remember_with_handshake,
+        где контроль качества уже выполнен вызывающим кодом.
+
+        user_explicit=True — вызывающий код уже знает, что это осознанный
+        запрос на сохранение (команда «запомни ...» в чате, MCP-инструмент
+        remember от внешнего клиента). Фильтр _is_storable_fact НЕ применяется:
+        отсекать простые пользовательские факты без цифр/факт-глаголов
+        («мой любимый цвет синий», «меня зовут Иван») — это ложная экономия,
+        которая молча ломает ожидание пользователя. Санитайзер из intellect
+        по-прежнему прогоняет факты из web-поиска/автоизвлечения — там
+        user_explicit остаётся False (дефолт), и фильтр работает.
+        """
+        self.refresh()
+
+        # ── Фильтр фактологичности ─────────────────────────────────────────
+        # Пропускается при force_new (осознанная замена) и user_explicit
+        # (осознанное «запомни» от пользователя/MCP-клиента).
+        if not force_new and not user_explicit:
+            ok, reason = _is_storable_fact(fact)
+            if not ok:
+                logger.info(f"[remember] отклонён нефакт ({reason}): {fact[:120]!r}")
+                return {
+                    "status": "rejected",
+                    "action": "rejected",
+                    "reason": reason,
+                    "requested_fact": fact,
+                }
+
+        # ── ИСПРАВЛЕНИЕ #3: проверка дубля (пропускаем если force_new=True) ──
+        if not force_new:
+            DEDUP_THRESHOLD = 0.88  # косинусное сходство
+            existing = await self.recall(fact, top_k=3, scope=scope)
+            for ex in existing:
+                if ex.get("score", 0) >= DEDUP_THRESHOLD:
+                    ex_id = ex.get("gcn_id") or ex.get("id")
+                    logger.info(f"[remember] дубль обнаружен (score={ex['score']:.2f}), "
+                                f"обновляю confidence вместо создания нового факта")
+                    # Повысить confidence существующего факта
+                    if ex_id:
+                        try:
+                            scope_name = ex.get("scope", "private")
+                            memory_layer = {
+                                "private": self.router.private_memory,
+                                "shared": self.router.shared_memory,
+                                "global": self.router.global_memory,
+                            }.get(scope_name, self.router.private_memory)
+
+                            ko = memory_layer.store.get(ex_id)
+                            if ko:
+                                new_confidence = min(1.0, max(ko.confidence, confidence))
+                                memory_layer.store.update(
+                                    ex_id,
+                                    {"confidence": new_confidence},
+                                    actor=self.user_id
+                                )
+                        except Exception as e:
+                            logger.debug(f"[remember] не удалось обновить дубль {ex_id}: {e}")
+                    return {
+                        "id": ex_id,
+                        "scope": ex.get("scope", "private"),
+                        "action": "deduplicated",
+                        "stored_fact": ex.get("text", fact),    # что реально хранится
+                        "requested_fact": fact,                  # что хотел пользователь
+                        "similarity": ex["score"],
+                    }
+        # ── конец проверки дубля ─────────────────────────────────────────────
+
+        if scope is None:
+            # Автодетекция scope: GLOBAL если есть ключевые слова, иначе PRIVATE
+            # SHARED недостижим через автодетекцию — требует явного указания
+            fact_lower = fact.lower()
+            if "глобально" in fact_lower or "global" in fact_lower:
+                scope_enum = MemoryScope.GLOBAL
+            elif "shared" in fact_lower or "общий" in fact_lower or "команд" in fact_lower:
+                scope_enum = MemoryScope.SHARED
+            else:
+                scope_enum = MemoryScope.PRIVATE
+        else:
+            scope_map = {"private": MemoryScope.PRIVATE, "shared": MemoryScope.SHARED, "global": MemoryScope.GLOBAL}
+            scope_enum = scope_map.get(scope.lower(), MemoryScope.PRIVATE)
+
+        # Улучшаем факт через LLM (как в чате)
+        enhanced = await self._enhance_fact(fact)
+        obj_id = self.router.add_knowledge(
+            subject=enhanced,
+            predicate="is_fact",
+            obj="true",
+            scope=scope_enum,
+            confidence=confidence,
+            author=self.user_id,
+            source_type="memory_service"
+        )
+        # Добавляем в рабочую память соответствующего слоя
+        if obj_id:
+            scope_memory = {
+                MemoryScope.GLOBAL: self.global_memory,
+                MemoryScope.SHARED: self.shared_memory,
+                MemoryScope.PRIVATE: self.private_memory,
+            }[scope_enum]
+            scope_memory.hierarchy.add_to_working(obj_id)
+
+        # Сохраняем соответствующий слой
+        await self._save_scope(scope_enum)
+        return {"id": obj_id, "scope": scope_enum.value, "fact": enhanced}
+
+    async def _enhance_fact(self, fact: str) -> str:
+        """Улучшает формулировку факта через LLM (как в ai_assistant)."""
+        try:
+            prompt = (
+                "Если факт структурирован и содержит достаточно информации по теме, запомни как есть, полный текст. "
+                "Иначе извлеки из запроса пользователя объективный факт (утверждение, которое может быть проверено или использовано как знание). "
+                "Игнорируй мнения, временные события, эмоции, инструкции и пожелания. "
+                "Сформулируй факт как краткое предложение в настоящем времени (или прошедшем, если это не теряет актуальности). "
+                "Ответь только фактом, без пояснений. Или полным текстом, если факт структурирован.\n\n"
+                f"Запрос: {fact}"
+            )
+            enhanced = await call_llm([{"role": "user", "content": prompt}], temp=0.3, max_tokens=150)
+            enhanced = enhanced.strip()
+            if len(enhanced) < 5:
+                enhanced = fact
+            return enhanced
+        except Exception:
+            return fact
+
+    async def _save_scope(self, scope: MemoryScope):
+        if scope == MemoryScope.GLOBAL:
+            await self.global_memory._schedule_save()
+        elif scope == MemoryScope.SHARED:
+            await self.shared_memory._schedule_save()
+        else:
+            await self.private_memory._schedule_save()
+
+    async def forget(self, query: str, scope: str = "private", dry_run: bool = True) -> Dict[str, Any]:
+        """
+        Удаляет факты, содержащие query, из указанного слоя.
+        Если dry_run=True – только возвращает кандидаты.
+
+        ИСПРАВЛЕНИЕ: если query выглядит как gcn_id (начинается с 'fct_'),
+        удаляем строго по ID, а не по подстроке текста.
+        """
+        self.refresh()
+        scope_map = {
+            "private": self.private_memory,
+            "shared": self.shared_memory,
+            "global": self.global_memory,
+        }
+        memory = scope_map.get(scope.lower())
+        if memory is None:
+            return {"status": "error", "message": f"Неизвестный scope: {scope}"}
+        memory.reload_if_stale()
+
+        # ИСПРАВЛЕНИЕ: удаление по gcn_id вместо поиска по подстроке
+        # Поддерживаем все форматы ID: fct_, concept_, goal_, episode_
+        is_gcn_id = any(query.startswith(p) for p in ("fact_", "fct_", "concept_", "goal_", "episode_"))
+        if is_gcn_id:
+            ko = memory.store.get(query)
+            if not ko:
+                return {"status": "ok", "removed": 0, "scope": scope.lower(), "message": "Факт не найден."}
+            if dry_run:
+                return {
+                    "status": "dry_run",
+                    "would_remove": 1,
+                    "scope": scope.lower(),
+                    # ИСПРАВЛЕНИЕ: у KnowledgeObject нет поля .text — оно называется
+                    # .subject (см. GCN/GCN.py:KnowledgeObject). Раньше forget(gcn_id,
+                    # dry_run=True) — а это ДЕФОЛТ MCP-инструмента forget — падал с
+                    # AttributeError сразу при попытке показать кандидата. В non-ID
+                    # ветке ниже используется f.text[:200], там f — локальный
+                    # memory_graph.Fact, у него поле .text действительно есть;
+                    # здесь же ko — это KnowledgeObject из GCN, и .text у него нет.
+                    "candidates": [{"id": ko.id, "text": ko.subject[:200]}],
+                    "message": "Ничего не удалено. Повторите вызов с dry_run=False, чтобы удалить этот факт.",
+                }
+            memory.store.retract(query, self.user_id, reason="forget_by_id")
+            await memory._schedule_save()
+            return {"status": "ok", "removed": 1, "scope": scope.lower()}
+
+        # Старое поведение: поиск по подстроке текста
+        to_remove = [f for f in memory.semantic_facts if query.lower() in f.text.lower()]
+        if not to_remove:
+            return {"status": "ok", "removed": 0, "scope": scope.lower(), "message": "Ничего не найдено."}
+
+        if dry_run:
+            return {
+                "status": "dry_run",
+                "would_remove": len(to_remove),
+                "scope": scope.lower(),
+                "candidates": [{"id": f.id, "text": f.text[:200]} for f in to_remove[:20]],
+                "message": "Ничего не удалено. Повторите вызов с dry_run=False, чтобы удалить эти факты.",
+            }
+
+        removed = memory._remove_facts({f.id for f in to_remove})
+        await memory._schedule_save()
+        return {"status": "ok", "removed": removed, "scope": scope.lower()}
+
+    async def add_goal(self, description: str, priority: float = 0.5,
+                        force_new: bool = False) -> Dict[str, Any]:
+        self.refresh()
+        gid = await self.private_memory.add_goal(description, priority, force_new=force_new)
+        return {"id": gid, "description": description, "priority": priority}
+
+    async def get_goals(self) -> List[Dict]:
+        self.refresh()
+        goals = await self.private_memory.get_active_goals()
+        return [
+            {"id": g.id, "gcn_id": g.gcn_id,
+             "description": g.description, "priority": g.priority, "confidence": g.confidence, "status": g.status}
+            for g in goals
+        ]
+
+    async def update_goal(self, goal_id: int, **kwargs) -> Dict[str, Any]:
+        """Обновляет поля цели (priority, status, confidence, progress, deadline)."""
+        self.refresh()
+        before = {g.id: (g.status, g.priority) for g in self.private_memory.goals}
+        if goal_id not in before:
+            return {"status": "error", "message": f"Цель id={goal_id} не найдена."}
+        await self.private_memory.update_goal(goal_id, **kwargs)
+        after = {g.id: (g.status, g.priority) for g in self.private_memory.goals}
+        g = next((x for x in self.private_memory.goals if x.id == goal_id), None)
+        return {
+            "status": "ok",
+            "changed": before.get(goal_id) != after.get(goal_id),
+            "goal": None if g is None else {
+                "id": g.id, "gcn_id": g.gcn_id, "description": g.description,
+                "priority": g.priority, "confidence": g.confidence, "status": g.status,
+            },
+        }
+
+    async def delete_goal(self, goal_id: Optional[int] = None,
+                          gcn_id: Optional[str] = None,
+                          reason: str = "") -> Dict[str, Any]:
+        """Удаляет цель полностью (retract в GCN + удаление из локального кэша).
+
+        Принимает либо числовой id цели (из get_goals), либо gcn_id.
+        Для мягкого закрытия вместо удаления используйте
+        update_goal(goal_id, status='completed').
+        """
+        self.refresh()
+        memory = self.private_memory
+        goal = None
+        if goal_id is not None:
+            goal = next((g for g in memory.goals if g.id == goal_id), None)
+        elif gcn_id:
+            goal = next((g for g in memory.goals if g.gcn_id == gcn_id), None)
+        else:
+            return {"status": "error", "message": "Укажите goal_id или gcn_id."}
+        if goal is None:
+            return {"status": "error", "message": "Цель не найдена."}
+
+        retracted = True
+        if goal.gcn_id:
+            try:
+                retracted = memory.gcn_store.retract(
+                    goal.gcn_id, memory.user_id, reason=reason or "delete_goal")
+            except Exception as e:
+                return {"status": "error", "message": f"retract в GCN не удался: {e}"}
+        if not retracted:
+            return {"status": "error", "message": f"Объект {goal.gcn_id} не найден в GCN."}
+
+        memory.goals = [g for g in memory.goals if g.id != goal.id]
+        memory._dirty = True
+        await memory._schedule_save()
+        return {"status": "ok", "removed": 1,
+                "goal_id": goal.id, "gcn_id": goal.gcn_id,
+                "description": goal.description[:200]}
+
+    async def push_notification(self, text: str, source: str, importance: float = 0.5) -> str:
+        """
+        Ставит проактивное сообщение в очередь пользователя — то, что
+        фоновый цикл (авто-исследование, рефлексия) решил сам донести, не
+        дожидаясь вопроса. Всегда личное (private) — уведомления не
+        расшариваются между пользователями.
+        """
+        self.refresh()
+        return await self.private_memory.push_notification(text, source, importance=importance)
+
+    async def get_pending_notifications(self, mark_delivered: bool = True) -> List[Dict]:
+        """
+        Недоставленные проактивные сообщения пользователя. Вызывается и из
+        основного чата (polling-эндпоинт), и из MCP-сервера
+        (get_notifications) — оба процесса смотрят в один и тот же
+        GCN-стор, поэтому находка одного видна другому.
+        """
+        self.refresh()
+        return await self.private_memory.get_pending_notifications(mark_delivered=mark_delivered)
+
+    async def semantic_search(self, query: str, top_k: int = 5,
+                              scope: Optional[str] = None) -> List[Dict]:
+        """
+        Векторный поиск по смыслу.
+
+        ИЗМЕНЕНИЕ: раньше искал только по приватному слою. Теперь — по всем
+        трём (private/shared/global) с scope-весами как в retrieve():
+          private ×1.2, shared ×1.0, global ×0.9
+        Результаты дедуплицируются по тексту, сортируются по взвешенному
+        скору, найденное помечается record_access (как в router.retrieve).
+
+        Аргументы:
+            query — поисковый запрос;
+            top_k — число результатов после слияния слоёв;
+            scope — опциональный фильтр 'private'|'shared'|'global'
+                    (по умолчанию None — поиск по всем слоям).
+
+        Возвращает список dict: text, score, raw_score, scope, gcn_id,
+        confidence.
+        """
+        self.refresh()
+        memory = self.private_memory
+        if not memory.use_embeddings or memory.embedder is None:
+            return []
+        emb = memory.embed_text(query, is_query=True)
+        if emb is None:
+            return []
+
+        # Какие слои сканируем
+        layers = [
+            ("private", self.private_memory),
+            ("shared", self.shared_memory),
+            ("global", self.global_memory),
+        ]
+        if scope:
+            scope_l = scope.lower()
+            layers = [(s, m) for s, m in layers if s == scope_l]
+            if not layers:
+                return []
+
+        merged: List[Dict] = []
+        seen_texts: set = set()
+        for scope_name, mem in layers:
+            try:
+                results = mem.store.semantic_search(emb, top_k=top_k * 2)
+            except Exception as e:
+                logger.debug(f"semantic_search: слой {scope_name} недоступен: {e}")
+                continue
+            for gcn_id, raw_score in results:
+                obj = mem.store.get(gcn_id)
+                if obj is None or not getattr(obj, "subject", ""):
+                    continue
+                text = obj.subject
+                key = text.strip().lower()
+                if key in seen_texts:
+                    continue
+                seen_texts.add(key)
+                weight = _SCOPE_WEIGHTS.get(scope_name, 1.0)
+                merged.append({
+                    "text": text,
+                    "score": min(1.0, max(0.0, raw_score) * weight),
+                    "raw_score": raw_score,
+                    "scope": scope_name,
+                    "gcn_id": gcn_id,
+                    "confidence": obj.confidence,
+                })
+
+        merged.sort(key=lambda x: x["score"], reverse=True)
+        final = merged[:top_k]
+
+        # Помечаем как использованные (свежесть/затухание работают корректно)
+        scope_map = {
+            "private": self.private_memory,
+            "shared": self.shared_memory,
+            "global": self.global_memory,
+        }
+        for item in final:
+            mem = scope_map.get(item["scope"])
+            if mem is not None and item.get("gcn_id"):
+                try:
+                    mem.store.record_access(item["gcn_id"], self.user_id)
+                except Exception as e:
+                    logger.debug(f"record_access failed for {item['gcn_id']}: {e}")
+        return final
+
+    async def graph_explore(self, seed_text: str, depth: int = 2) -> Dict[str, Any]:
+        self.refresh()
+        memory = self.private_memory
+        seed_ids = [f.id for f in memory.semantic_facts if seed_text.lower() in f.text.lower()]
+        if not seed_ids:
+            return {"error": f"Факты с '{seed_text}' не найдены."}
+        activation = await memory.spread_activation(seed_ids[:3], max_depth=min(depth, 3))
+        sorted_items = sorted(activation.items(), key=lambda x: x[1], reverse=True)
+        return {
+            "nodes": [
+                {"id": fid, "text": memory.facts_by_id.get(fid).text[:200] if memory.facts_by_id.get(fid) else "",
+                 "activation": act}
+                for fid, act in sorted_items[:20] if fid not in seed_ids
+            ]
+        }
+
+    async def explain_fact(self, gcn_id: str) -> Dict[str, Any]:
+        self.refresh()
+        obj = (self.private_memory.store.get(gcn_id) or
+               self.shared_memory.store.get(gcn_id) or
+               self.global_memory.store.get(gcn_id))
+        if not obj:
+            return {"error": f"Объект {gcn_id} не найден ни в одном слое памяти."}
+
+        store = (self.private_memory.store if self.private_memory.store.get(gcn_id) else
+                 self.shared_memory.store if self.shared_memory.store.get(gcn_id) else
+                 self.global_memory.store)
+
+        contradictions = store._graph.get_neighbors(gcn_id, "CONTRADICTS")
+        grounds_in = store._graph.get_neighbors(gcn_id, "GROUNDS_IN")
+        abstracts_from = store._graph.get_neighbors(gcn_id, "ABSTRACTS_FROM")
+        confirming_authors = [e.split("author:", 1)[1] for e in obj.evidence if e.startswith("author:")]
+
+        return {
+            "id": obj.id,
+            "type": obj.type.value,
+            "scope": obj.scope.value,
+            "text": obj.subject,
+            "confidence": obj.confidence,
+            "version": obj.version,
+            "author": obj.author,
+            "source_type": obj.source_type,
+            "created": obj.created.isoformat(),
+            "confirming_authors": confirming_authors,
+            "contradicts": [target for _, target in contradictions],
+            "grounds_in_global": [target for _, target in grounds_in],
+            "abstracted_from": [target for _, target in abstracts_from],
+        }
+
+    async def get_contradictions(self, limit: int = 5) -> List[Tuple[Dict, Dict]]:
+        self.refresh()
+        memory = self.private_memory
+        pairs = memory.get_unverified_contradictions(limit=limit)
+        return [
+            (
+                {"id": a.id, "text": a.text, "confidence": a.confidence},
+                {"id": b.id, "text": b.text, "confidence": b.confidence}
+            )
+            for a, b in pairs
+        ]
+
+    async def resolve_contradiction(self, fact_id_a: str, fact_id_b: str, verdict: str,
+                                    reason: str = "") -> Dict[str, Any]:
+        self.refresh()
+        memory = self.private_memory
+
+        def find_fact(fid):
+            if fid in memory.facts_by_id:
+                return memory.facts_by_id[fid]
+            for f in memory.semantic_facts:
+                if f.gcn_id == fid:
+                    return f
+            return None
+
+        fa = find_fact(fact_id_a)
+        fb = find_fact(fact_id_b)
+        if not fa or not fb:
+            return {"status": "error", "message": f"Факты не найдены: A={fact_id_a}, B={fact_id_b}"}
+
+        v = verdict.lower()
+        if v == "a":
+            memory._remove_facts({fb.id})
+            memory.gcn_store._graph.remove_relation(fa.gcn_id, "CONTRADICTS", fb.gcn_id)
+            memory.gcn_store._graph.remove_relation(fb.gcn_id, "CONTRADICTS", fa.gcn_id)
+            fa.contradicts.discard(fb.id)
+            fb.contradicts.discard(fa.id)
+            await memory._schedule_save()
+            return {"status": "ok", "verdict": "a", "kept": fa.text, "removed": fb.text}
+        elif v == "b":
+            memory._remove_facts({fa.id})
+            memory.gcn_store._graph.remove_relation(fa.gcn_id, "CONTRADICTS", fb.gcn_id)
+            memory.gcn_store._graph.remove_relation(fb.gcn_id, "CONTRADICTS", fa.gcn_id)
+            fa.contradicts.discard(fb.id)
+            fb.contradicts.discard(fa.id)
+            await memory._schedule_save()
+            return {"status": "ok", "verdict": "b", "kept": fb.text, "removed": fa.text}
+        elif v == "both":
+            memory.gcn_store._graph.remove_relation(fa.gcn_id, "CONTRADICTS", fb.gcn_id)
+            memory.gcn_store._graph.remove_relation(fb.gcn_id, "CONTRADICTS", fa.gcn_id)
+            fa.contradicts.discard(fb.id)
+            fb.contradicts.discard(fa.id)
+            await memory._schedule_save()
+            return {"status": "ok", "verdict": "both", "message": "Противоречие снято, оба сохранены."}
+        elif v == "neither":
+            memory._remove_facts({fa.id, fb.id})
+            await memory._schedule_save()
+            return {"status": "ok", "verdict": "neither", "message": "Оба удалены."}
+        else:
+            return {"status": "error", "message": f"Неизвестный вердикт: {verdict}"}
+
+    async def get_memory_stats(self) -> Dict:
+        self.refresh()
+        return self.private_memory.get_stats()
+
+    async def get_episodes(self, limit: int = 5) -> List[Dict]:
+        self.refresh()
+        episodes = self.private_memory.episodic_memory[-limit:] if self.private_memory.episodic_memory else []
+        return [
+            {"user": ep.user_msg, "assistant": ep.assistant_msg, "timestamp": ep.timestamp}
+            for ep in reversed(episodes)
+        ]
+
+    # ===== ДОБАВЛЕННЫЙ МЕТОД =====
+    async def add_episode(self, user_msg: str, assistant_msg: str, salience: float = 0.0):
+        """
+        Сохраняет эпизод (диалог) в личную память пользователя.
+        """
+        self.refresh()
+        await self.private_memory.add_episode(user_msg, assistant_msg, salience)
+
+    async def shutdown(self):
+        """
+        ИСПРАВЛЕНИЕ: раньше shutdown() одного пользователя закрывал private_memory
+        И shared_memory И global_memory. Но shared/global — это ПРОЦЕСС-ШИРОКИЕ
+        синглтоны (GCNMemoryRouter._get_shared_memory/_get_global_memory), общие
+        для всех пользователей, а не что-то принадлежащее этому MemoryService.
+        ai_assistant.py вызывает CognitiveController.shutdown() (который вызывает
+        этот метод) при обычной выгрузке простаивающего пользователя из LRU-кэша
+        (_evict_stale_assistants, по умолчанию раз в час простоя, или при
+        превышении лимита одновременных пользователей) — то есть в штатном
+        режиме, а не только при остановке процесса. Каждая такая выгрузка
+        отменяла фоновую _save_task и форсировала полное пересохранение
+        (включая перестройку FAISS-индекса) ОБЩЕЙ памяти для ВСЕХ пользователей
+        — просто потому, что один конкретный пользователь давно не писал в чат.
+        Теперь per-user shutdown трогает только private_memory. shared/global
+        должны закрываться ровно один раз, при остановке всего процесса — см.
+        shutdown_shared_global().
+        """
+        await self.private_memory.shutdown()
+
+    @staticmethod
+    async def shutdown_shared_global():
+        """
+        Закрывает общую (shared) и глобальную (global) память — процесс-широкие
+        синглтоны. Вызывать один раз при остановке всего приложения, а НЕ при
+        выгрузке отдельного простаивающего пользователя (см. комментарий в
+        shutdown() выше).
+
+        ИСПРАВЛЕНИЕ: раньше использовались _get_shared_memory/_get_global_memory,
+        которые при отсутствии инстанса его СОЗДАЮТ. В atexit-фазе завершения
+        процесса это означало: конструирование CognitiveMemory (загрузка
+        SentenceTransformer из сети/кэша, run_in_executor) уже ПОСЛЕ shutdown
+        executor'ов -> "cannot schedule new futures after interpreter shutdown"
+        и "Embeddings init failed ... Disabling". Закрываем только то, что
+        реально жило в этом процессе; несуществующие слои не трогаем.
+        """
+        from GCN.memory_graph import GCNMemoryRouter
+        if GCNMemoryRouter._shared_instance is not None:
+            await GCNMemoryRouter._shared_instance.shutdown()
+        if GCNMemoryRouter._global_instance is not None:
+            await GCNMemoryRouter._global_instance.shutdown()
+
+
+# ===== Фабрика сервисов с LRU-кэшированием (аналогично CognitiveController) =====
+_services: Dict[str, MemoryService] = {}
+_services_last_used: Dict[str, float] = {}
+_SERVICE_MAX_IDLE = 1800  # 30 минут
+_SERVICE_MAX_COUNT = 50
+
+
+async def get_memory_service(user_id: str) -> MemoryService:
+    """Возвращает экземпляр MemoryService для пользователя, с выгрузкой неактивных."""
+    if user_id not in _services:
+        _services[user_id] = MemoryService(user_id)
+        logger.info(f"MemoryService создан для {user_id[:16]}")
+        # ИСПРАВЛЕНИЕ: _SERVICE_MAX_IDLE/_SERVICE_MAX_COUNT были объявлены, но
+        # нигде не читались — MemoryService (со своим приватным
+        # CognitiveMemory: эмбеддинги, FAISS-индекс, факты) накапливался в
+        # словаре _services без ограничений для каждого нового user_id, в
+        # отличие от параллельного кэша _assistants в ai_assistant.py и кэша
+        # роутеров в mcp_server_blockcoin.py, у которых выгрузка уже была.
+        # Любой код, обращающийся к памяти через get_memory_service() напрямую
+        # (а не через CognitiveController), тёк по памяти процесса.
+        await _evict_stale_services(exclude_uid=user_id)
+    _services_last_used[user_id] = time.time()
+    return _services[user_id]
+
+
+async def _evict_stale_services(exclude_uid: Optional[str] = None) -> None:
+    now = time.time()
+    stale = [
+        uid for uid, ts in _services_last_used.items()
+        if uid != exclude_uid and now - ts > _SERVICE_MAX_IDLE
+    ]
+    for uid in stale:
+        service = _services.pop(uid, None)
+        _services_last_used.pop(uid, None)
+        if service is not None:
+            try:
+                await service.shutdown()  # только private_memory — см. MemoryService.shutdown()
+            except Exception as e:
+                logger.error(f"Ошибка при выгрузке MemoryService {uid[:16]}: {e}")
+            logger.info(f"MemoryService {uid[:16]} выгружен (простой > {_SERVICE_MAX_IDLE}с)")
+
+    while len(_services) > _SERVICE_MAX_COUNT:
+        # LRU-эвикция: пропускаем exclude_uid и берём следующего самого старого
+        oldest_uid = None
+        for uid in _services_last_used:
+            if uid != exclude_uid:
+                oldest_uid = uid
+                break
+        if oldest_uid is None:
+            break  # все оставшиеся — это exclude_uid
+        service = _services.pop(oldest_uid, None)
+        _services_last_used.pop(oldest_uid, None)
+        if service is not None:
+            try:
+                await service.shutdown()
+            except Exception as e:
+                logger.error(f"Ошибка при выгрузке MemoryService {oldest_uid[:16]}: {e}")
+        logger.info(f"MemoryService {oldest_uid[:16]} выгружен по лимиту количества (LRU, max={_SERVICE_MAX_COUNT})")

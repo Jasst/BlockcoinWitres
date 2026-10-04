@@ -25,7 +25,7 @@ from pydantic import Field
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from GCN.config_ai import GENERATED_IMAGES_DIR, EASYDIFFUSION_ENABLED
-from GCN.memory_service import get_memory_service, MemoryService
+from GCN.memory_graph import get_memory_service, MemoryService
 from GCN.web_search import deep_search
 from GCN.image_utils import enhance_prompt, generate_image as gen_image
 from routes.ai_assistant import get_assistant
