@@ -694,7 +694,7 @@ async def contribute_to_identity(
     явно показать пользователю/модели, а не проигнорировать; либо используйте
     merge_identity_branches() для явного слияния.
     """
-    from GCN.identity_core import append_snapshot
+    from GCN.GCN import append_snapshot
 
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
@@ -729,7 +729,7 @@ async def merge_identity_branches(
     (это не ошибка, просто нечего сводить). merged_heads_count в ответе
     показывает, сколько голов было объединено.
     """
-    from GCN.identity_core import merge_heads
+    from GCN.GCN import merge_heads
 
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
@@ -755,7 +755,7 @@ async def search_identity_chain(
     в FAISS и не находятся через semantic_search/recall. Это единственный
     способ найти "что говорилось про X" без ручного чтения всей цепочки.
     """
-    from GCN.identity_core import search_chain
+    from GCN.GCN import search_chain
     from dataclasses import asdict
 
     uid, err = _safe_resolve_user(user_id, ctx)
@@ -803,7 +803,7 @@ async def invalidate_identity(
         неточна, уточняю так: ..."). Выбирайте, если содержание звена
         не мусор, а лишь спорная формулировка.
     """
-    from GCN.identity_core import invalidate_snapshot
+    from GCN.GCN import invalidate_snapshot
 
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
@@ -832,7 +832,7 @@ async def get_identity_chain(
     heads содержит только ВАЛИДНЫЕ головы: аннулированные сюда не попадают.
     Если их больше одной — цепочка разошлась и требует сверки.
     """
-    from GCN.identity_core import get_chain, get_heads
+    from GCN.GCN import get_chain, get_heads
     from dataclasses import asdict
 
     uid, err = _safe_resolve_user(user_id, ctx)
@@ -1389,7 +1389,7 @@ async def session_start(
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
 
-    from GCN.identity_core import needs_consolidation, get_heads
+    from GCN.GCN import needs_consolidation, get_heads
 
     def _identity_status() -> Dict[str, Any]:
         try:

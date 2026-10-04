@@ -79,7 +79,7 @@ from GCN.fast_router import (ComplexityRouter, ActivityGate, StageTimer, Route,
                             make_background_llm, heuristic_only_llm)  # [fast-path-patch]
 # ИНТЕЛЛЕКТ-ПАКЕТ: заземлённые ответы, санитайзер фактов, подзапросный retrieval
 # (см. GCN/intellect.py)
-from GCN import intellect as intellect_mod
+from GCN import cognition as intellect_mod
 
 # ИЗМЕНЕНИЕ: импорт MemoryService и фабрики
 from GCN.memory_service import MemoryService
@@ -425,7 +425,7 @@ class CognitiveController:
 
         # Инициализация SelfModel для CognitiveController
         try:
-            from GCN.self_model import SelfModel
+            from GCN.cognition import SelfModel
             self.self_model = SelfModel(self.user_dir)
             logger.info(f"[CognitiveController] SelfModel инициализирован для {user_id[:16]}")
         except ImportError as e:
@@ -435,25 +435,8 @@ class CognitiveController:
         # AutonomyEngine теперь сам берёт self_model из контроллера
 
         # Регистрация внутренних инструментов
-        # Инструменты памяти вынесены в GCN/internal_tools/memory_tools.py
-        from GCN.internal_tools import memory_tools
-        memory_tools.register(self.tool_registry, self)
-
-        # Инструменты поиска вынесены в GCN/internal_tools/search_tools.py
-        from GCN.internal_tools import search_tools
-        search_tools.register(self.tool_registry, self, query_expander=_search_query_expander)
-
-        # Инструмент генерации изображений вынесен в GCN/internal_tools/image_tools.py
-        from GCN.internal_tools import image_tools
-        image_tools.register(self.tool_registry, self)
-
-        # Инструменты самоанализа кода (регистрируются только если флаг включён)
-        from GCN.internal_tools import code_tools
-        code_tools.register(self.tool_registry, self)
-
-        # >>> НОВОЕ: identity-цепочка ТЕКУЩЕЕ_Я <<<
-        from GCN.internal_tools import identity_tools
-        identity_tools.register(self.tool_registry, self)
+        from GCN.internal_tools import register_all
+        register_all(self.tool_registry, self, query_expander=_search_query_expander)
 
         self._external_tools_registered = False
 
@@ -1701,7 +1684,7 @@ class CognitiveController:
         # УЛУЧШЕНИЕ №2: Metacognitive gate перед выполнением инструмента
         if hasattr(self, 'self_model') and self.self_model is not None:
             try:
-                from GCN import intellect as intellect_mod
+                from GCN import cognition as intellect_mod
                 # tool_trace ещё неизвестен (объявлен ниже), используем эвристику
                 action_type = "tool_call" if search_meta.get("search_requested") else "reasoning"
                 can_proceed, conf, reason = await intellect_mod.metacognitive_check(
@@ -2090,7 +2073,7 @@ class CognitiveController:
         для модели узнать текущее состояние — этот явный блок.
         """
         try:
-            from GCN.identity_core import get_latest_head, get_heads
+            from GCN.GCN import get_latest_head, get_heads
             store = self.memory_service.shared_memory.gcn_store
             head = get_latest_head(store)
             if head is None:
