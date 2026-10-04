@@ -351,8 +351,7 @@ class AutonomyEngine:
 
         # Инициализация SelfModel и MotivationEngine
         try:
-            from GCN.self_model import SelfModel
-            from GCN.motivation_engine import MotivationEngine
+            from GCN.cognition import SelfModel, MotivationEngine
             
             # Используем SelfModel контроллера если он уже есть
             self.self_model = getattr(controller, 'self_model', None)
@@ -790,7 +789,7 @@ class AutonomyEngine:
             self.queue.defer(topic, AUTONOMY_LOOP_INTERVAL * 6)
             return
 
-        from GCN.identity_core import (
+        from GCN.GCN import (
             get_latest_head, get_heads, append_snapshot, merge_heads,
         )
 

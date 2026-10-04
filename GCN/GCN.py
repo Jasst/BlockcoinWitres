@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import threading
+import shutil
 import uuid
 import copy
 import time
@@ -39,7 +40,8 @@ try:
         HYBRID_WEIGHT_EVIDENCE, HYBRID_WEIGHT_CONFIDENCE,
         FAISS_NLIST, FAISS_NPROBE, FAISS_MIN_TRAIN_VECTORS,
         EMBEDDING_DIM,
-        WORKING_MEMORY_SIZE
+        WORKING_MEMORY_SIZE,
+        GCN_STATE_FILENAME
     )
 except ImportError:
     HYBRID_WEIGHT_SEMANTIC = 0.40
@@ -52,6 +54,7 @@ except ImportError:
     FAISS_MIN_TRAIN_VECTORS = 500
     EMBEDDING_DIM = 128
     WORKING_MEMORY_SIZE = 20        # <-- добавить fallback
+    GCN_STATE_FILENAME = "gcn_state.json"
 
 
 class KnowledgeType(Enum):
@@ -1514,6 +1517,557 @@ class MemoryHierarchy:
             if obj:
                 result.append(obj)
         return result
+
+
+# ============================================================
+# IDENTITY CHAIN (ТЕКУЩЕЕ_Я) — было GCN/identity_core.py
+# ============================================================
+
+IDENTITY_SUBJECT = "ТЕКУЩЕЕ_Я"
+RELATION_CONTINUES = "continues_from"
+
+# Сколько версий gcn_state.json общей памяти держать как бэкап-кольцо ПОСЛЕ
+# каждой записи в identity_core. Не защищает от порчи в моменте записи (это
+# уже делает MemoryStore.save() — tmp+rename+межпроцессная блокировка), а
+# даёт возможность откатиться, если новая версия ядра оказалась ошибочной
+# или потерянной по человеческой причине (a не по причине гонки процессов).
+_BACKUP_KEEP = 5
+
+
+@dataclass
+class IdentitySnapshot:
+    """Удобное представление одного звена цепочки для чтения.
+
+    Поля invalidated / invalidation_reason добавлены для append-only
+    аннулирования (см. invalidate_snapshot): звено остаётся в графе,
+    но помечено как недействительное — читатель видит его в истории,
+    но не путает с "текущим состоянием".
+    """
+    id: str
+    content: str
+    contributor_model: str
+    session_id: Optional[str]
+    open_question: Optional[str]
+    parent_id: Optional[str]
+    created: str
+    confidence: float = 1.0
+    invalidated: bool = False
+    invalidation_reason: Optional[str] = None
+    # НОВОЕ: доп. родители merge-звена (см. merge_heads/append_snapshot).
+    # parent_id остаётся "основным" родителем (по нему идёт линейный обход
+    # get_chain), merge_parent_ids — дополнительные ветки, которые это
+    # звено явно свело воедино. Пусто для обычных (не-merge) звеньев.
+    merge_parent_ids: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_object(cls, obj: KnowledgeObject) -> "IdentitySnapshot":
+        meta = obj.object if isinstance(obj.object, dict) else {}
+        return cls(
+            id=obj.id,
+            content=meta.get("content", ""),
+            contributor_model=obj.author,
+            session_id=meta.get("session_id"),
+            open_question=meta.get("open_question"),
+            parent_id=meta.get("parent_id"),
+            created=obj.created.isoformat() if isinstance(obj.created, datetime) else str(obj.created),
+            confidence=obj.confidence,
+            invalidated=bool(meta.get("invalidated")),
+            invalidation_reason=meta.get("invalidation_reason"),
+            merge_parent_ids=list(meta.get("merge_parent_ids") or []),
+        )
+
+
+def _all_identity_objects(store: MemoryStore) -> List[KnowledgeObject]:
+    ids = store._by_type.get(KnowledgeType.IDENTITY_CORE, set())
+    objs = [store._objects[i] for i in ids if i in store._objects]
+    objs.sort(key=lambda o: o.created)
+    return objs
+
+
+def _is_invalidated(obj: Optional[KnowledgeObject]) -> bool:
+    """Звено помечено как недействительное (см. invalidate_snapshot).
+
+    Такие звенья остаются в графе (append-only не нарушается), но:
+      - не считаются головами цепочки (get_heads);
+      - не обновляют "последнее обновление" для needs_consolidation;
+      - видны в get_chain с invalidated=True и текстом причины.
+    """
+    if obj is None:
+        return False
+    meta = obj.object if isinstance(obj.object, dict) else {}
+    return bool(meta.get("invalidated"))
+
+def get_heads(store: MemoryStore) -> List[KnowledgeObject]:
+    """Узлы, на которые никто из ВАЛИДНЫХ звеньев не ссылается как на parent —
+    "текущие концы" валидной цепочки.
+
+    Ссылки от аннулированных звеньев НЕ учитываются: если звено помечено
+    недействительным, его parent_id больше не "занимает" родителя как
+    внутренний узел — родитель снова становится кандидатом в головы.
+    Иначе после invalidate(head) мы бы получили пустой heads: сам
+    аннулированный head всё ещё держит ссылку на своего родителя, и тот
+    не мог бы стать головой.
+
+    В здоровом однопоточном протоколе валидная голова ровно одна. Больше
+    одной — значит параллельная незамёрженная запись (две модели/сессии
+    продолжили от одного и того же предка, не увидев друг друга) ЛИБО
+    аннулировано звено в середине цепочки, и она распалась на две валидные
+    ветки (см. invalidate_snapshot).
+    """
+    objs = _all_identity_objects(store)
+    if not objs:
+        return []
+    referenced_as_parent = set()
+    for o in objs:
+        if _is_invalidated(o):
+            continue  # ссылки от мёртвых звеньев не занимают родителя
+        meta = o.object if isinstance(o.object, dict) else {}
+        pid = meta.get("parent_id")
+        if pid:
+            referenced_as_parent.add(pid)
+        # merge-звено "занимает" не только основного родителя, но и все
+        # слитые ветки — иначе после merge_heads() старые головы, ставшие
+        # merge_parent_ids, продолжали бы считаться головами наравне с
+        # новым merge-звеном, и divergence выглядел бы неразрешённым.
+        for mpid in (meta.get("merge_parent_ids") or []):
+            if mpid:
+                referenced_as_parent.add(mpid)
+    return [o for o in objs
+            if o.id not in referenced_as_parent and not _is_invalidated(o)]
+
+def get_latest_head(store: MemoryStore) -> Optional[KnowledgeObject]:
+    """При нескольких головах — берёт самую свежую по времени создания
+    (детерминированный дефолт для append_snapshot).
+
+    Если все "головы" аннулированы (get_heads их отфильтровывает) — берёт
+    самую свежую ВАЛИДНУЮ не-голову, чтобы append_snapshot не отваливался
+    с пустым parent_id на непустой цепочке. Вызывающий код должен отдельно
+    проверить get_heads() > 1 и не молчать об этом.
+    """
+    heads = get_heads(store)
+    if heads:
+        return max(heads, key=lambda o: o.created)
+    all_valid = [o for o in _all_identity_objects(store) if not _is_invalidated(o)]
+    if not all_valid:
+        return None
+    return max(all_valid, key=lambda o: o.created)
+
+
+def get_chain(store: MemoryStore, from_id: Optional[str] = None, limit: int = 50) -> List[IdentitySnapshot]:
+    """Цепочка от указанного узла (или самой свежей ВАЛИДНОЙ головы) назад
+    к корню, возвращается в хронологическом порядке (старое → новое).
+
+    Аннулированные звенья включаются в вывод с invalidated=True и текстом
+    invalidation_reason — история неизменна, каждое звено несёт информацию
+    о своём статусе. Скрывать их нельзя: читатель должен видеть, где
+    именно цепочка "прыгнула" через ошибочный шаг.
+
+    Поведение при разных состояниях цепочки:
+      - есть хотя бы одна валидная голова → start = самая свежая валидная
+        голова (get_latest_head), читаем назад к корню;
+      - все звенья аннулированы → start = самое свежее звено из ВСЕХ
+        (включая аннулированные), чтобы не отдавать пустой chain на
+        непустой истории. Читатель увидит полную картину с флагами
+        invalidated=True и поймёт, что "текущего" ядра нет;
+      - объектов вообще нет → [].
+
+    from_id, если передан явно, используется как стартовая точка
+    безусловно — включая аннулированное звено. Это нужно для аудита:
+    можно запросить цепочку "от звена X назад к корню", даже если X уже
+    помечен недействительным (например, чтобы посмотреть, что было до
+    инцидента).
+    """
+    if from_id:
+        start = store.get(from_id)
+    else:
+        start = get_latest_head(store)
+
+    if start is None:
+        # get_latest_head вернул None — либо цепочка пуста, либо все звенья
+        # аннулированы. Для аудита показываем полную историю от самого
+        # свежего звена: не даём читателю подумать, что "ничего не было".
+        all_objs = _all_identity_objects(store)
+        if not all_objs:
+            return []
+        start = max(all_objs, key=lambda o: o.created)
+
+    chain: List[KnowledgeObject] = []
+    cur: Optional[KnowledgeObject] = start
+    seen = set()
+    while cur is not None and len(chain) < limit:
+        if cur.id in seen:
+            logger.warning(
+                f"identity_core: обнаружен цикл в цепочке на {cur.id}, обрываю обход"
+            )
+            break
+        seen.add(cur.id)
+        chain.append(cur)
+        meta = cur.object if isinstance(cur.object, dict) else {}
+        parent_id = meta.get("parent_id")
+        cur = store.get(parent_id) if parent_id else None
+
+    chain.reverse()
+    return [IdentitySnapshot.from_object(o) for o in chain]
+
+def _rotate_backup(gcn_state_path: Path) -> None:
+    """Копия gcn_state.json общей памяти сразу после записи identity-звена.
+    Не подменяет атомарную запись в MemoryStore.save() — это она уже
+    гарантирует, что на диске не окажется битого файла. Бэкап нужен для
+    другого случая: откат, если новая версия ядра сама по себе (по
+    содержанию) оказалась нежелательной."""
+    if not gcn_state_path.exists():
+        return
+    backup_dir = gcn_state_path.parent / "identity_backups"
+    backup_dir.mkdir(exist_ok=True)
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    dest = backup_dir / f"{gcn_state_path.stem}.{ts}.json"
+    try:
+        shutil.copy2(gcn_state_path, dest)
+    except OSError as e:
+        logger.warning(f"identity_core: не удалось создать бэкап {dest}: {e}")
+        return
+    backups = sorted(backup_dir.glob(f"{gcn_state_path.stem}.*.json"))
+    for old in backups[:-_BACKUP_KEEP]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+async def append_snapshot(
+    service,  # GCN.memory_service.MemoryService
+    content: str,
+    contributor_model: str,
+    session_id: Optional[str] = None,
+    open_question: Optional[str] = None,
+    parent_id: Optional[str] = None,
+    merge_parent_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Добавляет новое звено в цепочку identity_core (shared-память).
+
+    Если parent_id не указан явно — используется текущая голова цепочки.
+
+    merge_parent_ids (НОВОЕ): список ДОПОЛНИТЕЛЬНЫХ голов, которые это
+    звено явно сводит воедино (настоящий merge, а не "продолжение от
+    свежей головы с потерей остальных веток"). parent_id остаётся
+    основным родителем (по нему идёт линейный обход get_chain), а
+    merge_parent_ids только помечают остальные ветки как "поглощённые" —
+    они перестают быть головами (см. get_heads), но остаются в графе
+    полностью нетронутыми (append-only). Для типового случая "свести все
+    текущие головы" удобнее вызвать merge_heads() — он сам подставит
+    parent_id/merge_parent_ids.
+
+    Возвращает статус, включая явные предупреждения:
+      - branch_warning — на момент записи в цепочке уже было несколько
+        несведённых голов (и они НЕ были явно перечислены через
+        merge_parent_ids — то есть это не merge, а обычное продолжение,
+        оставляющее расхождение неразрешённым);
+      - parent_warning — parent_id указывает на АННУЛИРОВАННОЕ звено;
+        новая запись формально "продолжит мусор", обычно это не то, что нужно.
+    """
+    memory = service.shared_memory
+    memory.reload_if_stale()  # см. модульный докстринг: критично не читать
+                               # устаревшую голову перед append — иначе
+                               # словим divergence, который сами же детектируем
+    store = memory.gcn_store
+
+    heads_before = get_heads(store)
+    branch_warning = None
+    parent_warning = None
+    merge_parent_ids = [m for m in (merge_parent_ids or []) if m]
+
+    if parent_id is None:
+        if len(heads_before) > 1 and not merge_parent_ids:
+            branch_warning = (
+                f"На момент записи в цепочке уже было {len(heads_before)} несведённых "
+                f"голов (id: {[h.id for h in heads_before]}) — вероятно, параллельная "
+                f"запись другой моделью/сессией. Эта запись продолжает самую свежую "
+                f"голову БЕЗ слияния; расхождение стоит явно свести через merge_heads() "
+                f"или передать остальные головы в merge_parent_ids."
+            )
+        parent = get_latest_head(store)
+        parent_id = parent.id if parent else None
+    else:
+        parent_obj = store.get(parent_id)
+        if parent_obj is None:
+            return {"status": "error", "message": f"parent_id {parent_id} не найден в цепочке"}
+        if _is_invalidated(parent_obj):
+            meta = parent_obj.object if isinstance(parent_obj.object, dict) else {}
+            grandparent_id = meta.get("parent_id")
+            parent_warning = (
+                f"parent_id {parent_id} указывает на АННУЛИРОВАННОЕ звено "
+                f"(причина: {meta.get('invalidation_reason', '—')}). "
+                f"Новая запись формально 'продолжит мусор' — читатели увидят её "
+                f"как 'идёт после [INVALIDATED]'. Если хотите писать от "
+                f"предыдущего валидного, передайте parent_id="
+                f"{grandparent_id!r} (или None, чтобы взять текущую валидную голову)."
+            )
+
+    # Валидируем merge_parent_ids: каждый должен существовать и не быть
+    # тем же, что и основной parent_id (иначе бессмысленная самоссылка).
+    merge_warnings: List[str] = []
+    valid_merge_ids: List[str] = []
+    for mpid in merge_parent_ids:
+        if mpid == parent_id:
+            continue
+        mobj = store.get(mpid)
+        if mobj is None:
+            merge_warnings.append(f"merge_parent_ids: {mpid} не найден в цепочке, пропущен")
+            continue
+        if mobj.type != KnowledgeType.IDENTITY_CORE:
+            merge_warnings.append(f"merge_parent_ids: {mpid} не является звеном identity_core, пропущен")
+            continue
+        valid_merge_ids.append(mpid)
+
+    obj = KnowledgeObject(
+        id=f"identity_{uuid.uuid4().hex[:12]}",
+        type=KnowledgeType.IDENTITY_CORE,
+        subject=IDENTITY_SUBJECT,
+        predicate="snapshot",
+        object={
+            "content": content,
+            "open_question": open_question,
+            "contributor_model": contributor_model,
+            "session_id": session_id,
+            "parent_id": parent_id,
+            "merge_parent_ids": valid_merge_ids,
+        },
+        author=contributor_model,
+        created=datetime.now(timezone.utc),
+        scope=MemoryScope.SHARED,
+        confidence=1.0,
+        source_type="identity_core",
+    )
+    store.create(obj, actor=contributor_model)
+    if parent_id:
+        store.link(obj.id, parent_id, RELATION_CONTINUES, contributor_model)
+    for mpid in valid_merge_ids:
+        store.link(obj.id, mpid, RELATION_CONTINUES, contributor_model)
+
+    # Критичные данные — сохраняем сразу синхронно, не через debounced
+    # _schedule_save() (см. комментарий у _periodic_save в memory_graph.py).
+    await memory._save_async()
+
+    gcn_state_path = memory.base_dir / GCN_STATE_FILENAME
+    _rotate_backup(gcn_state_path)
+
+    heads_after = get_heads(store)
+    result: Dict[str, Any] = {
+        "status": "ok",
+        "id": obj.id,
+        "parent_id": parent_id,
+        "merge_parent_ids": valid_merge_ids,
+        "chain_length": len(get_chain(store, from_id=obj.id)),
+        "heads_count": len(heads_after),
+        "branch_warning": branch_warning,
+    }
+    if parent_warning:
+        result["parent_warning"] = parent_warning
+    if merge_warnings:
+        result["merge_warnings"] = merge_warnings
+    return result
+
+
+async def merge_heads(
+    service,  # GCN.memory_service.MemoryService
+    content: str,
+    contributor_model: str,
+    session_id: Optional[str] = None,
+    open_question: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Удобная обёртка: сводит ВСЕ текущие несведённые головы в одно новое
+    merge-звено за один вызов, не заставляя вызывающего вручную собирать
+    список parent_id/merge_parent_ids через get_heads().
+
+    Если голова всего одна — работает как обычный append_snapshot (это
+    штатное продолжение цепочки, не merge). Если голов 0 (пустая цепочка
+    или все аннулированы) — создаёт корневое звено.
+    """
+    memory = service.shared_memory
+    memory.reload_if_stale()
+    store = memory.gcn_store
+    heads = get_heads(store)
+
+    if not heads:
+        return await append_snapshot(
+            service, content, contributor_model,
+            session_id=session_id, open_question=open_question, parent_id=None,
+        )
+
+    # Основной родитель — самая свежая голова (сохраняем то же соглашение,
+    # что и get_latest_head), остальные — merge_parent_ids.
+    heads_sorted = sorted(heads, key=lambda o: o.created, reverse=True)
+    primary = heads_sorted[0]
+    others = [h.id for h in heads_sorted[1:]]
+
+    result = await append_snapshot(
+        service, content, contributor_model,
+        session_id=session_id, open_question=open_question,
+        parent_id=primary.id, merge_parent_ids=others,
+    )
+    result["merged_heads_count"] = len(heads)
+    return result
+
+
+def search_chain(store: MemoryStore, query: str, limit: int = 20) -> List[IdentitySnapshot]:
+    """Полнотекстовый (подстрочный, регистронезависимый) поиск по содержимому
+    цепочки identity_core.
+
+    Нужен потому, что identity-звенья создаются в обход remember()/_add_fact()
+    (см. модульный докстринг) и поэтому НЕ попадают в FAISS-индекс
+    CognitiveMemory — обычные semantic_search/recall их не видят. Это
+    простая линейная замена: при размере цепочки в десятки-сотни звеньев
+    полнотекстовый скан достаточно быстр и не требует отдельного индекса.
+    Ищет по content, open_question и contributor_model.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    objs = _all_identity_objects(store)
+    matches: List[KnowledgeObject] = []
+    for o in objs:
+        meta = o.object if isinstance(o.object, dict) else {}
+        haystack = " ".join([
+            str(meta.get("content", "")),
+            str(meta.get("open_question", "")),
+            str(o.author or ""),
+        ]).lower()
+        if q in haystack:
+            matches.append(o)
+    matches.sort(key=lambda o: o.created, reverse=True)
+    return [IdentitySnapshot.from_object(o) for o in matches[:limit]]
+
+async def invalidate_snapshot(
+    service,  # GCN.memory_service.MemoryService
+    identity_id: str,
+    reason: str,
+) -> Dict[str, Any]:
+    """Помечает звено цепочки как недействительное, НЕ удаляя его.
+
+    Append-only инвариант сохраняется полностью: объект в сторе остаётся,
+    content никогда не перезаписывается, рёбра continues_from не трогаются.
+    Меняется только meta["invalidated"] = True и meta["invalidation_reason"].
+
+    Эффекты после вызова:
+      - get_heads() перестаёт видеть это звено как голову цепочки;
+      - get_latest_head() при аннулировании головы откатывается к
+        предыдущему ВАЛИДНОМУ звену;
+      - get_chain() продолжает показывать звено, но с флагом
+        invalidated=True и текстом invalidation_reason — читатель видит
+        полную историю и понимает, почему цепочка "перепрыгнула" шаг;
+      - needs_consolidation() игнорирует возраст аннулированного звена
+        при проверке staleness (не поднимает ложную цель "обновить ядро").
+
+    Идемпотентно: повторный вызов на уже аннулированном звене возвращает
+    status="already_invalidated" без изменения состояния.
+    """
+    if not identity_id:
+        return {"status": "error", "message": "identity_id обязателен"}
+    if not reason or not reason.strip():
+        return {
+            "status": "error",
+            "message": ("reason обязателен — без него читатель цепочки не поймёт, "
+                        "почему звено ошибочно и что вместо него считать верным."),
+        }
+
+    service.shared_memory.reload_if_stale()  # та же причина, что в append_snapshot
+    store = service.shared_memory.gcn_store
+    obj = store.get(identity_id)
+    if obj is None:
+        return {"status": "error", "message": f"Звено {identity_id} не найдено"}
+    if obj.type != KnowledgeType.IDENTITY_CORE:
+        return {
+            "status": "error",
+            "message": (f"Объект {identity_id} не является звеном identity_core "
+                        f"(type={obj.type.value}). Аннулировать можно только звенья цепочки."),
+        }
+
+    meta = dict(obj.object) if isinstance(obj.object, dict) else {}
+    if meta.get("invalidated"):
+        return {
+            "status": "already_invalidated",
+            "id": identity_id,
+            "invalidation_reason": meta.get("invalidation_reason"),
+            "message": "Звено уже помечено как недействительное — повторное помечивание не требуется.",
+        }
+
+    meta["invalidated"] = True
+    meta["invalidation_reason"] = reason.strip()[:500]
+    meta["invalidated_at"] = datetime.now(timezone.utc).isoformat()
+
+    # ВАЖНО: content НЕ трогаем — только meta. store.update() инкрементит
+    # version и создаёт событие UPDATE в event-log, что и нужно для аудита.
+    store.update(identity_id, {"object": meta}, actor="invalidation")
+
+    # Синхронная запись на диск — как в append_snapshot, критичные данные.
+    await service.shared_memory._save_async()
+
+    heads_after = get_heads(store)
+    return {
+        "status": "ok",
+        "id": identity_id,
+        "invalidated_reason": meta["invalidation_reason"],
+        "heads_after": [h.id for h in heads_after],
+        "heads_count": len(heads_after),
+        "note": (
+            "Звено помечено недействительным. Оно осталось в истории, "
+            "но больше не является концом цепочки. Продолжайте цепочку "
+            "от текущей головы (heads_after), а не от этого звена."
+        ),
+    }
+
+def needs_consolidation(service, stale_after_seconds: float = 7 * 86400) -> Optional[Dict[str, Any]]:
+    """Чистая проверка без побочных эффектов — для вызова из
+    MotivationEngine на каждом tick() дёшево, без LLM. Возвращает причину,
+    если есть, иначе None:
+      - несколько несведённых ВАЛИДНЫХ голов (расхождение требует внимания);
+      - либо самая свежая валидная голова не обновлялась дольше stale_after_seconds;
+      - либо все звенья аннулированы (цепочка фактически пуста — нужен
+        новый "чистый лист").
+
+    Аннулированные звенья игнорируются: они часть истории, но не "текущее
+    состояние". Иначе свежий invalidate(old_head) тут же поднял бы ложную
+    цель "ядро устарело".
+    """
+    store = service.shared_memory.gcn_store
+    heads = get_heads(store)
+
+    if len(heads) > 1:
+        return {
+            "reason": "diverging_heads",
+            "heads": [h.id for h in heads],
+            "heads_count": len(heads),
+        }
+
+    if not heads:
+        all_objs = _all_identity_objects(store)
+        if all_objs and all(_is_invalidated(o) for o in all_objs):
+            return {"reason": "all_invalidated", "count": len(all_objs)}
+        return None
+
+    latest = heads[0]
+    age = (datetime.now(timezone.utc) - latest.created).total_seconds()
+    if age > stale_after_seconds:
+        return {
+            "reason": "stale",
+            "head_id": latest.id,
+            "age_days": round(age / 86400, 1),
+        }
+    return None
+
+__all__ = [
+    "IdentitySnapshot",
+    "append_snapshot",
+    "merge_heads",
+    "invalidate_snapshot",
+    "get_chain",
+    "search_chain",
+    "get_heads",
+    "get_latest_head",
+    "needs_consolidation",
+    "IDENTITY_SUBJECT",
+    "RELATION_CONTINUES",
+]
 
 
 # ==================== Демонстрация ====================
