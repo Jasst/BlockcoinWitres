@@ -140,8 +140,9 @@ _ALLOW_LEGACY_HTTP = os.getenv("MCP_ALLOW_LEGACY_HTTP", "0") == "1"
 _TRUST_X_USER_ID = os.getenv("MCP_TRUST_X_USER_ID", "0") == "1"
 
 _LOGIN_HINT = (
-    "Требуется вход. Откройте веб-чат -> Профиль -> «Подключить ИИ», получите "
-    "одноразовый код и вызовите инструмент login(code)."
+    "Требуется вход. Откройте веб-чат -> Профиль -> «Подключить ИИ», "
+    "получите код доступа (действует, пока вы не отзовёте его в Профиле) "
+    "и вызовите инструмент login(code)."
 )
 
 
@@ -230,7 +231,12 @@ def revoke_login_code(user_id: str) -> Dict[str, int]:
         f"[auth] revoke для {uid[:16]}…: codes={len(codes_removed)}, "
         f"sids={len(sids_removed)}, ips={len(ips_removed)}"
     )
-    return {"codes": len(codes_removed), "sessions": len(sids_removed)}
+    return {
+        "codes": len(codes_removed),
+        "sessions": len(sids_removed),
+        "ips": len(ips_removed),
+        "total": len(codes_removed) + len(sids_removed) + len(ips_removed),
+    }
 
 
 def _user_from_ctx(ctx: "Optional[Context]") -> "Optional[str]":
@@ -489,10 +495,19 @@ def _prune_last_commands(now: float) -> None:
 
 @mcp.tool()
 async def login(
-        code: str = Field(..., description="Одноразовый код из веб-чата: Профиль -> «Подключить ИИ»"),
+        code: str = Field(...,
+                          description="Код доступа из веб-чата: Профиль -> «Подключить ИИ». "
+                                      "Действует, пока пользователь не отзовёт его в Профиле."),
         ctx: Context = None,
 ) -> Dict[str, Any]:
-    """Вход внешнего ИИ в вашу память по одноразовому коду из веб-чата (HTTP)."""
+    """Вход внешнего ИИ в вашу память по коду доступа из веб-чата (HTTP).
+
+    Код, выданный кнопкой «Получить код подключения», действует бессрочно,
+    пока пользователь не нажмёт «Отозвать» в профиле. Один и тот же код можно
+    использовать много раз (переподключение после перезапуска клиента, работа
+    с нескольких устройств и т.п.). Отзыв немедленно сбрасывает все активные
+    MCP-сессии этого пользователя.
+    """
     req = _http_request(ctx)
     if req is None:
         return {"status": "error",
