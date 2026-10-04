@@ -1735,7 +1735,7 @@ def _rotate_backup(gcn_state_path: Path) -> None:
 
 
 async def append_snapshot(
-    service,  # GCN.memory_service.MemoryService
+    service,  # GCN.memory_graph.MemoryService
     content: str,
     contributor_model: str,
     session_id: Optional[str] = None,
@@ -1869,7 +1869,7 @@ async def append_snapshot(
 
 
 async def merge_heads(
-    service,  # GCN.memory_service.MemoryService
+    service,  # GCN.memory_graph.MemoryService
     content: str,
     contributor_model: str,
     session_id: Optional[str] = None,
@@ -1938,7 +1938,7 @@ def search_chain(store: MemoryStore, query: str, limit: int = 20) -> List[Identi
     return [IdentitySnapshot.from_object(o) for o in matches[:limit]]
 
 async def invalidate_snapshot(
-    service,  # GCN.memory_service.MemoryService
+    service,  # GCN.memory_graph.MemoryService
     identity_id: str,
     reason: str,
 ) -> Dict[str, Any]:

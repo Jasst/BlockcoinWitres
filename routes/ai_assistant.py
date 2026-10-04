@@ -82,7 +82,7 @@ from GCN.fast_router import (ComplexityRouter, ActivityGate, StageTimer, Route,
 from GCN import cognition as intellect_mod
 
 # ИЗМЕНЕНИЕ: импорт MemoryService и фабрики
-from GCN.memory_service import MemoryService
+from GCN.memory_graph import MemoryService
 
 from GCN.config_ai import ENABLE_CODE_SELF_REFLECTION
 # Импорт инструментов самоанализа кода
@@ -3327,7 +3327,7 @@ async def shutdown_all():
     # ассистентов, а не только остановку процесса. Здесь, при реальной
     # остановке всего приложения, сохраняем их явно и ровно один раз.
     try:
-        from GCN.memory_service import MemoryService
+        from GCN.memory_graph import MemoryService
         await MemoryService.shutdown_shared_global()
     except Exception as e:
         logger.error(f"Ошибка при закрытии общей/глобальной памяти: {e}")
