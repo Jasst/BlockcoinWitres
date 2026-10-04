@@ -590,6 +590,100 @@ class CognitiveController:
         except Exception as e:
             logger.warning(f"[ForceCodeTool] не удалось вызвать project_structure: {e}")
 
+    async def _force_memory_tool_if_requested(self, message: str,
+                                              tool_trace: List[Dict[str, Any]]) -> None:
+        """
+        Детерминированный вызов memory-инструментов для явных команд
+        «запомни X», «сохрани во всех местах X», «вспомни Y».
+
+        Зачем: fast_router теперь гарантированно уводит такие сообщения в
+        TOOLS, но даже там локальная LLM иногда не выбирает инструмент —
+        отвечает текстом «сохранил», ничего не сохранив (наблюдалось:
+        «Test fact from Qwen identity chain» в чате, отсутствующий в памяти).
+
+        Что делает:
+          - «запомни/сохрани/запиши …» → internal__remember с определением scope
+          - «во всех местах» → три вызова remember (private+shared+global)
+          - «вспомни/что ты знаешь о X» → internal__recall с X
+        Пропускает вызов, если модель УЖЕ вызвала соответствующий инструмент
+        (проверка по tool_trace), чтобы не дублировать запись.
+        """
+        low = message.lower()
+
+        # --- вспомнить / что ты знаешь о X ---
+        recall_match = re.search(
+            r"(?:вспомни|напомни|что\s+ты\s+(?:знаешь|помнишь)\s+о)\s+(.+?)[\?\.]?$",
+            low,
+        )
+        if recall_match:
+            if not any((t.get("tool") or "").endswith("__recall") for t in tool_trace):
+                query = recall_match.group(1).strip(" .,!?:;")
+                if len(query) >= 3:
+                    try:
+                        results = await self.memory_service.recall(query, top_k=7)
+                        tool_trace.append({
+                            "tool": "internal__recall",
+                            "arguments": {"query": query, "top_k": 7},
+                            "result": "\n".join(
+                                f"- {r['text'][:200]} (scope={r.get('scope')}, conf={r.get('confidence', 0.5):.2f})"
+                                for r in results
+                            ) or f"По запросу '{query}' ничего не найдено.",
+                            "verification": "sufficient" if results else "irrelevant",
+                        })
+                        logger.info(f"[ForceRecall] '{query[:60]}' → {len(results)} записей")
+                    except Exception as e:
+                        logger.warning(f"[ForceRecall] failed: {e}")
+
+        # --- запомни / сохрани / запиши ---
+        remember_match = re.search(
+            r"(?:запомни|сохрани(?:\s+в\s+память)?|запиши(?:\s+в\s+память)?)[:\s]+(.+)$",
+            message, re.IGNORECASE,
+        )
+        if not remember_match:
+            return
+        if any((t.get("tool") or "").endswith("__remember")
+               or (t.get("tool") or "").endswith("__remember_batch")
+               for t in tool_trace):
+            return  # модель уже вызвала сама — не дублируем
+
+        fact = remember_match.group(1).strip()
+        if len(fact) < 5:
+            return
+        # Убираем возможные хвосты «в личную/общую/глобальную память»
+        fact = re.sub(r"\s+(?:в\s+(?:личную|общую|глобальную)\s+память|глобально|shared|global)\s*$",
+                      "", fact, flags=re.IGNORECASE).strip()
+
+        # Определяем scope по маркерам в исходном сообщении
+        low_full = message.lower()
+        if "во всех местах" in low_full or "во все места" in low_full or "во все три" in low_full:
+            scopes = ["private", "shared", "global"]
+        elif "глобально" in low_full or "global" in low_full:
+            scopes = ["global"]
+        elif "shared" in low_full or "в общую" in low_full or "общую память" in low_full:
+            scopes = ["shared"]
+        elif "в личную" in low_full or "private" in low_full:
+            scopes = ["private"]
+        else:
+            scopes = ["private"]  # дефолт
+
+        written = []
+        try:
+            for scope in scopes:
+                res = await self.memory_service.remember(fact, scope=scope, user_explicit=True)
+                written.append({"scope": scope, "id": res.get("id")})
+            tool_trace.append({
+                "tool": "internal__remember",
+                "arguments": {"fact": fact, "scopes": scopes},
+                "result": f"Записано в {len(written)} скоуп(ов): " + ", ".join(written[i]["scope"] for i in range(len(written))),
+                "verification": "sufficient",
+            })
+            logger.info(
+                f"[ForceRemember] записано в {scopes}: {fact[:80]!r} "
+                f"(ids: {[w['id'] for w in written]})"
+            )
+        except Exception as e:
+            logger.warning(f"[ForceRemember] failed: {e}")
+
     # Инструменты памяти/поиска/генерации живут в mcp_server_blockcoin.py. Веб-чат
     # вызывает их НАПРЯМУЮ (в том же процессе) от имени своего user_id — адреса
     # кошелька из require_auth. Ни HTTP, ни X-User-Id, ни mcp-remote здесь не нужны:
@@ -1749,6 +1843,8 @@ class CognitiveController:
         # (см. docstring метода — локи 2026-09-15 показали, что LLM не
         # выбирает project_structure сама, хотя hint и примеры есть).
         await self._force_code_tool_if_requested(message, tool_trace)
+        # Детерминированный вызов memory-инструментов для «запомни X» / «вспомни Y»
+        await self._force_memory_tool_if_requested(message, tool_trace)
 
         # === ИСПРАВЛЕНИЕ: активное уточнение ПОСЛЕ ReAct-цикла ===
         # Теперь, после того как инструменты отработали, пересчитываем уверенность
@@ -2367,37 +2463,105 @@ class CognitiveController:
 
     # ===== ИССЛЕДОВАНИЕ =====
     async def research(self, goal: str) -> Dict[str, Any]:
+        # ── ШАГ 1: прочитать память (Уровень 1) ─────────────────────────
+        memory_context = ""
+        memory_hits: List[Dict] = []
+        try:
+            memory_hits = await self.memory_service.recall(goal, top_k=7)
+            if memory_hits:
+                lines = []
+                for r in memory_hits:
+                    scope = r.get("scope", "private")
+                    conf = r.get("confidence", 0.5)
+                    lines.append(f"- [{scope}, conf={conf:.2f}] {r['text'][:250]}")
+                memory_context = (
+                    "=== ЧТО УЖЕ ИЗВЕСТНО ИЗ МОЕЙ ПАМЯТИ ===\n"
+                    + "\n".join(lines)
+                    + "\n\n(Учти эти данные при формулировке гипотез. "
+                      "НЕ предлагай гипотезу, которая уже подтверждена или "
+                      "опровергнута в памяти, если только цель не пересмотреть её.)"
+                )
+                logger.info(f"[research] recall по '{goal[:60]}': {len(memory_hits)} записей")
+        except Exception as e:
+            logger.debug(f"research: recall failed: {e}")
+
+        # ── ШАГ 2: сформулировать гипотезы с учётом памяти ─────────────
         prompt = (
-            f"Сформулируй 3 чёткие, проверяемые гипотезы по вопросу: {goal}. "
-            "Каждая гипотеза должна быть кратким утверждением (не вопросом), содержащим конкретное предположение. "
-            "Ответь в виде маркированного списка, без пояснений."
+            f"Сформулируй 3 чёткие, проверяемые гипотезы по вопросу: {goal}.\n\n"
+            f"{memory_context}\n\n"
+            "Каждая гипотеза — краткое утверждение (не вопрос) с конкретным "
+            "предположением. Ответь маркированным списком, без пояснений."
         )
         hypotheses_text = await call_llm([{"role": "user", "content": prompt}], temp=0.8)
         hypotheses = [h.strip("-• ").strip() for h in hypotheses_text.split('\n') if h.strip()][:3]
         if not hypotheses:
             hypotheses = ["Не удалось сгенерировать гипотезы"]
 
+        # ── ШАГ 3: веб-поиск ────────────────────────────────────────────
         all_evidence = []
         queries = [goal] + hypotheses[:2]
         for q in queries:
             try:
                 data = await deep_search(q, max_results=3)
                 for src in data.get("sources", []):
-                    all_evidence.append({"source": src.get("url", ""), "title": src.get("title", ""), "query": q})
+                    all_evidence.append({
+                        "source": src.get("url", ""),
+                        "title": src.get("title", ""),
+                        "query": q,
+                    })
             except Exception as e:
                 logger.debug(f"Research search error for '{q}': {e}")
 
-        evidence_text = "\n".join([f"- {e['title']}: {e['source']} (запрос: {e['query']})" for e in all_evidence[:6]])
+        evidence_text = "\n".join(
+            f"- {e['title']}: {e['source']} (запрос: {e['query']})"
+            for e in all_evidence[:6]
+        )
 
+        # ── ШАГ 4: синтез ответа ────────────────────────────────────────
         answer_prompt = (
-            f"На основе следующих гипотез и собранных доказательств дай развёрнутый ответ на вопрос: {goal}.\n"
-            "Укажи уверенность (0-1) для каждого утверждения и приведи аргументы.\n"
-            "Структурируй ответ: вступление, основная часть с аргументацией, заключение.\n\n"
-            f"Гипотезы: {', '.join(hypotheses)}\n\n"
-            f"Источники:\n{evidence_text}"
+            f"Ответь на вопрос: {goal}.\n\n"
+            f"{memory_context}\n\n"
+            f"Гипотезы, которые нужно проверить:\n"
+            + "\n".join(f"- {h}" for h in hypotheses) + "\n\n"
+            f"Доказательства из веб-поиска:\n{evidence_text}\n\n"
+            "Структурируй ответ: вступление, основная часть с аргументацией, "
+            "заключение. Для каждого утверждения укажи уверенность 0-1. "
+            "Если гипотеза подтверждается уже имеющейся памятью — сошлись на неё."
         )
         answer = await call_llm([{"role": "user", "content": answer_prompt}], temp=0.6)
-        return {"answer": answer, "confidence": 0.7, "hypotheses": hypotheses, "evidence": all_evidence}
+
+        # ── ШАГ 5: записать новые факты в память (Уровень 2) ────────────
+        saved_fact_ids: List[str] = []
+        try:
+            if answer and len(answer) > 150:
+                facts = await self._extract_facts_llm(answer, all_evidence)
+                if facts:
+                    sanitized = intellect_mod.sanitize_search_facts(facts, all_evidence)
+                    # Сохраняем через сервис — он сам разложит по scope
+                    for text, scope, conf in sanitized:
+                        res = await self.memory_service.remember(
+                            text, scope=scope, confidence=conf
+                        )
+                        if res.get("id"):
+                            saved_fact_ids.append(res["id"])
+                    logger.info(
+                        f"[research] из ответа сохранено {len(saved_fact_ids)} "
+                        f"фактов (scopes: {sorted({s for _, s, _ in sanitized})})"
+                    )
+        except Exception as e:
+            logger.warning(f"research: не удалось сохранить факты из ответа: {e}")
+
+        return {
+            "answer": answer,
+            "confidence": 0.7,
+            "hypotheses": hypotheses,
+            "evidence": all_evidence,
+            "memory_hits": [
+                {"id": r.get("gcn_id"), "text": r["text"][:200], "scope": r.get("scope")}
+                for r in memory_hits[:7]
+            ],
+            "saved_fact_ids": saved_fact_ids,
+        }
 
     # ===== ПОТОКОВЫЙ ОТВЕТ =====
     async def stream_response(self, message: str, web_search: bool = False,
@@ -2634,6 +2798,8 @@ class CognitiveController:
                     timer.mark("route+tools")
                     # Детерминированный вызов code-tools (см. _force_code_tool_if_requested)
                     await self._force_code_tool_if_requested(message, tool_trace)
+                    # Детерминированный вызов memory-инструментов («запомни X» / «вспомни Y»)
+                    await self._force_memory_tool_if_requested(message, tool_trace)
 
                     # === ИСПРАВЛЕНИЕ: активное уточнение ПОСЛЕ ReAct-цикла (для stream) ===
                     if not skip_clarification_before_react:

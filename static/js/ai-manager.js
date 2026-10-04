@@ -1119,7 +1119,7 @@ async function _sendToAi(messageText, imageFile) {
     }
 
     // Исследовательский режим
-    const researchKeywords = ['правда ли', 'докажи', 'опровергни', 'исследуй', 'проверь', 'действительно ли'];
+    const researchKeywords = ['правда ли', 'докажи', 'опровергни', 'исследуй', 'действительно ли', 'проведи исследование'];
     const isResearch = researchKeywords.some(kw => messageText.toLowerCase().includes(kw));
 
     if (isResearch && !imageFile) {
