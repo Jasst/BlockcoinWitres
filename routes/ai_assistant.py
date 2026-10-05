@@ -1350,7 +1350,8 @@ class CognitiveController:
     async def _prepare_messages(self, message: str, web_search: bool = False,
                                 image_base64: Optional[str] = None,
                                 image_mime: Optional[str] = None,
-                                reasoning: bool = False) -> Tuple[List[Dict], Dict]:
+                                reasoning: bool = False,
+                                rerank: bool = True) -> Tuple[List[Dict], Dict]:
         auto_search = False
         if AUTO_SEARCH_ENABLED and not web_search and needs_search_heuristic(message):
             web_search = True
@@ -1383,7 +1384,12 @@ class CognitiveController:
         # GCNMemoryRouter._retrieve_subqueries).
         # без LLM: эвристическая декомпозиция вместо отдельного вызова модели
         subqueries = await intellect_mod.make_subqueries(message, llm_caller=heuristic_only_llm)
-        relevant = await self.memory_service.recall(message, top_k=7, subqueries=subqueries or None)
+        # Рекол и загрузка целей независимы — выполняем параллельно.
+        # rerank=False на быстром маршруте: без отдельного LLM-вызова перед ответом.
+        relevant, active_goals = await asyncio.gather(
+            self.memory_service.recall(message, top_k=7, subqueries=subqueries or None, rerank=rerank),
+            self.memory_service.get_goals(),
+        )
         memory_context = ""
         # ИСПРАВЛЕНИЕ (причина №2 — "путаница" памяти в браузерном чате, которой
         # нет в MCP-режиме): отсекаем низкорелевантные результаты по порогу.
@@ -1451,7 +1457,6 @@ class CognitiveController:
             uncertainty *= 0.7
 
         # ИЗМЕНЕНИЕ: получение целей через сервис
-        active_goals = await self.memory_service.get_goals()
         goal_hint = ""
         if active_goals:
             goal_hint = "Активные цели: " + ", ".join([g["description"] for g in active_goals[:2]])
@@ -1463,7 +1468,7 @@ class CognitiveController:
                 goal_texts = [g["description"] for g in active_goals[:3]]
                 goal_relevant = []
                 _extras = await asyncio.gather(
-                    *[self.memory_service.recall(g_text, top_k=3) for g_text in goal_texts],
+                    *[self.memory_service.recall(g_text, top_k=3, rerank=False) for g_text in goal_texts],
                     return_exceptions=True)
                 for extra in _extras:
                     if isinstance(extra, Exception):
@@ -1626,7 +1631,15 @@ class CognitiveController:
         if response:
             uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
             salience = 1.0 - uncertainty
-            await self.memory_service.add_episode(message, stored_response, salience=salience)
+            # Эпизод (эмбеддинги + синапсы) и сохранение — в фоне: [DONE] и разблокировка
+            # ввода не ждут тяжёлых вычислений памяти.
+            async def _persist_episode(_m=message, _r=stored_response, _s=salience):
+                try:
+                    await self.memory_service.add_episode(_m, _r, salience=_s)
+                    await self.memory_service.private_memory._schedule_save()
+                except Exception as _pe:
+                    logger.error(f"[finalize] фоновое сохранение эпизода не удалось: {_pe}")
+            self._spawn_background_task(_persist_episode(), name="persist-episode")
             self._last_exchange = {"user": message, "assistant": response, "timestamp": time.time()}
 
             # Прогресс активных целей, упомянутых в ответе (теперь и в non-stream).
@@ -1643,7 +1656,6 @@ class CognitiveController:
                                 g.gcn_id, {"object": new_obj, "confidence": g.confidence}, self.user_id)
                             self.memory._sync_goal_from_gcn(g.gcn_id)
                             break
-            await self.memory_service.private_memory._schedule_save()
 
             relevant = self._last_prepare_meta.get("relevant", [])
             for fact_dict in relevant[:3]:
@@ -2735,8 +2747,16 @@ class CognitiveController:
 
             await self._ensure_external_tools_registered()
 
+            # Классификация (без LLM) ДО подготовки сообщений: на быстром маршруте
+            # пропускаем LLM-реранк памяти. force_slow считаем так же, как это делает
+            # _prepare_messages для search_requested.
+            _pre_slow = bool(web_search or reasoning or image_base64
+                             or (AUTO_SEARCH_ENABLED and needs_search_heuristic(message)))
+            decision = self.fast_router.classify(message, force_slow=_pre_slow) if FAST_ROUTER_ENABLED else None
+
             messages, search_meta = await self._prepare_messages(
-                message, web_search, image_base64, image_mime, reasoning
+                message, web_search, image_base64, image_mime, reasoning,
+                rerank=(decision is None or decision.route is Route.TOOLS),
             )
             uncertainty = self._last_prepare_meta.get("uncertainty", 0.5)
             if self.autonomy is not None:
@@ -2780,11 +2800,9 @@ class CognitiveController:
                             "[Пользователю, вероятно, нужны актуальные данные из интернета — рассмотри вызов internal__web_search]"
                         )
                     timer.mark("prepare")
-                    decision = self.fast_router.classify(
-                        message,
-                        force_slow=bool(web_search or reasoning or image_base64
-                                        or search_meta.get("search_requested")),
-                    ) if FAST_ROUTER_ENABLED else None
+                    if (decision is not None and search_meta.get("search_requested")
+                            and not _pre_slow):
+                        decision = self.fast_router.classify(message, force_slow=True)
                     if decision is None or decision.route is Route.TOOLS:
                         tool_run = await self.tool_router.run(message, messages, history_tail=history_tail)
                         tool_trace = tool_run.get("tool_trace", [])
@@ -2936,6 +2954,10 @@ class CognitiveController:
                     _stream_max_tokens = DEFAULT_MAX_TOKENS
                     if reasoning:
                         _stream_max_tokens = DEFAULT_MAX_TOKENS + REASONING_MAX_TOKENS_BOOST
+                    # Ответ по результатам инструментов/поиска — холоднее, меньше выдумок.
+                    _stream_temp = (GROUNDED_ANSWER_TEMP
+                                    if (tool_trace or search_meta.get("context")) and not reasoning
+                                    else 0.7)
 
                     # Reasoning-токены идут отдельным SSE-полем reasoning_token и НЕ попадают
                     # в full_response — это критично: full_response уходит в _finalize_answer
@@ -2945,6 +2967,7 @@ class CognitiveController:
                     # буфера генерации на бэкенде — там хранятся все SSE-события как есть.
                     async for event in call_llm_stream(
                         messages,
+                        temp=_stream_temp,
                         max_tokens=_stream_max_tokens,
                         stop=stream_stop_tokens,
                         include_reasoning=reasoning,

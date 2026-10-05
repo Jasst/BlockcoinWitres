@@ -1742,7 +1742,7 @@ class GCNMemoryRouter:
         self.global_memory.reload_if_stale()
 
     async def retrieve(self, query: str, top_k: int = 7, include_private: bool = True,
-                       subqueries: Optional[List[str]] = None) -> List[Dict]:
+                       subqueries: Optional[List[str]] = None, rerank: bool = True) -> List[Dict]:
         """
         Объединённый поиск по всем доступным слоям с ранжированием.
         ИНТЕЛЛЕКТ-ПАКЕТ (C): если переданы subqueries — каждый подзапрос ищется
@@ -1763,9 +1763,10 @@ class GCNMemoryRouter:
         _llm_rerank/_mark_accessed ровно один раз — на уже слитом пуле.
         """
         if subqueries:
-            return await self._retrieve_subqueries(query, subqueries, top_k, include_private)
+            return await self._retrieve_subqueries(query, subqueries, top_k, include_private, rerank)
         unique = await self._collect_candidates(query, top_k, include_private)
-        reranked = await self._llm_rerank(query, unique, top_k)
+        # rerank=False — быстрый маршрут: пропускаем отдельный LLM-вызов, берём порядок по _score.
+        reranked = await self._llm_rerank(query, unique, top_k) if rerank else None
         final = reranked if reranked is not None else unique[:top_k]
         self._mark_accessed(final)
         return final
@@ -1830,7 +1831,8 @@ class GCNMemoryRouter:
         return unique
 
     async def _retrieve_subqueries(self, query: str, subqueries: List[str],
-                                   top_k: int, include_private: bool) -> List[Dict]:
+                                   top_k: int, include_private: bool,
+                                   rerank: bool = True) -> List[Dict]:
         """
         ИНТЕЛЛЕКТ-ПАКЕТ (C): retrieval по подзапросам. Каждый подзапрос идёт
         через обычный multi-scope retrieve() (private+shared+global, rerank,
@@ -1866,7 +1868,7 @@ class GCNMemoryRouter:
                     merged[key] = item
 
         unique = sorted(merged.values(), key=lambda x: x.get("_score", 0.0), reverse=True)
-        reranked = await self._llm_rerank(query, unique, top_k)
+        reranked = await self._llm_rerank(query, unique, top_k) if rerank else None
         final = reranked if reranked is not None else unique[:top_k]
         self._mark_accessed(final)
         return final
@@ -1942,8 +1944,10 @@ class GCNMemoryRouter:
             "Пример: [3, 0, 7]. Если ни один пункт не релевантен — верни []."
         )
         try:
-            raw = await self._llm_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=120)
-        except Exception as e:
+            raw = await asyncio.wait_for(
+                self._llm_caller([{"role": "user", "content": prompt}], temp=0.0, max_tokens=120),
+                timeout=RERANK_TIMEOUT)
+        except Exception as e:  # включая asyncio.TimeoutError — откат на порядок по _score
             logger.debug(f"LLM-реранкинг памяти не удался, откат на исходный порядок: {e}")
             return None
 
@@ -2385,7 +2389,7 @@ class MemoryService:
         self.router.refresh(include_private=True)
 
     async def recall(self, query: str, top_k: int = 5, scope: Optional[str] = None,
-                     subqueries: Optional[List[str]] = None) -> List[Dict]:
+                     subqueries: Optional[List[str]] = None, rerank: bool = True) -> List[Dict]:
         """
         Поиск по всем слоям с опциональным фильтром по скоупу.
         ИНТЕЛЛЕКТ-ПАКЕТ (C): subqueries — декомпозиция составного запроса,
@@ -2394,7 +2398,7 @@ class MemoryService:
         """
         self.refresh()
         results = await self.router.retrieve(query, top_k=top_k * 2, include_private=True,
-                                             subqueries=subqueries)
+                                             subqueries=subqueries, rerank=rerank)
         if scope:
             scope_lower = scope.lower()
             results = [r for r in results if r.get('scope') == scope_lower]
