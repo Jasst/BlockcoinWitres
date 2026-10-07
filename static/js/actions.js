@@ -213,8 +213,9 @@
         const messageInput = document.getElementById('messageContent');
         const hasText = messageInput && messageInput.value.trim() !== '';
         const hasFile = pendingFile !== null;
+        const hasReply = !!(window.getReplyQuote && window.getReplyQuote());
 
-        if (hasText || hasFile) {
+        if (hasText || hasFile || hasReply) {
             sendBtn.style.display = 'flex';
             recordBtn.style.display = 'none';
         } else {
@@ -229,8 +230,9 @@
     if (window.isSending) return;
     const contentEl = document.getElementById('messageContent');
     let content = contentEl ? contentEl.value.trim() : '';
-    // WhatsApp-style reply: prepend the stored quote as a blockquote to the outgoing text
-    if (content && window.consumeReplyQuote) content = window.consumeReplyQuote(content);
+    // WhatsApp-style reply: the quote is attached BEFORE the empty-check so that
+    // "Reply" + pressing send on an empty input still sends the quoted message.
+    if (window.consumeReplyQuote) content = window.consumeReplyQuote(content);
     if (!content && !pendingFile) {
         window.NotificationManager?.showToast(t('enter_message_or_attach'), 'warning');
         return;
@@ -765,6 +767,8 @@
         hide: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c7 0 10 8 10 8a18 18 0 0 1-2.16 3.19"/><path d="M6.61 6.61A18 18 0 0 0 2 12s3 8 10 8a9 9 0 0 0 5.39-1.61"/><path d="M14.12 14.12A3 3 0 1 1 9.88 9.88"/><path d="M2 2l20 20"/></svg>'
     };
     window.CTX_ICONS = CTX_ICONS; // shared set for ui.js / contacts / groups
+    // Shared loading spinner (SVG, no emoji) for inline button states
+    window.CTX_SPINNER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9" /></svg>';
 
     // --- Единое хранилище закреплённых сообщений (по одному на чат) ---
     window.getPinnedForChat = function (chatAddress) {
@@ -1016,6 +1020,9 @@
             window.NotificationManager?.showToast(t('open_chat_first'), 'warning');
             return;
         }
+        // The input may be disabled until a chat is fully opened - enable it so
+        // the user can type the reply immediately (WhatsApp behaviour).
+        textarea.disabled = false;
         _replyQuote = { messageId: String(messageId || ''), sender: sender || '', text: text || '' };
 
         let box = document.getElementById('replyQuoteBox');
@@ -1023,7 +1030,12 @@
             box = document.createElement('div');
             box.id = 'replyQuoteBox';
             box.className = 'reply-quote-box';
-            textarea.parentNode.insertBefore(box, textarea);
+            // Insert as the FIRST child of the .input-area form so the chip
+            // sits inside the rounded input bubble, above the text line.
+            const area = textarea.closest('.input-area');
+            const wrapper = textarea.closest('.input-wrapper');
+            const container = area || (wrapper ? wrapper.parentNode : textarea.parentNode);
+            container.insertBefore(box, container.firstChild);
         }
         const shortText = (_replyQuote.text || '').replace(/\s+/g, ' ').slice(0, 120);
         box.innerHTML = `
@@ -1054,13 +1066,28 @@
         if (window.updateSendButtonVisibility) window.updateSendButtonVisibility();
     };
 
-    window.scrollToAndHighlightMessage = function (msgId) {
+    // Scroll to a message and highlight it. If the message is not rendered yet
+    // (old history page), reuse jumpToPinnedMessage which loads older pages.
+    window.scrollToAndHighlightMessage = async function (msgId) {
         if (!msgId) return;
-        const el = document.getElementById('msg-' + msgId);
-        if (!el) return;
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        el.classList.add('msg-highlight');
-        setTimeout(() => el.classList.remove('msg-highlight'), 2200);
+        let el = document.getElementById('msg-' + msgId);
+        if (!el) {
+            const container = document.getElementById('messagesContainer');
+            if (container) {
+                for (const m of container.querySelectorAll('.message')) {
+                    if (String(m.dataset.messageId) === String(msgId)) { el = m; break; }
+                }
+            }
+        }
+        if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.classList.add('msg-highlight');
+            setTimeout(() => el.classList.remove('msg-highlight'), 2200);
+            return;
+        }
+        if (window.jumpToPinnedMessage) {
+            try { await window.jumpToPinnedMessage(msgId); } catch (e) {}
+        }
     };
 
     // Compose outgoing text with the quote prefix, then clear the chip
@@ -1069,8 +1096,9 @@
         const q = _replyQuote;
         window.clearReplyQuote();
         const quotedLines = (q.text || '').split('\n').map(l => '> ' + l).join('\n');
-        const prefix = (q.sender ? q.sender + ':\n' : '') + quotedLines + '\n\n';
-        return prefix + userText;
+        const prefix = (q.sender ? q.sender + ':\n' : '') + quotedLines;
+        // Empty user text: send just the quote (WhatsApp-style quick reply)
+        return userText ? prefix + '\n\n' + userText : prefix;
     };
 
     // Pinned message bar (single source of truth: localStorage pinned_<chat>)

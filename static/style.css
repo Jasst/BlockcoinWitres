@@ -3296,15 +3296,24 @@ body.light-theme .ctx-target-active {
   to   { opacity: 1; transform: translateY(0) scale(1); }
 }
 /* ========== Reply quote chip (WhatsApp-style) ========== */
+/* The chip is inserted as the first child of the .input-area form, so the
+   pill becomes a two-row column: quote row on top, input row below. */
+.input-area:has(> .reply-quote-box.active) {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  border-radius: 26px;
+  padding: 6px 16px 8px;
+}
 .reply-quote-box {
   display: none;
   align-items: center;
   gap: 10px;
-  margin: 0 4px 8px;
-  padding: 8px 12px 8px 0;
-  background: var(--bg-surface, #212329);
+  margin: 2px 0 6px;
+  padding: 7px 8px 7px 0;
+  background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--border-color, rgba(255,255,255,0.09));
-  border-radius: 12px;
+  border-radius: 14px;
   animation: ctxFadeIn 0.16s ease;
 }
 .reply-quote-box.active { display: flex; }
@@ -3349,10 +3358,21 @@ body.light-theme .ctx-target-active {
   background: rgba(255,255,255,0.08);
   color: var(--text-primary, #eceef1);
 }
-body.light-theme .reply-quote-box { background: #e9eaee; border-color: rgba(36,38,44,0.1); }
+body.light-theme .reply-quote-box { background: rgba(36,38,44,0.05); border-color: rgba(36,38,44,0.1); }
 body.light-theme .reply-quote-sender { color: #3f4653; }
 body.light-theme .reply-quote-text { color: #6b7280; }
 body.light-theme .reply-quote-close:hover { background: rgba(36,38,44,0.08); color: #24262c; }
+
+/* ========== Inline SVG loading state for icon buttons ========== */
+.btn-loading svg {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  fill: none;
+  display: block;
+  animation: btnSpin 0.8s linear infinite;
+}
+@keyframes btnSpin { to { transform: rotate(360deg); } }
 
 /* Подсветка сообщения при ответе/переходе к нему (как в WhatsApp) */
 .message.msg-highlight > *,
