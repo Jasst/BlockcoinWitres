@@ -173,6 +173,8 @@
                                  ${deleteBtn}
                                  ${statusHtml}
                                </div></div>`;
+        // Долгое нажатие на сообщении (тач) открывает то же меню, что и правый клик (ПК)
+        if (window.bindMessageHold) window.bindMessageHold(messageDiv);
         return messageDiv;
     }
 
@@ -261,6 +263,7 @@
                 item.innerHTML = `<div class="avatar ${isGroup ? 'group' : ''}">${Utils.escapeHtml(initials)}</div>
                     <div class="info"><div class="name truncate">${Utils.escapeHtml(shortName)}</div><div class="meta"><span class="status"></span><span class="truncate">${previewText}</span></div></div>`;
                 item.onclick = ((addr, name, group) => () => window.selectConversation(addr, name, group))(address, conv.name || address, isGroup);
+                bindConversationHold(item, address, displayName, isGroup);
                 container.appendChild(item);
                 convElements.push({ el: item, address, isGroup });
             }
