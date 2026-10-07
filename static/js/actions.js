@@ -1015,14 +1015,26 @@
     window.getReplyQuote = function () { return _replyQuote; };
 
     window.attachReplyQuote = function ({ messageId, sender, text }) {
-        const textarea = document.getElementById('messageContent');
-        if (!textarea) {
-            window.NotificationManager?.showToast(t('open_chat_first'), 'warning');
+        let textarea = document.getElementById('messageContent');
+        const panel = document.getElementById('chatPanel');
+        // On mobile the chat panel is toggled via inline display styles
+        // (showChatPanel in chat.html) - open it so the reply chip and input
+        // are actually visible before attaching the quote.
+        if (panel && window.innerWidth < 768 && typeof window.showChatPanel === 'function') {
+            window.showChatPanel();
+        } else if (panel && !panel.classList.contains('open')) {
+            panel.classList.add('open');
+        }
+        if (!textarea || textarea.offsetParent === null) {
+            // No message input on this page (e.g. contacts/groups) or it is
+            // inside a hidden container - do nothing silently instead of
+            // building an invisible chip.
             return;
         }
         // The input may be disabled until a chat is fully opened - enable it so
         // the user can type the reply immediately (WhatsApp behaviour).
         textarea.disabled = false;
+        textarea.readOnly = false;
         _replyQuote = { messageId: String(messageId || ''), sender: sender || '', text: text || '' };
 
         let box = document.getElementById('replyQuoteBox');
