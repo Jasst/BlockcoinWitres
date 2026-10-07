@@ -3264,6 +3264,25 @@ body.light-theme .bottom-nav { background: rgba(255, 255, 255, 0.94); }
   background: rgba(255, 255, 255, 0.07);
   border-radius: 12px;
 }
+/* Mobile long-press reliability: suppress the native text-selection bubble
+   and callout on bound rows/messages so only OUR menu appears */
+.conversation-item, .list-item, .message {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.message .message-content, .message textarea, .message pre {
+  /* keep inner code blocks selectable if needed in future */
+  -webkit-user-select: text;
+  user-select: text;
+}
+@media (max-width: 768px) {
+  /* larger tap targets + no hover-stuck highlight on touch devices */
+  .ctx-menu { min-width: 230px; }
+  .ctx-item { padding: 12px 12px; font-size: 15px; }
+  .ctx-item:hover { background: transparent; }
+  .ctx-item:active { background: rgba(255, 255, 255, 0.11); }
+}
 /* Светлая тема */
 body.light-theme .ctx-menu {
   background: #ffffff;

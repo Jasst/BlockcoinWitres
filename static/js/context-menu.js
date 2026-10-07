@@ -207,6 +207,13 @@
 
             // если тач-скролл начался — отменяем таймер
             el.addEventListener('scroll', cancelHold, { capture: true, passive: true });
+
+            // Android long-press produces a NATIVE contextmenu event ~600ms
+            // after touchstart; our custom menu already opened at HOLD_MS.
+            // Without this suppression both menus would stack on screen.
+            el.addEventListener('contextmenu', (e) => {
+                if (Date.now() < suppressClickUntil || activeMenu) e.preventDefault();
+            });
         }
     };
 

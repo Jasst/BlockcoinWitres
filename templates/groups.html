@@ -877,7 +877,8 @@ container.innerHTML = `<div class="empty-state">
   };
 
   window.openDetail = async (groupJson) => {
-    const g = JSON.parse(groupJson);
+    // Accept either a JSON string (inline buttons) or an object (context menu)
+    const g = (typeof groupJson === 'string') ? JSON.parse(groupJson) : groupJson;
     currentGroup = g;
     const isCreator = g.creator === MY_ADDR;
     const tabsDiv = document.getElementById('detailTabs');
@@ -1096,7 +1097,7 @@ container.innerHTML = `<div class="empty-state">
     ContextMenu.bind(card, () => {
       const items = [
         { icon: GRP_ICONS.chat, label: t('open_chat'), onClick: () => openGroupChatById('group:' + group.id, group.name) },
-        { icon: GRP_ICONS.info, label: t('info'), onClick: () => openDetail(JSON.stringify(group)) },
+        { icon: GRP_ICONS.info, label: t('info'), onClick: () => openDetail(group) },
         { icon: GRP_ICONS.copy, label: t('copy_group_id'), onClick: () => {
             const done = () => window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
             if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(group.id).then(done).catch(done);

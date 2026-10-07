@@ -32,9 +32,16 @@ except Exception:
 
 _orig_url_for = templates.env.globals['url_for']
 
-def _versioned_url_for(path, **kwargs):
-    url = _orig_url_for(path, **kwargs)
-    if path.startswith('js/') or path.endswith('.css') or path.startswith('locales/'):
+def _versioned_url_for(endpoint=None, /, *args, **kwargs):
+    """Drop-in replacement for Jinja's url_for that appends ?v=<build> to
+    local static assets (cache-busting). Supports both calling styles used
+    in templates: url_for('static', path='...') and url_for('/chat')."""
+    url = _orig_url_for(endpoint, *args, **kwargs) if endpoint is not None else _orig_url_for(*args, **kwargs)
+    try:
+        path = kwargs.get('path', '') if endpoint == 'static' else ''
+    except Exception:
+        path = ''
+    if isinstance(path, str) and (path.startswith('js/') or path.endswith('.css') or path.startswith('locales/')):
         sep = '&' if '?' in url else '?'
         url = f'{url}{sep}v={_ASSET_VER}'
     return url

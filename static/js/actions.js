@@ -1035,6 +1035,58 @@
         } else if (panel && !panel.classList.contains('open')) {
             panel.classList.add('open');
         }
+        // If no chat is opened yet, "reply" opens the conversation that owns
+        // the quoted message first (WhatsApp behaviour). The payload stays in
+        // _pendingReply and is consumed by attachReplyQuote itself once the
+        // messages of that chat have been rendered.
+        const chatAddress = window.State?.currentChatAddress;
+        const ownMessage = document.querySelector(
+            `.message[data-message-id="${CSS.escape(String(messageId))}"]`);
+        const convItem = (!chatAddress && ownMessage) ? ownMessage.closest('.conversation-item') : null;
+        if ((!chatAddress || chatAddress === 'ai_bot') && (window.selectConversation || convItem)) {
+            let targetAddr = '', targetName = '', targetGroup = false;
+            if (convItem) {
+                targetAddr = convItem.dataset.address || '';
+                targetName = convItem.querySelector('.name')?.textContent || '';
+                targetGroup = convItem.dataset.isGroup === '1';
+            } else if (ownMessage) {
+                // Message element found but no chat selected - derive sender
+                targetAddr = ownMessage.classList.contains('sent')
+                    ? '' : (ownMessage.dataset.sender || '');
+            }
+            if (targetAddr) {
+                window._pendingReply = { messageId, sender, text };
+                const waitMsg = () => {
+                    let tries = 0;
+                    const iv = setInterval(() => {
+                        tries++;
+                        const el = document.querySelector(
+                            `.message[data-message-id="${CSS.escape(String(messageId))}"]`);
+                        if (el) {
+                            clearInterval(iv);
+                            const p = window._pendingReply;
+                            window._pendingReply = null;
+                            window.attachReplyQuote(p || { messageId, sender, text });
+                        } else if (tries > 100) { // ~5s: chat loaded without that msg
+                            clearInterval(iv);
+                            const ta = document.getElementById('messageContent');
+                            if (ta) {
+                                const p = window._pendingReply;
+                                window._pendingReply = null;
+                                window.attachReplyQuote(p || { messageId, sender, text });
+                            }
+                        }
+                    }, 50);
+                };
+                if (window.selectConversation) {
+                    Promise.resolve(window.selectConversation(targetAddr, targetName, targetGroup))
+                        .then(waitMsg).catch(waitMsg);
+                } else {
+                    window.location.href = '/chat?start_with=' + encodeURIComponent(targetAddr);
+                }
+                return;
+            }
+        }
         if (!textarea) {
             // The page has no chat markup at all (contacts/groups/etc.) or a
             // stale cached script bundle is loaded - open /chat and attach the
