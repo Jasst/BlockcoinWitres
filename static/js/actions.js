@@ -672,7 +672,10 @@
         const withBreaks = p.innerHTML.replace(/<br\s*\/?>/gi, '\n');
         const tmp = document.createElement('div');
         tmp.innerHTML = withBreaks;
-        return tmp.textContent || '';
+        let text = tmp.textContent || '';
+        // Убираем пометку "(изменено)" / "(edited)", добавляемую при редактировании
+        text = text.replace(/\s*[（(]?(изменено|отредактировано|edited)[）)]?\s*$/i, '');
+        return text.trim();
     }
 
     function findCachedMessage(msgId) {
@@ -734,6 +737,8 @@
         ta.remove();
     }
 
+    // Единый набор SVG-иконок для контекстных меню (stroke через CSS).
+    // ВАЖНО: иконки — только SVG, без PNG <img>, иначе в меню появляются «двойные» иконки.
     const CTX_ICONS = {
         copy: '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
         reply: '<svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 5 5v1a5 5 0 0 1-5 5h-3"/></svg>',
@@ -744,7 +749,24 @@
         open: '<svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
         contact: '<svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
         call: '<svg viewBox="0 0 24 24"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .7 2.9a2 2 0 0 1-.4 2.1L8.1 10a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.9.6 2.9.7a2 2 0 0 1 1.6 1.9z"/></svg>',
-        info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>'
+        info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>',
+        hide: '<svg viewBox="0 0 24 24"><path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c7 0 10 8 10 8a18 18 0 0 1-2.16 3.19"/><path d="M6.61 6.61A18 18 0 0 0 2 12s3 8 10 8a9 9 0 0 0 5.39-1.61"/><path d="M14.12 14.12A3 3 0 1 1 9.88 9.88"/><path d="M2 2l20 20"/></svg>'
+    };
+
+    // --- Единое хранилище закреплённых сообщений (по одному на чат) ---
+    window.getPinnedForChat = function (chatAddress) {
+        if (!chatAddress) return null;
+        try {
+            const raw = localStorage.getItem('pinned_' + chatAddress);
+            return raw ? JSON.parse(raw) : null;
+        } catch (e) { return null; }
+    };
+    window.setPinnedForChat = function (chatAddress, data) {
+        if (!chatAddress) return;
+        const key = 'pinned_' + chatAddress;
+        if (data) localStorage.setItem(key, JSON.stringify(data));
+        else localStorage.removeItem(key);
+        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(chatAddress);
     };
 
     function buildMessageMenuItems(messageEl) {
@@ -755,8 +777,8 @@
         const messageContent = getMessageText(messageEl);
         let isPinned = false;
         try {
-            const pinnedRaw = localStorage.getItem(`pinned_${State.currentChatAddress}`);
-            isPinned = pinnedRaw && String(JSON.parse(pinnedRaw).messageId) === String(msgId);
+            const pinnedData = window.getPinnedForChat ? window.getPinnedForChat(State.currentChatAddress) : null;
+            isPinned = !!(pinnedData && String(pinnedData.messageId) === String(msgId));
         } catch (e) {}
 
         return [
@@ -819,17 +841,24 @@
                 label: isPinned ? t('unpin_message') : t('pin_message'),
                 onClick: () => {
                     const chatAddress = State.currentChatAddress;
-                    if (!chatAddress) return;
+                    if (!chatAddress) {
+                        window.NotificationManager?.showToast(t('open_chat_first'), 'warning');
+                        return;
+                    }
                     if (isPinned) {
-                        window.unpinMessage(chatAddress);
+                        // Открепление текущего сообщения
+                        window.setPinnedForChat(chatAddress, null);
+                        messageEl.classList.remove('pinned-highlight');
                         window.NotificationManager?.showToast(t('unpinned_message'), 'success');
                     } else {
-                        localStorage.setItem(`pinned_${chatAddress}`, JSON.stringify({
+                        // Закрепление (заменяет предыдущее закреплённое в этом чате)
+                        window.setPinnedForChat(chatAddress, {
                             messageId: msgId,
                             content: messageContent.substring(0, 100),
                             timestamp: Date.now()
-                        }));
-                        window.updatePinnedMessageBar(chatAddress);
+                        });
+                        messageEl.classList.add('pinned-highlight');
+                        setTimeout(() => messageEl.classList.remove('pinned-highlight'), 2000);
                         window.NotificationManager?.showToast(t('pinned_message'), 'success');
                     }
                 }
@@ -951,21 +980,24 @@
         });
     };
     
-    // Pinned message bar functions
+    // Pinned message bar (single source of truth: localStorage pinned_<chat>)
     window.updatePinnedMessageBar = function(chatAddress) {
         const bar = document.getElementById('pinnedMessagesBar');
         const preview = document.getElementById('pinnedMessagePreview');
         if (!bar || !preview) return;
-        
-        const storageKey = `pinned_${chatAddress}`;
-        const pinnedData = localStorage.getItem(storageKey);
-        
-        if (pinnedData) {
-            const data = JSON.parse(pinnedData);
-            preview.textContent = data.content;
+
+        let data = null;
+        try {
+            const raw = localStorage.getItem('pinned_' + chatAddress);
+            data = raw ? JSON.parse(raw) : null;
+        } catch (e) { data = null; }
+
+        if (data && data.messageId) {
+            preview.textContent = data.content || '';
             bar.classList.add('active');
-            
-            // Scroll to pinned message on click
+            bar.dataset.pinnedMessageId = data.messageId;
+
+            // Click on the bar scrolls to the pinned message
             preview.onclick = () => {
                 const msgEl = document.getElementById('msg-' + data.messageId);
                 if (msgEl) {
@@ -976,12 +1008,13 @@
             };
         } else {
             bar.classList.remove('active');
+            delete bar.dataset.pinnedMessageId;
+            preview.onclick = null;
         }
     };
-    
+
     window.unpinMessage = function(chatAddress) {
-        const storageKey = `pinned_${chatAddress}`;
-        localStorage.removeItem(storageKey);
+        localStorage.removeItem('pinned_' + chatAddress);
         window.updatePinnedMessageBar(chatAddress);
     };
 })();
