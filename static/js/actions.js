@@ -1030,9 +1030,12 @@
             panel.classList.add('open');
         }
         if (!textarea) {
-            // The page has no chat markup at all (contacts/groups/etc.) -
-            // navigate to /chat first, then attach the quote once the input
-            // exists (SPA navigation keeps the menu state alive).
+            // The page has no chat markup at all (contacts/groups/etc.) or a
+            // stale cached script bundle is loaded - open /chat and attach the
+            // quote once the input exists. If the installed code is outdated
+            // (attachReplyQuote missing after SPA re-entry), fall back to a
+            // full page reload which always fetches fresh scripts.
+            const payload = { messageId, sender, text };
             const goChat = () => {
                 try {
                     if (window.spaNavigate) window.spaNavigate('/chat');
@@ -1040,11 +1043,25 @@
                 } catch (e) { window.location.href = '/chat'; }
             };
             goChat();
+            window._pendingReply = payload;
             let tries = 0;
             const waitInput = setInterval(() => {
                 tries++;
                 const ta = document.getElementById('messageContent');
-                if (ta) { clearInterval(waitInput); window.attachReplyQuote({ messageId, sender, text }); }
+                if (ta) {
+                    clearInterval(waitInput);
+                    if (typeof window.attachReplyQuote === 'function') {
+                        const p = window._pendingReply || payload;
+                        window._pendingReply = null;
+                        window.attachReplyQuote(p);
+                    } else {
+                        // Old cached actions.js still active on this page -
+                        // hard reload so the browser fetches the new file.
+                        clearInterval(waitInput);
+                        try { sessionStorage.setItem('_replyRetry', JSON.stringify(payload)); } catch (e) {}
+                        window.location.href = '/chat?reply=' + encodeURIComponent(messageId || '');
+                    }
+                }
                 else if (tries > 40) clearInterval(waitInput); // ~4s timeout
             }, 100);
             return;
@@ -1110,6 +1127,35 @@
         if (box) { box.remove(); }
         if (window.updateSendButtonVisibility) window.updateSendButtonVisibility();
     };
+
+    // Consume a reply request saved before a fallback full page reload
+    // (?reply=<id> or sessionStorage payload) once the chat page is ready.
+    window._tryConsumePendingReply = function () {
+        let id = '';
+        try { id = new URLSearchParams(location.search).get('reply') || ''; } catch (e) {}
+        let payload = null;
+        try { payload = JSON.parse(sessionStorage.getItem('_replyRetry') || 'null'); } catch (e) {}
+        if (!id && !payload) return false;
+        const el = id ? (document.getElementById('msg-' + id) ||
+            Array.from(document.querySelectorAll('.message')).find(m => String(m.dataset.messageId) === String(id))) : null;
+        if (el) {
+            const content = (window.getMessageText ? window.getMessageText(el) : (el.querySelector('.message-content')?.textContent || ''));
+            const sender = el.querySelector('.content strong')?.textContent || '';
+            try { sessionStorage.removeItem('_replyRetry'); } catch (e) {}
+            window.attachReplyQuote({ messageId: el.dataset.messageId || id, sender, text: content });
+            try { history.replaceState({}, '', '/chat'); } catch (e) {}
+            return true;
+        }
+        if (payload) {
+            try { sessionStorage.removeItem('_replyRetry'); } catch (e) {}
+            window.attachReplyQuote(payload);
+            try { history.replaceState({}, '', '/chat'); } catch (e) {}
+            return true;
+        }
+        return false;
+    };
+    setTimeout(() => { try { window._tryConsumePendingReply(); } catch (e) {} }, 600);
+    setTimeout(() => { try { window._tryConsumePendingReply(); } catch (e) {} }, 2500);
 
     // Scroll to a message and highlight it. If the message is not rendered yet
     // (old history page), reuse jumpToPinnedMessage which loads older pages.
