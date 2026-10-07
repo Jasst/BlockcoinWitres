@@ -73,7 +73,17 @@
                     btn.type = 'button';
                     btn.className = 'ctx-item' + (it.danger ? ' danger' : '');
                     btn.setAttribute('role', 'menuitem');
-                    btn.innerHTML = `<span class="ctx-icon">${it.icon || ''}</span><span>${it.label}</span>`;
+                    // Одна иконка: берём ТОЛЬКО первый <svg>/<img>; текст вне тегов отбрасывается,
+                    // чтобы исключить визуальные дубли иконок в пункте меню.
+                    let iconHtml = '';
+                    const rawIcon = it.icon || '';
+                    if (rawIcon) {
+                        const tmp = document.createElement('div');
+                        tmp.innerHTML = rawIcon;
+                        const firstSvg = tmp.querySelector('svg') || tmp.querySelector('img');
+                        if (firstSvg) iconHtml = firstSvg.outerHTML;
+                    }
+                    btn.innerHTML = `<span class="ctx-icon">${iconHtml}</span><span>${it.label}</span>`;
                     btn.addEventListener('click', (e) => {
                         e.stopPropagation();
                         closeMenu();

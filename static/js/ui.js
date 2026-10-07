@@ -396,8 +396,9 @@
         State.currentChatIsGroup = !!isGroup;
         State.currentChatPartnerAddress = isGroup ? '' : (address === State.userAddress ? '' : address);
 
-        // Панель закреплённого сообщения — актуальное состояние для выбранного чата
+        // // Clear pinned bar and reply quote for the newly opened chat
         if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(address);
+        if (window.clearReplyQuote) window.clearReplyQuote();
 
         const callBtn = document.getElementById('callButton');
         if (callBtn) {
