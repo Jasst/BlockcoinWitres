@@ -1036,48 +1036,89 @@ body.light-theme .search-icon {
   display: none;
 }
 
-/* ===== Pinned Messages ===== */
+/* ===== Pinned Messages (Telegram-style floating bar under the chat header) ===== */
 .pinned-messages-bar {
-  display: none;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 16px;
-  background: var(--accent-soft);
-  border-bottom: 1px solid var(--border-color);
-  font-size: 13px;
-  color: var(--text-secondary);
-  flex-shrink: 0;
+  position: absolute;
+  top: 64px;               /* just below .chat-panel-header */
+  left: 0;
+  right: 0;
+  z-index: 14;
+  display: flex;
+  justify-content: center;
+  padding: 0 12px;
+  pointer-events: none;   /* only the inner pill is clickable */
+  opacity: 0;
+  transform: translateY(-8px);
+  visibility: hidden;
+  transition: opacity .22s ease, transform .22s ease, visibility .22s;
 }
 .pinned-messages-bar.active {
+  opacity: 1;
+  transform: translateY(0);
+  visibility: visible;
+}
+.pinned-bar-inner {
+  pointer-events: auto;
   display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  max-width: 640px;
+  padding: 7px 10px 7px 14px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+.pinned-bar-inner:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong, var(--border-color));
+}
+.pinned-pin-icon {
+  flex-shrink: 0;
+  color: var(--accent-solid, var(--text-secondary));
+}
+.pinned-bar-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+.pinned-bar-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-primary);
 }
 .pinned-message-preview {
-  flex: 1;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  cursor: pointer;
-  opacity: 0.9;
-}
-.pinned-message-preview:hover {
-  opacity: 1;
-  text-decoration: underline;
+  opacity: 0.85;
 }
 .pinned-close-btn {
   background: transparent;
   border: none;
   color: var(--text-muted);
   cursor: pointer;
-  padding: 4px;
+  padding: 6px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
   transition: all var(--transition-fast);
 }
 .pinned-close-btn:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+@media (max-width: 768px) {
+  .pinned-messages-bar { top: 58px; }
 }
 
 /* ===== Highlight for Pinned Message ===== */
@@ -2841,10 +2882,11 @@ body.light-theme .chat-panel-header {
 }
 
 /* Fix pinned messages bar in light theme */
-body.light-theme .pinned-messages-bar {
-  background: rgba(86, 93, 104, 0.12);
-  border-bottom: 1px solid rgba(86, 93, 104, 0.18);
-  color: #1b1d21;
+body.light-theme .pinned-bar-inner {
+  background: #ffffff;
+  border-color: rgba(86, 93, 104, 0.25);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.10);
+  color: #4a4f57;
 }
 
 body.light-theme .conversations-header {

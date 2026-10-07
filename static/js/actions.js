@@ -1053,9 +1053,13 @@
     };
 
     // Pinned message bar (single source of truth: localStorage pinned_<chat>)
+    // Telegram-style floating pill under the chat header. Clicking it scrolls
+    // to the pinned message; if the message is not loaded yet (old history),
+    // the chat is reloaded from the server so the message can be found.
     window.updatePinnedMessageBar = function(chatAddress) {
         const bar = document.getElementById('pinnedMessagesBar');
         const preview = document.getElementById('pinnedMessagePreview');
+        const label = document.getElementById('pinnedMessageLabel');
         if (!bar || !preview) return;
 
         let data = null;
@@ -1065,24 +1069,74 @@
         } catch (e) { data = null; }
 
         if (data && data.messageId) {
+            if (label) label.textContent = t('pinned_message') || 'Pinned message';
             preview.textContent = data.content || '';
             bar.classList.add('active');
             bar.dataset.pinnedMessageId = data.messageId;
 
-            // Click on the bar scrolls to the pinned message
-            preview.onclick = () => {
-                const msgEl = document.getElementById('msg-' + data.messageId);
-                if (msgEl) {
-                    msgEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    msgEl.classList.add('pinned-highlight');
-                    setTimeout(() => msgEl.classList.remove('pinned-highlight'), 2000);
-                }
-            };
+            const inner = bar.querySelector('.pinned-bar-inner');
+            // Remove old handler before attaching a new one (avoid duplicates)
+            const fresh = inner.cloneNode(true);
+            inner.parentNode.replaceChild(fresh, inner);
+            const textBtn = fresh.querySelector('.pinned-bar-text');
+            if (textBtn) {
+                textBtn.style.cursor = 'pointer';
+                textBtn.addEventListener('click', () => jumpToMessage(data.messageId));
+            }
         } else {
             bar.classList.remove('active');
             delete bar.dataset.pinnedMessageId;
-            preview.onclick = null;
         }
+    };
+
+    // Scroll to a message by id; reload chat from server if it isn't rendered yet
+    function jumpToMessage(messageId) {
+        const scrollToEl = (el) => {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.classList.add('pinned-highlight');
+            setTimeout(() => el.classList.remove('pinned-highlight'), 2000);
+        };
+        let msgEl = document.getElementById('msg-' + messageId);
+        if (!msgEl) {
+            const container = document.getElementById('messagesContainer');
+            const msgs = container ? container.querySelectorAll('.message') : [];
+            for (const m of msgs) {
+                if (String(m.dataset.messageId) === String(messageId)) { msgEl = m; break; }
+            }
+        }
+        if (msgEl) { scrollToEl(msgEl); return; }
+
+        // Message not in current DOM - reload the chat history from the server
+        const chatAddress = State.currentChatAddress;
+        if (!chatAddress) return;
+        try {
+            if (window.clearMessageCache) window.clearMessageCache(chatAddress);
+            const loader = window.loadMessagesForConversation || window.loadMessages;
+            if (typeof loader === 'function') {
+                Promise.resolve(loader(chatAddress, false, true)).then(() => {
+                    const el = document.getElementById('msg-' + messageId);
+                    if (el) scrollToEl(el);
+                    else window.NotificationManager?.showToast(t('message_not_found') || 'Message not found', 'warning');
+                }).catch(() => {});
+            }
+        } catch (e) { console.error('jumpToMessage error:', e); }
+    }
+    window.jumpToPinnedMessage = jumpToMessage;
+
+    // Keep messages-container padding so the floating pinned pill never covers
+    // the first message line (Telegram behaviour).
+    function adjustPinnedBarPadding() {
+        const container = document.getElementById('messagesContainer');
+        const bar = document.getElementById('pinnedMessagesBar');
+        if (!container || !bar) return;
+        const active = bar.classList.contains('active');
+        container.style.paddingTop = active ? '60px' : '';
+    }
+    window.adjustPinnedBarPadding = adjustPinnedBarPadding;
+    const _origUpdatePinnedBar = window.updatePinnedMessageBar;
+    window.updatePinnedMessageBar = function (chatAddress) {
+        _origUpdatePinnedBar(chatAddress);
+        adjustPinnedBarPadding();
     };
 
     window.unpinMessage = function(chatAddress) {

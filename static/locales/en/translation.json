@@ -463,5 +463,6 @@
   "compression_failed": "File compression failed",
   "copy_group_id": "Copy group ID",
   "edited": "edited",
-  "unpinned_message": "Message unpinned"
+  "unpinned_message": "Message unpinned",
+  "message_not_found": "Message not found in this chat"
 }
