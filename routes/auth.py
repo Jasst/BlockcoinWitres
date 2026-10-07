@@ -30,24 +30,13 @@ try:
 except Exception:
     _ASSET_VER = '1'
 
-_orig_url_for = templates.env.globals['url_for']
-
-def _versioned_url_for(endpoint=None, /, *args, **kwargs):
-    """Drop-in replacement for Jinja's url_for that appends ?v=<build> to
-    local static assets (cache-busting). Supports both calling styles used
-    in templates: url_for('static', path='...') and url_for('/chat')."""
-    url = _orig_url_for(endpoint, *args, **kwargs) if endpoint is not None else _orig_url_for(*args, **kwargs)
-    try:
-        path = kwargs.get('path', '') if endpoint == 'static' else ''
-    except Exception:
-        path = ''
-    if isinstance(path, str) and (path.startswith('js/') or path.endswith('.css') or path.startswith('locales/')):
-        sep = '&' if '?' in url else '?'
-        url = f'{url}{sep}v={_ASSET_VER}'
-    return url
-
-templates.env.filters['url_for_v'] = _versioned_url_for
-templates.env.globals['url_for'] = _versioned_url_for
+# NOTE: do NOT wrap templates.env.globals['url_for']. Starlette's default
+# url_for reads the request from the render context via a closure over
+# ('request', ...), so any wrapper breaks template rendering with
+# "missing 1 required positional argument: 'name'" -> HTTP 500.
+# Cache-busting is done instead by appending ?v=<build> inside
+# main.py's StaticFiles mount (see add_cache_headers / versioned_static).
+templates.env.filters['url_for_v'] = lambda path: f'/static/{path}?v={_ASSET_VER}'
 
 
 @router.get('/', response_class=HTMLResponse)
