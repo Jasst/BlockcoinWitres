@@ -77,10 +77,15 @@
                     // чтобы исключить визуальные дубли иконок в пункте меню.
                     let iconHtml = '';
                     const rawIcon = it.icon || '';
-                    if (rawIcon) {
+                    if (rawIcon.trim().startsWith('<svg') || rawIcon.trim().startsWith('<SVG')) {
+                        // Take ONLY the svg markup itself: find the closing tag and drop
+                        // any trailing text/emoji that would render as a second "icon".
+                        const end = rawIcon.lastIndexOf('</svg>');
+                        iconHtml = end >= 0 ? rawIcon.slice(0, end + 6) : rawIcon;
+                    } else if (rawIcon.trim()) {
                         const tmp = document.createElement('div');
                         tmp.innerHTML = rawIcon;
-                        const firstSvg = tmp.querySelector('svg') || tmp.querySelector('img');
+                        const firstSvg = tmp.querySelector('svg');
                         if (firstSvg) iconHtml = firstSvg.outerHTML;
                     }
                     btn.innerHTML = `<span class="ctx-icon">${iconHtml}</span><span>${it.label}</span>`;

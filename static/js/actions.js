@@ -213,8 +213,9 @@
         const messageInput = document.getElementById('messageContent');
         const hasText = messageInput && messageInput.value.trim() !== '';
         const hasFile = pendingFile !== null;
+        const hasReply = !!(window.getReplyQuote && window.getReplyQuote());
 
-        if (hasText || hasFile) {
+        if (hasText || hasFile || hasReply) {
             sendBtn.style.display = 'flex';
             recordBtn.style.display = 'none';
         } else {
@@ -229,8 +230,9 @@
     if (window.isSending) return;
     const contentEl = document.getElementById('messageContent');
     let content = contentEl ? contentEl.value.trim() : '';
-    // WhatsApp-style reply: prepend the stored quote as a blockquote to the outgoing text
-    if (content && window.consumeReplyQuote) content = window.consumeReplyQuote(content);
+    // WhatsApp-style reply: the quote is attached BEFORE the empty-check so that
+    // "Reply" + pressing send on an empty input still sends the quoted message.
+    if (window.consumeReplyQuote) content = window.consumeReplyQuote(content);
     if (!content && !pendingFile) {
         window.NotificationManager?.showToast(t('enter_message_or_attach'), 'warning');
         return;
@@ -717,6 +719,13 @@
                     msgDiv.remove();
                 }
                 if (window.clearMessageCacheForId) window.clearMessageCacheForId(State.currentChatAddress, msgId);
+                // If the deleted message was pinned - unpin it automatically
+                try {
+                    const _pr = localStorage.getItem('pinned_' + State.currentChatAddress);
+                    if (_pr && String(JSON.parse(_pr).messageId) === String(msgId)) {
+                        window.unpinMessage(State.currentChatAddress);
+                    }
+                } catch (e) {}
                 window.loadConversations();
                 window.NotificationManager?.showToast(t('message_deleted'), 'success');
             } else {
@@ -758,6 +767,8 @@
         hide: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c7 0 10 8 10 8a18 18 0 0 1-2.16 3.19"/><path d="M6.61 6.61A18 18 0 0 0 2 12s3 8 10 8a9 9 0 0 0 5.39-1.61"/><path d="M14.12 14.12A3 3 0 1 1 9.88 9.88"/><path d="M2 2l20 20"/></svg>'
     };
     window.CTX_ICONS = CTX_ICONS; // shared set for ui.js / contacts / groups
+    // Shared loading spinner (SVG, no emoji) for inline button states
+    window.CTX_SPINNER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9" /></svg>';
 
     // --- Единое хранилище закреплённых сообщений (по одному на чат) ---
     window.getPinnedForChat = function (chatAddress) {
@@ -852,6 +863,7 @@
                         // Открепление текущего сообщения
                         window.setPinnedForChat(chatAddress, null);
                         messageEl.classList.remove('pinned-highlight');
+                        messageEl.classList.remove('pinned');
                         window.NotificationManager?.showToast(t('unpinned_message'), 'success');
                     } else {
                         // Закрепление (заменяет предыдущее закреплённое в этом чате)
@@ -860,6 +872,19 @@
                             content: messageContent.substring(0, 100),
                             timestamp: Date.now()
                         });
+                        // Telegram-style: persistent marker on the message itself
+                        const _pinInner = document.querySelector('#pinnedMessagesBar .pinned-bar-inner');
+                        if (_pinInner) {
+                            _pinInner.querySelectorAll('[data-pin-marker]').forEach(m => m.remove());
+                            const marker = document.createElement('span');
+                            marker.className = 'pinned-msg-author';
+                            marker.dataset.pinMarker = '1';
+                            marker.textContent = t('pinned_by') || 'Pinned';
+                            const txt = _pinInner.querySelector('.pinned-bar-text');
+                            if (txt) txt.prepend(marker);
+                        }
+                        document.querySelectorAll('.message.pinned').forEach(el => el.classList.remove('pinned'));
+                        messageEl.classList.add('pinned');
                         messageEl.classList.add('pinned-highlight');
                         setTimeout(() => messageEl.classList.remove('pinned-highlight'), 2000);
                         window.NotificationManager?.showToast(t('pinned_message'), 'success');
@@ -995,6 +1020,9 @@
             window.NotificationManager?.showToast(t('open_chat_first'), 'warning');
             return;
         }
+        // The input may be disabled until a chat is fully opened - enable it so
+        // the user can type the reply immediately (WhatsApp behaviour).
+        textarea.disabled = false;
         _replyQuote = { messageId: String(messageId || ''), sender: sender || '', text: text || '' };
 
         let box = document.getElementById('replyQuoteBox');
@@ -1002,7 +1030,12 @@
             box = document.createElement('div');
             box.id = 'replyQuoteBox';
             box.className = 'reply-quote-box';
-            textarea.parentNode.insertBefore(box, textarea);
+            // Insert as the FIRST child of the .input-area form so the chip
+            // sits inside the rounded input bubble, above the text line.
+            const area = textarea.closest('.input-area');
+            const wrapper = textarea.closest('.input-wrapper');
+            const container = area || (wrapper ? wrapper.parentNode : textarea.parentNode);
+            container.insertBefore(box, container.firstChild);
         }
         const shortText = (_replyQuote.text || '').replace(/\s+/g, ' ').slice(0, 120);
         box.innerHTML = `
@@ -1033,13 +1066,28 @@
         if (window.updateSendButtonVisibility) window.updateSendButtonVisibility();
     };
 
-    window.scrollToAndHighlightMessage = function (msgId) {
+    // Scroll to a message and highlight it. If the message is not rendered yet
+    // (old history page), reuse jumpToPinnedMessage which loads older pages.
+    window.scrollToAndHighlightMessage = async function (msgId) {
         if (!msgId) return;
-        const el = document.getElementById('msg-' + msgId);
-        if (!el) return;
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        el.classList.add('msg-highlight');
-        setTimeout(() => el.classList.remove('msg-highlight'), 2200);
+        let el = document.getElementById('msg-' + msgId);
+        if (!el) {
+            const container = document.getElementById('messagesContainer');
+            if (container) {
+                for (const m of container.querySelectorAll('.message')) {
+                    if (String(m.dataset.messageId) === String(msgId)) { el = m; break; }
+                }
+            }
+        }
+        if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.classList.add('msg-highlight');
+            setTimeout(() => el.classList.remove('msg-highlight'), 2200);
+            return;
+        }
+        if (window.jumpToPinnedMessage) {
+            try { await window.jumpToPinnedMessage(msgId); } catch (e) {}
+        }
     };
 
     // Compose outgoing text with the quote prefix, then clear the chip
@@ -1048,14 +1096,19 @@
         const q = _replyQuote;
         window.clearReplyQuote();
         const quotedLines = (q.text || '').split('\n').map(l => '> ' + l).join('\n');
-        const prefix = (q.sender ? q.sender + ':\n' : '') + quotedLines + '\n\n';
-        return prefix + userText;
+        const prefix = (q.sender ? q.sender + ':\n' : '') + quotedLines;
+        // Empty user text: send just the quote (WhatsApp-style quick reply)
+        return userText ? prefix + '\n\n' + userText : prefix;
     };
 
     // Pinned message bar (single source of truth: localStorage pinned_<chat>)
+    // Telegram-style floating pill under the chat header. Clicking it scrolls
+    // to the pinned message; if the message is not loaded yet (old history),
+    // the chat is reloaded from the server so the message can be found.
     window.updatePinnedMessageBar = function(chatAddress) {
         const bar = document.getElementById('pinnedMessagesBar');
         const preview = document.getElementById('pinnedMessagePreview');
+        const label = document.getElementById('pinnedMessageLabel');
         if (!bar || !preview) return;
 
         let data = null;
@@ -1065,24 +1118,86 @@
         } catch (e) { data = null; }
 
         if (data && data.messageId) {
+            if (label) label.textContent = t('pinned_message') || 'Pinned message';
             preview.textContent = data.content || '';
             bar.classList.add('active');
             bar.dataset.pinnedMessageId = data.messageId;
 
-            // Click on the bar scrolls to the pinned message
-            preview.onclick = () => {
-                const msgEl = document.getElementById('msg-' + data.messageId);
-                if (msgEl) {
-                    msgEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    msgEl.classList.add('pinned-highlight');
-                    setTimeout(() => msgEl.classList.remove('pinned-highlight'), 2000);
-                }
-            };
+            const inner = bar.querySelector('.pinned-bar-inner');
+            // Remove old handler before attaching a new one (avoid duplicates)
+            const fresh = inner.cloneNode(true);
+            inner.parentNode.replaceChild(fresh, inner);
+            const textBtn = fresh.querySelector('.pinned-bar-text');
+            if (textBtn) {
+                textBtn.style.cursor = 'pointer';
+                textBtn.addEventListener('click', () => jumpToMessage(data.messageId));
+            }
         } else {
             bar.classList.remove('active');
             delete bar.dataset.pinnedMessageId;
-            preview.onclick = null;
         }
+    };
+
+    // Scroll to a message by id. If it isn't rendered yet (old history, only
+    // the last page is loaded), fetch older pages until found (max 10).
+    async function jumpToMessage(messageId) {
+        const scrollToEl = (el) => {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.classList.add('pinned-highlight');
+            setTimeout(() => el.classList.remove('pinned-highlight'), 2000);
+        };
+
+        const findEl = () => {
+            let el = document.getElementById('msg-' + messageId);
+            if (!el) {
+                const container = document.getElementById('messagesContainer');
+                const msgs = container ? container.querySelectorAll('.message') : [];
+                for (const m of msgs) {
+                    if (String(m.dataset.messageId) === String(messageId)) { el = m; break; }
+                }
+            }
+            return el;
+        };
+
+        let el = findEl();
+        if (el) { scrollToEl(el); return; }
+
+        const chatAddress = State.currentChatAddress;
+        if (!chatAddress || !window.loadOlderMessages) return;
+
+        for (let attempt = 0; attempt < 10; attempt++) {
+            const container = document.getElementById('messagesContainer');
+            const first = container ? container.querySelector('.message') : null;
+            if (!first) break;
+            const oldestId = parseInt(first.dataset.messageId);
+            if (!oldestId) break;
+            try {
+                await window.loadOlderMessages(chatAddress, oldestId);
+            } catch (e) { break; }
+            el = findEl();
+            if (el) { scrollToEl(el); return; }
+            // Stop if no older messages were added (beginning of history reached)
+            const newFirst = document.getElementById('messagesContainer')?.querySelector('.message');
+            if (newFirst && parseInt(newFirst.dataset.messageId) === oldestId) break;
+        }
+        window.NotificationManager?.showToast(t('message_not_found') || 'Message not found', 'warning');
+    }
+    window.jumpToPinnedMessage = jumpToMessage;
+
+    // Keep messages-container padding so the floating pinned pill never covers
+    // the first message line (Telegram behaviour).
+    function adjustPinnedBarPadding() {
+        const container = document.getElementById('messagesContainer');
+        const bar = document.getElementById('pinnedMessagesBar');
+        if (!container || !bar) return;
+        const active = bar.classList.contains('active');
+        container.style.paddingTop = active ? '60px' : '';
+    }
+    window.adjustPinnedBarPadding = adjustPinnedBarPadding;
+    const _origUpdatePinnedBar = window.updatePinnedMessageBar;
+    window.updatePinnedMessageBar = function (chatAddress) {
+        _origUpdatePinnedBar(chatAddress);
+        adjustPinnedBarPadding();
     };
 
     window.unpinMessage = function(chatAddress) {

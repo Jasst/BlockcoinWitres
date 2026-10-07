@@ -640,7 +640,8 @@
     if (trimmed === currentName) return;
     btn.disabled = true;
     const originalText = btn.innerHTML;
-    btn.innerHTML = '⏳';
+    btn.classList.add('btn-loading');
+    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9" /></svg>';
     try {
       const res = await secureFetch('/edit_contact', { method: 'POST', body: JSON.stringify({ address, name: trimmed }) });
       if (!res) return;
@@ -656,7 +657,7 @@
         window.NotificationManager?.showToast(data.error || i18next.t('error'), 'error');
       }
     } catch (error) { console.error(error); window.NotificationManager?.showToast(i18next.t('network_error'), 'error'); }
-    finally { btn.disabled = false; btn.innerHTML = originalText; }
+    finally { btn.disabled = false; btn.classList.remove('btn-loading'); btn.innerHTML = originalText; }
   }
 
   async function deleteContact(address, btn) {
@@ -664,7 +665,8 @@
     const confirmed = await showConfirmModal(i18next.t('delete_contact'), i18next.t('confirm_delete_contact'));
     if (!confirmed) return;
     btn.disabled = true;
-    btn.innerHTML = '⏳';
+    btn.classList.add('btn-loading');
+    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9" /></svg>';
     try {
       const res = await secureFetch('/delete_contact', { method: 'POST', body: JSON.stringify({ address }) });
       if (!res) return;
@@ -681,7 +683,7 @@
         window.NotificationManager?.showToast(data.error || i18next.t('delete_failed'), 'error');
       }
     } catch (error) { console.error(error); window.NotificationManager?.showToast(i18next.t('network_error'), 'error'); }
-    finally { btn.disabled = false; btn.innerHTML = '✕'; }
+    finally { btn.disabled = false; btn.classList.remove('btn-loading'); btn.innerHTML = '✕'; }
   }
 
   document.addEventListener('DOMContentLoaded', function() {
@@ -711,7 +713,7 @@
   function bindContactHold(item, address, name) {
     if (!window.ContextMenu) return;
     ContextMenu.bind(item, () => [
-      { icon: CTX_ICONS.chat, label: i18next.t('start_chat'), onClick: () => startChatWithContact(address, name) },
+      { icon: CTX_ICONS.open, label: i18next.t('start_chat'), onClick: () => startChatWithContact(address, name) },
       { icon: CTX_ICONS.call, label: i18next.t('call'), onClick: () => {
           if (window.CallManager && typeof window.CallManager.makeCall === 'function') {
             window.CallManager.makeCall(address, false, name);

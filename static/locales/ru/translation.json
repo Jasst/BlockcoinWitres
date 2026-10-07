@@ -463,5 +463,7 @@
   "compression_failed": "Не удалось сжать файл",
   "copy_group_id": "Копировать ID группы",
   "edited": "изменено",
-  "unpinned_message": "Сообщение откреплено"
+  "unpinned_message": "Сообщение откреплено",
+  "message_not_found": "Сообщение не найдено в этом чате",
+  "pinned_by": "Закреплённое сообщение"
 }
