@@ -288,5 +288,9 @@
     navigate(location.pathname + location.search, false);
   });
 
+  // Programmatic navigation API (used by context-menu actions on pages
+  // without chat markup, e.g. "Reply" from contacts -> open /chat first).
+  window.spaNavigate = function (url) { navigate(url, true); };
+
   console.log('✅ SPA navigation enabled');
 })();

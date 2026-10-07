@@ -864,6 +864,8 @@
                         window.setPinnedForChat(chatAddress, null);
                         messageEl.classList.remove('pinned-highlight');
                         messageEl.classList.remove('pinned');
+                        // Refresh the floating pinned bar so it disappears immediately.
+                        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(chatAddress);
                         window.NotificationManager?.showToast(t('unpinned_message'), 'success');
                     } else {
                         // Закрепление (заменяет предыдущее закреплённое в этом чате)
@@ -887,6 +889,8 @@
                         messageEl.classList.add('pinned');
                         messageEl.classList.add('pinned-highlight');
                         setTimeout(() => messageEl.classList.remove('pinned-highlight'), 2000);
+                        // Re-render the floating pinned pill (Telegram behaviour)
+                        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(chatAddress);
                         window.NotificationManager?.showToast(t('pinned_message'), 'success');
                     }
                 }
@@ -1025,11 +1029,40 @@
         } else if (panel && !panel.classList.contains('open')) {
             panel.classList.add('open');
         }
-        if (!textarea || textarea.offsetParent === null) {
-            // No message input on this page (e.g. contacts/groups) or it is
-            // inside a hidden container - do nothing silently instead of
-            // building an invisible chip.
+        if (!textarea) {
+            // The page has no chat markup at all (contacts/groups/etc.) -
+            // navigate to /chat first, then attach the quote once the input
+            // exists (SPA navigation keeps the menu state alive).
+            const goChat = () => {
+                try {
+                    if (window.spaNavigate) window.spaNavigate('/chat');
+                    else window.location.href = '/chat';
+                } catch (e) { window.location.href = '/chat'; }
+            };
+            goChat();
+            let tries = 0;
+            const waitInput = setInterval(() => {
+                tries++;
+                const ta = document.getElementById('messageContent');
+                if (ta) { clearInterval(waitInput); window.attachReplyQuote({ messageId, sender, text }); }
+                else if (tries > 40) clearInterval(waitInput); // ~4s timeout
+            }, 100);
             return;
+        }
+        if (textarea.offsetParent === null) {
+            // Input exists but is inside a hidden container - make it visible:
+            // clear legacy inline display:none set by AI-chat switching,
+            // force-open the chat panel, and fall back to enabling the field.
+            const area = textarea.closest('.input-area');
+            if (area) area.style.display = '';
+            textarea.style.display = '';
+            if (panel) {
+                panel.style.display = '';
+                panel.classList.add('open');
+            }
+            if (window.innerWidth < 768 && typeof window.showChatPanel === 'function') {
+                window.showChatPanel();
+            }
         }
         // The input may be disabled until a chat is fully opened - enable it so
         // the user can type the reply immediately (WhatsApp behaviour).
