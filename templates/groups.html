@@ -642,6 +642,7 @@
   let allContacts = [];
   let selectedMembers = {};
   let currentGroup = null;
+  let allGroupsCache = [];
 
   function escapeHtml(str) {
     if (!str) return '';
@@ -701,6 +702,7 @@
   async function loadGroups() {
     const container = document.getElementById('groupsList');
     if (!container) return;
+    allGroupsCache = [];
     container.innerHTML = `<div class="loading">${t('loading')}</div>`;
     try {
       const res = await fetch('/get_groups');
@@ -715,11 +717,13 @@ container.innerHTML = `<div class="empty-state">
  return;
       }
       container.innerHTML = '';
+      allGroupsCache = data.groups;
       data.groups.forEach(g => {
         const card = document.createElement('div');
         card.className = 'list-item group-card';
         card.dataset.id = g.id;
         const isCreator = g.creator === MY_ADDR;
+        if (window.ContextMenu) bindGroupHold(card, g);
         const date = g.created_at ? new Date(g.created_at * 1000).toLocaleDateString() : '—';
         card.innerHTML = `
           <div class="info" style="flex:1;">
@@ -1077,6 +1081,47 @@ container.innerHTML = `<div class="empty-state">
   window.submitRemoveMember = submitRemoveMember;
   window.showCreateError = showCreateError;
   window.showConfirmModal = showConfirmModal;
+
+  // ========== Контекстное меню группы (ПКМ + долгое нажатие) ==========
+  const GRP_ICONS = {
+    chat:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+    info:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
+    copy:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
+  };
+
+  function bindGroupHold(card, group) {
+    if (!window.ContextMenu) return;
+    ContextMenu.bind(card, () => {
+      const items = [
+        { icon: GRP_ICONS.chat, label: t('open_chat'), onClick: () => openGroupChatById('group:' + group.id, group.name) },
+        { icon: GRP_ICONS.info, label: t('info'), onClick: () => openDetail(JSON.stringify(group)) },
+        { icon: GRP_ICONS.copy, label: t('copy_group_id'), onClick: () => {
+            const done = () => window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
+            if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(group.id).then(done).catch(done);
+            else done();
+          } },
+      ];
+      if (group.creator === MY_ADDR) {
+        items.push({ separator: true });
+        items.push({ icon: GRP_ICONS.trash, label: t('delete_group'), danger: true, onClick: () => deleteGroup(group.id, group.name) });
+      }
+      return items;
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    const mo = new MutationObserver(() => {
+      document.querySelectorAll('#groupsList .group-card').forEach(el => {
+        if (el._ctxBound || !el.dataset.id) return;
+        el._ctxBound = true;
+        const g = allGroupsCache.find(x => String(x.id) === el.dataset.id);
+        if (g) bindGroupHold(el, g);
+      });
+    });
+    const list = document.getElementById('groupsList');
+    if (list) mo.observe(list, { childList: true });
+  });
 })();
 </script>
 {% endblock %}
