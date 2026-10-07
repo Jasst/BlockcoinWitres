@@ -22,21 +22,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=['auth'])
 templates = Jinja2Templates(directory=TEMPLATE_FOLDER)
 
-# Cache-busting: append a build version (?v=...) to every local static asset
-# URL so browsers/PWA never run stale JS/CSS after a deploy (fixes context
-# menu / reply / pin regressions caused by cached old scripts).
-try:
-    _ASSET_VER = str(int(__import__('time').time()))
-except Exception:
-    _ASSET_VER = '1'
-
-# NOTE: do NOT wrap templates.env.globals['url_for']. Starlette's default
-# url_for reads the request from the render context via a closure over
-# ('request', ...), so any wrapper breaks template rendering with
-# "missing 1 required positional argument: 'name'" -> HTTP 500.
-# Cache-busting is done instead by appending ?v=<build> inside
-# main.py's StaticFiles mount (see add_cache_headers / versioned_static).
-templates.env.filters['url_for_v'] = lambda path: f'/static/{path}?v={_ASSET_VER}'
+# IMPORTANT: do NOT wrap/replace templates.env.globals['url_for'].
+# Starlette's built-in url_for is a closure that reads the request from the
+# Jinja render context; any wrapper breaks every page with
+# "TypeError: url_for() missing 1 required positional argument: 'name'" -> HTTP 500.
+# Cache-busting for JS/CSS is handled server-side in main.py via the
+# VersionedStaticFiles class (Cache-Control: no-cache headers on /static assets),
+# so browsers/PWA always revalidate and never run stale scripts after a deploy.
 
 
 @router.get('/', response_class=HTMLResponse)
