@@ -6,14 +6,26 @@
     if (window._contextMenuLoaded) return;
     window._contextMenuLoaded = true;
 
-    const HOLD_MS = 480;          // длительность долгого нажатия
+    const HOLD_MS = 450;          // длительность долгого нажатия
     const MOVE_TOLERANCE = 12;    // пикселей до — считаем свайпом, а не нажатием
 
     let activeMenu = null;        // { el, cleanup }
-    let holdTimer = null;
-    let startX = 0, startY = 0;
-    let pressedTarget = null;
+    // Per-element hold state (a single global timer broke the menu when two
+    // elements were touched/pressed close together - mobile bug).
+    const holdState = new WeakMap();
     let suppressClickUntil = 0;   // блокируем «фантомный» клик после долгого нажатия
+
+    function sanitizeIcon(raw) {
+        raw = String(raw || '');
+        if (!raw.trim()) return '';
+        // Only ever render SVG markup as an icon; any emoji/text passed by
+        // mistake is dropped so a menu item can never show "two icons".
+        const start = raw.indexOf('<svg');
+        if (start === -1) return '';
+        const end = raw.lastIndexOf('</svg>');
+        if (end === -1) return '';
+        return raw.slice(start, end + 6);
+    }
 
     // ---------- Вспомогательные ----------
     function haptic(ms) {
@@ -73,22 +85,14 @@
                     btn.type = 'button';
                     btn.className = 'ctx-item' + (it.danger ? ' danger' : '');
                     btn.setAttribute('role', 'menuitem');
-                    // Одна иконка: берём ТОЛЬКО первый <svg>/<img>; текст вне тегов отбрасывается,
-                    // чтобы исключить визуальные дубли иконок в пункте меню.
-                    let iconHtml = '';
-                    const rawIcon = it.icon || '';
-                    if (rawIcon.trim().startsWith('<svg') || rawIcon.trim().startsWith('<SVG')) {
-                        // Take ONLY the svg markup itself: find the closing tag and drop
-                        // any trailing text/emoji that would render as a second "icon".
-                        const end = rawIcon.lastIndexOf('</svg>');
-                        iconHtml = end >= 0 ? rawIcon.slice(0, end + 6) : rawIcon;
-                    } else if (rawIcon.trim()) {
-                        const tmp = document.createElement('div');
-                        tmp.innerHTML = rawIcon;
-                        const firstSvg = tmp.querySelector('svg');
-                        if (firstSvg) iconHtml = firstSvg.outerHTML;
-                    }
-                    btn.innerHTML = `<span class="ctx-icon">${iconHtml}</span><span>${it.label}</span>`;
+                    // Одна иконка: берём ТОЛЬКО <svg>-разметку; эмодзи/текст вне тегов
+                    // отбрасываются — пункт меню не может показать «две иконки».
+                    const iconHtml = sanitizeIcon(it.icon);
+                    const labelSpan = document.createElement('span');
+                    labelSpan.className = 'ctx-label';
+                    labelSpan.textContent = it.label || '';
+                    btn.innerHTML = `<span class="ctx-icon">${iconHtml}</span>`;
+                    btn.appendChild(labelSpan);
                     btn.addEventListener('click', (e) => {
                         e.stopPropagation();
                         closeMenu();
@@ -141,43 +145,76 @@
                 if (items) this.open(items, { x: e.clientX, y: e.clientY }, { target: el });
             }, { passive: false });
 
-            el.addEventListener('pointerdown', (e) => {
-                if (e.pointerType === 'mouse' && e.button !== 0) return; // правый клик обрабатывается выше
-                if (e.target.closest('button, a, input, textarea, select, audio, .no-hold')) return;
-                pressedTarget = el;
-                startX = e.clientX; startY = e.clientY;
-                clearTimeout(holdTimer);
-                holdTimer = setTimeout(() => {
-                    if (!pressedTarget) return;
-                    const items = buildItems(el, { x: startX, y: startY });
+            // --- Long press: Pointer Events first, touch/mouse fallbacks for
+            // older mobile browsers where pointer events are unreliable. ---
+            function getState() {
+                let s = holdState.get(el);
+                if (!s) { s = { timer: null, x: 0, y: 0 }; holdState.set(el, s); }
+                return s;
+            }
+            function cancelHold() {
+                const s = holdState.get(el);
+                if (s && s.timer) { clearTimeout(s.timer); s.timer = null; }
+            }
+            function startHold(x, y) {
+                const s = getState();
+                cancelHold();
+                s.x = x; s.y = y;
+                s.timer = setTimeout(() => {
+                    s.timer = null;
+                    const items = buildItems(el, { x: s.x, y: s.y });
                     if (!items) return;
                     haptic(15);
                     suppressClickUntil = Date.now() + 700;
                     // подсветка-«отклик»: цель слегка сжимается перед появлением меню
                     el.classList.add('ctx-press');
                     setTimeout(() => el.classList.remove('ctx-press'), 200);
-                    this.open(items, { x: startX, y: startY }, { target: el });
+                    ContextMenu.open(items, { x: s.x, y: s.y }, { target: el });
                 }, HOLD_MS);
-            });
-
-            const cancelHold = (e) => {
-                if (holdTimer && e && pressedTarget === el) {
-                    const dx = Math.abs(e.clientX - startX), dy = Math.abs(e.clientY - startY);
-                    if (dx > MOVE_TOLERANCE || dy > MOVE_TOLERANCE) { clearTimeout(holdTimer); holdTimer = null; }
+            }
+            function movedTooFar(x, y) {
+                const s = holdState.get(el);
+                if (!s || !s.timer) return false;
+                if (Math.abs(x - s.x) > MOVE_TOLERANCE || Math.abs(y - s.y) > MOVE_TOLERANCE) {
+                    cancelHold();
+                    return true;
                 }
-            };
-            el.addEventListener('pointermove', cancelHold);
-            el.addEventListener('pointerup', () => { clearTimeout(holdTimer); holdTimer = null; });
-            el.addEventListener('pointercancel', () => { clearTimeout(holdTimer); holdTimer = null; });
+                return false;
+            }
+
+            el.addEventListener('pointerdown', (e) => {
+                if (e.pointerType === 'mouse' && e.button !== 0) return; // правый клик обрабатывается выше
+                if (e.target.closest('button, a, input, textarea, select, audio, .no-hold')) return;
+                startHold(e.clientX, e.clientY);
+            });
+            el.addEventListener('pointermove', (e) => { movedTooFar(e.clientX, e.clientY); });
+            el.addEventListener('pointerup', cancelHold);
+            el.addEventListener('pointercancel', cancelHold);
+
+            // Fallbacks (iOS Safari <13 / old Android WebView): touch events
+            el.addEventListener('touchstart', (e) => {
+                if (e.target.closest('button, a, input, textarea, select, audio, .no-hold')) return;
+                const t0 = e.touches[0];
+                if (!t0) return;
+                startHold(t0.clientX, t0.clientY);
+            }, { passive: true });
+            el.addEventListener('touchmove', (e) => {
+                const t0 = e.touches[0];
+                if (t0) movedTooFar(t0.clientX, t0.clientY);
+            }, { passive: true });
+            el.addEventListener('touchend', cancelHold);
+            el.addEventListener('touchcancel', cancelHold);
+
             // если тач-скролл начался — отменяем таймер
-            el.addEventListener('scroll', () => { clearTimeout(holdTimer); holdTimer = null; }, { capture: true, passive: true });
+            el.addEventListener('scroll', cancelHold, { capture: true, passive: true });
         }
     };
 
     // Глобально: клик вне любого открытого меню закрывает его (страховка)
-    document.addEventListener('DOMContentLoaded', () => {
-        document.addEventListener('click', (e) => {
-            if (activeMenu && !e.target.closest('.ctx-menu')) closeMenu();
-        });
+    document.addEventListener('click', (e) => {
+        if (activeMenu && !e.target.closest('.ctx-menu')) closeMenu();
     });
+    // Safety net: any native context menu opened on a bound element (e.g. text
+    // selection bubble on some Android keyboards) closes our custom menu too.
+    document.addEventListener('contextmenu', () => { if (activeMenu) closeMenu(); });
 })();
