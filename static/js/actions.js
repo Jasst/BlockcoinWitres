@@ -864,6 +864,8 @@
                         window.setPinnedForChat(chatAddress, null);
                         messageEl.classList.remove('pinned-highlight');
                         messageEl.classList.remove('pinned');
+                        // Refresh the floating pinned bar so it disappears immediately.
+                        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(chatAddress);
                         window.NotificationManager?.showToast(t('unpinned_message'), 'success');
                     } else {
                         // Закрепление (заменяет предыдущее закреплённое в этом чате)
@@ -887,6 +889,8 @@
                         messageEl.classList.add('pinned');
                         messageEl.classList.add('pinned-highlight');
                         setTimeout(() => messageEl.classList.remove('pinned-highlight'), 2000);
+                        // Re-render the floating pinned pill (Telegram behaviour)
+                        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(chatAddress);
                         window.NotificationManager?.showToast(t('pinned_message'), 'success');
                     }
                 }
@@ -905,6 +909,9 @@
     document.addEventListener('contextmenu', (e) => {
         const messageEl = e.target.closest('.message');
         if (!messageEl || !window.ContextMenu) return;
+        // Never open a second menu when one is already active (fixes the
+        // "double context menu" seen on some Android long-press combos).
+        if (window.ContextMenu.isOpen()) return;
         e.preventDefault();
         const items = buildMessageMenuItems(messageEl);
         if (!items) return;
@@ -915,7 +922,10 @@
     window.bindMessageHold = function (messageEl) {
         if (!messageEl || !window.ContextMenu || messageEl._ctxBound) return;
         messageEl._ctxBound = true;
-        window.ContextMenu.bind(messageEl, () => buildMessageMenuItems(messageEl));
+        window.ContextMenu.bind(messageEl, () => {
+            if (window.ContextMenu.isOpen()) return null;
+            return buildMessageMenuItems(messageEl);
+        });
     };
 
     // Очистка кэша сообщений при удалении
@@ -1025,11 +1035,57 @@
         } else if (panel && !panel.classList.contains('open')) {
             panel.classList.add('open');
         }
-        if (!textarea || textarea.offsetParent === null) {
-            // No message input on this page (e.g. contacts/groups) or it is
-            // inside a hidden container - do nothing silently instead of
-            // building an invisible chip.
+        if (!textarea) {
+            // The page has no chat markup at all (contacts/groups/etc.) or a
+            // stale cached script bundle is loaded - open /chat and attach the
+            // quote once the input exists. If the installed code is outdated
+            // (attachReplyQuote missing after SPA re-entry), fall back to a
+            // full page reload which always fetches fresh scripts.
+            const payload = { messageId, sender, text };
+            const goChat = () => {
+                try {
+                    if (window.spaNavigate) window.spaNavigate('/chat');
+                    else window.location.href = '/chat';
+                } catch (e) { window.location.href = '/chat'; }
+            };
+            goChat();
+            window._pendingReply = payload;
+            let tries = 0;
+            const waitInput = setInterval(() => {
+                tries++;
+                const ta = document.getElementById('messageContent');
+                if (ta) {
+                    clearInterval(waitInput);
+                    if (typeof window.attachReplyQuote === 'function') {
+                        const p = window._pendingReply || payload;
+                        window._pendingReply = null;
+                        window.attachReplyQuote(p);
+                    } else {
+                        // Old cached actions.js still active on this page -
+                        // hard reload so the browser fetches the new file.
+                        clearInterval(waitInput);
+                        try { sessionStorage.setItem('_replyRetry', JSON.stringify(payload)); } catch (e) {}
+                        window.location.href = '/chat?reply=' + encodeURIComponent(messageId || '');
+                    }
+                }
+                else if (tries > 40) clearInterval(waitInput); // ~4s timeout
+            }, 100);
             return;
+        }
+        if (textarea.offsetParent === null) {
+            // Input exists but is inside a hidden container - make it visible:
+            // clear legacy inline display:none set by AI-chat switching,
+            // force-open the chat panel, and fall back to enabling the field.
+            const area = textarea.closest('.input-area');
+            if (area) area.style.display = '';
+            textarea.style.display = '';
+            if (panel) {
+                panel.style.display = '';
+                panel.classList.add('open');
+            }
+            if (window.innerWidth < 768 && typeof window.showChatPanel === 'function') {
+                window.showChatPanel();
+            }
         }
         // The input may be disabled until a chat is fully opened - enable it so
         // the user can type the reply immediately (WhatsApp behaviour).
@@ -1077,6 +1133,35 @@
         if (box) { box.remove(); }
         if (window.updateSendButtonVisibility) window.updateSendButtonVisibility();
     };
+
+    // Consume a reply request saved before a fallback full page reload
+    // (?reply=<id> or sessionStorage payload) once the chat page is ready.
+    window._tryConsumePendingReply = function () {
+        let id = '';
+        try { id = new URLSearchParams(location.search).get('reply') || ''; } catch (e) {}
+        let payload = null;
+        try { payload = JSON.parse(sessionStorage.getItem('_replyRetry') || 'null'); } catch (e) {}
+        if (!id && !payload) return false;
+        const el = id ? (document.getElementById('msg-' + id) ||
+            Array.from(document.querySelectorAll('.message')).find(m => String(m.dataset.messageId) === String(id))) : null;
+        if (el) {
+            const content = (window.getMessageText ? window.getMessageText(el) : (el.querySelector('.message-content')?.textContent || ''));
+            const sender = el.querySelector('.content strong')?.textContent || '';
+            try { sessionStorage.removeItem('_replyRetry'); } catch (e) {}
+            window.attachReplyQuote({ messageId: el.dataset.messageId || id, sender, text: content });
+            try { history.replaceState({}, '', '/chat'); } catch (e) {}
+            return true;
+        }
+        if (payload) {
+            try { sessionStorage.removeItem('_replyRetry'); } catch (e) {}
+            window.attachReplyQuote(payload);
+            try { history.replaceState({}, '', '/chat'); } catch (e) {}
+            return true;
+        }
+        return false;
+    };
+    setTimeout(() => { try { window._tryConsumePendingReply(); } catch (e) {} }, 600);
+    setTimeout(() => { try { window._tryConsumePendingReply(); } catch (e) {} }, 2500);
 
     // Scroll to a message and highlight it. If the message is not rendered yet
     // (old history page), reuse jumpToPinnedMessage which loads older pages.
