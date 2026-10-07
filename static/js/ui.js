@@ -396,6 +396,9 @@
         State.currentChatIsGroup = !!isGroup;
         State.currentChatPartnerAddress = isGroup ? '' : (address === State.userAddress ? '' : address);
 
+        // Панель закреплённого сообщения — актуальное состояние для выбранного чата
+        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(address);
+
         const callBtn = document.getElementById('callButton');
         if (callBtn) {
             if (!isGroup && address && address !== State.userAddress && address !== 'ai_bot') {

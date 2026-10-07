@@ -3170,6 +3170,11 @@ body.light-theme .bottom-nav { background: rgba(255, 255, 255, 0.94); }
   stroke-linejoin: round;
   display: block;
 }
+/* Защита от «двойных» иконок: если в пункт меню по ошибке попал PNG-иконка,
+   скрываем <img> — визуально остаётся только одна SVG-иконка */
+.ctx-item .ctx-icon img {
+  display: none !important;
+}
 .ctx-item.danger {
   color: #e5544f;
 }
