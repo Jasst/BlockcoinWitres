@@ -179,6 +179,13 @@
                     const firstChild = container.firstChild;
                     if (firstChild) container.insertBefore(fragment, firstChild);
                     else container.appendChild(fragment);
+                    try {
+                        const pin = window.getPinnedForChat ? window.getPinnedForChat(chatId) : null;
+                        if (pin) {
+                            const pe = document.getElementById('msg-' + pin.messageId);
+                            if (pe) pe.classList.add('pinned');
+                        }
+                    } catch (e) {}
                     const firstMsgId = olderMessages[0]?.id;
                     if (firstMsgId) State.lastKnownMessageId = Math.min(State.lastKnownMessageId, firstMsgId);
                     setupTopObserver();
@@ -503,6 +510,14 @@
                 if (displayMsg.id > lastKnownId) lastKnownId = displayMsg.id;
             }
             renderMessagesWithSeparators(container, decryptedCache);
+            // Re-attach the pinned marker to its message after re-render
+            try {
+                const _pin = window.getPinnedForChat ? window.getPinnedForChat(chatWithAddress) : null;
+                if (_pin) {
+                    const _pe = document.getElementById('msg-' + _pin.messageId);
+                    if (_pe) _pe.classList.add('pinned');
+                }
+            } catch (e) {}
             const wasAtBottom = isUserAtBottom(container, 30);
             if (wasAtBottom || forceScroll) {
                 container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
@@ -749,6 +764,7 @@
     window.loadConversations = loadConversations;
     window.selectConversation = selectConversation;
     window.loadMessagesForConversation = loadMessagesForConversation;
+    window.loadOlderMessages = loadOlderMessages;
     window.createMessageElement = createMessageElement;
     window.updateStatusIcon = updateStatusIcon;
     window.updateConversationPreview = updateConversationPreview;

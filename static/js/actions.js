@@ -717,6 +717,13 @@
                     msgDiv.remove();
                 }
                 if (window.clearMessageCacheForId) window.clearMessageCacheForId(State.currentChatAddress, msgId);
+                // If the deleted message was pinned - unpin it automatically
+                try {
+                    const _pr = localStorage.getItem('pinned_' + State.currentChatAddress);
+                    if (_pr && String(JSON.parse(_pr).messageId) === String(msgId)) {
+                        window.unpinMessage(State.currentChatAddress);
+                    }
+                } catch (e) {}
                 window.loadConversations();
                 window.NotificationManager?.showToast(t('message_deleted'), 'success');
             } else {
@@ -852,6 +859,7 @@
                         // Открепление текущего сообщения
                         window.setPinnedForChat(chatAddress, null);
                         messageEl.classList.remove('pinned-highlight');
+                        messageEl.classList.remove('pinned');
                         window.NotificationManager?.showToast(t('unpinned_message'), 'success');
                     } else {
                         // Закрепление (заменяет предыдущее закреплённое в этом чате)
@@ -860,6 +868,19 @@
                             content: messageContent.substring(0, 100),
                             timestamp: Date.now()
                         });
+                        // Telegram-style: persistent marker on the message itself
+                        const _pinInner = document.querySelector('#pinnedMessagesBar .pinned-bar-inner');
+                        if (_pinInner) {
+                            _pinInner.querySelectorAll('[data-pin-marker]').forEach(m => m.remove());
+                            const marker = document.createElement('span');
+                            marker.className = 'pinned-msg-author';
+                            marker.dataset.pinMarker = '1';
+                            marker.textContent = t('pinned_by') || 'Pinned';
+                            const txt = _pinInner.querySelector('.pinned-bar-text');
+                            if (txt) txt.prepend(marker);
+                        }
+                        document.querySelectorAll('.message.pinned').forEach(el => el.classList.remove('pinned'));
+                        messageEl.classList.add('pinned');
                         messageEl.classList.add('pinned-highlight');
                         setTimeout(() => messageEl.classList.remove('pinned-highlight'), 2000);
                         window.NotificationManager?.showToast(t('pinned_message'), 'success');
@@ -1089,37 +1110,49 @@
         }
     };
 
-    // Scroll to a message by id; reload chat from server if it isn't rendered yet
-    function jumpToMessage(messageId) {
+    // Scroll to a message by id. If it isn't rendered yet (old history, only
+    // the last page is loaded), fetch older pages until found (max 10).
+    async function jumpToMessage(messageId) {
         const scrollToEl = (el) => {
             el.scrollIntoView({ behavior: 'smooth', block: 'center' });
             el.classList.add('pinned-highlight');
             setTimeout(() => el.classList.remove('pinned-highlight'), 2000);
         };
-        let msgEl = document.getElementById('msg-' + messageId);
-        if (!msgEl) {
-            const container = document.getElementById('messagesContainer');
-            const msgs = container ? container.querySelectorAll('.message') : [];
-            for (const m of msgs) {
-                if (String(m.dataset.messageId) === String(messageId)) { msgEl = m; break; }
-            }
-        }
-        if (msgEl) { scrollToEl(msgEl); return; }
 
-        // Message not in current DOM - reload the chat history from the server
-        const chatAddress = State.currentChatAddress;
-        if (!chatAddress) return;
-        try {
-            if (window.clearMessageCache) window.clearMessageCache(chatAddress);
-            const loader = window.loadMessagesForConversation || window.loadMessages;
-            if (typeof loader === 'function') {
-                Promise.resolve(loader(chatAddress, false, true)).then(() => {
-                    const el = document.getElementById('msg-' + messageId);
-                    if (el) scrollToEl(el);
-                    else window.NotificationManager?.showToast(t('message_not_found') || 'Message not found', 'warning');
-                }).catch(() => {});
+        const findEl = () => {
+            let el = document.getElementById('msg-' + messageId);
+            if (!el) {
+                const container = document.getElementById('messagesContainer');
+                const msgs = container ? container.querySelectorAll('.message') : [];
+                for (const m of msgs) {
+                    if (String(m.dataset.messageId) === String(messageId)) { el = m; break; }
+                }
             }
-        } catch (e) { console.error('jumpToMessage error:', e); }
+            return el;
+        };
+
+        let el = findEl();
+        if (el) { scrollToEl(el); return; }
+
+        const chatAddress = State.currentChatAddress;
+        if (!chatAddress || !window.loadOlderMessages) return;
+
+        for (let attempt = 0; attempt < 10; attempt++) {
+            const container = document.getElementById('messagesContainer');
+            const first = container ? container.querySelector('.message') : null;
+            if (!first) break;
+            const oldestId = parseInt(first.dataset.messageId);
+            if (!oldestId) break;
+            try {
+                await window.loadOlderMessages(chatAddress, oldestId);
+            } catch (e) { break; }
+            el = findEl();
+            if (el) { scrollToEl(el); return; }
+            // Stop if no older messages were added (beginning of history reached)
+            const newFirst = document.getElementById('messagesContainer')?.querySelector('.message');
+            if (newFirst && parseInt(newFirst.dataset.messageId) === oldestId) break;
+        }
+        window.NotificationManager?.showToast(t('message_not_found') || 'Message not found', 'warning');
     }
     window.jumpToPinnedMessage = jumpToMessage;
 

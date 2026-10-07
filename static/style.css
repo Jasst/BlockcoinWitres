@@ -1100,6 +1100,21 @@ body.light-theme .search-icon {
   text-overflow: ellipsis;
   opacity: 0.85;
 }
+.pinned-msg-author {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-solid-hover, #9aa3b2);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.pinned-msg-author::before {
+  content: '';
+  width: 3px;
+  height: 11px;
+  border-radius: 2px;
+  background: currentColor;
+}
 .pinned-close-btn {
   background: transparent;
   border: none;
