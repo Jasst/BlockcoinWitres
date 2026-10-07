@@ -3232,3 +3232,93 @@ body.light-theme .ctx-press,
 body.light-theme .ctx-target-active {
   background: rgba(36, 38, 44, 0.06) !important;
 }
+
+
+@keyframes ctxFadeIn {
+  from { opacity: 0; transform: translateY(4px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+/* ========== Reply quote chip (WhatsApp-style) ========== */
+.reply-quote-box {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  margin: 0 4px 8px;
+  padding: 8px 12px 8px 0;
+  background: var(--bg-surface, #212329);
+  border: 1px solid var(--border-color, rgba(255,255,255,0.09));
+  border-radius: 12px;
+  animation: ctxFadeIn 0.16s ease;
+}
+.reply-quote-box.active { display: flex; }
+.reply-quote-bar {
+  width: 3px;
+  align-self: stretch;
+  border-radius: 2px;
+  background: var(--accent-solid, #9aa3b2);
+  margin-right: 2px;
+  flex: 0 0 3px;
+}
+.reply-quote-body {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+.reply-quote-sender {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-solid-hover, #c3cad6);
+}
+.reply-quote-text {
+  font-size: 12.5px;
+  color: var(--text-muted, #a6abb5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.reply-quote-close {
+  border: none;
+  background: transparent;
+  color: var(--text-muted, #a6abb5);
+  font-size: 20px;
+  line-height: 1;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  cursor: pointer;
+  flex: 0 0 28px;
+}
+.reply-quote-close:hover {
+  background: rgba(255,255,255,0.08);
+  color: var(--text-primary, #eceef1);
+}
+body.light-theme .reply-quote-box { background: #e9eaee; border-color: rgba(36,38,44,0.1); }
+body.light-theme .reply-quote-sender { color: #3f4653; }
+body.light-theme .reply-quote-text { color: #6b7280; }
+body.light-theme .reply-quote-close:hover { background: rgba(36,38,44,0.08); color: #24262c; }
+
+/* Подсветка сообщения при ответе/переходе к нему (как в WhatsApp) */
+.message.msg-highlight > *,
+.message.msg-highlight {
+  box-shadow: 0 0 0 2px rgba(154, 163, 178, 0.55);
+  border-radius: 14px;
+  transition: box-shadow 0.25s ease;
+}
+body.light-theme .message.msg-highlight > *,
+body.light-theme .message.msg-highlight {
+  box-shadow: 0 0 0 2px rgba(36, 38, 44, 0.35);
+}
+
+/* Inline SVG внутри круглых кнопок (контакты и др.) */
+.btn-icon-oval svg {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  display: block;
+}
+.btn-icon-oval.danger { color: var(--status-error, #e5544f); }
+.btn-icon-oval.danger:hover { background: rgba(229, 84, 79, 0.14); }

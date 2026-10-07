@@ -1,0 +1,2646 @@
+diff --git a/.gitignore b/.gitignore
+index 097ee77..7bfcd7a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,54 +1,2 @@
+-```
+-# Compiled and build artifacts
+-*.pyc
+ __pycache__/
+-*.o
+-*.obj
+-
+-# Dependencies
+-.venv/
+-venv/
+-node_modules/
+-
+-# Logs and temp files
+-*.log
+-*.tmp
+-*.swp
+-
+-# Environment
+-.env
+-.env.local
+-*.env.*
+-
+-# Editors
+-.vscode/
+-.idea/
+-
+-# Coverage reports
+-coverage/
+-htmlcov/
+-.coverage
+-
+-# Python specific
+-*.pyo
+-*.pyd
+-.Python
+-*.so
+-*.egg-info/
+-
+-# Distribution / packaging
+-*.tar.gz
+-*.whl
+-pip-log.txt
+-pip-delete-this-directory.txt
+-
+-# Testing
+-.pytest_cache/
+-.mypy_cache/
+-.hypothesis/
+-
+-# OS generated files
+-.DS_Store
+-Thumbs.db
+-/ai_memory_v3
+-/uploads
++*.pyc
+\ No newline at end of file
+diff --git a/database.py b/database.py
+index 5de0aff..8d5b7de 100644
+--- a/database.py
++++ b/database.py
+@@ -333,6 +333,26 @@ async def _apply_migrations(conn: asyncpg.Connection):
+                 ON CONFLICT (version) DO NOTHING
+             """)
+ 
++    # ──────────────────────────────────────────────────────────────
++    # МИГРАЦИЯ (версия 12) – таблица hidden_conversations
++    # (пользователь скрывает чат из списка через контекстное меню)
++    # ──────────────────────────────────────────────────────────────
++    if current_version < 12:
++        await conn.execute("""
++            CREATE TABLE IF NOT EXISTS hidden_conversations (
++                user_address TEXT NOT NULL,
++                chat_id      TEXT NOT NULL,
++                hidden_at    DOUBLE PRECISION DEFAULT extract(epoch from now()),
++                PRIMARY KEY (user_address, chat_id)
++            )
++        """)
++        await conn.execute("""
++            INSERT INTO schema_version (version, applied_at)
++            VALUES (12, extract(epoch from now()))
++            ON CONFLICT (version) DO NOTHING
++        """)
++        current_version = 12
++
+ 
+ async def _create_indexes(conn: asyncpg.Connection):
+     indexes = [
+diff --git a/models.py b/models.py
+index 8b9ce72..ed26041 100644
+--- a/models.py
++++ b/models.py
+@@ -245,6 +245,10 @@ class MarkReadRequest(BaseModel):
+     last_message_id: Optional[int] = None
+ 
+ 
++class HideConversationRequest(BaseModel):
++    chat_with: str
++
++
+ class MessageStatusesRequest(BaseModel):
+     ids: List[int] = []
+ 
+diff --git a/routes/messages.py b/routes/messages.py
+index cb624d7..e1ecaef 100644
+--- a/routes/messages.py
++++ b/routes/messages.py
+@@ -14,7 +14,7 @@ from cache import (
+ )
+ from config import MESSAGE_FEE, COIN, COIN_NAME, STAKING_FEE_POOL_ADDRESS, ENABLE_STAKING
+ from dependencies import require_auth, make_rate_limit_dep
+-from models import SendMessageRequest, MarkReadRequest, MessageStatusesRequest
++from models import SendMessageRequest, MarkReadRequest, MessageStatusesRequest, HideConversationRequest
+ from services.messaging import get_conversations_list_cached, invalidate_conversations_cache
+ from services.wallet import staking_manager
+ from setup import message_limiter
+@@ -267,7 +267,52 @@ async def get_conversation(
+ 
+ @router.get('/get_conversations')
+ async def get_conversations(address: str = Depends(require_auth)):
+-    return {'conversations': await get_conversations_list_cached(address)}
++    conversations = await get_conversations_list_cached(address)
++    # Исключаем чаты, скрытые пользователем через контекстное меню
++    try:
++        from database import get_db_cursor
++        async with get_db_cursor() as conn:
++            rows = await conn.fetch(
++                'SELECT chat_id FROM hidden_conversations WHERE user_address = $1', address)
++        hidden = {r['chat_id'] for r in rows}
++        if hidden:
++            conversations = [c for c in conversations
++                             if c.get('address') not in hidden and c.get('chat_with') not in hidden]
++    except Exception as e:
++        logger.warning(f'hidden_conversations filter failed (non-critical): {e}')
++    return {'conversations': conversations}
++
++
++@router.post('/hide_conversation')
++async def hide_conversation(body: HideConversationRequest, address: str = Depends(require_auth)):
++    """Скрыть беседу из списка чатов (контекстное меню -> «Скрыть чат»)."""
++    chat_with = body.chat_with.strip()
++    if not chat_with:
++        raise HTTPException(400, 'Missing chat_with')
++    from database import get_db_cursor
++    async with get_db_cursor() as conn:
++        await conn.execute('''
++            INSERT INTO hidden_conversations (user_address, chat_id, hidden_at)
++            VALUES ($1, $2, $3)
++            ON CONFLICT (user_address, chat_id) DO NOTHING
++        ''', address, chat_with, time.time())
++    await invalidate_conversations_cache(address)
++    return {'status': 'ok'}
++
++
++@router.post('/unhide_conversation')
++async def unhide_conversation(body: HideConversationRequest, address: str = Depends(require_auth)):
++    """Показать ранее скрытую беседу."""
++    chat_with = body.chat_with.strip()
++    if not chat_with:
++        raise HTTPException(400, 'Missing chat_with')
++    from database import get_db_cursor
++    async with get_db_cursor() as conn:
++        await conn.execute(
++            'DELETE FROM hidden_conversations WHERE user_address = $1 AND chat_id = $2',
++            address, chat_with)
++    await invalidate_conversations_cache(address)
++    return {'status': 'ok'}
+ 
+ 
+ @router.post('/mark_conversation_read')
+diff --git a/static/js/actions.js b/static/js/actions.js
+index 5eeee01..293bf91 100644
+--- a/static/js/actions.js
++++ b/static/js/actions.js
+@@ -662,64 +662,161 @@
+         }
+     });
+ 
+-    // Контекстное меню по правому клику
+-    document.addEventListener('contextmenu', async (e) => {
+-        const messageEl = e.target.closest('.message');
+-        if (!messageEl) return;
++    // ========== Контекстное меню сообщений ==========
++    // Единый движок: правый клик (ПК) + долгое нажатие (тач) — context-menu.js.
++
++    function getMessageText(messageEl) {
++        const p = messageEl.querySelector('.content p');
++        if (!p) return '';
++        // Сохраняем переносы строк (<br>) при копировании
++        const withBreaks = p.innerHTML.replace(/<br\s*\/?>/gi, '\n');
++        const tmp = document.createElement('div');
++        tmp.innerHTML = withBreaks;
++        let text = tmp.textContent || '';
++        // Убираем пометку "(изменено)" / "(edited)", добавляемую при редактировании
++        text = text.replace(/\s*[（(]?(изменено|отредактировано|edited)[）)]?\s*$/i, '');
++        return text.trim();
++    }
+ 
+-        e.preventDefault();
+-        const msgId = messageEl.dataset.messageId || messageEl.dataset.id;
+-        if (!msgId) return;
+-
+-        // Закрыть другие открытые меню
+-        document.querySelectorAll('.message-context-menu').forEach(menu => menu.remove());
+-
+-        // Создать контекстное меню
+-        const menu = document.createElement('div');
+-        menu.className = 'message-context-menu active';
+-        menu.style.left = e.pageX + 'px';
+-        menu.style.top = e.pageY + 'px';
+-
+-        const isOwnMessage = messageEl.classList.contains('sent') || messageEl.classList.contains('message-own');
+-        const messageContent = messageEl.querySelector('.content p')?.textContent || '';
+-
+-        menu.innerHTML = `
+-            <button class="copy-action"><img src="/static/icons/Copy.png" width="16" height="16" alt=""> ${t('copy')}</button>
+-            ${isOwnMessage ? `<button class="edit-action"><img src="/static/icons/Edit.png" width="16" height="16" alt=""> ${t('edit')}</button>` : ''}
+-            <button class="reply-action">↩️ ${t('reply')}</button>
+-            <button class="pin-action">📌 ${t('pin_message')}</button>
+-            <div class="separator"></div>
+-            ${isOwnMessage ? `<button class="delete-action danger"><img src="/static/icons/Remove.png" width="16" height="16" alt=""> ${t('delete')}</button>` : ''}
+-        `;
+-
+-        document.body.appendChild(menu);
+-
+-        // Позиционирование с учётом краёв экрана
+-        const rect = menu.getBoundingClientRect();
+-        if (rect.right > window.innerWidth) {
+-            menu.style.left = (e.pageX - rect.width) + 'px';
+-        }
+-        if (rect.bottom > window.innerHeight) {
+-            menu.style.top = (e.pageY - rect.height) + 'px';
+-        }
++    function findCachedMessage(msgId) {
++        const chatId = State.currentChatAddress;
++        if (!chatId || !window.getCachedMessages) return null;
++        return window.getCachedMessages(chatId).find(m => String(m.id) === String(msgId)) || null;
++    }
++
++    function applyMessageEditLocally(msgId, newText) {
++        const sel = `.message[data-message-id="${msgId}"], .message[data-id="${msgId}"]`;
++        document.querySelectorAll(sel).forEach(el => {
++            const p = el.querySelector('.content p');
++            if (p) {
++                p.textContent = newText;
++                if (!el.querySelector('.msg-edited-tag')) {
++                    p.insertAdjacentHTML('afterend', `<span class="msg-edited-tag">${t('edited')}</span>`);
++                }
++            }
++        });
++        const cached = findCachedMessage(msgId);
++        if (cached) cached.content = newText;
++    }
+ 
+-        // Обработчики действий
+-        menu.querySelector('.copy-action').onclick = () => {
+-            navigator.clipboard.writeText(messageContent).then(() => {
+-                window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
+-                menu.remove();
+-            }).catch(err => {
+-                console.error('Copy failed:', err);
+-                window.NotificationManager?.showToast(t('copy_failed'), 'error');
++    async function doDeleteMessage(msgId) {
++        const confirmed = await window.showConfirmModal(t('delete_message_title'), t('delete_message_confirm'));
++        if (!confirmed) return;
++        try {
++            const res = await fetch('/delete_message', {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ message_id: parseInt(msgId) })
+             });
+-        };
++            if (res.ok) {
++                const msgDiv = document.getElementById('msg-' + msgId);
++                if (msgDiv) {
++                    msgDiv.querySelectorAll('[data-object-url]').forEach(el => URL.revokeObjectURL(el.dataset.objectUrl));
++                    msgDiv.remove();
++                }
++                if (window.clearMessageCacheForId) window.clearMessageCacheForId(State.currentChatAddress, msgId);
++                window.loadConversations();
++                window.NotificationManager?.showToast(t('message_deleted'), 'success');
++            } else {
++                window.NotificationManager?.showToast(t('delete_failed'), 'error');
++            }
++        } catch (err) {
++            console.error('Delete error:', err);
++            window.NotificationManager?.showToast(t('delete_failed'), 'error');
++        }
++    }
++
++    function fallbackCopy(text, done) {
++        const ta = document.createElement('textarea');
++        ta.value = text;
++        ta.style.cssText = 'position:fixed;opacity:0;left:-9999px;';
++        document.body.appendChild(ta);
++        ta.select();
++        try { document.execCommand('copy'); done && done(); }
++        catch (e) { window.NotificationManager?.showToast(t('copy_failed'), 'error'); }
++        ta.remove();
++    }
++
++    // Единый набор SVG-иконок для контекстных меню (stroke через CSS).
++    // ВАЖНО: иконки — только SVG, без PNG <img>, иначе в меню появляются «двойные» иконки.
++    const CTX_ICONS = {
++        copy: '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
++        reply: '<svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 5 5v1a5 5 0 0 1-5 5h-3"/></svg>',
++        edit: '<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
++        pin: '<svg viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.8V4h6v6.8l2 2.2H7l2-2.2Z"/></svg>',
++        unpin: '<svg viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.8V4h6v6.8l2 2.2H7l2-2.2Z"/><path d="M4 4l16 16" stroke-width="1.6"/></svg>',
++        trash: '<svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>',
++        open: '<svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
++        contact: '<svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
++        call: '<svg viewBox="0 0 24 24"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .7 2.9a2 2 0 0 1-.4 2.1L8.1 10a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.9.6 2.9.7a2 2 0 0 1 1.6 1.9z"/></svg>',
++        info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>',
++        hide: '<svg viewBox="0 0 24 24"><path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c7 0 10 8 10 8a18 18 0 0 1-2.16 3.19"/><path d="M6.61 6.61A18 18 0 0 0 2 12s3 8 10 8a9 9 0 0 0 5.39-1.61"/><path d="M14.12 14.12A3 3 0 1 1 9.88 9.88"/><path d="M2 2l20 20"/></svg>'
++    };
++
++    // --- Единое хранилище закреплённых сообщений (по одному на чат) ---
++    window.getPinnedForChat = function (chatAddress) {
++        if (!chatAddress) return null;
++        try {
++            const raw = localStorage.getItem('pinned_' + chatAddress);
++            return raw ? JSON.parse(raw) : null;
++        } catch (e) { return null; }
++    };
++    window.setPinnedForChat = function (chatAddress, data) {
++        if (!chatAddress) return;
++        const key = 'pinned_' + chatAddress;
++        if (data) localStorage.setItem(key, JSON.stringify(data));
++        else localStorage.removeItem(key);
++        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(chatAddress);
++    };
++
++    function buildMessageMenuItems(messageEl) {
++        const msgId = messageEl.dataset.messageId || messageEl.dataset.id;
++        if (!msgId || String(msgId).startsWith('temp')) return null; // временные сообщения — без меню
+ 
+-        const editBtn = menu.querySelector('.edit-action');
+-        if (editBtn) {
+-            editBtn.onclick = async () => {
+-                menu.remove();
+-                const newText = prompt(t('edit_message_prompt'), messageContent);
+-                if (newText !== null && newText.trim() !== '') {
++        const isOwn = messageEl.classList.contains('sent') || messageEl.classList.contains('message-own');
++        const messageContent = getMessageText(messageEl);
++        let isPinned = false;
++        try {
++            const pinnedData = window.getPinnedForChat ? window.getPinnedForChat(State.currentChatAddress) : null;
++            isPinned = !!(pinnedData && String(pinnedData.messageId) === String(msgId));
++        } catch (e) {}
++
++        return [
++            {
++                icon: CTX_ICONS.copy,
++                label: t('copy'),
++                onClick: () => {
++                    const done = () => window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
++                    if (navigator.clipboard?.writeText) {
++                        navigator.clipboard.writeText(messageContent).then(done).catch(() => fallbackCopy(messageContent, done));
++                    } else {
++                        fallbackCopy(messageContent, done);
++                    }
++                }
++            },
++            {
++                icon: CTX_ICONS.reply,
++                label: t('reply'),
++                onClick: () => {
++                    const senderName = messageEl.querySelector('.content strong')?.textContent || '';
++                    const quoted = messageContent.split('\n').map(l => '> ' + l).join('\n');
++                    const textarea = document.getElementById('messageContent');
++                    if (textarea) {
++                        textarea.value += (textarea.value ? '\n' : '') + (senderName ? senderName + ':\n' : '') + quoted + '\n';
++                        textarea.focus();
++                        textarea.setSelectionRange(textarea.value.length, textarea.value.length);
++                        if (window.autoResizeTextarea) window.autoResizeTextarea(textarea);
++                        updateSendButtonVisibility();
++                    }
++                }
++            },
++            {
++                icon: CTX_ICONS.edit,
++                label: t('edit'),
++                hidden: !isOwn,
++                onClick: async () => {
++                    const newText = await window.showPromptModal(t('edit'), t('edit_message_prompt'), messageContent);
++                    if (newText === null || newText.trim() === '' || newText.trim() === messageContent.trim()) return;
+                     try {
+                         const res = await fetch('/edit_message', {
+                             method: 'POST',
+@@ -727,11 +824,7 @@
+                             body: JSON.stringify({ message_id: parseInt(msgId), content: newText.trim() })
+                         });
+                         if (res.ok) {
+-                            const msgDiv = document.getElementById('msg-' + msgId);
+-                            if (msgDiv) {
+-                                const contentP = msgDiv.querySelector('.content p');
+-                                if (contentP) contentP.textContent = newText.trim();
+-                            }
++                            applyMessageEditLocally(msgId, newText.trim());
+                             window.NotificationManager?.showToast(t('message_edited'), 'success');
+                         } else {
+                             window.NotificationManager?.showToast(t('edit_failed'), 'error');
+@@ -741,72 +834,73 @@
+                         window.NotificationManager?.showToast(t('edit_failed'), 'error');
+                     }
+                 }
+-            };
+-        }
+-
+-        menu.querySelector('.reply-action').onclick = () => {
+-            menu.remove();
+-            const senderName = messageEl.querySelector('.content strong')?.textContent || '';
+-            const replyText = `${senderName ? senderName + ': ' : ''}${messageContent}`;
+-            const textarea = document.getElementById('messageContent');
+-            if (textarea) {
+-                textarea.value = replyText + '\n';
+-                textarea.focus();
+-                if (window.autoResizeTextarea) window.autoResizeTextarea(textarea);
+-            }
+-        };
+-
+-        const deleteAction = menu.querySelector('.delete-action');
+-        if (deleteAction) {
+-            deleteAction.onclick = async () => {
+-                const confirmed = await window.showConfirmModal(t('delete_message_title'), t('delete_message_confirm'));
+-                if (confirmed) {
+-                    const res = await fetch('/delete_message', {
+-                        method: 'POST',
+-                        headers: { 'Content-Type': 'application/json' },
+-                        body: JSON.stringify({ message_id: parseInt(msgId) })
+-                    });
+-                    if (res.ok) {
+-                        const msgDiv = document.getElementById('msg-' + msgId);
+-                        if (msgDiv) {
+-                            msgDiv.querySelectorAll('[data-object-url]').forEach(el => {
+-                                URL.revokeObjectURL(el.dataset.objectUrl);
+-                            });
+-                            msgDiv.remove();
+-                        }
+-                        window.loadConversations();
+-                        window.NotificationManager?.showToast(t('message_deleted'), 'success');
++            },
++            { separator: true },
++            {
++                icon: isPinned ? CTX_ICONS.unpin : CTX_ICONS.pin,
++                label: isPinned ? t('unpin_message') : t('pin_message'),
++                onClick: () => {
++                    const chatAddress = State.currentChatAddress;
++                    if (!chatAddress) {
++                        window.NotificationManager?.showToast(t('open_chat_first'), 'warning');
++                        return;
++                    }
++                    if (isPinned) {
++                        // Открепление текущего сообщения
++                        window.setPinnedForChat(chatAddress, null);
++                        messageEl.classList.remove('pinned-highlight');
++                        window.NotificationManager?.showToast(t('unpinned_message'), 'success');
+                     } else {
+-                        window.NotificationManager?.showToast(t('delete_failed'), 'error');
++                        // Закрепление (заменяет предыдущее закреплённое в этом чате)
++                        window.setPinnedForChat(chatAddress, {
++                            messageId: msgId,
++                            content: messageContent.substring(0, 100),
++                            timestamp: Date.now()
++                        });
++                        messageEl.classList.add('pinned-highlight');
++                        setTimeout(() => messageEl.classList.remove('pinned-highlight'), 2000);
++                        window.NotificationManager?.showToast(t('pinned_message'), 'success');
+                     }
+                 }
+-                menu.remove();
+-            };
+-        }
++            },
++            {
++                icon: CTX_ICONS.trash,
++                label: t('delete'),
++                danger: true,
++                hidden: !isOwn,
++                onClick: () => doDeleteMessage(msgId)
++            }
++        ];
++    }
+ 
+-        // Pin message action
+-        const pinAction = menu.querySelector('.pin-action');
+-        if (pinAction) {
+-            pinAction.onclick = async () => {
+-                menu.remove();
+-                const chatAddress = State.currentChatAddress;
+-                if (!chatAddress) return;
+-                
+-                // Store pinned message in localStorage
+-                const storageKey = `pinned_${chatAddress}`;
+-                const pinnedData = {
+-                    messageId: msgId,
+-                    content: messageContent.substring(0, 100),
+-                    timestamp: Date.now()
+-                };
+-                localStorage.setItem(storageKey, JSON.stringify(pinnedData));
+-                
+-                // Update UI
+-                window.updatePinnedMessageBar(chatAddress);
+-                window.NotificationManager?.showToast(t('pinned_message'), 'success');
+-            };
++    // Правый клик по сообщению (делегирование — работает и для новых сообщений из WebSocket)
++    document.addEventListener('contextmenu', (e) => {
++        const messageEl = e.target.closest('.message');
++        if (!messageEl || !window.ContextMenu) return;
++        e.preventDefault();
++        const items = buildMessageMenuItems(messageEl);
++        if (!items) return;
++        window.ContextMenu.open(items, { x: e.clientX, y: e.clientY }, { target: messageEl });
++    }, { passive: false });
++
++    // Долгое нажатие по сообщению (тач/стикус) — вешаем при создании элемента
++    window.bindMessageHold = function (messageEl) {
++        if (!messageEl || !window.ContextMenu || messageEl._ctxBound) return;
++        messageEl._ctxBound = true;
++        window.ContextMenu.bind(messageEl, () => buildMessageMenuItems(messageEl));
++    };
++
++    // Очистка кэша сообщений при удалении
++    window.clearMessageCacheForId = function (chatId, msgId) {
++        if (!chatId || !window.messagesCache) return;
++        const arr = window.messagesCache.get(chatId);
++        if (arr) {
++            const idx = arr.findIndex(m => String(m.id) === String(msgId));
++            if (idx >= 0) arr.splice(idx, 1);
++            const idSet = window._messageIdSets?.get(chatId);
++            if (idSet) { idSet.delete(parseInt(msgId)); idSet.delete(msgId); }
+         }
+-    });
++    };
+ 
+     // Unpin button handler
+     document.addEventListener('DOMContentLoaded', function() {
+@@ -886,21 +980,24 @@
+         });
+     };
+     
+-    // Pinned message bar functions
++    // Pinned message bar (single source of truth: localStorage pinned_<chat>)
+     window.updatePinnedMessageBar = function(chatAddress) {
+         const bar = document.getElementById('pinnedMessagesBar');
+         const preview = document.getElementById('pinnedMessagePreview');
+         if (!bar || !preview) return;
+-        
+-        const storageKey = `pinned_${chatAddress}`;
+-        const pinnedData = localStorage.getItem(storageKey);
+-        
+-        if (pinnedData) {
+-            const data = JSON.parse(pinnedData);
+-            preview.textContent = data.content;
++
++        let data = null;
++        try {
++            const raw = localStorage.getItem('pinned_' + chatAddress);
++            data = raw ? JSON.parse(raw) : null;
++        } catch (e) { data = null; }
++
++        if (data && data.messageId) {
++            preview.textContent = data.content || '';
+             bar.classList.add('active');
+-            
+-            // Scroll to pinned message on click
++            bar.dataset.pinnedMessageId = data.messageId;
++
++            // Click on the bar scrolls to the pinned message
+             preview.onclick = () => {
+                 const msgEl = document.getElementById('msg-' + data.messageId);
+                 if (msgEl) {
+@@ -911,12 +1008,13 @@
+             };
+         } else {
+             bar.classList.remove('active');
++            delete bar.dataset.pinnedMessageId;
++            preview.onclick = null;
+         }
+     };
+-    
++
+     window.unpinMessage = function(chatAddress) {
+-        const storageKey = `pinned_${chatAddress}`;
+-        localStorage.removeItem(storageKey);
++        localStorage.removeItem('pinned_' + chatAddress);
+         window.updatePinnedMessageBar(chatAddress);
+     };
+ })();
+\ No newline at end of file
+diff --git a/static/js/context-menu.js b/static/js/context-menu.js
+new file mode 100644
+index 0000000..0c47385
+--- /dev/null
++++ b/static/js/context-menu.js
+@@ -0,0 +1,168 @@
++// context-menu.js — единый движок контекстных меню:
++// • правый клик (ПК) • долгое нажатие (тач/стикус) • вибрация • подсветка цели
++// Используется для сообщений чата, списка бесед, контактов и групп.
++(function () {
++    'use strict';
++    if (window._contextMenuLoaded) return;
++    window._contextMenuLoaded = true;
++
++    const HOLD_MS = 480;          // длительность долгого нажатия
++    const MOVE_TOLERANCE = 12;    // пикселей до — считаем свайпом, а не нажатием
++
++    let activeMenu = null;        // { el, cleanup }
++    let holdTimer = null;
++    let startX = 0, startY = 0;
++    let pressedTarget = null;
++    let suppressClickUntil = 0;   // блокируем «фантомный» клик после долгого нажатия
++
++    // ---------- Вспомогательные ----------
++    function haptic(ms) {
++        try { if (navigator.vibrate) navigator.vibrate(ms || 12); } catch (e) {}
++    }
++
++    function closeMenu() {
++        if (!activeMenu) return;
++        const { el, target } = activeMenu;
++        if (target) target.classList.remove('ctx-target-active');
++        if (typeof activeMenu.cleanup === 'function') activeMenu.cleanup();
++        el.classList.remove('active');
++        // лёгкая анимация закрытия
++        setTimeout(() => el.remove(), 140);
++        activeMenu = null;
++        document.removeEventListener('pointerdown', onDocPointerDown, true);
++    }
++
++    function onDocPointerDown(e) {
++        if (activeMenu && !e.target.closest('.ctx-menu')) closeMenu();
++    }
++
++    function positionMenu(menu, x, y) {
++        menu.style.left = x + 'px';
++        menu.style.top = y + 'px';
++        const rect = menu.getBoundingClientRect();
++        const vw = window.innerWidth, vh = window.innerHeight;
++        if (rect.right > vw - 8)  menu.style.left = Math.max(8, x - rect.width) + 'px';
++        if (rect.bottom > vh - 8) menu.style.top = Math.max(8, y - rect.height) + 'px';
++    }
++
++    // ---------- Публичный API ----------
++    window.ContextMenu = {
++        /**
++         * Открыть меню.
++         * items: [{ icon, label, danger, hidden, onClick }] | HTMLElement
++         * anchor: {x,y} координаты экрана или HTMLElement (меню привяжется к нему)
++         */
++        open(items, anchor, opts = {}) {
++            closeMenu();
++
++            const menu = document.createElement('div');
++            menu.className = 'ctx-menu active';
++            menu.setAttribute('role', 'menu');
++
++            if (Array.isArray(items)) {
++                for (const it of items) {
++                    if (!it) continue;
++                    if (it.separator) {
++                        const sep = document.createElement('div');
++                        sep.className = 'ctx-separator';
++                        menu.appendChild(sep);
++                        continue;
++                    }
++                    if (it.hidden) continue;
++                    const btn = document.createElement('button');
++                    btn.type = 'button';
++                    btn.className = 'ctx-item' + (it.danger ? ' danger' : '');
++                    btn.setAttribute('role', 'menuitem');
++                    btn.innerHTML = `<span class="ctx-icon">${it.icon || ''}</span><span>${it.label}</span>`;
++                    btn.addEventListener('click', (e) => {
++                        e.stopPropagation();
++                        closeMenu();
++                        try { it.onClick && it.onClick(e); } catch (err) { console.error('ctx action:', err); }
++                    });
++                    menu.appendChild(btn);
++                }
++            } else if (items instanceof HTMLElement) {
++                menu.appendChild(items);
++            }
++
++            document.body.appendChild(menu);
++
++            let ax, ay;
++            if (anchor instanceof HTMLElement) {
++                const r = anchor.getBoundingClientRect();
++                ax = r.left + Math.min(r.width / 2, 120);
++                ay = r.bottom + 6;
++            } else {
++                ax = anchor.x; ay = anchor.y;
++            }
++            positionMenu(menu, ax, ay);
++
++            activeMenu = { el: menu, target: opts.target || null };
++            if (opts.target) opts.target.classList.add('ctx-target-active');
++
++            // Esc закрывает меню
++            const onKey = (e) => { if (e.key === 'Escape') closeMenu(); };
++            document.addEventListener('keydown', onKey);
++            activeMenu.cleanup = () => document.removeEventListener('keydown', onKey);
++
++            requestAnimationFrame(() => menu.classList.add('ctx-visible'));
++            document.addEventListener('pointerdown', onDocPointerDown, true);
++            return menu;
++        },
++        close: closeMenu,
++        isOpen: () => !!activeMenu,
++
++        /**
++         * Навесить обработчики на элемент: правый клик + долгое нажатие.
++         * buildItems(targetEl, {x,y}) -> массив items
++         */
++        bind(el, buildItems, opts = {}) {
++            el.addEventListener('contextmenu', (e) => {
++                if (Date.now() < suppressClickUntil) return;
++                e.preventDefault();
++                e.stopPropagation();
++                haptic(8);
++                const items = buildItems(el, { x: e.clientX, y: e.clientY });
++                if (items) this.open(items, { x: e.clientX, y: e.clientY }, { target: el });
++            }, { passive: false });
++
++            el.addEventListener('pointerdown', (e) => {
++                if (e.pointerType === 'mouse' && e.button !== 0) return; // правый клик обрабатывается выше
++                if (e.target.closest('button, a, input, textarea, select, audio, .no-hold')) return;
++                pressedTarget = el;
++                startX = e.clientX; startY = e.clientY;
++                clearTimeout(holdTimer);
++                holdTimer = setTimeout(() => {
++                    if (!pressedTarget) return;
++                    const items = buildItems(el, { x: startX, y: startY });
++                    if (!items) return;
++                    haptic(15);
++                    suppressClickUntil = Date.now() + 700;
++                    // подсветка-«отклик»: цель слегка сжимается перед появлением меню
++                    el.classList.add('ctx-press');
++                    setTimeout(() => el.classList.remove('ctx-press'), 200);
++                    this.open(items, { x: startX, y: startY }, { target: el });
++                }, HOLD_MS);
++            });
++
++            const cancelHold = (e) => {
++                if (holdTimer && e && pressedTarget === el) {
++                    const dx = Math.abs(e.clientX - startX), dy = Math.abs(e.clientY - startY);
++                    if (dx > MOVE_TOLERANCE || dy > MOVE_TOLERANCE) { clearTimeout(holdTimer); holdTimer = null; }
++                }
++            };
++            el.addEventListener('pointermove', cancelHold);
++            el.addEventListener('pointerup', () => { clearTimeout(holdTimer); holdTimer = null; });
++            el.addEventListener('pointercancel', () => { clearTimeout(holdTimer); holdTimer = null; });
++            // если тач-скролл начался — отменяем таймер
++            el.addEventListener('scroll', () => { clearTimeout(holdTimer); holdTimer = null; }, { capture: true, passive: true });
++        }
++    };
++
++    // Глобально: клик вне любого открытого меню закрывает его (страховка)
++    document.addEventListener('DOMContentLoaded', () => {
++        document.addEventListener('click', (e) => {
++            if (activeMenu && !e.target.closest('.ctx-menu')) closeMenu();
++        });
++    });
++})();
+diff --git a/static/js/ui.js b/static/js/ui.js
+index b162d94..4176133 100644
+--- a/static/js/ui.js
++++ b/static/js/ui.js
+@@ -6,6 +6,86 @@
+     // Helper for i18n
+     function t(key, opts) { return i18next.t(key, opts); }
+ 
++    // ========== КОНТЕКСТНОЕ МЕНЮ БЕСЕД (ПКМ + долгое нажатие) ==========
++    const CONV_ICONS = {
++        open:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
++        call:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>',
++        user:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
++        copy:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
++        eyeOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
++    };
++
++    function hiddenChatsKey() {
++        return 'hidden_chats_' + ((window.State && State.userAddress) || 'anon');
++    }
++    function getHiddenChats() {
++        try { return JSON.parse(localStorage.getItem(hiddenChatsKey()) || '[]'); } catch (e) { return []; }
++    }
++    window.isChatHidden = function (address) {
++        return getHiddenChats().some(a => String(a).toLowerCase() === String(address).toLowerCase());
++    };
++
++    async function hideConversation(address, name) {
++        const confirmed = await window.showConfirmModal(t('hide_chat'), t('confirm_hide_chat', { name: name || '' }));
++        if (!confirmed) return;
++        try {
++            const res = await fetch('/hide_conversation', {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ chat_with: address })
++            });
++            if (!res.ok) throw new Error('HTTP ' + res.status);
++        } catch (err) {
++            console.warn('hide_conversation server error, hiding locally:', err);
++        }
++        const key = hiddenChatsKey();
++        const list = getHiddenChats();
++        if (!list.some(a => String(a).toLowerCase() === String(address).toLowerCase())) list.push(address);
++        localStorage.setItem(key, JSON.stringify(list));
++        const el = document.querySelector(`.conversation-item[data-address="${CSS.escape(address)}"]`);
++        if (el) el.remove();
++        if (window.State && State.currentChatAddress === address) {
++            State.currentChatAddress = null;
++            const panel = document.getElementById('chatPanel');
++            if (panel) panel.classList.remove('open');
++        }
++        if (window.NotificationManager) window.NotificationManager.showToast(t('chat_hidden'), 'success');
++    }
++
++    function bindConversationHold(item, address, displayName, isGroup) {
++        if (!window.ContextMenu || !address || address === 'ai_bot') return;
++        ContextMenu.bind(item, () => {
++            const items = [
++                { icon: CONV_ICONS.open, label: t('open_chat'), onClick: () => window.selectConversation(address, displayName, isGroup) },
++            ];
++            if (!isGroup) {
++                items.push(
++                    { icon: CONV_ICONS.call, label: t('call'), onClick: () => {
++                        if (window.CallManager && typeof window.CallManager.makeCall === 'function') {
++                            window.CallManager.makeCall(address, false, displayName);
++                        } else if (window.NotificationManager) {
++                            window.NotificationManager.showToast(t('calls_not_available'), 'warning');
++                        }
++                    } },
++                    { icon: CONV_ICONS.user, label: t('add_to_contacts'), onClick: () => {
++                        window.location.href = '/contacts?start_with=' + encodeURIComponent(address) + '&name=' + encodeURIComponent(displayName);
++                    } }
++                );
++            }
++            items.push(
++                { icon: CONV_ICONS.copy, label: t('copy_address'), onClick: () => {
++                    const done = () => window.NotificationManager && window.NotificationManager.showToast(t('copied_to_clipboard'), 'success');
++                    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(address).then(done).catch(done);
++                    else done();
++                } },
++                { separator: true },
++                { icon: CONV_ICONS.eyeOff, label: t('hide_chat'), danger: true, onClick: () => hideConversation(address, displayName) }
++            );
++            return items;
++        });
++    }
++    window.bindConversationHold = bindConversationHold;
++
+     // ========== ФОРМАТИРОВАНИЕ ДАТ ДЛЯ РАЗДЕЛИТЕЛЕЙ ==========
+     function formatDateDivider(timestamp) {
+         const date = new Date(timestamp * 1000);
+@@ -173,6 +253,8 @@
+                                  ${deleteBtn}
+                                  ${statusHtml}
+                                </div></div>`;
++        // Long press (touch) opens the same context menu as right click
++        if (window.bindMessageHold) window.bindMessageHold(messageDiv);
+         return messageDiv;
+     }
+ 
+@@ -260,7 +342,9 @@
+                 let previewText = Utils.escapeHtml(conv.last_preview || t('no_messages'));
+                 item.innerHTML = `<div class="avatar ${isGroup ? 'group' : ''}">${Utils.escapeHtml(initials)}</div>
+                     <div class="info"><div class="name truncate">${Utils.escapeHtml(shortName)}</div><div class="meta"><span class="status"></span><span class="truncate">${previewText}</span></div></div>`;
++                if (window.isChatHidden(address)) continue;
+                 item.onclick = ((addr, name, group) => () => window.selectConversation(addr, name, group))(address, conv.name || address, isGroup);
++                bindConversationHold(item, address, displayName, isGroup);
+                 container.appendChild(item);
+                 convElements.push({ el: item, address, isGroup });
+             }
+@@ -312,6 +396,9 @@
+         State.currentChatIsGroup = !!isGroup;
+         State.currentChatPartnerAddress = isGroup ? '' : (address === State.userAddress ? '' : address);
+ 
++        // ������ ������������� ��������� � ���������� ��������� ��� ���������� ����
++        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(address);
++
+         const callBtn = document.getElementById('callButton');
+         if (callBtn) {
+             if (!isGroup && address && address !== State.userAddress && address !== 'ai_bot') {
+@@ -676,6 +763,16 @@
+ 
+     // ========== ИНИЦИАЛИЗАЦИЯ ==========
+     document.addEventListener('DOMContentLoaded', () => {
++        if (window.ResizeObserver) {
++            const messagesEl = document.getElementById('messagesContainer');
++            const aiMsgsEl = document.getElementById('aiMessagesContainer');
++            [messagesEl, aiMsgsEl].forEach(el => {
++                if (!el) return;
++                const ro = new ResizeObserver(() => adjustMessagesPadding());
++                ro.observe(el);
++            });
++        }
++
+         const inputArea = document.querySelector('.chat-panel .input-area');
+         if (inputArea && window.ResizeObserver) {
+             const resizeObserver = new ResizeObserver(() => adjustMessagesPadding());
+diff --git a/static/locales/en/translation.json b/static/locales/en/translation.json
+index a6ef742..9c42f20 100644
+--- a/static/locales/en/translation.json
++++ b/static/locales/en/translation.json
+@@ -6,7 +6,7 @@
+   "chats": "Chats",
+   "new_chat": "💬",
+   "type_message": "Type a message…✎",
+-  "send": "➤",
++  "send": "Send",
+   "your_address": "Your address",
+   "balance": "Balance",
+   "your_address_qr": "Your Address",
+@@ -449,10 +449,19 @@
+   "add_reaction": "Add reaction",
+   "search_chats": "Search chats...",
+   "pin_message": "Pin message",
++  "open_chat_first": "Open a chat first",
+   "unpin_message": "Unpin message",
+   "pinned_message": "Pinned message",
+   "light_theme": "Light theme",
+   "dark_theme": "Dark theme",
+   "theme_toggle": "Toggle theme",
+-  "login": "Login"
+-}
++  "login": "Login",
++  "hide_chat": "Hide chat",
++  "confirm_hide_chat": "Hide the chat with \"{{name}}\"? New messages from this contact will not appear in the list.",
++  "chat_hidden": "Chat hidden",
++  "calls_not_available": "Calls are not available yet",
++  "compression_failed": "File compression failed",
++  "copy_group_id": "Copy group ID",
++  "edited": "edited",
++  "unpinned_message": "Message unpinned"
++}
+\ No newline at end of file
+diff --git a/static/locales/ru/translation.json b/static/locales/ru/translation.json
+index ea3e891..a5a85ae 100644
+--- a/static/locales/ru/translation.json
++++ b/static/locales/ru/translation.json
+@@ -6,7 +6,7 @@
+   "chats": "Чаты",
+   "new_chat": "💬",
+   "type_message": "Введите сообщение…✎",
+-  "send": "➤",
++  "send": "Отправить",
+   "your_address": "Ваш адрес",
+   "balance": "Баланс",
+   "your_address_qr": "Ваш адрес",
+@@ -449,10 +449,19 @@
+   "add_reaction": "Добавить реакцию",
+   "search_chats": "Поиск чатов...",
+   "pin_message": "Закрепить сообщение",
++  "open_chat_first": "Откройте чат сначала",
+   "unpin_message": "Открепить сообщение",
+   "pinned_message": "Закреплённое сообщение",
+   "light_theme": "Светлая тема",
+   "dark_theme": "Тёмная тема",
+   "theme_toggle": "Переключить тему",
+-  "login": "Войти"
++  "login": "Войти",
++  "hide_chat": "Скрыть чат",
++  "confirm_hide_chat": "Скрыть переписку с «{{name}}»? Новые сообщения этого контакта не будут появляться в списке.",
++  "chat_hidden": "Чат скрыт",
++  "calls_not_available": "Звонки пока недоступны",
++  "compression_failed": "Не удалось сжать файл",
++  "copy_group_id": "Копировать ID группы",
++  "edited": "изменено",
++  "unpinned_message": "Сообщение откреплено"
+ }
+\ No newline at end of file
+diff --git a/static/manifest.json b/static/manifest.json
+index bacc807..48c6e9f 100644
+--- a/static/manifest.json
++++ b/static/manifest.json
+@@ -5,8 +5,8 @@
+   "scope": "/",
+   "display": "standalone",
+   "orientation": "portrait",
+-  "theme_color": "#0a0a0a",
+-  "background_color": "#0a0a0a",
++  "theme_color": "#0d0e11",
++  "background_color": "#0d0e11",
+   "description": "Decentralized encrypted messenger with built-in blockchain wallet and AI assistant",
+   "icons": [
+     {
+diff --git a/static/style.css b/static/style.css
+index 892a927..3a77ecf 100644
+--- a/static/style.css
++++ b/static/style.css
+@@ -1,124 +1,133 @@
+ /**
+- * style.css — Enhanced Glass-Purple Theme for Dark Messenger
+- * v3.0 — Micro-animations, skeletons, optimized gradients, page transitions
+- *
+- * Improvements:
+- *  - Smooth micro-animations on hover and interaction
+- *  - Enhanced gradients and glow effects
+- *  - Loading skeletons instead of spinners
+- *  - Optimized CSS (removed duplicates)
+- *  - Page transitions
+- *  - Smooth message appearance in chat
+- *  - Message sending animation
++ * style.css — Modern Neutral-Gray Theme for Dark Messenger
++ * v4.0 — Редизайн в серых тонах (стиль современных AI-интерфейсов):
++ *  - Нейтральная графитовая палитра вместо фиолетового неона
++ *  - Тонкие границы, мягкие тени, аккуратные радиусы
++ *  - Обновлённые кнопки чата: круглая кнопка отправки с SVG-иконкой
++ *  - Улучшенные пузыри сообщений, сайдбар, модалки, тосты
+  */
+ 
+ :root {
+-  --bg-primary: #0a0a0f;
+-  --bg-secondary: #14141c;
+-  --bg-tertiary: #1e1e28;
+-  --bg-hover: rgba(42, 42, 56, 0.6);
+-  --bg-active: #34344a;
+-  --bg-surface: #16161f;
+-  
+-  --glass-bg: rgba(20, 20, 30, 0.65);
+-  --glass-bg-light: rgba(30, 30, 45, 0.45);
+-  --glass-border: rgba(255, 255, 255, 0.1);
+-  --glass-border-light: rgba(255, 255, 255, 0.15);
+-  
+-  --accent-color: #6c5ce7;
++  --bg-primary: #0d0e11;
++  --bg-secondary: #17181c;
++  --bg-tertiary: #212329;
++  --bg-hover: rgba(255, 255, 255, 0.06);
++  --bg-active: #2b2e35;
++  --bg-surface: #1a1c21;
++
++  --glass-bg: rgba(26, 28, 33, 0.72);
++  --glass-bg-light: rgba(38, 41, 48, 0.5);
++  --glass-border: rgba(255, 255, 255, 0.08);
++  --glass-border-light: rgba(255, 255, 255, 0.13);
++
++  /* Акцент — холодный графитово-стальной, как у современных AI-продуктов */
++  --accent-color: #9aa3b2;
+   --accent: var(--accent-color);
+-  --accent-hover: #a29bfe;
+-  --accent-light: rgba(108, 92, 231, 0.08);
+-  --accent-soft: rgba(108, 92, 231, 0.15);
+-  --accent-glow: rgba(108, 92, 231, 0.5);
+-  --accent-gradient: linear-gradient(135deg, #6c5ce7 0%, #8e7bf5 50%, #a29bfe 100%);
+-  --accent-gradient-strong: linear-gradient(135deg, #6c5ce7, #5a4bd1);
+-  
+-  --text-main: #f5f6fa;
++  --accent-hover: #c4cbd6;
++  --accent-light: rgba(154, 163, 178, 0.08);
++  --accent-soft: rgba(154, 163, 178, 0.14);
++  --accent-glow: rgba(154, 163, 178, 0.28);
++  --accent-gradient: linear-gradient(135deg, #5b626f 0%, #7d8595 50%, #a7afbc 100%);
++  --accent-gradient-strong: linear-gradient(135deg, #3f434b, #26282d);
++
++  /* Тёмный акцент для кнопок и пузырей «отправлено» */
++  --accent-solid: #24262c;
++  --accent-solid-hover: #34373f;
++  --on-accent: #f2f3f5;
++
++  --text-main: #eceef1;
+   --text-primary: var(--text-main);
+-  --text-secondary: #a4b0be;
+-  --text-muted: #7d8494;
++  --text-secondary: #a6abb5;
++  --text-muted: #787e89;
+   --text-inverse: #ffffff;
+-  
+-  --border-color: rgba(38, 38, 53, 0.8);
+-  --border-focus: #6c5ce7;
+-  
+-  --success-color: #00b894;
+-  --danger-color: #d63031;
+-  --warning-color: #e17055;
++
++  --border-color: rgba(255, 255, 255, 0.09);
++  --border-focus: #b6bec9;
++
++  --success-color: #4cc38a;
++  --danger-color: #e5544f;
++  --warning-color: #e0a458;
+   --status-success: var(--success-color);
+   --status-warning: var(--warning-color);
+   --status-error: var(--danger-color);
+   --danger: var(--danger-color);
+-  
+-  --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.3);
+-  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+-  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
+-  --shadow-xl: 0 12px 48px rgba(0, 0, 0, 0.6);
+-  --glow-sm: 0 0 10px rgba(108, 92, 231, 0.3);
+-  --glow-md: 0 0 20px rgba(108, 92, 231, 0.4);
+-  --glow-lg: 0 0 30px rgba(108, 92, 231, 0.5);
+-  
++
++  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
++  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
++  --shadow-lg: 0 10px 34px rgba(0, 0, 0, 0.45);
++  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.55);
++  --glow-sm: 0 0 10px rgba(154, 163, 178, 0.16);
++  --glow-md: 0 0 20px rgba(154, 163, 178, 0.2);
++  --glow-lg: 0 0 30px rgba(154, 163, 178, 0.24);
++
+   --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+   --transition-normal: 250ms cubic-bezier(0.4, 0, 0.2, 1);
+   --transition-slow: 400ms cubic-bezier(0.4, 0, 0.2, 1);
+   --transition-bounce: 500ms cubic-bezier(0.68, -0.55, 0.265, 1.55);
+-  
++
+   --space-xs: 4px;
+   --space-sm: 8px;
+   --space-md: 16px;
+   --space-lg: 24px;
+   --space-xl: 32px;
+-  
++
+   --radius-sm: 8px;
+-  --radius-md: 14px;
+-  --radius-lg: 22px;
++  --radius-md: 12px;
++  --radius-lg: 18px;
+   --radius-full: 9999px;
+-  
+-  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
++
++  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+   --font-mono: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+   --font-size-base: 16px;
+ }
+ 
+-/* Light theme overrides */
++/* Light theme overrides — тёплый светло-серый («paper»-стиль) */
+ body.light-theme {
+-  --bg-primary: #f5f6fa;
+-  --bg-secondary: #e8eaf0;
+-  --bg-tertiary: #d9dbe6;
+-  --bg-hover: rgba(108, 92, 231, 0.08);
+-  --bg-active: #cdd2e0;
++  --bg-primary: #f3f4f6;
++  --bg-secondary: #ffffff;
++  --bg-tertiary: #e9eaee;
++  --bg-hover: rgba(36, 38, 44, 0.06);
++  --bg-active: #dfe1e6;
+   --bg-surface: #ffffff;
+-  
++
+   --glass-bg: rgba(255, 255, 255, 0.85);
+-  --glass-bg-light: rgba(245, 246, 250, 0.65);
+-  --glass-border: rgba(108, 92, 231, 0.12);
+-  --glass-border-light: rgba(108, 92, 231, 0.18);
+-  
+-  --accent-color: #6c5ce7;
++  --glass-bg-light: rgba(243, 244, 246, 0.7);
++  --glass-border: rgba(36, 38, 44, 0.1);
++  --glass-border-light: rgba(36, 38, 44, 0.16);
++
++  --accent-color: #565d68;
+   --accent: var(--accent-color);
+-  --accent-hover: #5a4bd1;
+-  --accent-light: rgba(108, 92, 231, 0.12);
+-  --accent-soft: rgba(108, 92, 231, 0.18);
+-  --accent-glow: rgba(108, 92, 231, 0.35);
+-  --accent-gradient: linear-gradient(135deg, #7c6ef5 0%, #8e7bf5 50%, #a29bfe 100%);
+-  --accent-gradient-strong: linear-gradient(135deg, #7c6ef5, #6c5ce7);
+-  
+-  --text-main: #1e1e2e;
++  --accent-hover: #2f333a;
++  --accent-light: rgba(86, 93, 104, 0.08);
++  --accent-soft: rgba(86, 93, 104, 0.12);
++  --accent-glow: rgba(86, 93, 104, 0.18);
++  --accent-gradient: linear-gradient(135deg, #6b7280 0%, #4b5563 100%);
++  --accent-gradient-strong: linear-gradient(135deg, #4b5563, #374151);
++
++  --accent-solid: #2f333a;
++  --accent-solid-hover: #444953;
++  --on-accent: #ffffff;
++
++  --text-main: #1b1d21;
+   --text-primary: var(--text-main);
+-  --text-secondary: #5a5a7a;
+-  --text-muted: #7a7a9a;
+-  
+-  --border-color: rgba(108, 92, 231, 0.15);
+-  --border-focus: #6c5ce7;
+-  
+-  --shadow-sm: 0 2px 4px rgba(108, 92, 231, 0.08);
+-  --shadow-md: 0 4px 16px rgba(108, 92, 231, 0.12);
+-  --shadow-lg: 0 8px 32px rgba(108, 92, 231, 0.16);
+-  --shadow-xl: 0 12px 48px rgba(108, 92, 231, 0.2);
+-  
+-  --glow-sm: 0 0 8px rgba(108, 92, 231, 0.2);
+-  --glow-md: 0 0 16px rgba(108, 92, 231, 0.25);
+-  --glow-lg: 0 0 24px rgba(108, 92, 231, 0.3);
++  --text-secondary: #5b6068;
++  --text-muted: #8b909a;
++
++  --border-color: rgba(36, 38, 44, 0.12);
++  --border-focus: #565d68;
++
++  --success-color: #1f9d61;
++  --danger-color: #d13c37;
++  --warning-color: #b97e2e;
++
++  --shadow-sm: 0 1px 2px rgba(20, 22, 26, 0.06);
++  --shadow-md: 0 4px 16px rgba(20, 22, 26, 0.08);
++  --shadow-lg: 0 10px 34px rgba(20, 22, 26, 0.1);
++  --shadow-xl: 0 16px 48px rgba(20, 22, 26, 0.14);
++
++  --glow-sm: 0 0 8px rgba(86, 93, 104, 0.12);
++  --glow-md: 0 0 16px rgba(86, 93, 104, 0.15);
++  --glow-lg: 0 0 24px rgba(86, 93, 104, 0.18);
+ }
+ 
+ /* ===== Base Reset ===== */
+@@ -169,13 +178,13 @@ img[lazy="loaded"], img.loaded {
+   transition: background var(--transition-normal);
+ }
+ .accent-gradient-bg:hover {
+-  background: linear-gradient(135deg, #8e7bf5 0%, #a29bfe 50%, #6c5ce7 100%);
++  background: linear-gradient(135deg, #7d8595 0%, #a7afbc 50%, #565d68 100%);
+   box-shadow: var(--glow-md);
+ }
+ 
+ /* Light theme gradient adjustments */
+ body.light-theme .accent-gradient-bg:hover {
+-  background: linear-gradient(135deg, #a29bfe 0%, #8e7bf5 50%, #7c6ef5 100%);
++  background: linear-gradient(135deg, #a7afbc 0%, #7d8595 50%, #6b7280 100%);
+   box-shadow: var(--glow-sm);
+ }
+ 
+@@ -228,7 +237,7 @@ body {
+   line-height: 1.5;
+   color: var(--text-primary);
+   background:
+-    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(108, 92, 231, 0.15), transparent),
++    radial-gradient(ellipse 90% 60% at 50% -20%, rgba(255, 255, 255, 0.05), transparent 70%),
+     var(--bg-primary);
+   background-attachment: fixed;
+   -webkit-font-smoothing: antialiased;
+@@ -239,7 +248,7 @@ body {
+ /* Light theme background gradient */
+ body.light-theme {
+   background:
+-    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(108, 92, 231, 0.08), transparent),
++    radial-gradient(ellipse 90% 60% at 50% -20%, rgba(86, 93, 104, 0.06), transparent 70%),
+     var(--bg-primary);
+ }
+ 
+@@ -348,9 +357,9 @@ textarea:focus:not(:focus-visible) {
+   100% { background-position: 200% 0; }
+ }
+ @keyframes buttonRipple {
+-  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(108, 92, 231, 0.4); }
+-  70% { transform: scale(1.02); box-shadow: 0 0 0 10px rgba(108, 92, 231, 0); }
+-  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(108, 92, 231, 0); }
++  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(86, 93, 104, 0.4); }
++  70% { transform: scale(1.02); box-shadow: 0 0 0 10px rgba(86, 93, 104, 0); }
++  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(86, 93, 104, 0); }
+ }
+ @keyframes pageEnter {
+   from { opacity: 0; transform: scale(0.98); }
+@@ -502,7 +511,7 @@ textarea:focus:not(:focus-visible) {
+   -webkit-tap-highlight-color: transparent;
+ }
+ .btn-primary-oval {
+-  background: linear-gradient(135deg, var(--accent-color), #5a4bd1);
++  background: var(--accent-gradient-strong);
+   color: #fff;
+   border-color: transparent;
+   box-shadow: 0 4px 15px var(--accent-glow);
+@@ -566,14 +575,14 @@ textarea:focus:not(:focus-visible) {
+ 
+ /* Light theme button adjustments */
+ body.light-theme .btn-primary-oval {
+-  background: linear-gradient(135deg, #7c6ef5, #6c5ce7);
+-  box-shadow: 0 4px 15px rgba(108, 92, 231, 0.25);
++  background: linear-gradient(135deg, #6b7280, #565d68);
++  box-shadow: 0 4px 15px rgba(86, 93, 104, 0.25);
+ }
+ body.light-theme .btn-primary-oval:hover:not(:disabled) {
+-  box-shadow: 0 6px 20px rgba(108, 92, 231, 0.35), var(--glow-sm);
++  box-shadow: 0 6px 20px rgba(86, 93, 104, 0.35), var(--glow-sm);
+ }
+ body.light-theme .btn-primary-oval:active:not(:disabled) {
+-  box-shadow: 0 2px 8px rgba(108, 92, 231, 0.2);
++  box-shadow: 0 2px 8px rgba(86, 93, 104, 0.2);
+ }
+ 
+ .btn-primary-oval:active:not(:disabled) {
+@@ -612,6 +621,71 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
+   box-shadow: none;
+ }
+ 
++
++/* ===== Send button: compact round, modern AI style ===== */
++#sendButton.btn-primary-oval,
++#aiSendBtn.btn-primary-oval {
++  padding: 0;
++  width: 40px;
++  height: 40px;
++  min-width: 40px;
++  min-height: 40px;
++  border-radius: 50%;
++  background: var(--accent-gradient-strong);
++  border: 1px solid rgba(255, 255, 255, 0.12);
++  color: var(--on-accent);
++  font-size: 0;            /* скрывает текстовую заглушку ➤ — видна только SVG-иконка */
++  box-shadow: var(--shadow-sm);
++}
++#sendButton svg,
++#aiSendBtn svg {
++  width: 18px;
++  height: 18px;
++  stroke: currentColor;
++  fill: none;
++  stroke-width: 2;
++  stroke-linecap: round;
++  stroke-linejoin: round;
++  display: block;
++}
++#sendButton:not(:disabled):hover,
++#aiSendBtn:not(:disabled):hover {
++  background: linear-gradient(135deg, #4a4f59, #2f333a);
++  box-shadow: var(--shadow-md);
++  transform: translateY(-1px) scale(1.04);
++}
++#sendButton:disabled,
++#aiSendBtn:disabled {
++  opacity: 0.35;
++  filter: grayscale(0.4);
++}
++body.light-theme #sendButton,
++body.light-theme #aiSendBtn {
++  background: var(--accent-solid);
++  border-color: transparent;
++  color: #fff;
++}
++body.light-theme #sendButton:not(:disabled):hover,
++body.light-theme #aiSendBtn:not(:disabled):hover {
++  background: var(--accent-solid-hover);
++}
++
++/* Иконки-кнопки внутри области ввода чата — ровные круги */
++.input-area .btn-icon-oval {
++  width: 40px;
++  height: 40px;
++  min-width: 40px;
++  min-height: 40px;
++  padding: 0;
++  border-radius: 50%;
++  color: var(--text-secondary);
++}
++.input-area .btn-icon-oval:hover {
++  background: var(--bg-hover);
++  color: var(--text-primary);
++}
++.input-area .btn-icon-oval:disabled { opacity: 0.35; }
++
+ /* ===== Inputs ===== */
+ .input {
+   width: 100%;
+@@ -746,7 +820,7 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
+   width: 64px;
+   height: 64px;
+   margin: 0 auto var(--space-md);
+-  background: linear-gradient(135deg, var(--accent-color), #5a4bd1);
++  background: var(--accent-gradient-strong);
+   border-radius: var(--radius-lg);
+   display: flex;
+   align-items: center;
+@@ -922,8 +996,8 @@ body.light-theme .btn-primary-oval:active:not(:disabled) {
+ 
+ /* Light theme search icon visibility */
+ body.light-theme .search-icon {
+-  color: #5a5a7a;
+-  stroke: #5a5a7a;
++  color: #5b6068;
++  stroke: #5b6068;
+ }
+ 
+ /* ===== Theme Toggle Button ===== */
+@@ -1073,7 +1147,7 @@ body.light-theme .search-icon {
+   width: 48px;
+   height: 48px;
+   border-radius: 60px;
+-  background: linear-gradient(135deg, var(--accent-color), #5a4bd1);
++  background: var(--accent-gradient-strong);
+   color: #fff;
+   display: flex;
+   align-items: center;
+@@ -1083,7 +1157,7 @@ body.light-theme .search-icon {
+   flex-shrink: 0;
+ }
+ .conversation-item .avatar.group {
+-  background: linear-gradient(135deg, #00b894, #00cec9);
++  background: linear-gradient(135deg, #4cc38a, #3aa9c9);
+ }
+ .conversation-item .info {
+   flex: 1;
+@@ -1177,7 +1251,7 @@ body.light-theme .search-icon {
+   width: 36px;
+   height: 36px;
+   border-radius: 60px;
+-  background: linear-gradient(135deg, var(--accent-color), #5a4bd1);
++  background: var(--accent-gradient-strong);
+   color: #fff;
+   display: flex;
+   align-items: center;
+@@ -1201,12 +1275,12 @@ body.light-theme .search-icon {
+   color: var(--text-main);
+ }
+ .message.sent .content {
+-  background: linear-gradient(135deg, var(--accent-color), #5a4bd1);
+-  color: #ffffff;
+-  border: none;
++  background: var(--accent-solid);
++  color: var(--on-accent);
++  border: 1px solid rgba(255, 255, 255, 0.07);
+   border-radius: 20px;
+-  border-top-right-radius: 4px;
+-  box-shadow: 0 2px 12px rgba(108, 92, 231, 0.25);
++  border-top-right-radius: 6px;
++  box-shadow: var(--shadow-sm);
+ }
+ .message .content p {
+   font-size: 15px;
+@@ -1242,7 +1316,7 @@ body.light-theme .search-icon {
+ .msg-status--sent { color: var(--text-muted); }
+ .msg-status--delivered { color: var(--text-secondary); }
+ .msg-status--read { color: var(--success-color); font-weight: 700; }
+-.message.sent .msg-status--read { color: #7bedd3; }
++.message.sent .msg-status--read { color: #8fdcb8; }
+ 
+ /* Кнопка удаления — приглушена, ярче при наведении/касании */
+ .delete-btn {
+@@ -1304,7 +1378,7 @@ body.light-theme .search-icon {
+ }
+ 
+ .message-context-menu button.danger:hover {
+-  background: rgba(214, 48, 49, 0.15);
++  background: rgba(229, 84, 79, 0.15);
+ }
+ 
+ .message-context-menu .separator {
+@@ -1481,16 +1555,16 @@ body.light-theme .search-icon {
+ }
+ 
+ body.light-theme .message:hover {
+-  background: rgba(108, 92, 231, 0.04);
++  background: rgba(86, 93, 104, 0.04);
+   border-radius: 8px;
+ }
+ 
+ body.light-theme .message.sent:hover .content {
+-  box-shadow: 0 4px 16px rgba(108, 92, 231, 0.25);
++  box-shadow: 0 4px 16px rgba(86, 93, 104, 0.25);
+ }
+ 
+ body.light-theme .message.received:hover .content {
+-  box-shadow: 0 4px 16px rgba(108, 92, 231, 0.15);
++  box-shadow: 0 4px 16px rgba(86, 93, 104, 0.15);
+ }
+ 
+ .message:hover {
+@@ -1499,7 +1573,7 @@ body.light-theme .message.received:hover .content {
+ }
+ 
+ .message.sent:hover .content {
+-  box-shadow: 0 4px 16px rgba(108, 92, 231, 0.35);
++  box-shadow: 0 4px 16px rgba(86, 93, 104, 0.35);
+ }
+ 
+ /* Анимация появления */
+@@ -1694,7 +1768,7 @@ body.light-theme .message.received:hover .content {
+   align-items: center;
+   justify-content: center;
+   font-size: 20px;
+-  box-shadow: 0 0 12px rgba(214, 48, 49, 0.5);
++  box-shadow: 0 0 12px rgba(229, 84, 79, 0.5);
+   border: none;
+   cursor: pointer;
+ }
+@@ -1774,7 +1848,7 @@ audio::-webkit-media-controls-time-remaining-display {
+ .markdown-body hr { border: none; border-top: 1px solid var(--border-color); margin: 14px 0; }
+ 
+ .markdown-body pre {
+-  background: #14141c;
++  background: #17181c;
+   border: 1px solid var(--border-color);
+   border-radius: 16px;
+   padding: 16px;
+@@ -2122,7 +2196,7 @@ audio::-webkit-media-controls-time-remaining-display {
+   width: 32px;
+   height: 32px;
+   border-radius: 50%;
+-  background: linear-gradient(135deg, var(--accent-color), #5a4bd1);
++  background: var(--accent-gradient-strong);
+   color: #fff;
+   display: flex;
+   align-items: center;
+@@ -2195,8 +2269,8 @@ audio::-webkit-media-controls-time-remaining-display {
+   font-weight: 600;
+   white-space: nowrap;
+ }
+-.status-success { background: rgba(0, 184, 148, 0.18); color: var(--success-color); }
+-.status-warning { background: rgba(225, 112, 85, 0.18); color: var(--warning-color); }
++.status-success { background: rgba(76, 195, 138, 0.18); color: var(--success-color); }
++.status-warning { background: rgba(224, 164, 88, 0.18); color: var(--warning-color); }
+ 
+ .error {
+   color: var(--danger-color);
+@@ -2233,7 +2307,7 @@ audio::-webkit-media-controls-time-remaining-display {
+   width: 40px;
+   height: 40px;
+   border-radius: 60px;
+-  background: linear-gradient(135deg, var(--accent-color), #5a4bd1);
++  background: var(--accent-gradient-strong);
+   color: #fff;
+   display: flex;
+   align-items: center;
+@@ -2280,9 +2354,9 @@ audio::-webkit-media-controls-time-remaining-display {
+   animation: slideDown 0.3s ease-out;
+   max-width: calc(100vw - 32px);
+ }
+-.system-toast.success { border-color: rgba(0, 184, 148, 0.5); }
+-.system-toast.error { border-color: rgba(214, 48, 49, 0.5); }
+-.system-toast.warning { border-color: rgba(225, 112, 85, 0.5); }
++.system-toast.success { border-color: rgba(76, 195, 138, 0.5); }
++.system-toast.error { border-color: rgba(229, 84, 79, 0.5); }
++.system-toast.warning { border-color: rgba(224, 164, 88, 0.5); }
+ .system-toast .close {
+   background: none;
+   border: none;
+@@ -2416,19 +2490,19 @@ audio::-webkit-media-controls-time-remaining-display {
+   background: var(--danger-color);
+   border-color: transparent;
+   color: #fff;
+-  box-shadow: 0 4px 15px rgba(214, 48, 49, 0.4);
++  box-shadow: 0 4px 15px rgba(229, 84, 79, 0.4);
+ }
+ .call-end-btn:hover, .call-reject-btn:hover {
+-  background: #b02324;
++  background: #c43f3a;
+   transform: scale(1.08);
+ }
+ .call-accept-btn {
+   background: var(--success-color);
+   border-color: transparent;
+   color: #fff;
+-  box-shadow: 0 4px 15px rgba(0, 184, 148, 0.4);
++  box-shadow: 0 4px 15px rgba(76, 195, 138, 0.4);
+ }
+-.call-accept-btn:hover { background: #019d7f; transform: scale(1.08); }
++.call-accept-btn:hover { background: #178251; transform: scale(1.08); }
+ .call-control-btn.active {
+   background: var(--accent-color);
+   border-color: transparent;
+@@ -2522,8 +2596,8 @@ audio::-webkit-media-controls-time-remaining-display {
+ 
+ /* Входящий звонок: пульсация аватара */
+ @keyframes call-pulse {
+-  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 184, 148, 0.45); }
+-  50% { box-shadow: 0 0 0 16px rgba(0, 184, 148, 0); }
++  0%, 100% { box-shadow: 0 0 0 0 rgba(76, 195, 138, 0.45); }
++  50% { box-shadow: 0 0 0 16px rgba(76, 195, 138, 0); }
+ }
+ #incomingCallModal .call-avatar { animation: call-pulse 1.4s ease infinite; }
+ 
+@@ -2661,27 +2735,27 @@ body.light-theme .message.received {
+ }
+ 
+ body.light-theme .message.sent .content {
+-  background: linear-gradient(135deg, #7c6ef5, #6c5ce7);
+-  box-shadow: 0 2px 12px rgba(108, 92, 231, 0.2);
++  background: var(--accent-solid);
++  box-shadow: 0 2px 10px rgba(20, 22, 26, 0.15);
+   color: #ffffff !important;
+ }
+ 
+ body.light-theme .message.received .content {
+   background: rgba(255, 255, 255, 0.9);
+   backdrop-filter: blur(8px);
+-  border: 1px solid rgba(108, 92, 231, 0.15);
+-  color: #2d3436 !important;
++  border: 1px solid rgba(86, 93, 104, 0.15);
++  color: #1b1d21 !important;
+   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+ }
+ 
+ body.light-theme .message .content {
+   background: rgba(255, 255, 255, 0.8);
+-  border: 1px solid rgba(108, 92, 231, 0.1);
+-  color: #2d3436 !important;
++  border: 1px solid rgba(86, 93, 104, 0.1);
++  color: #1b1d21 !important;
+ }
+ 
+ body.light-theme .message .meta {
+-  color: rgba(45, 52, 54, 0.6);
++  color: rgba(27, 29, 33, 0.6);
+ }
+ 
+ body.light-theme .message.sent .meta {
+@@ -2699,7 +2773,7 @@ body.light-theme #messagesContainer {
+ body.light-theme .conversations-panel {
+   background: rgba(255, 255, 255, 0.85);
+   backdrop-filter: blur(16px);
+-  border: 1px solid rgba(108, 92, 231, 0.12);
++  border: 1px solid rgba(86, 93, 104, 0.12);
+ }
+ 
+ body.light-theme .chat-layout {
+@@ -2709,21 +2783,21 @@ body.light-theme .chat-layout {
+ body.light-theme .chat-panel {
+   background: rgba(255, 255, 255, 0.85);
+   backdrop-filter: blur(16px);
+-  border: 1px solid rgba(108, 92, 231, 0.12);
++  border: 1px solid rgba(86, 93, 104, 0.12);
+ }
+ 
+ body.light-theme .conversation-item {
+   background: rgba(255, 255, 255, 0.7);
+-  border: 1px solid rgba(108, 92, 231, 0.1);
++  border: 1px solid rgba(86, 93, 104, 0.1);
+ }
+ 
+ body.light-theme .conversation-item:hover {
+-  background: rgba(108, 92, 231, 0.06);
++  background: rgba(86, 93, 104, 0.06);
+ }
+ 
+ body.light-theme .conversation-item.active {
+-  background: rgba(108, 92, 231, 0.1);
+-  border-color: #6c5ce7;
++  background: rgba(86, 93, 104, 0.1);
++  border-color: #565d68;
+ }
+ 
+ body.light-theme .conversations-list {
+@@ -2732,93 +2806,93 @@ body.light-theme .conversations-list {
+ 
+ body.light-theme .input {
+   background: rgba(255, 255, 255, 0.9);
+-  border-color: rgba(108, 92, 231, 0.15);
++  border-color: rgba(86, 93, 104, 0.15);
+ }
+ 
+ body.light-theme .input:focus {
+   background: #ffffff;
+-  border-color: #6c5ce7;
+-  box-shadow: 0 0 0 3px rgba(108, 92, 231, 0.1);
++  border-color: #565d68;
++  box-shadow: 0 0 0 3px rgba(86, 93, 104, 0.1);
+ }
+ 
+ body.light-theme .modal-content {
+   background: rgba(255, 255, 255, 0.95);
+-  border: 1px solid rgba(108, 92, 231, 0.15);
++  border: 1px solid rgba(86, 93, 104, 0.15);
+ }
+ 
+ /* Fix modal close button in light theme */
+ body.light-theme .modal-close {
+-  color: #5a5a7a;
++  color: #5b6068;
+ }
+ body.light-theme .modal-close:hover {
+-  color: #2d3436;
+-  background: rgba(108, 92, 231, 0.08);
++  color: #1b1d21;
++  background: rgba(86, 93, 104, 0.08);
+ }
+ 
+ body.light-theme .card {
+   background: rgba(255, 255, 255, 0.9);
+-  border: 1px solid rgba(108, 92, 231, 0.12);
++  border: 1px solid rgba(86, 93, 104, 0.12);
+ }
+ 
+ body.light-theme .chat-panel-header {
+   background: rgba(255, 255, 255, 0.85);
+-  border-bottom: 1px solid rgba(108, 92, 231, 0.12);
++  border-bottom: 1px solid rgba(86, 93, 104, 0.12);
+   backdrop-filter: blur(12px);
+ }
+ 
+ /* Fix pinned messages bar in light theme */
+ body.light-theme .pinned-messages-bar {
+-  background: rgba(108, 92, 231, 0.12);
+-  border-bottom: 1px solid rgba(108, 92, 231, 0.18);
+-  color: #2d3436;
++  background: rgba(86, 93, 104, 0.12);
++  border-bottom: 1px solid rgba(86, 93, 104, 0.18);
++  color: #1b1d21;
+ }
+ 
+ body.light-theme .conversations-header {
+   background: rgba(255, 255, 255, 0.85);
+-  border-bottom: 1px solid rgba(108, 92, 231, 0.12);
++  border-bottom: 1px solid rgba(86, 93, 104, 0.12);
+   backdrop-filter: blur(12px);
+ }
+ 
+ body.light-theme .bottom-nav {
+   background: rgba(255, 255, 255, 0.9);
+-  border-top: 1px solid rgba(108, 92, 231, 0.12);
++  border-top: 1px solid rgba(86, 93, 104, 0.12);
+ }
+ 
+ body.light-theme .message .avatar {
+-  background: linear-gradient(135deg, #7c6ef5, #6c5ce7);
++  background: linear-gradient(135deg, #6b7280, #565d68);
+ }
+ 
+ body.light-theme .message.sent .avatar {
+-  background: rgba(108, 92, 231, 0.15);
+-  color: #6c5ce7;
++  background: rgba(86, 93, 104, 0.15);
++  color: #565d68;
+ }
+ 
+ body.light-theme .btn-oval:not(.btn-primary-oval):hover,
+ body.light-theme .btn-icon-oval:hover {
+-  background: rgba(108, 92, 231, 0.08);
++  background: rgba(86, 93, 104, 0.08);
+ }
+ 
+ body.light-theme .skeleton {
+   background: linear-gradient(
+     90deg,
+-    #e8eaf0 0%,
+-    #d9dbe6 50%,
+-    #e8eaf0 100%
++    #f3f4f6 0%,
++    #e9eaee 50%,
++    #f3f4f6 100%
+   );
+   background-size: 200% 100%;
+ }
+ 
+ body.light-theme .glow-effect:hover {
+-  box-shadow: 0 0 15px rgba(108, 92, 231, 0.25);
++  box-shadow: 0 0 15px rgba(86, 93, 104, 0.25);
+ }
+ 
+ body.light-theme .accent-gradient-bg {
+-  background: linear-gradient(135deg, #7c6ef5 0%, #8e7bf5 50%, #a29bfe 100%);
++  background: linear-gradient(135deg, #6b7280 0%, #7d8595 50%, #a7afbc 100%);
+ }
+ 
+ body.light-theme .input-area {
+   background: rgba(255, 255, 255, 0.9);
+-  border: 1px solid rgba(108, 92, 231, 0.15);
++  border: 1px solid rgba(86, 93, 104, 0.15);
+   backdrop-filter: blur(20px);
+ }
+ 
+@@ -2832,34 +2906,34 @@ body.light-theme .input-wrapper {
+ }
+ 
+ body.light-theme .input-wrapper textarea {
+-  color: #2d3436;
++  color: #1b1d21;
+ }
+ 
+ body.light-theme .input-wrapper textarea::placeholder {
+-  color: rgba(45, 52, 54, 0.5);
++  color: rgba(27, 29, 33, 0.5);
+ }
+ 
+ /* AI Chat Container textarea fix for light theme */
+ body.light-theme #aiChatContainer .input-wrapper textarea {
+-  color: #1e1e2e !important;
++  color: #1b1d21 !important;
+   background: transparent !important;
+ }
+ 
+ body.light-theme #aiChatContainer .input-wrapper textarea::placeholder {
+-  color: rgba(30, 30, 46, 0.6) !important;
++  color: rgba(27, 29, 33, 0.6) !important;
+ }
+ 
+ /* Additional fix for any textarea in light theme within chat */
+ body.light-theme #aiChatContainer textarea#aiMessageInput {
+-  color: #1e1e2e !important;
++  color: #1b1d21 !important;
+ }
+ 
+ body.light-theme ::-webkit-scrollbar-thumb {
+-  background: rgba(108, 92, 231, 0.3);
++  background: rgba(86, 93, 104, 0.3);
+ }
+ 
+ body.light-theme ::-webkit-scrollbar-thumb:hover {
+-  background: rgba(108, 92, 231, 0.5);
++  background: rgba(86, 93, 104, 0.5);
+ }
+ 
+ /* ===== Light Theme Icon Visibility Fixes ===== */
+@@ -2869,8 +2943,8 @@ body.light-theme .btn-icon-oval svg,
+ body.light-theme .theme-toggle-btn svg,
+ body.light-theme .search-icon,
+ body.light-theme .empty-state .icon {
+-  stroke: #2d3436;
+-  color: #2d3436;
++  stroke: #1b1d21;
++  color: #1b1d21;
+   fill: none;
+ }
+ 
+@@ -2885,13 +2959,13 @@ body.light-theme .ai-tool-btn img[style*="filter: invert(1)"] {
+ }
+ 
+ body.light-theme .bottom-nav-item.active .nav-icon svg {
+-  stroke: #6c5ce7;
+-  color: #6c5ce7;
++  stroke: #565d68;
++  color: #565d68;
+ }
+ 
+ body.light-theme .btn-icon-oval:hover svg {
+-  stroke: #5a4bd1;
+-  color: #5a4bd1;
++  stroke: #3a3e46;
++  color: #3a3e46;
+ }
+ 
+ /* Emoji icons in empty states should remain visible */
+@@ -2899,3 +2973,262 @@ body.light-theme .empty-state .icon {
+   opacity: 1;
+   filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.1));
+ }
++
++/* ===== v4.0 Visual Polish (Modern Neutral Gray) ===== */
++
++/* Единый тон поверх стеклянных панелей — спокойный, без пересветов */
++.chat-panel-header,
++.conversations-header {
++  background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0)) , var(--bg-secondary);
++  backdrop-filter: blur(14px);
++  -webkit-backdrop-filter: blur(14px);
++}
++
++/* Аккуратные скроллбары */
++* { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.14) transparent; }
++::-webkit-scrollbar { width: 8px; height: 8px; }
++::-webkit-scrollbar-track { background: transparent; }
++::-webkit-scrollbar-thumb {
++  background: rgba(255, 255, 255, 0.12);
++  border-radius: 8px;
++  border: 2px solid transparent;
++  background-clip: padding-box;
++}
++::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); background-clip: padding-box; }
++
++/* Фокус — тонкий светлый ring вместо цветного свечения */
++.input:focus, .search-input:focus, .input-wrapper textarea:focus {
++  outline: none;
++  border-color: var(--border-focus);
++  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.06);
++}
++.btn-primary-oval:focus-visible, .btn-oval:focus-visible, .btn-icon-oval:focus-visible,
++.bottom-nav-item:focus-visible, .ai-tool-btn:focus-visible {
++  outline: 2px solid var(--accent-hover);
++  outline-offset: 2px;
++}
++
++/* Отключаем «прыжки» hover-трансформаций для кнопок чата — только подсветка */
++.input-area .btn-icon-oval:hover,
++#sendButton:hover, #aiSendBtn:hover { transform: none; box-shadow: var(--shadow-sm); }
++.input-area .btn-icon-oval:active,
++#sendButton:active, #aiSendBtn:active { transform: scale(0.94); }
++
++/* Панель бесед — разделение тонкой линией, а не «стеклом» */
++.conversations-panel { border-right: 1px solid var(--border-color); }
++.chat-layout { background: var(--bg-primary); }
++
++/* Карточки списков — ровный фон поверхности, мягкий hover без сдвига */
++.conversation-item, .list-item, .group-card, .profile-card {
++  transition: background var(--transition-fast), border-color var(--transition-fast), box-shadow var(--transition-fast);
++}
++.conversation-item:hover { transform: none; background: var(--bg-hover); border-color: var(--glass-border); }
++.list-item:hover, .group-card:hover { border-color: var(--glass-border-light); box-shadow: var(--shadow-sm); }
++
++/* Пузыри принятых сообщений — чуть более «матовые», читаемые */
++.message .content {
++  background: var(--bg-surface);
++  border: 1px solid var(--border-color);
++  box-shadow: none;
++}
++.message:hover .content { box-shadow: var(--shadow-sm); transform: none; }
++.message.sent:hover .content { box-shadow: var(--shadow-md); }
++
++/* Тумблер AI-инструментов — нейтральная активная подсветка */
++.ai-tool-btn[data-active="true"] {
++  background: rgba(255, 255, 255, 0.10);
++  color: var(--text-primary);
++  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.14);
++}
++
++/* Нижняя навигация — активный пункт: светлая «таблетка» */
++.bottom-nav-item.active {
++  background: rgba(255, 255, 255, 0.08);
++  color: var(--text-primary);
++}
++.bottom-nav-item.active .nav-icon svg { stroke: var(--text-primary); }
++
++/* Статусы/бейджи — приглушённые полупрозрачные плашки */
++.status-badge { border: 1px solid transparent; }
++.status-success { background: rgba(76, 195, 138, 0.12); color: var(--success-color); border-color: rgba(76, 195, 138, 0.25); }
++.status-warning { background: rgba(224, 164, 88, 0.12); color: var(--warning-color); border-color: rgba(224, 164, 88, 0.25); }
++
++/* Модалки — глубже тень, плотнее фон */
++.modal-overlay { background: rgba(5, 6, 8, 0.72); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
++.modal, .call-modal { background: var(--bg-surface); border: 1px solid var(--glass-border); }
++
++/* Код в markdown — контрастная, но нейтральная подложка */
++.markdown-body pre { background: #121317; }
++.markdown-body code:not(pre code) { background: rgba(255, 255, 255, 0.07); border-color: rgba(255,255,255,0.10); }
++
++/* Светлая тема — те же принципы: нейтральный серый, без фиолетового маржина */
++body.light-theme .message .content { background: #ffffff; border-color: rgba(36,38,44,0.08); }
++body.light-theme .conversation-item { background: #ffffff; border: 1px solid rgba(36,38,44,0.07); }
++body.light-theme .conversation-item:hover { background: #f0f1f4; }
++body.light-theme .conversation-item.active { background: #e9eaee; border-color: rgba(36,38,44,0.16); }
++body.light-theme .conversations-panel { background: #fafbfc; border-right: 1px solid rgba(36,38,44,0.08); }
++body.light-theme .chat-panel { background: #f3f4f6; }
++body.light-theme .chat-panel-header, body.light-theme .conversations-header { background: rgba(255,255,255,0.9); }
++body.light-theme .bottom-nav { background: rgba(255,255,255,0.92); border: 1px solid rgba(36,38,44,0.08); }
++body.light-theme .bottom-nav-item.active { background: rgba(36,38,44,0.07); color: #1b1d21; }
++body.light-theme .bottom-nav-item.active .nav-icon svg { stroke: #1b1d21; }
++body.light-theme .input:focus, body.light-theme .search-input:focus { box-shadow: 0 0 0 3px rgba(36,38,44,0.06); }
++body.light-theme .modal, body.light-theme .call-modal { background: #ffffff; }
++body.light-theme .markdown-body pre { background: #17181c; } /* код остаётся тёмным — как в AI-продуктах */
++body.light-theme ::-webkit-scrollbar-thumb { background: rgba(36,38,44,0.18); background-clip: padding-box; }
++body.light-theme ::-webkit-scrollbar-thumb:hover { background: rgba(36,38,44,0.3); background-clip: padding-box; }
++
++/* ===== v4.0 PNG-иконки в светлой теме (надёжно, без inline-стилей) ===== */
++body.light-theme .btn-icon-oval img[src*="/icons/"],
++body.light-theme .ai-tool-btn img[src*="/icons/"],
++body.light-theme .bottom-nav-item img[src*="/icons/"] {
++  filter: invert(0.12) sepia(0) saturate(0.6) brightness(0.55);
++}
++
++/* Иконки в овальных кнопках — по центру, без лишних отступов */
++.btn-icon-oval img { width: 20px; height: 20px; display: block; }
++
++/* Область ввода: аккуратная внутренняя «капсула» */
++.input-area { border-color: var(--glass-border-light); }
++.input-wrapper textarea { padding: 9px 4px; }
++
++/* Плавающая навигация — чуть плотнее фон для читаемости */
++.bottom-nav { background: rgba(23, 24, 28, 0.88); }
++body.light-theme .bottom-nav { background: rgba(255, 255, 255, 0.94); }
++
++/* Отправка AI: кнопка стоп — нейтрально-красная, без неона */
++.stop-btn { box-shadow: 0 4px 14px rgba(229, 84, 79, 0.35); }
++
++/* ============================================================
++   Контекстные меню (правый клик / долгое нажатие) — ctx-menu.js
++   ============================================================ */
++.ctx-menu {
++  position: fixed;
++  z-index: 10000;
++  min-width: 210px;
++  max-width: 300px;
++  padding: 6px;
++  background: var(--bg-surface, #1a1c21);
++  border: 1px solid var(--border-color, rgba(255,255,255,0.09));
++  border-radius: 14px;
++  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.3);
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  opacity: 0;
++  transform: scale(0.96) translateY(-4px);
++  transform-origin: top left;
++  transition: opacity 0.14s ease, transform 0.14s ease;
++  -webkit-backdrop-filter: blur(14px);
++  backdrop-filter: blur(14px);
++}
++.ctx-menu.ctx-visible {
++  opacity: 1;
++  transform: scale(1) translateY(0);
++}
++.ctx-item {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  width: 100%;
++  padding: 9px 11px;
++  border: none;
++  border-radius: 9px;
++  background: transparent;
++  color: var(--text-primary, #eceef1);
++  font-size: 14px;
++  font-family: inherit;
++  line-height: 1.3;
++  text-align: left;
++  cursor: pointer;
++  transition: background 0.12s ease, color 0.12s ease;
++}
++.ctx-item:hover,
++.ctx-item:focus-visible {
++  background: rgba(255, 255, 255, 0.07);
++  outline: none;
++}
++.ctx-item:active {
++  background: rgba(255, 255, 255, 0.11);
++}
++.ctx-item .ctx-icon {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 18px;
++  height: 18px;
++  flex: 0 0 18px;
++  color: var(--text-muted, #a6abb5);
++}
++.ctx-item .ctx-icon svg {
++  width: 18px;
++  height: 18px;
++  stroke: currentColor;
++  fill: none;
++  stroke-width: 1.8;
++  stroke-linecap: round;
++  stroke-linejoin: round;
++  display: block;
++}
++/* Защита от «двойных» иконок: если в пункт меню по ошибке попал PNG-иконка,
++   скрываем <img> — визуально остаётся только одна SVG-иконка */
++.ctx-item .ctx-icon img {
++  display: none !important;
++}
++.ctx-item.danger {
++  color: #e5544f;
++}
++.ctx-item.danger .ctx-icon {
++  color: #e5544f;
++}
++.ctx-item.danger:hover,
++.ctx-item.danger:focus-visible {
++  background: rgba(229, 84, 79, 0.12);
++}
++.ctx-separator {
++  height: 1px;
++  margin: 4px 8px;
++  background: var(--border-color, rgba(255,255,255,0.09));
++}
++/* Подсветка элемента, на котором открыто меню */
++.ctx-press {
++  background: rgba(255, 255, 255, 0.06) !important;
++  transition: background 0.1s ease;
++}
++.ctx-target-active {
++  background: rgba(255, 255, 255, 0.07);
++  border-radius: 12px;
++}
++/* Светлая тема */
++body.light-theme .ctx-menu {
++  background: #ffffff;
++  border-color: rgba(36, 38, 44, 0.12);
++  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.14), 0 2px 6px rgba(0, 0, 0, 0.08);
++}
++body.light-theme .ctx-item {
++  color: #24262c;
++}
++body.light-theme .ctx-item:hover,
++body.light-theme .ctx-item:focus-visible {
++  background: rgba(36, 38, 44, 0.06);
++}
++body.light-theme .ctx-item:active {
++  background: rgba(36, 38, 44, 0.1);
++}
++body.light-theme .ctx-item .ctx-icon {
++  color: #6b7280;
++}
++body.light-theme .ctx-item.danger,
++body.light-theme .ctx-item.danger .ctx-icon {
++  color: #d43f3a;
++}
++body.light-theme .ctx-item.danger:hover {
++  background: rgba(212, 63, 58, 0.08);
++}
++body.light-theme .ctx-separator {
++  background: rgba(36, 38, 44, 0.1);
++}
++body.light-theme .ctx-press,
++body.light-theme .ctx-target-active {
++  background: rgba(36, 38, 44, 0.06) !important;
++}
+diff --git a/templates/base.html b/templates/base.html
+index 30c23a5..3563067 100644
+--- a/templates/base.html
++++ b/templates/base.html
+@@ -5,7 +5,7 @@
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
+   <meta name="description" content="Decentralized encrypted messenger">
+-  <meta name="theme-color" content="#0a0a0a">
++  <meta name="theme-color" content="#0d0e11">
+   <meta name="color-scheme" content="dark">
+   <meta name="user-address" content="{{ address|default('', true) }}">
+ 
+@@ -23,13 +23,13 @@
+     :root {
+       --glass-bg: rgba(20, 20, 30, 0.6);
+       --glass-border: rgba(255, 255, 255, 0.08);
+-      --accent-color: #6c5ce7;
+-      --accent-glow: rgba(108, 92, 231, 0.4);
+-      --success-color: #00b894;
+-      --danger-color: #d63031;
+-      --text-main: #f5f6fa;
+-      --text-muted: #a4b0be;
+-      --bg-primary: #0a0a0f;
++      --accent-color: #565d68;
++      --accent-glow: rgba(86, 93, 104, 0.4);
++      --success-color: #4cc38a;
++      --danger-color: #e5544f;
++      --text-main: #eceef1;
++      --text-muted: #a6abb5;
++      --bg-primary: #0d0e11;
+     }
+ 
+     /* Анимации */
+@@ -118,7 +118,7 @@
+     .call-control-btn.call-end-btn {
+       background: var(--danger-color);
+       color: white;
+-      box-shadow: 0 4px 15px rgba(214, 48, 49, 0.4);
++      box-shadow: 0 4px 15px rgba(229, 84, 79, 0.4);
+     }
+ 
+     .call-control-btn.call-end-btn:hover {
+@@ -238,7 +238,7 @@
+       font-weight: 600;
+       cursor: pointer;
+       transition: all 0.2s;
+-      background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
++      background: linear-gradient(135deg, var(--accent-color), #565d68);
+       color: white;
+       font-size: 14px;
+       display: inline-flex;
+diff --git a/templates/calls.html b/templates/calls.html
+index 2862acd..5ae11ad 100644
+--- a/templates/calls.html
++++ b/templates/calls.html
+@@ -8,13 +8,13 @@
+   :root {
+     --glass-bg: rgba(20, 20, 30, 0.6);
+     --glass-border: rgba(255, 255, 255, 0.08);
+-    --accent-color: #6c5ce7;
+-    --accent-glow: rgba(108, 92, 231, 0.4);
+-    --success-color: #00b894;
+-    --danger-color: #d63031;
+-    --text-main: #f5f6fa;
+-    --text-muted: #a4b0be;
+-    --bg-primary: #0a0a0f;
++    --accent-color: #565d68;
++    --accent-glow: rgba(86, 93, 104, 0.4);
++    --success-color: #4cc38a;
++    --danger-color: #e5544f;
++    --text-main: #eceef1;
++    --text-muted: #a6abb5;
++    --bg-primary: #0d0e11;
+   }
+ 
+   @keyframes fadeInUp {
+@@ -143,7 +143,7 @@
+     flex-wrap: wrap;
+   }
+   .contact-meta .missed-badge {
+-    background: rgba(214,48,49,0.2);
++    background: rgba(229, 84, 79,0.2);
+     color: var(--danger-color);
+     padding: 1px 10px;
+     border-radius: 50px;
+@@ -183,7 +183,7 @@
+   }
+   .btn-icon-oval.danger:hover {
+     color: var(--danger-color);
+-    background: rgba(214,48,49,0.15);
++    background: rgba(229, 84, 79,0.15);
+   }
+ 
+   .expand-icon {
+@@ -326,7 +326,7 @@
+     padding: 12px 24px;
+     border-radius: 50px;
+     border: none;
+-    background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
++    background: linear-gradient(135deg, var(--accent-color), #565d68);
+     color: white;
+     font-weight: 700;
+     cursor: pointer;
+diff --git a/templates/chat.html b/templates/chat.html
+index ea7067e..5e5fd6f 100644
+--- a/templates/chat.html
++++ b/templates/chat.html
+@@ -67,7 +67,7 @@
+           <button type="button" class="btn-icon-oval" id="recordAudioButton" disabled title="Record voice message">
+             <img src="/static/icons/Mic.png" width="20" height="20" alt="Record" style="filter: invert(1);">
+           </button>
+-          <button type="submit" class="btn-primary-oval" id="sendButton" disabled style="display: none;" data-i18n="send">➤</button>
++          <button type="submit" class="btn-primary-oval" id="sendButton" disabled style="display: none;" title="Send" aria-label="Send"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg></button>
+         </div>
+       </div>
+     </form>
+@@ -106,7 +106,7 @@
+   <button type="button" id="aiAttachBtn" class="btn-icon-oval" title="Attach image">
+     <img src="/static/icons/Attach.png" width="20" height="20" alt="Attach" style="filter: invert(1);">
+   </button>
+-  <button type="submit" id="aiSendBtn" class="btn-primary-oval" data-i18n="send">➤</button>
++  <button type="submit" id="aiSendBtn" class="btn-primary-oval" title="Send" aria-label="Send"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg></button>
+   <!-- Новая кнопка стоп – будет видна только во время генерации -->
+   <button type="button" id="aiStopBtn" class="btn-icon-oval stop-btn" title="Stop generation" style="display:none;">⏹</button>
+ </div>
+@@ -170,6 +170,7 @@
+ <script>window.process = window.process || { env: {} };</script>
+ 
+ <!-- Подключаем скрипты (основные уже в base.html, но оставляем для наглядности) -->
++<script src="{{ url_for('static', path='js/context-menu.js') }}"></script>
+ <script src="{{ url_for('static', path='js/ui.js') }}"></script>
+ <script src="{{ url_for('static', path='js/actions.js') }}"></script>
+ <!-- call-manager.js загружается из base.html с defer -->
+diff --git a/templates/contacts.html b/templates/contacts.html
+index 1256c7a..825d9ff 100644
+--- a/templates/contacts.html
++++ b/templates/contacts.html
+@@ -8,13 +8,13 @@
+   :root {
+     --glass-bg: rgba(20, 20, 30, 0.6);
+     --glass-border: rgba(255, 255, 255, 0.08);
+-    --accent-color: #6c5ce7;
+-    --accent-glow: rgba(108, 92, 231, 0.4);
+-    --success-color: #00b894;
+-    --danger-color: #d63031;
+-    --text-main: #f5f6fa;
+-    --text-muted: #a4b0be;
+-    --bg-primary: #0a0a0f;
++    --accent-color: #565d68;
++    --accent-glow: rgba(86, 93, 104, 0.4);
++    --success-color: #4cc38a;
++    --danger-color: #e5544f;
++    --text-main: #eceef1;
++    --text-muted: #a6abb5;
++    --bg-primary: #0d0e11;
+   }
+ 
+   /* Анимация */
+@@ -105,7 +105,7 @@
+     font-weight: 600;
+     cursor: pointer;
+     transition: all 0.2s;
+-    background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
++    background: linear-gradient(135deg, var(--accent-color), #565d68);
+     color: white;
+     font-size: 14px;
+     display: inline-flex;
+@@ -172,7 +172,7 @@
+   }
+ 
+   .btn-icon-oval[style*="color:var(--status-error);"]:hover {
+-    background: rgba(214, 48, 49, 0.2);
++    background: rgba(229, 84, 79, 0.2);
+     color: var(--danger-color);
+   }
+ 
+@@ -429,6 +429,7 @@
+ </div>
+ 
+ 
++<script src="{{ url_for('static', path='js/context-menu.js') }}"></script>
+ <script>
+ (function() {
+   if (window._contactsScriptLoaded) return;
+@@ -710,6 +711,46 @@
+   window.deleteContact = deleteContact;
+   window.showConfirmModal = showConfirmModal;
+   window.showPromptModal = showPromptModal;
++
++  // ========== Контекстное меню контакта (ПКМ + долгое нажатие) ==========
++  const CTX_ICONS = {
++    chat:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
++    call:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>',
++    edit:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>',
++    copy:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
++    trash:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
++  };
++
++  function bindContactHold(item, address, name) {
++    if (!window.ContextMenu) return;
++    ContextMenu.bind(item, () => [
++      { icon: CTX_ICONS.chat, label: i18next.t('start_chat'), onClick: () => startChatWithContact(address, name) },
++      { icon: CTX_ICONS.call, label: i18next.t('call'), onClick: () => {
++          if (window.CallManager && typeof window.CallManager.makeCall === 'function') {
++            window.CallManager.makeCall(address, false, name);
++          } else {
++            window.NotificationManager?.showToast(i18next.t('calls_not_available'), 'warning');
++          }
++        } },
++      { icon: CTX_ICONS.edit, label: i18next.t('edit_contact'), onClick: () => editContact(address, name, item.querySelector('.btn-icon-oval')) },
++      { icon: CTX_ICONS.copy, label: i18next.t('copy_address'), onClick: () => copyAddressToClipboard(address) },
++      { separator: true },
++      { icon: CTX_ICONS.trash, label: i18next.t('delete_contact'), danger: true, onClick: () => deleteContact(address, item.querySelector('.btn-icon-oval:last-of-type')) },
++    ]);
++  }
++
++  document.addEventListener('DOMContentLoaded', () => {
++    const mo = new MutationObserver(() => {
++      document.querySelectorAll('#contactsList .list-item').forEach(el => {
++        if (el._ctxBound || !el.dataset.address) return;
++        el._ctxBound = true;
++        const nameEl = el.querySelector('.name');
++        bindContactHold(el, el.dataset.address, nameEl ? nameEl.textContent : '');
++      });
++    });
++    const list = document.getElementById('contactsList');
++    if (list) mo.observe(list, { childList: true });
++  });
+ })();
+ </script>
+ {% endblock %}
+\ No newline at end of file
+diff --git a/templates/groups.html b/templates/groups.html
+index 5afc2cb..f4ab745 100644
+--- a/templates/groups.html
++++ b/templates/groups.html
+@@ -8,13 +8,13 @@
+   :root {
+     --glass-bg: rgba(20, 20, 30, 0.6);
+     --glass-border: rgba(255, 255, 255, 0.08);
+-    --accent-color: #6c5ce7;
+-    --accent-glow: rgba(108, 92, 231, 0.4);
+-    --success-color: #00b894;
+-    --danger-color: #d63031;
+-    --text-main: #f5f6fa;
+-    --text-muted: #a4b0be;
+-    --bg-primary: #0a0a0f;
++    --accent-color: #565d68;
++    --accent-glow: rgba(86, 93, 104, 0.4);
++    --success-color: #4cc38a;
++    --danger-color: #e5544f;
++    --text-main: #eceef1;
++    --text-muted: #a6abb5;
++    --bg-primary: #0d0e11;
+   }
+ 
+   /* Анимация */
+@@ -98,7 +98,7 @@
+     font-weight: 600;
+     cursor: pointer;
+     transition: all 0.2s;
+-    background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
++    background: linear-gradient(135deg, var(--accent-color), #565d68);
+     color: white;
+     font-size: 14px;
+     display: inline-flex;
+@@ -339,7 +339,7 @@
+   }
+ 
+   .selected-tag {
+-    background: rgba(108, 92, 231, 0.2);
++    background: rgba(86, 93, 104, 0.2);
+     border: 1px solid var(--accent-color);
+     border-radius: 50px;
+     padding: 6px 14px;
+@@ -633,6 +633,7 @@
+ </div>
+ 
+ {% block scripts %}
++<script src="{{ url_for('static', path='js/context-menu.js') }}"></script>
+ <script>
+ (function() {
+   if (window._groupsScriptLoaded) return;
+@@ -642,6 +643,7 @@
+   let allContacts = [];
+   let selectedMembers = {};
+   let currentGroup = null;
++  let allGroupsCache = [];
+ 
+   function escapeHtml(str) {
+     if (!str) return '';
+@@ -701,6 +703,7 @@
+   async function loadGroups() {
+     const container = document.getElementById('groupsList');
+     if (!container) return;
++    allGroupsCache = [];
+     container.innerHTML = `<div class="loading">${t('loading')}</div>`;
+     try {
+       const res = await fetch('/get_groups');
+@@ -715,11 +718,13 @@ container.innerHTML = `<div class="empty-state">
+  return;
+       }
+       container.innerHTML = '';
++      allGroupsCache = data.groups;
+       data.groups.forEach(g => {
+         const card = document.createElement('div');
+         card.className = 'list-item group-card';
+         card.dataset.id = g.id;
+         const isCreator = g.creator === MY_ADDR;
++        if (window.ContextMenu) bindGroupHold(card, g);
+         const date = g.created_at ? new Date(g.created_at * 1000).toLocaleDateString() : '—';
+         card.innerHTML = `
+           <div class="info" style="flex:1;">
+@@ -1077,6 +1082,47 @@ container.innerHTML = `<div class="empty-state">
+   window.submitRemoveMember = submitRemoveMember;
+   window.showCreateError = showCreateError;
+   window.showConfirmModal = showConfirmModal;
++
++  // ========== Контекстное меню группы (ПКМ + долгое нажатие) ==========
++  const GRP_ICONS = {
++    chat:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
++    info:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
++    copy:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
++    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
++  };
++
++  function bindGroupHold(card, group) {
++    if (!window.ContextMenu) return;
++    ContextMenu.bind(card, () => {
++      const items = [
++        { icon: GRP_ICONS.chat, label: t('open_chat'), onClick: () => openGroupChatById('group:' + group.id, group.name) },
++        { icon: GRP_ICONS.info, label: t('info'), onClick: () => openDetail(JSON.stringify(group)) },
++        { icon: GRP_ICONS.copy, label: t('copy_group_id'), onClick: () => {
++            const done = () => window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
++            if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(group.id).then(done).catch(done);
++            else done();
++          } },
++      ];
++      if (group.creator === MY_ADDR) {
++        items.push({ separator: true });
++        items.push({ icon: GRP_ICONS.trash, label: t('delete_group'), danger: true, onClick: () => deleteGroup(group.id, group.name) });
++      }
++      return items;
++    });
++  }
++
++  document.addEventListener('DOMContentLoaded', () => {
++    const mo = new MutationObserver(() => {
++      document.querySelectorAll('#groupsList .group-card').forEach(el => {
++        if (el._ctxBound || !el.dataset.id) return;
++        el._ctxBound = true;
++        const g = allGroupsCache.find(x => String(x.id) === el.dataset.id);
++        if (g) bindGroupHold(el, g);
++      });
++    });
++    const list = document.getElementById('groupsList');
++    if (list) mo.observe(list, { childList: true });
++  });
+ })();
+ </script>
+ {% endblock %}
+diff --git a/templates/index.html b/templates/index.html
+index bc6cf02..aa4c3da 100644
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -8,13 +8,13 @@
+   :root {
+     --glass-bg: rgba(20, 20, 30, 0.6);
+     --glass-border: rgba(255, 255, 255, 0.08);
+-    --accent-color: #6c5ce7;
+-    --accent-glow: rgba(108, 92, 231, 0.4);
+-    --success-color: #00b894;
+-    --danger-color: #d63031;
+-    --text-main: #f5f6fa;
+-    --text-muted: #a4b0be;
+-    --bg-primary: #0a0a0f;
++    --accent-color: #565d68;
++    --accent-glow: rgba(86, 93, 104, 0.4);
++    --success-color: #4cc38a;
++    --danger-color: #e5544f;
++    --text-main: #eceef1;
++    --text-muted: #a6abb5;
++    --bg-primary: #0d0e11;
+   }
+ 
+   /* Анимация */
+@@ -83,7 +83,7 @@
+     font-weight: 700;
+     cursor: pointer;
+     transition: all 0.2s;
+-    background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
++    background: linear-gradient(135deg, var(--accent-color), #565d68);
+     color: white;
+     font-size: 16px;
+     display: inline-flex;
+diff --git a/templates/login.html b/templates/login.html
+index d551d21..3f8530e 100644
+--- a/templates/login.html
++++ b/templates/login.html
+@@ -8,13 +8,13 @@
+   :root {
+     --glass-bg: rgba(20, 20, 30, 0.6);
+     --glass-border: rgba(255, 255, 255, 0.08);
+-    --accent-color: #6c5ce7;
+-    --accent-glow: rgba(108, 92, 231, 0.4);
+-    --success-color: #00b894;
+-    --danger-color: #d63031;
+-    --text-main: #f5f6fa;
+-    --text-muted: #a4b0be;
+-    --bg-primary: #0a0a0f;
++    --accent-color: #565d68;
++    --accent-glow: rgba(86, 93, 104, 0.4);
++    --success-color: #4cc38a;
++    --danger-color: #e5544f;
++    --text-main: #eceef1;
++    --text-muted: #a6abb5;
++    --bg-primary: #0d0e11;
+   }
+ 
+   /* Анимация */
+@@ -120,7 +120,7 @@
+     font-weight: 700;
+     cursor: pointer;
+     transition: all 0.2s;
+-    background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
++    background: linear-gradient(135deg, var(--accent-color), #565d68);
+     color: white;
+     font-size: 16px;
+     display: inline-flex;
+diff --git a/templates/profile.html b/templates/profile.html
+index 7fd4cf2..fb593fa 100644
+--- a/templates/profile.html
++++ b/templates/profile.html
+@@ -8,13 +8,13 @@
+   :root {
+     --glass-bg: rgba(20, 20, 30, 0.6);
+     --glass-border: rgba(255, 255, 255, 0.08);
+-    --accent-color: #6c5ce7;
+-    --accent-glow: rgba(108, 92, 231, 0.4);
+-    --success-color: #00b894;
+-    --danger-color: #d63031;
+-    --text-main: #f5f6fa;
+-    --text-muted: #a4b0be;
+-    --bg-primary: #0a0a0f; /* добавим для фона */
++    --accent-color: #565d68;
++    --accent-glow: rgba(86, 93, 104, 0.4);
++    --success-color: #4cc38a;
++    --danger-color: #e5544f;
++    --text-main: #eceef1;
++    --text-muted: #a6abb5;
++    --bg-primary: #0d0e11; /* добавим для фона */
+   }
+ 
+   /* Общие анимации */
+@@ -153,7 +153,7 @@
+   }
+ 
+   .btn-primary-oval {
+-    background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
++    background: linear-gradient(135deg, var(--accent-color), #565d68);
+     box-shadow: 0 4px 15px var(--accent-glow);
+   }
+ 
+@@ -170,7 +170,7 @@
+ 
+   .btn-oval.outline:hover,
+   .btn-action.outline:hover {
+-    background: rgba(108, 92, 231, 0.1);
++    background: rgba(86, 93, 104, 0.1);
+   }
+ 
+   /* Иконки-кнопки */
+@@ -204,12 +204,12 @@
+   }
+ 
+   .status-success {
+-    background: rgba(0, 184, 148, 0.2);
++    background: rgba(76, 195, 138, 0.2);
+     color: var(--success-color);
+   }
+ 
+   .status-warning {
+-    background: rgba(214, 48, 49, 0.2);
++    background: rgba(229, 84, 79, 0.2);
+     color: var(--danger-color);
+   }
+ 
+diff --git a/templates/wallet.html b/templates/wallet.html
+index e58ca9d..b420454 100644
+--- a/templates/wallet.html
++++ b/templates/wallet.html
+@@ -8,12 +8,12 @@
+   :root {
+     --glass-bg: rgba(20, 20, 30, 0.6);
+     --glass-border: rgba(255, 255, 255, 0.08);
+-    --accent-color: #6c5ce7;
+-    --accent-glow: rgba(108, 92, 231, 0.4);
+-    --success-color: #00b894;
+-    --danger-color: #d63031;
+-    --text-main: #f5f6fa;
+-    --text-muted: #a4b0be;
++    --accent-color: #565d68;
++    --accent-glow: rgba(86, 93, 104, 0.4);
++    --success-color: #4cc38a;
++    --danger-color: #e5544f;
++    --text-main: #eceef1;
++    --text-muted: #a6abb5;
+   }
+ 
+   .wallet-wrapper {
+@@ -65,7 +65,7 @@
+   .mining-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+   .mining-title { font-size: 18px; font-weight: 700; color: var(--text-main); display: flex; align-items: center; gap: 8px; }
+   .mining-badge { padding: 4px 12px; border-radius: 50px; font-size: 12px; font-weight: 600; background: rgba(255,255,255,0.1); color: var(--text-muted); display: flex; align-items: center; gap: 6px; transition: all 0.3s; }
+-  .mining-badge.active { background: rgba(0, 184, 148, 0.2); color: var(--success-color); }
++  .mining-badge.active { background: rgba(76, 195, 138, 0.2); color: var(--success-color); }
+   .pulse-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+   .mining-badge.active .pulse-dot { background: var(--success-color); animation: pulse 1.5s infinite; }
+ 
+@@ -76,15 +76,15 @@
+ 
+   /* Прогресс бар майнинга */
+   .mining-progress-bar { width: 100%; height: 6px; background: rgba(255,255,255,0.1); border-radius: 50px; margin-bottom: 15px; overflow: hidden; }
+-  .mining-progress-bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent-color), #a29bfe); border-radius: 50px; transition: width 0.3s ease; box-shadow: 0 0 10px var(--accent-glow); }
++  .mining-progress-bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent-color), #a7afbc); border-radius: 50px; transition: width 0.3s ease; box-shadow: 0 0 10px var(--accent-glow); }
+ 
+   /* Кнопки майнинга */
+   .mining-actions { display: flex; gap: 10px; }
+   .btn-mine { flex: 1; padding: 14px 20px; border: none; border-radius: 50px; font-size: 15px; font-weight: 700; cursor: pointer; transition: all 0.3s; position: relative; overflow: hidden; }
+-  .btn-mine.start { background: linear-gradient(135deg, var(--accent-color), #6c5ce7); color: white; box-shadow: 0 4px 15px var(--accent-glow); }
++  .btn-mine.start { background: linear-gradient(135deg, var(--accent-color), #565d68); color: white; box-shadow: 0 4px 15px var(--accent-glow); }
+   .btn-mine.start:hover { transform: scale(1.02); box-shadow: 0 6px 20px var(--accent-glow); }
+-  .btn-mine.stop { background: rgba(214, 48, 49, 0.2); color: var(--danger-color); border: 1px solid var(--danger-color); }
+-  .btn-mine.stop:hover { background: rgba(214, 48, 49, 0.4); }
++  .btn-mine.stop { background: rgba(229, 84, 79, 0.2); color: var(--danger-color); border: 1px solid var(--danger-color); }
++  .btn-mine.stop:hover { background: rgba(229, 84, 79, 0.4); }
+ 
+   /* Вкладки */
+   .tabs-nav { display: flex; gap: 5px; margin-bottom: 20px; background: var(--glass-bg); padding: 5px; border-radius: 50px; border: 1px solid var(--glass-border); }
+@@ -152,7 +152,7 @@
+   /* Анимации */
+   @keyframes fadeInUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+-  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(0, 184, 148, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(0, 184, 148, 0); } 100% { box-shadow: 0 0 0 0 rgba(0, 184, 148, 0); } }
++  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(76, 195, 138, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(76, 195, 138, 0); } 100% { box-shadow: 0 0 0 0 rgba(76, 195, 138, 0); } }
+ 
+   .hidden { display: none !important; }
+ </style>

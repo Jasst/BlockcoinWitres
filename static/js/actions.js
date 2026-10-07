@@ -229,6 +229,8 @@
     if (window.isSending) return;
     const contentEl = document.getElementById('messageContent');
     let content = contentEl ? contentEl.value.trim() : '';
+    // WhatsApp-style reply: prepend the stored quote as a blockquote to the outgoing text
+    if (content && window.consumeReplyQuote) content = window.consumeReplyQuote(content);
     if (!content && !pendingFile) {
         window.NotificationManager?.showToast(t('enter_message_or_attach'), 'warning');
         return;
@@ -739,19 +741,23 @@
 
     // Единый набор SVG-иконок для контекстных меню (stroke через CSS).
     // ВАЖНО: иконки — только SVG, без PNG <img>, иначе в меню появляются «двойные» иконки.
+    let _replyQuote = null; // active reply quote state
+    const escapeHtml = (str) => Utils.escapeHtml(str);
+
     const CTX_ICONS = {
-        copy: '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
-        reply: '<svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 5 5v1a5 5 0 0 1-5 5h-3"/></svg>',
-        edit: '<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
-        pin: '<svg viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.8V4h6v6.8l2 2.2H7l2-2.2Z"/></svg>',
-        unpin: '<svg viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.8V4h6v6.8l2 2.2H7l2-2.2Z"/><path d="M4 4l16 16" stroke-width="1.6"/></svg>',
-        trash: '<svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>',
-        open: '<svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
-        contact: '<svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
-        call: '<svg viewBox="0 0 24 24"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .7 2.9a2 2 0 0 1-.4 2.1L8.1 10a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.9.6 2.9.7a2 2 0 0 1 1.6 1.9z"/></svg>',
-        info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>',
-        hide: '<svg viewBox="0 0 24 24"><path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c7 0 10 8 10 8a18 18 0 0 1-2.16 3.19"/><path d="M6.61 6.61A18 18 0 0 0 2 12s3 8 10 8a9 9 0 0 0 5.39-1.61"/><path d="M14.12 14.12A3 3 0 1 1 9.88 9.88"/><path d="M2 2l20 20"/></svg>'
+        copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+        reply: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 5 5v1a5 5 0 0 1-5 5h-3"/></svg>',
+        edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+        pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.8V4h6v6.8l2 2.2H7l2-2.2Z"/></svg>',
+        unpin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.8V4h6v6.8l2 2.2H7l2-2.2Z"/><path d="M4 4l16 16"/></svg>',
+        trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>',
+        open: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+        contact: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+        call: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .7 2.9a2 2 0 0 1-.4 2.1L8.1 10a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.9.6 2.9.7a2 2 0 0 1 1.6 1.9z"/></svg>',
+        info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>',
+        hide: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c7 0 10 8 10 8a18 18 0 0 1-2.16 3.19"/><path d="M6.61 6.61A18 18 0 0 0 2 12s3 8 10 8a9 9 0 0 0 5.39-1.61"/><path d="M14.12 14.12A3 3 0 1 1 9.88 9.88"/><path d="M2 2l20 20"/></svg>'
     };
+    window.CTX_ICONS = CTX_ICONS; // shared set for ui.js / contacts / groups
 
     // --- Единое хранилище закреплённых сообщений (по одному на чат) ---
     window.getPinnedForChat = function (chatAddress) {
@@ -798,16 +804,13 @@
                 icon: CTX_ICONS.reply,
                 label: t('reply'),
                 onClick: () => {
+                    // WhatsApp-style: attach a quote chip above the input + highlight the source message
                     const senderName = messageEl.querySelector('.content strong')?.textContent || '';
-                    const quoted = messageContent.split('\n').map(l => '> ' + l).join('\n');
-                    const textarea = document.getElementById('messageContent');
-                    if (textarea) {
-                        textarea.value += (textarea.value ? '\n' : '') + (senderName ? senderName + ':\n' : '') + quoted + '\n';
-                        textarea.focus();
-                        textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-                        if (window.autoResizeTextarea) window.autoResizeTextarea(textarea);
-                        updateSendButtonVisibility();
-                    }
+                    window.attachReplyQuote({
+                        messageId: msgId,
+                        sender: senderName,
+                        text: messageContent
+                    });
                 }
             },
             {
@@ -980,6 +983,75 @@
         });
     };
     
+    // ========== Reply quote (WhatsApp-style) ==========
+    // Attaches a clickable quote chip above the input; clicking scrolls to and
+    // highlights the original message. The quoted text is sent together with
+    // the new message as a markdown blockquote prefixed by the sender name.
+    window.getReplyQuote = function () { return _replyQuote; };
+
+    window.attachReplyQuote = function ({ messageId, sender, text }) {
+        const textarea = document.getElementById('messageContent');
+        if (!textarea) {
+            window.NotificationManager?.showToast(t('open_chat_first'), 'warning');
+            return;
+        }
+        _replyQuote = { messageId: String(messageId || ''), sender: sender || '', text: text || '' };
+
+        let box = document.getElementById('replyQuoteBox');
+        if (!box) {
+            box = document.createElement('div');
+            box.id = 'replyQuoteBox';
+            box.className = 'reply-quote-box';
+            textarea.parentNode.insertBefore(box, textarea);
+        }
+        const shortText = (_replyQuote.text || '').replace(/\s+/g, ' ').slice(0, 120);
+        box.innerHTML = `
+            <div class="reply-quote-bar"></div>
+            <div class="reply-quote-body">
+                <div class="reply-quote-sender">${escapeHtml(_replyQuote.sender || t('reply'))}</div>
+                <div class="reply-quote-text truncate">${escapeHtml(shortText)}</div>
+            </div>
+            <button type="button" class="reply-quote-close" aria-label="Cancel reply">&times;</button>`;
+        box.classList.add('active');
+        box.querySelector('.reply-quote-body').addEventListener('click', () => {
+            window.scrollToAndHighlightMessage(_replyQuote.messageId);
+        });
+        box.querySelector('.reply-quote-close').addEventListener('click', () => window.clearReplyQuote());
+
+        textarea.focus();
+        if (window.autoResizeTextarea) window.autoResizeTextarea(textarea);
+        if (window.updateSendButtonVisibility) window.updateSendButtonVisibility();
+
+        // Highlight the source message like WhatsApp does when replying
+        window.scrollToAndHighlightMessage(_replyQuote.messageId);
+    };
+
+    window.clearReplyQuote = function () {
+        _replyQuote = null;
+        const box = document.getElementById('replyQuoteBox');
+        if (box) { box.remove(); }
+        if (window.updateSendButtonVisibility) window.updateSendButtonVisibility();
+    };
+
+    window.scrollToAndHighlightMessage = function (msgId) {
+        if (!msgId) return;
+        const el = document.getElementById('msg-' + msgId);
+        if (!el) return;
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.add('msg-highlight');
+        setTimeout(() => el.classList.remove('msg-highlight'), 2200);
+    };
+
+    // Compose outgoing text with the quote prefix, then clear the chip
+    window.consumeReplyQuote = function (userText) {
+        if (!_replyQuote) return userText;
+        const q = _replyQuote;
+        window.clearReplyQuote();
+        const quotedLines = (q.text || '').split('\n').map(l => '> ' + l).join('\n');
+        const prefix = (q.sender ? q.sender + ':\n' : '') + quotedLines + '\n\n';
+        return prefix + userText;
+    };
+
     // Pinned message bar (single source of truth: localStorage pinned_<chat>)
     window.updatePinnedMessageBar = function(chatAddress) {
         const bar = document.getElementById('pinnedMessagesBar');
