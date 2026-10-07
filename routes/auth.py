@@ -22,32 +22,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=['auth'])
 templates = Jinja2Templates(directory=TEMPLATE_FOLDER)
 
-# Cache-busting: append a build version (?v=...) to every local static asset
-# URL so browsers/PWA never run stale JS/CSS after a deploy (fixes context
-# menu / reply / pin regressions caused by cached old scripts).
-try:
-    _ASSET_VER = str(int(__import__('time').time()))
-except Exception:
-    _ASSET_VER = '1'
-
-_orig_url_for = templates.env.globals['url_for']
-
-def _versioned_url_for(endpoint=None, /, *args, **kwargs):
-    """Drop-in replacement for Jinja's url_for that appends ?v=<build> to
-    local static assets (cache-busting). Supports both calling styles used
-    in templates: url_for('static', path='...') and url_for('/chat')."""
-    url = _orig_url_for(endpoint, *args, **kwargs) if endpoint is not None else _orig_url_for(*args, **kwargs)
-    try:
-        path = kwargs.get('path', '') if endpoint == 'static' else ''
-    except Exception:
-        path = ''
-    if isinstance(path, str) and (path.startswith('js/') or path.endswith('.css') or path.startswith('locales/')):
-        sep = '&' if '?' in url else '?'
-        url = f'{url}{sep}v={_ASSET_VER}'
-    return url
-
-templates.env.filters['url_for_v'] = _versioned_url_for
-templates.env.globals['url_for'] = _versioned_url_for
+# IMPORTANT: do NOT wrap/replace templates.env.globals['url_for'].
+# Starlette's built-in url_for is a closure that reads the request from the
+# Jinja render context; any wrapper breaks every page with
+# "TypeError: url_for() missing 1 required positional argument: 'name'" -> HTTP 500.
+# Cache-busting for JS/CSS is handled server-side in main.py via the
+# VersionedStaticFiles class (Cache-Control: no-cache headers on /static assets),
+# so browsers/PWA always revalidate and never run stale scripts after a deploy.
 
 
 @router.get('/', response_class=HTMLResponse)

@@ -152,8 +152,19 @@ async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={'error': 'Internal server error'})
 
 
+class VersionedStaticFiles(StaticFiles):
+    """Serve JS/CSS with no-cache so browsers/PWA never run stale scripts
+    after a deploy (cache-busting without touching url_for in templates)."""
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if path.endswith(('.js', '.css')) or path.startswith('locales/'):
+            response.headers['Cache-Control'] = 'no-cache, must-revalidate'
+        return response
+
+
 if os.path.isdir(STATIC_FOLDER):
-    app.mount('/static', StaticFiles(directory=STATIC_FOLDER), name='static')
+    app.mount('/static', VersionedStaticFiles(directory=STATIC_FOLDER), name='static')
 if os.path.isdir(UPLOAD_FOLDER):
     app.mount('/uploads', StaticFiles(directory=UPLOAD_FOLDER), name='uploads')
 
