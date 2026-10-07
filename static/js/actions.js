@@ -662,64 +662,139 @@
         }
     });
 
-    // Контекстное меню по правому клику
-    document.addEventListener('contextmenu', async (e) => {
-        const messageEl = e.target.closest('.message');
-        if (!messageEl) return;
+    // ========== Контекстное меню сообщений ==========
+    // Единый движок: правый клик (ПК) + долгое нажатие (тач) — context-menu.js.
 
-        e.preventDefault();
-        const msgId = messageEl.dataset.messageId || messageEl.dataset.id;
-        if (!msgId) return;
+    function getMessageText(messageEl) {
+        const p = messageEl.querySelector('.content p');
+        if (!p) return '';
+        // Сохраняем переносы строк (<br>) при копировании
+        const withBreaks = p.innerHTML.replace(/<br\s*\/?>/gi, '\n');
+        const tmp = document.createElement('div');
+        tmp.innerHTML = withBreaks;
+        return tmp.textContent || '';
+    }
 
-        // Закрыть другие открытые меню
-        document.querySelectorAll('.message-context-menu').forEach(menu => menu.remove());
+    function findCachedMessage(msgId) {
+        const chatId = State.currentChatAddress;
+        if (!chatId || !window.getCachedMessages) return null;
+        return window.getCachedMessages(chatId).find(m => String(m.id) === String(msgId)) || null;
+    }
 
-        // Создать контекстное меню
-        const menu = document.createElement('div');
-        menu.className = 'message-context-menu active';
-        menu.style.left = e.pageX + 'px';
-        menu.style.top = e.pageY + 'px';
+    function applyMessageEditLocally(msgId, newText) {
+        const sel = `.message[data-message-id="${msgId}"], .message[data-id="${msgId}"]`;
+        document.querySelectorAll(sel).forEach(el => {
+            const p = el.querySelector('.content p');
+            if (p) {
+                p.textContent = newText;
+                if (!el.querySelector('.msg-edited-tag')) {
+                    p.insertAdjacentHTML('afterend', `<span class="msg-edited-tag">${t('edited')}</span>`);
+                }
+            }
+        });
+        const cached = findCachedMessage(msgId);
+        if (cached) cached.content = newText;
+    }
 
-        const isOwnMessage = messageEl.classList.contains('sent') || messageEl.classList.contains('message-own');
-        const messageContent = messageEl.querySelector('.content p')?.textContent || '';
-
-        menu.innerHTML = `
-            <button class="copy-action"><img src="/static/icons/Copy.png" width="16" height="16" alt=""> ${t('copy')}</button>
-            ${isOwnMessage ? `<button class="edit-action"><img src="/static/icons/Edit.png" width="16" height="16" alt=""> ${t('edit')}</button>` : ''}
-            <button class="reply-action">↩️ ${t('reply')}</button>
-            <button class="pin-action">📌 ${t('pin_message')}</button>
-            <div class="separator"></div>
-            ${isOwnMessage ? `<button class="delete-action danger"><img src="/static/icons/Remove.png" width="16" height="16" alt=""> ${t('delete')}</button>` : ''}
-        `;
-
-        document.body.appendChild(menu);
-
-        // Позиционирование с учётом краёв экрана
-        const rect = menu.getBoundingClientRect();
-        if (rect.right > window.innerWidth) {
-            menu.style.left = (e.pageX - rect.width) + 'px';
-        }
-        if (rect.bottom > window.innerHeight) {
-            menu.style.top = (e.pageY - rect.height) + 'px';
-        }
-
-        // Обработчики действий
-        menu.querySelector('.copy-action').onclick = () => {
-            navigator.clipboard.writeText(messageContent).then(() => {
-                window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
-                menu.remove();
-            }).catch(err => {
-                console.error('Copy failed:', err);
-                window.NotificationManager?.showToast(t('copy_failed'), 'error');
+    async function doDeleteMessage(msgId) {
+        const confirmed = await window.showConfirmModal(t('delete_message_title'), t('delete_message_confirm'));
+        if (!confirmed) return;
+        try {
+            const res = await fetch('/delete_message', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message_id: parseInt(msgId) })
             });
-        };
+            if (res.ok) {
+                const msgDiv = document.getElementById('msg-' + msgId);
+                if (msgDiv) {
+                    msgDiv.querySelectorAll('[data-object-url]').forEach(el => URL.revokeObjectURL(el.dataset.objectUrl));
+                    msgDiv.remove();
+                }
+                if (window.clearMessageCacheForId) window.clearMessageCacheForId(State.currentChatAddress, msgId);
+                window.loadConversations();
+                window.NotificationManager?.showToast(t('message_deleted'), 'success');
+            } else {
+                window.NotificationManager?.showToast(t('delete_failed'), 'error');
+            }
+        } catch (err) {
+            console.error('Delete error:', err);
+            window.NotificationManager?.showToast(t('delete_failed'), 'error');
+        }
+    }
 
-        const editBtn = menu.querySelector('.edit-action');
-        if (editBtn) {
-            editBtn.onclick = async () => {
-                menu.remove();
-                const newText = prompt(t('edit_message_prompt'), messageContent);
-                if (newText !== null && newText.trim() !== '') {
+    function fallbackCopy(text, done) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;opacity:0;left:-9999px;';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); done && done(); }
+        catch (e) { window.NotificationManager?.showToast(t('copy_failed'), 'error'); }
+        ta.remove();
+    }
+
+    const CTX_ICONS = {
+        copy: '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+        reply: '<svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 5 5v1a5 5 0 0 1-5 5h-3"/></svg>',
+        edit: '<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+        pin: '<svg viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.8V4h6v6.8l2 2.2H7l2-2.2Z"/></svg>',
+        unpin: '<svg viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.8V4h6v6.8l2 2.2H7l2-2.2Z"/><path d="M4 4l16 16" stroke-width="1.6"/></svg>',
+        trash: '<svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>',
+        open: '<svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+        contact: '<svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+        call: '<svg viewBox="0 0 24 24"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .7 2.9a2 2 0 0 1-.4 2.1L8.1 10a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.9.6 2.9.7a2 2 0 0 1 1.6 1.9z"/></svg>',
+        info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>'
+    };
+
+    function buildMessageMenuItems(messageEl) {
+        const msgId = messageEl.dataset.messageId || messageEl.dataset.id;
+        if (!msgId || String(msgId).startsWith('temp')) return null; // временные сообщения — без меню
+
+        const isOwn = messageEl.classList.contains('sent') || messageEl.classList.contains('message-own');
+        const messageContent = getMessageText(messageEl);
+        let isPinned = false;
+        try {
+            const pinnedRaw = localStorage.getItem(`pinned_${State.currentChatAddress}`);
+            isPinned = pinnedRaw && String(JSON.parse(pinnedRaw).messageId) === String(msgId);
+        } catch (e) {}
+
+        return [
+            {
+                icon: CTX_ICONS.copy,
+                label: t('copy'),
+                onClick: () => {
+                    const done = () => window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
+                    if (navigator.clipboard?.writeText) {
+                        navigator.clipboard.writeText(messageContent).then(done).catch(() => fallbackCopy(messageContent, done));
+                    } else {
+                        fallbackCopy(messageContent, done);
+                    }
+                }
+            },
+            {
+                icon: CTX_ICONS.reply,
+                label: t('reply'),
+                onClick: () => {
+                    const senderName = messageEl.querySelector('.content strong')?.textContent || '';
+                    const quoted = messageContent.split('\n').map(l => '> ' + l).join('\n');
+                    const textarea = document.getElementById('messageContent');
+                    if (textarea) {
+                        textarea.value += (textarea.value ? '\n' : '') + (senderName ? senderName + ':\n' : '') + quoted + '\n';
+                        textarea.focus();
+                        textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+                        if (window.autoResizeTextarea) window.autoResizeTextarea(textarea);
+                        updateSendButtonVisibility();
+                    }
+                }
+            },
+            {
+                icon: CTX_ICONS.edit,
+                label: t('edit'),
+                hidden: !isOwn,
+                onClick: async () => {
+                    const newText = await window.showPromptModal(t('edit'), t('edit_message_prompt'), messageContent);
+                    if (newText === null || newText.trim() === '' || newText.trim() === messageContent.trim()) return;
                     try {
                         const res = await fetch('/edit_message', {
                             method: 'POST',
@@ -727,11 +802,7 @@
                             body: JSON.stringify({ message_id: parseInt(msgId), content: newText.trim() })
                         });
                         if (res.ok) {
-                            const msgDiv = document.getElementById('msg-' + msgId);
-                            if (msgDiv) {
-                                const contentP = msgDiv.querySelector('.content p');
-                                if (contentP) contentP.textContent = newText.trim();
-                            }
+                            applyMessageEditLocally(msgId, newText.trim());
                             window.NotificationManager?.showToast(t('message_edited'), 'success');
                         } else {
                             window.NotificationManager?.showToast(t('edit_failed'), 'error');
@@ -741,72 +812,66 @@
                         window.NotificationManager?.showToast(t('edit_failed'), 'error');
                     }
                 }
-            };
-        }
-
-        menu.querySelector('.reply-action').onclick = () => {
-            menu.remove();
-            const senderName = messageEl.querySelector('.content strong')?.textContent || '';
-            const replyText = `${senderName ? senderName + ': ' : ''}${messageContent}`;
-            const textarea = document.getElementById('messageContent');
-            if (textarea) {
-                textarea.value = replyText + '\n';
-                textarea.focus();
-                if (window.autoResizeTextarea) window.autoResizeTextarea(textarea);
-            }
-        };
-
-        const deleteAction = menu.querySelector('.delete-action');
-        if (deleteAction) {
-            deleteAction.onclick = async () => {
-                const confirmed = await window.showConfirmModal(t('delete_message_title'), t('delete_message_confirm'));
-                if (confirmed) {
-                    const res = await fetch('/delete_message', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ message_id: parseInt(msgId) })
-                    });
-                    if (res.ok) {
-                        const msgDiv = document.getElementById('msg-' + msgId);
-                        if (msgDiv) {
-                            msgDiv.querySelectorAll('[data-object-url]').forEach(el => {
-                                URL.revokeObjectURL(el.dataset.objectUrl);
-                            });
-                            msgDiv.remove();
-                        }
-                        window.loadConversations();
-                        window.NotificationManager?.showToast(t('message_deleted'), 'success');
+            },
+            { separator: true },
+            {
+                icon: isPinned ? CTX_ICONS.unpin : CTX_ICONS.pin,
+                label: isPinned ? t('unpin_message') : t('pin_message'),
+                onClick: () => {
+                    const chatAddress = State.currentChatAddress;
+                    if (!chatAddress) return;
+                    if (isPinned) {
+                        window.unpinMessage(chatAddress);
+                        window.NotificationManager?.showToast(t('unpinned_message'), 'success');
                     } else {
-                        window.NotificationManager?.showToast(t('delete_failed'), 'error');
+                        localStorage.setItem(`pinned_${chatAddress}`, JSON.stringify({
+                            messageId: msgId,
+                            content: messageContent.substring(0, 100),
+                            timestamp: Date.now()
+                        }));
+                        window.updatePinnedMessageBar(chatAddress);
+                        window.NotificationManager?.showToast(t('pinned_message'), 'success');
                     }
                 }
-                menu.remove();
-            };
-        }
+            },
+            {
+                icon: CTX_ICONS.trash,
+                label: t('delete'),
+                danger: true,
+                hidden: !isOwn,
+                onClick: () => doDeleteMessage(msgId)
+            }
+        ];
+    }
 
-        // Pin message action
-        const pinAction = menu.querySelector('.pin-action');
-        if (pinAction) {
-            pinAction.onclick = async () => {
-                menu.remove();
-                const chatAddress = State.currentChatAddress;
-                if (!chatAddress) return;
-                
-                // Store pinned message in localStorage
-                const storageKey = `pinned_${chatAddress}`;
-                const pinnedData = {
-                    messageId: msgId,
-                    content: messageContent.substring(0, 100),
-                    timestamp: Date.now()
-                };
-                localStorage.setItem(storageKey, JSON.stringify(pinnedData));
-                
-                // Update UI
-                window.updatePinnedMessageBar(chatAddress);
-                window.NotificationManager?.showToast(t('pinned_message'), 'success');
-            };
+    // Правый клик по сообщению (делегирование — работает и для новых сообщений из WebSocket)
+    document.addEventListener('contextmenu', (e) => {
+        const messageEl = e.target.closest('.message');
+        if (!messageEl || !window.ContextMenu) return;
+        e.preventDefault();
+        const items = buildMessageMenuItems(messageEl);
+        if (!items) return;
+        window.ContextMenu.open(items, { x: e.clientX, y: e.clientY }, { target: messageEl });
+    }, { passive: false });
+
+    // Долгое нажатие по сообщению (тач/стикус) — вешаем при создании элемента
+    window.bindMessageHold = function (messageEl) {
+        if (!messageEl || !window.ContextMenu || messageEl._ctxBound) return;
+        messageEl._ctxBound = true;
+        window.ContextMenu.bind(messageEl, () => buildMessageMenuItems(messageEl));
+    };
+
+    // Очистка кэша сообщений при удалении
+    window.clearMessageCacheForId = function (chatId, msgId) {
+        if (!chatId || !window.messagesCache) return;
+        const arr = window.messagesCache.get(chatId);
+        if (arr) {
+            const idx = arr.findIndex(m => String(m.id) === String(msgId));
+            if (idx >= 0) arr.splice(idx, 1);
+            const idSet = window._messageIdSets?.get(chatId);
+            if (idSet) { idSet.delete(parseInt(msgId)); idSet.delete(msgId); }
         }
-    });
+    };
 
     // Unpin button handler
     document.addEventListener('DOMContentLoaded', function() {
