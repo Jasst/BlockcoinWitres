@@ -245,6 +245,10 @@ class MarkReadRequest(BaseModel):
     last_message_id: Optional[int] = None
 
 
+class HideConversationRequest(BaseModel):
+    chat_with: str
+
+
 class MessageStatusesRequest(BaseModel):
     ids: List[int] = []
 

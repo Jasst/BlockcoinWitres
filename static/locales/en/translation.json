@@ -454,5 +454,13 @@
   "light_theme": "Light theme",
   "dark_theme": "Dark theme",
   "theme_toggle": "Toggle theme",
-  "login": "Login"
+  "login": "Login",
+  "hide_chat": "Hide chat",
+  "confirm_hide_chat": "Hide the chat with \"{{name}}\"? New messages from this contact will not appear in the list.",
+  "chat_hidden": "Chat hidden",
+  "calls_not_available": "Calls are not available yet",
+  "compression_failed": "File compression failed",
+  "copy_group_id": "Copy group ID",
+  "edited": "edited",
+  "unpinned_message": "Message unpinned"
 }
