@@ -14,7 +14,7 @@ from cache import (
 )
 from config import MESSAGE_FEE, COIN, COIN_NAME, STAKING_FEE_POOL_ADDRESS, ENABLE_STAKING
 from dependencies import require_auth, make_rate_limit_dep
-from models import SendMessageRequest, MarkReadRequest, MessageStatusesRequest
+from models import SendMessageRequest, MarkReadRequest, MessageStatusesRequest, HideConversationRequest
 from services.messaging import get_conversations_list_cached, invalidate_conversations_cache
 from services.wallet import staking_manager
 from setup import message_limiter
@@ -267,7 +267,52 @@ async def get_conversation(
 
 @router.get('/get_conversations')
 async def get_conversations(address: str = Depends(require_auth)):
-    return {'conversations': await get_conversations_list_cached(address)}
+    conversations = await get_conversations_list_cached(address)
+    # Исключаем чаты, скрытые пользователем через контекстное меню
+    try:
+        from database import get_db_cursor
+        async with get_db_cursor() as conn:
+            rows = await conn.fetch(
+                'SELECT chat_id FROM hidden_conversations WHERE user_address = $1', address)
+        hidden = {r['chat_id'] for r in rows}
+        if hidden:
+            conversations = [c for c in conversations
+                             if c.get('address') not in hidden and c.get('chat_with') not in hidden]
+    except Exception as e:
+        logger.warning(f'hidden_conversations filter failed (non-critical): {e}')
+    return {'conversations': conversations}
+
+
+@router.post('/hide_conversation')
+async def hide_conversation(body: HideConversationRequest, address: str = Depends(require_auth)):
+    """Скрыть беседу из списка чатов (контекстное меню -> «Скрыть чат»)."""
+    chat_with = body.chat_with.strip()
+    if not chat_with:
+        raise HTTPException(400, 'Missing chat_with')
+    from database import get_db_cursor
+    async with get_db_cursor() as conn:
+        await conn.execute('''
+            INSERT INTO hidden_conversations (user_address, chat_id, hidden_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_address, chat_id) DO NOTHING
+        ''', address, chat_with, time.time())
+    await invalidate_conversations_cache(address)
+    return {'status': 'ok'}
+
+
+@router.post('/unhide_conversation')
+async def unhide_conversation(body: HideConversationRequest, address: str = Depends(require_auth)):
+    """Показать ранее скрытую беседу."""
+    chat_with = body.chat_with.strip()
+    if not chat_with:
+        raise HTTPException(400, 'Missing chat_with')
+    from database import get_db_cursor
+    async with get_db_cursor() as conn:
+        await conn.execute(
+            'DELETE FROM hidden_conversations WHERE user_address = $1 AND chat_id = $2',
+            address, chat_with)
+    await invalidate_conversations_cache(address)
+    return {'status': 'ok'}
 
 
 @router.post('/mark_conversation_read')

@@ -333,6 +333,26 @@ async def _apply_migrations(conn: asyncpg.Connection):
                 ON CONFLICT (version) DO NOTHING
             """)
 
+    # ──────────────────────────────────────────────────────────────
+    # МИГРАЦИЯ (версия 12) – таблица hidden_conversations
+    # (пользователь скрывает чат из списка через контекстное меню)
+    # ──────────────────────────────────────────────────────────────
+    if current_version < 12:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS hidden_conversations (
+                user_address TEXT NOT NULL,
+                chat_id      TEXT NOT NULL,
+                hidden_at    DOUBLE PRECISION DEFAULT extract(epoch from now()),
+                PRIMARY KEY (user_address, chat_id)
+            )
+        """)
+        await conn.execute("""
+            INSERT INTO schema_version (version, applied_at)
+            VALUES (12, extract(epoch from now()))
+            ON CONFLICT (version) DO NOTHING
+        """)
+        current_version = 12
+
 
 async def _create_indexes(conn: asyncpg.Connection):
     indexes = [

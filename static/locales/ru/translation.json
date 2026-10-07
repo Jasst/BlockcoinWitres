@@ -454,5 +454,13 @@
   "light_theme": "Светлая тема",
   "dark_theme": "Тёмная тема",
   "theme_toggle": "Переключить тему",
-  "login": "Войти"
+  "login": "Войти",
+  "hide_chat": "Скрыть чат",
+  "confirm_hide_chat": "Скрыть переписку с «{{name}}»? Новые сообщения этого контакта не будут появляться в списке.",
+  "chat_hidden": "Чат скрыт",
+  "calls_not_available": "Звонки пока недоступны",
+  "compression_failed": "Не удалось сжать файл",
+  "copy_group_id": "Копировать ID группы",
+  "edited": "изменено",
+  "unpinned_message": "Сообщение откреплено"
 }
