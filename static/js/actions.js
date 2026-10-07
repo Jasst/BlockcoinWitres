@@ -909,6 +909,9 @@
     document.addEventListener('contextmenu', (e) => {
         const messageEl = e.target.closest('.message');
         if (!messageEl || !window.ContextMenu) return;
+        // Never open a second menu when one is already active (fixes the
+        // "double context menu" seen on some Android long-press combos).
+        if (window.ContextMenu.isOpen()) return;
         e.preventDefault();
         const items = buildMessageMenuItems(messageEl);
         if (!items) return;
@@ -919,7 +922,10 @@
     window.bindMessageHold = function (messageEl) {
         if (!messageEl || !window.ContextMenu || messageEl._ctxBound) return;
         messageEl._ctxBound = true;
-        window.ContextMenu.bind(messageEl, () => buildMessageMenuItems(messageEl));
+        window.ContextMenu.bind(messageEl, () => {
+            if (window.ContextMenu.isOpen()) return null;
+            return buildMessageMenuItems(messageEl);
+        });
     };
 
     // Очистка кэша сообщений при удалении

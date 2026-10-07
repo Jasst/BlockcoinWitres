@@ -22,6 +22,26 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=['auth'])
 templates = Jinja2Templates(directory=TEMPLATE_FOLDER)
 
+# Cache-busting: append a build version (?v=...) to every local static asset
+# URL so browsers/PWA never run stale JS/CSS after a deploy (fixes context
+# menu / reply / pin regressions caused by cached old scripts).
+try:
+    _ASSET_VER = str(int(__import__('time').time()))
+except Exception:
+    _ASSET_VER = '1'
+
+_orig_url_for = templates.env.globals['url_for']
+
+def _versioned_url_for(path, **kwargs):
+    url = _orig_url_for(path, **kwargs)
+    if path.startswith('js/') or path.endswith('.css') or path.startswith('locales/'):
+        sep = '&' if '?' in url else '?'
+        url = f'{url}{sep}v={_ASSET_VER}'
+    return url
+
+templates.env.filters['url_for_v'] = _versioned_url_for
+templates.env.globals['url_for'] = _versioned_url_for
+
 
 @router.get('/', response_class=HTMLResponse)
 def index(request: Request):
