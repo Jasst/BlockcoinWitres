@@ -1,291 +1,82 @@
-// ui.js – полностью интернационализированная версия с разделителями дат и улучшенными статусами
-(function() {
-    if (window._uiLoaded) return;
-    window._uiLoaded = true;
+    // ========== КОНТЕКСТНОЕ МЕНЮ БЕСЕД (ПКМ + долгое нажатие) ==========
+    const CONV_ICONS = {
+        open:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+        call:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>',
+        user:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+        copy:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+        trash:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
+    };
 
-    // Helper for i18n
-    function t(key, opts) { return i18next.t(key, opts); }
+    function hiddenChatsKey() {
+        return 'hidden_chats_' + ((window.State && State.userAddress) || 'anon');
+    }
+    function getHiddenChats() {
+        try { return JSON.parse(localStorage.getItem(hiddenChatsKey()) || '[]'); } catch (e) { return []; }
+    }
+    window.isChatHidden = function (address) {
+        return getHiddenChats().some(a => String(a).toLowerCase() === String(address).toLowerCase());
+    };
 
-    // ========== ФОРМАТИРОВАНИЕ ДАТ ДЛЯ РАЗДЕЛИТЕЛЕЙ ==========
-    function formatDateDivider(timestamp) {
-        const date = new Date(timestamp * 1000);
-        const now = new Date();
-        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-        const yesterday = new Date(today);
-        yesterday.setDate(yesterday.getDate() - 1);
+    async function hideConversation(address, name) {
+        const confirmed = await window.showConfirmModal(t('hide_chat'), t('confirm_hide_chat', { name: name || '' }));
+        if (!confirmed) return;
+        try {
+            const res = await fetch('/hide_conversation', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_with: address })
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+        } catch (err) {
+            console.warn('hide_conversation server error, hiding locally:', err);
+        }
+        const key = hiddenChatsKey();
+        const list = getHiddenChats();
+        if (!list.some(a => String(a).toLowerCase() === String(address).toLowerCase())) list.push(address);
+        localStorage.setItem(key, JSON.stringify(list));
+        const el = document.querySelector(`.conversation-item[data-address="${CSS.escape(address)}"]`);
+        if (el) el.remove();
+        if (window.State && State.currentChatAddress === address) {
+            State.currentChatAddress = null;
+            const panel = document.getElementById('chatPanel');
+            if (panel) panel.classList.remove('open');
+        }
+        window.NotificationManager?.showToast(t('chat_hidden'), 'success');
+    }
 
-        const msgDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-
-        if (msgDate.getTime() === today.getTime()) return t('today');
-        if (msgDate.getTime() === yesterday.getTime()) return t('yesterday');
-
-        return date.toLocaleDateString(undefined, {
-            day: 'numeric',
-            month: 'long',
-            year: (date.getFullYear() !== now.getFullYear() ? 'numeric' : undefined)
+    function bindConversationHold(item, address, displayName, isGroup) {
+        if (!window.ContextMenu || !address || address === 'ai_bot') return;
+        ContextMenu.bind(item, () => {
+            const items = [
+                { icon: CONV_ICONS.open, label: t('open_chat'), onClick: () => window.selectConversation(address, displayName, isGroup) },
+            ];
+            if (!isGroup) {
+                items.push(
+                    { icon: CONV_ICONS.call, label: t('call'), onClick: () => {
+                        if (window.CallManager && typeof window.CallManager.makeCall === 'function') {
+                            window.CallManager.makeCall(address, false, displayName);
+                        } else {
+                            window.NotificationManager?.showToast(t('calls_not_available'), 'warning');
+                        }
+                    } },
+                    { icon: CONV_ICONS.user, label: t('add_to_contacts'), onClick: () => {
+                        window.location.href = '/contacts?start_with=' + encodeURIComponent(address) + '&name=' + encodeURIComponent(displayName);
+                    } }
+                );
+            }
+            items.push(
+                { icon: CONV_ICONS.copy, label: t('copy_address'), onClick: () => {
+                    const done = () => window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
+                    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(address).then(done).catch(done);
+                    else done();
+                } },
+                { separator: true },
+                { icon: CONV_ICONS.trash, label: t('delete_chat'), danger: true, onClick: () => hideConversation(address, displayName) }
+            );
+            return items;
         });
     }
-
-    function renderMessagesWithSeparators(container, messages) {
-        if (!container || !messages.length) return;
-        let lastDateKey = null;
-        const fragment = document.createDocumentFragment();
-        for (const msg of messages) {
-            const msgDate = new Date(msg.timestamp * 1000);
-            const dateKey = `${msgDate.getFullYear()}-${msgDate.getMonth()}-${msgDate.getDate()}`;
-            if (lastDateKey !== dateKey) {
-                const divider = document.createElement('div');
-                divider.className = 'date-divider';
-                divider.textContent = formatDateDivider(msg.timestamp);
-                fragment.appendChild(divider);
-                lastDateKey = dateKey;
-            }
-            fragment.appendChild(createMessageElement(msg));
-        }
-        container.appendChild(fragment);
-    }
-
-    function isUserAtBottom(container, threshold = 50) {
-        if (!container) return false;
-        return container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
-    }
-
-    function smartScrollToBottom(container, force = false) {
-        if (!container) return;
-        if (force || isUserAtBottom(container)) {
-            container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
-        } else {
-            showNewMessagesBadge();
-        }
-    }
-
-    function showNewMessagesBadge() {
-        if (document.getElementById('newMessagesBadge')) return;
-        const badge = document.createElement('button');
-        badge.id = 'newMessagesBadge';
-        badge.innerHTML = t('new_messages_badge');
-        badge.style.cssText = 'position:absolute;bottom:110px;right:20px;background:var(--accent);color:var(--text-inverse);border:none;padding:8px 16px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;box-shadow:var(--shadow-md);z-index:100;display:flex;align-items:center;gap:6px;';
-        badge.onclick = () => {
-            const c = document.getElementById('messagesContainer');
-            if (c) { c.scrollTo({ top: c.scrollHeight, behavior: 'smooth' }); badge.remove(); }
-        };
-        // ИСПРАВЛЕНО: раньше искали .main-content, которого нет в вёрстке — бейдж никогда не показывался
-        const anchor = document.querySelector('.chat-panel') || document.querySelector('.chat-layout') || document.body;
-        if (anchor) {
-            if (getComputedStyle(anchor).position === 'static') anchor.style.position = 'relative';
-            anchor.appendChild(badge);
-        }
-        setTimeout(() => badge?.remove(), 15000);
-    }
-
-    async function loadOlderMessages(chatId, beforeId) {
-        const container = document.getElementById('messagesContainer');
-        if (!container) return;
-        try {
-            const res = await fetch(`/get_conversation?with=${chatId}&before_id=${beforeId}&limit=30`);
-            if (!res.ok) throw new Error('Failed');
-            const data = await res.json();
-            if (data.messages?.length) {
-                const olderMessages = [];
-                for (const msg of data.messages) {
-                    if (document.getElementById('msg-' + msg.id)) continue;
-                    const decrypted = await window.processMessageDecryption(msg);
-                    olderMessages.push(decrypted);
-                }
-                if (olderMessages.length) {
-                    window.addMessagesToCache(chatId, olderMessages, 'start');
-                    const fragment = document.createDocumentFragment();
-                    renderMessagesWithSeparators(fragment, olderMessages);
-                    const firstChild = container.firstChild;
-                    if (firstChild) container.insertBefore(fragment, firstChild);
-                    else container.appendChild(fragment);
-                    const firstMsgId = olderMessages[0]?.id;
-                    if (firstMsgId) State.lastKnownMessageId = Math.min(State.lastKnownMessageId, firstMsgId);
-                    setupTopObserver();
-                }
-            }
-        } catch (e) { console.error('Older messages error:', e); }
-    }
-
-    function setupTopObserver() {
-        if (State.topObserver) State.topObserver.disconnect();
-        const firstMsg = document.querySelector('#messagesContainer .message:first-of-type');
-        if (firstMsg) {
-            State.topObserver = new IntersectionObserver((entries) => {
-                if (entries[0].isIntersecting && State.currentChatAddress) {
-                    const oldestId = parseInt(firstMsg.dataset.messageId);
-                    loadOlderMessages(State.currentChatAddress, oldestId);
-                }
-            }, { threshold: 0.1 });
-            State.topObserver.observe(firstMsg);
-        }
-    }
-
-    function createMessageElement(msg) {
-        const messageDiv = document.createElement('div');
-        messageDiv.id = 'msg-' + msg.id;
-        const ownClass = msg.is_mine ? 'message-own' : '';
-        messageDiv.className = `message ${msg.is_mine ? 'sent' : 'received'} ${ownClass} animate-fade`;
-        messageDiv.dataset.messageId = msg.id;
-        messageDiv.dataset.id = msg.id;
-        if (msg.is_mine) messageDiv.dataset.status = msg.status || 'sent';
-        else messageDiv.dataset.status = msg.status || 'delivered';
-
-        const initials = (msg.sender || 'U').slice(0, 1).toUpperCase();
-        const senderName = msg.is_mine || !State.currentChatIsGroup
-            ? ''
-            : '<strong>' + Utils.escapeHtml(msg.sender_name || (msg.sender ? msg.sender.slice(0,10)+'…' : '')) + '</strong><br>';
-
-        let mediaHtml = '';
-        if (msg.image) {
-            let imageUrl = msg.image;
-            if (!imageUrl.startsWith('data:image') && !imageUrl.startsWith('http'))
-                imageUrl = 'data:image/jpeg;base64,' + imageUrl;
-            mediaHtml = `<img src="${Utils.escapeHtml(imageUrl)}" alt="Image" loading="lazy" onclick="openImageModal('${Utils.escapeHtml(imageUrl)}')" style="cursor:pointer;max-width:100%;border-radius:6px;margin:4px 0;">`;
-        }
-        if (msg.fileUrl && msg.fileKey && msg.fileIv) {
-            const safeUrl = Utils.escapeHtml(msg.fileUrl);
-            const safeKey = Utils.escapeHtml(msg.fileKey);
-            const safeIv = Utils.escapeHtml(msg.fileIv);
-            const safeType = Utils.escapeHtml(msg.fileType || '');
-            mediaHtml = `<div class="file-attachment" data-url="${safeUrl}"
-                         data-key="${safeKey}" data-iv="${safeIv}" data-type="${safeType}">
-                         <span>⏳ ${t('decrypting')}</span></div>`;
-            setTimeout(() => decryptAndShowAttachment(messageDiv), 0);
-        }
-
-        const timeStr = Utils.formatTimestamp(msg.timestamp);
-        const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" title="${t('delete')}"><img src="/static/icons/Remove.png" width="16" height="16" alt="Delete"></button>` : '';
-        let statusHtml = '';
-        if (msg.is_mine) {
-            const st = msg.status || 'sent';
-            let icon = '✓', cls = 'msg-status--sent';
-            if (st === 'delivered') { icon = '✓✓'; cls = 'msg-status--delivered'; }
-            else if (st === 'read')  { icon = '✓✓'; cls = 'msg-status--read'; }
-            statusHtml = `<span class="msg-status ${cls}">${icon}</span>`;
-        }
-
-        messageDiv.innerHTML = `<div class="avatar">${Utils.escapeHtml(initials)}</div>
-                               <div class="content">${senderName}<p>${Utils.escapeHtml(msg.content || '')}</p>
-                               ${mediaHtml}
-                               <div class="meta">
-                                 <span class="meta-time">${timeStr}</span>
-                                 ${deleteBtn}
-                                 ${statusHtml}
-                               </div></div>`;
-        // ������ ������� �� ��������� (���) ��������� �� �� ����, ��� � ������ ���� (��)
-        if (window.bindMessageHold) window.bindMessageHold(messageDiv);
-        return messageDiv;
-    }
-
-    async function decryptAndShowAttachment(messageDiv) {
-        const div = messageDiv.querySelector('.file-attachment');
-        if (!div) return;
-        const url = div.dataset.url;
-        const keyBase64 = div.dataset.key;
-        const ivBase64 = div.dataset.iv;
-        const fileType = div.dataset.type;
-
-        if (!url || !keyBase64 || !ivBase64) {
-            div.innerHTML = `<span class="text-error">${t('invalid_file_data')}</span>`;
-            return;
-        }
-
-        try {
-            const res = await fetch(url);
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const encryptedBlob = await res.arrayBuffer();
-            const key = DarkCrypto.base64ToArrayBuffer(keyBase64);
-            const iv = DarkCrypto.base64ToArrayBuffer(ivBase64);
-            const decrypted = await DarkCrypto.decryptFile(new Uint8Array(encryptedBlob), new Uint8Array(key), new Uint8Array(iv));
-            const blob = new Blob([decrypted], { type: fileType });
-            const objectUrl = URL.createObjectURL(blob);
-
-            div.dataset.objectUrl = objectUrl;
-
-            if (fileType.startsWith('image/')) {
-                div.innerHTML = `<img src="${objectUrl}" style="max-width:100%; border-radius:8px; cursor:pointer;" onclick="window.openImageModal('${objectUrl.replace(/'/g, "\\'")}')">`;
-            } else if (fileType.startsWith('audio/')) {
-                div.innerHTML = `<div class="voice-message-label">${t('voice_message_decrypted')}</div><audio controls src="${objectUrl}" style="width:100%;" preload="auto"></audio>`;
-                const audioEl = div.querySelector('audio');
-                if (audioEl) audioEl.load();
-            } else {
-                div.innerHTML = `<a href="${objectUrl}" download>${t('download_file')}</a>`;
-            }
-        } catch (err) {
-            console.error('Decryption error:', err);
-            div.innerHTML = `<span class="text-error">${t('decrypt_failed')}</span>`;
-            if (window.NotificationManager) window.NotificationManager.showToast(t('could_not_load_file'), 'error');
-        }
-    }
-
-    function updateStatusIcon(msgDiv, status) {
-        const icon = msgDiv.querySelector('.msg-status');
-        if (!icon) return;
-        icon.classList.remove('msg-status--sent', 'msg-status--delivered', 'msg-status--read');
-        if (status === 'sent')      { icon.textContent = '✓';  icon.classList.add('msg-status--sent'); }
-        else if (status === 'delivered') { icon.textContent = '✓✓'; icon.classList.add('msg-status--delivered'); }
-        else if (status === 'read') { icon.textContent = '✓✓'; icon.classList.add('msg-status--read'); }
-    }
-
-    async function fetchUserStatuses(addresses) {
-        if (!addresses.length) return {};
-        try {
-            const res = await fetch('/get_many_statuses', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ addresses }) });
-            const data = await res.json();
-            return data.statuses || {};
-        } catch (err) { console.warn('Failed to fetch statuses:', err); return {}; }
-    }
-
-    async function loadConversations() {
-        const container = document.getElementById('conversationsList');
-        if (!container) return;
-        try {
-            const res = await fetch('/get_conversations');
-            const data = await res.json();
-            if (!res.ok || !data.conversations?.length) {
-                container.innerHTML = `<div class="empty-state"><div class="icon">💬</div><p>${t('no_conversations')}</p><button class="btn-primary-oval" onclick="openNewChatModal()">${t('start_one')}</button></div>`;
-                return;
-            }
-            container.innerHTML = '';
-            const convElements = [];
-            for (const conv of data.conversations) {
-                const isGroup = !!conv.is_group;
-                const address = conv.address || '';
-                const item = document.createElement('div');
-                item.className = 'conversation-item';
-                item.dataset.address = address;
-                item.dataset.isGroup = isGroup ? '1' : '0';
-                const displayName = conv.name || address || 'Unknown';
-                const shortName = displayName.length > 25 ? displayName.slice(0,22)+'…' : displayName;
-                const initials = displayName.slice(0,2).toUpperCase();
-                let previewText = Utils.escapeHtml(conv.last_preview || t('no_messages'));
-                item.innerHTML = `<div class="avatar ${isGroup ? 'group' : ''}">${Utils.escapeHtml(initials)}</div>
-                    <div class="info"><div class="name truncate">${Utils.escapeHtml(shortName)}</div><div class="meta"><span class="status"></span><span class="truncate">${previewText}</span></div></div>`;
-                item.onclick = ((addr, name, group) => () => window.selectConversation(addr, name, group))(address, conv.name || address, isGroup);
-                bindConversationHold(item, address, displayName, isGroup);
-                container.appendChild(item);
-                convElements.push({ el: item, address, isGroup });
-            }
-            const addressesToCheck = convElements.filter(c => !c.isGroup && c.address !== State.userAddress).map(c => c.address);
-            if (addressesToCheck.length) {
-                const statuses = await fetchUserStatuses(addressesToCheck);
-                for (const { el, address } of convElements) {
-                    if (addressesToCheck.includes(address)) {
-                        const status = statuses[address]?.status || 'offline';
-                        const statusSpan = el.querySelector('.status');
-                        if (statusSpan) {
-                            statusSpan.className = `status ${status}`;
-                            statusSpan.title = status === 'online' ? t('online') : t('offline');
-                        }
-                    }
-                }
-            }
-        } catch (error) {
-            console.error('Load conversations error:', error);
-            container.innerHTML = `<p class="text-muted text-center">${t('failed_to_load')}</p>`;
-        }
-    }
+    window.bindConversationHold = bindConversationHold;
 
     // ========== ДИНАМИЧЕСКИЙ ОТСТУП ПОД ПОЛЕ ВВОДА ==========
     window.adjustMessagesPadding = function() {
