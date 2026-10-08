@@ -470,5 +470,7 @@
   "open_group": "Open group",
   "group_info": "Group info",
   "unhide_chat": "Unhide chat",
-  "delete_chat": "Delete chat"
+  "delete_chat": "Delete chat",
+  "copy_message": "Copy message",
+  "delete_message": "Delete message"
 }

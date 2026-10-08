@@ -802,7 +802,9 @@
         return [
             {
                 icon: CTX_ICONS.copy,
-                label: t('copy'),
+                // Без текста в пункте: полная подпись — в title/aria-label.
+                title: t('copy_message'),
+                label: '',
                 onClick: () => {
                     const done = () => window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
                     if (navigator.clipboard?.writeText) {
@@ -915,7 +917,8 @@
             },
             {
                 icon: CTX_ICONS.trash,
-                label: t('delete'),
+                title: t('delete_message'),
+                label: '',
                 danger: true,
                 hidden: !isOwn,
                 onClick: () => doDeleteMessage(msgId)
