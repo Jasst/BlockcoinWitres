@@ -56,7 +56,8 @@ async def close_db():
 
 @asynccontextmanager
 async def get_db_cursor():
-    async with _pool.acquire() as conn:
+    # timeout: если пул занят, запрос падает с ошибкой, а не висит бесконечно
+    async with _pool.acquire(timeout=15) as conn:
         async with conn.transaction():
             yield conn
 

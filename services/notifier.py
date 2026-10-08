@@ -34,7 +34,7 @@ class AsyncMessageNotifier:
         # 🔥 ИСПРАВЛЕНИЕ: Отправляем push ВЛЮБОМ СЛУЧАЕ
         # Если приложение в фоне на мобильном, WS еще жив, но JS заморожен.
         # Push придет в Service Worker и разбудит телефон.
-        await self._send_push_for_message(user_address, message)
+        asyncio.create_task(self._send_push_for_message(user_address, message))
 
     async def _send_push_for_message(self, user_address: str, message: dict):
         """Отправляет push-уведомление для оффлайн-пользователя или если приложение в фоне."""

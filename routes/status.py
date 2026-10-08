@@ -1,6 +1,7 @@
 """
 routes/status.py — Статусы пользователей (онлайн/оффлайн) (асинхронная версия)
 """
+import asyncio
 import logging
 import time
 
@@ -31,7 +32,7 @@ async def heartbeat(body: HeartbeatRequest, request: Request, address: str = Dep
             ''', address, time.time(), body.current_chat)
         # НОВОЕ: оповещаем всех через WebSocket, что этот адрес стал онлайн
         from routes.ws import manager
-        await manager.broadcast_status_update(address, 'online')
+        asyncio.create_task(manager.broadcast_status_update(address, 'online'))
         return {'status': 'ok'}
     except Exception as e:
         logger.error(f"Heartbeat error: {e}")

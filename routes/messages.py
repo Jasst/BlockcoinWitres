@@ -114,6 +114,7 @@ async def send_message(body: SendMessageRequest, request: Request, address: str 
         group = None
         message_obj = None
         reply_to = None
+        pending_notify = []   # уведомления шлём ПОСЛЕ транзакции (не держим соединение БД)
         if msg_type == 'group' and body.group_id:
             if not body.encrypted_map:
 
@@ -146,7 +147,7 @@ async def send_message(body: SendMessageRequest, request: Request, address: str 
 
 
             for member in group['members']:
-                await message_notifier.add_message(member, message_obj)
+                pending_notify.append((member, message_obj))
 
             for member in group['members']:
                 if member != sender:
@@ -188,7 +189,7 @@ async def send_message(body: SendMessageRequest, request: Request, address: str 
                 'status': 'sent'
             }
 
-            await message_notifier.add_message(recipient, message_obj)
+            pending_notify.append((recipient, message_obj))
 
             asyncio.create_task(
                 send_push(
@@ -198,6 +199,10 @@ async def send_message(body: SendMessageRequest, request: Request, address: str 
                     url=f"/chat?start_with={sender}"
                 )
             )
+
+    # Доставка после коммита транзакции: соединение с БД уже возвращено в пул
+    for _uid, _obj in pending_notify:
+        await message_notifier.add_message(_uid, _obj)
 
     await invalidate_conversations_cache(sender)
     if msg_type == 'group' and body.group_id and group:
