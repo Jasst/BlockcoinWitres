@@ -794,7 +794,8 @@
         const messageContent = getMessageText(messageEl);
         let isPinned = false;
         try {
-            const pinnedData = window.getPinnedForChat ? window.getPinnedForChat(State.currentChatAddress) : null;
+            const _addr = (window.State && State.currentChatAddress) || '';
+            const pinnedData = (_addr && window.getPinnedForChat) ? window.getPinnedForChat(_addr) : null;
             isPinned = !!(pinnedData && String(pinnedData.messageId) === String(msgId));
         } catch (e) {}
 
@@ -854,9 +855,26 @@
                 icon: isPinned ? CTX_ICONS.unpin : CTX_ICONS.pin,
                 label: isPinned ? t('unpin_message') : t('pin_message'),
                 onClick: () => {
-                    const chatAddress = State.currentChatAddress;
-                    if (!chatAddress) {
-                        window.NotificationManager?.showToast(t('open_chat_first'), 'warning');
+                    const chatAddress = (window.State && State.currentChatAddress) || '';
+                    // Pinning from a preview / closed chat: remember the request
+                    // and open the owning conversation first - the pin is then
+                    // applied automatically (see _tryConsumePendingPin).
+                    if (!chatAddress || chatAddress === 'ai_bot') {
+                        const targetAddr = resolveMessageChatAddress(msgId);
+                        if (targetAddr) {
+                            try { localStorage.setItem('_pendingPin', JSON.stringify({ chat: targetAddr, messageId: msgId })); } catch (e) {}
+                            if (window.selectConversation) {
+                                Promise.resolve(window.selectConversation(
+                                    targetAddr,
+                                    (document.querySelector(`.conversation-item[data-address="${CSS.escape(targetAddr)}"]`)?.querySelector('.name')?.textContent) || '',
+                                    targetAddr.startsWith('group:')
+                                )).then(() => window._tryConsumePendingPin());
+                            } else {
+                                window.location.href = '/chat?start_with=' + encodeURIComponent(targetAddr);
+                            }
+                        } else {
+                            window.NotificationManager?.showToast(t('open_chat_first'), 'warning');
+                        }
                         return;
                     }
                     if (isPinned) {
@@ -1024,8 +1042,62 @@
     // the new message as a markdown blockquote prefixed by the sender name.
     window.getReplyQuote = function () { return _replyQuote; };
 
+    // Robustly find the message element by id (supports data-message-id,
+    // data-id and the #msg-<id> convention used across the app).
+    function findMessageEl(msgId) {
+        if (msgId === undefined || msgId === null || msgId === '') return null;
+        const s = String(msgId);
+        let el = document.getElementById('msg-' + s);
+        if (!el) el = document.querySelector(`.message[data-message-id="${CSS.escape(s)}"]`);
+        if (!el) el = document.querySelector(`.message[data-id="${CSS.escape(s)}"]`);
+        return el;
+    }
+    window.findMessageEl = findMessageEl;
+
+    // Resolve the conversation address a message belongs to: the currently
+    // open chat first, then the owning list item (contacts preview), then the
+    // message's own sender dataset.
+    function resolveMessageChatAddress(msgId) {
+        const cur = window.State?.currentChatAddress;
+        if (cur && cur !== 'ai_bot') return cur;
+        const el = findMessageEl(msgId);
+        if (el) {
+            const item = el.closest('.conversation-item');
+            if (item && item.dataset.address) return item.dataset.address;
+            if (el.dataset.chatAddress) return el.dataset.chatAddress;
+            if (el.dataset.sender) return el.dataset.sender;
+        }
+        return '';
+    }
+
+    // Attach the reply chip as soon as the message input exists. Used after
+    // an SPA navigation or a full page reload (the old code waited for the
+    // quoted message to be *rendered*, which never happens for messages from
+    // older history pages - that was the main reason "Reply" silently did
+    // nothing). Also consumes any pending pin request saved before a reload.
+    function _ensureReplyAttached(payload, tries) {
+        tries = tries || 0;
+        const ta = document.getElementById('messageContent');
+        if (ta && typeof window.attachReplyQuote === 'function') {
+            const p = window._pendingReply || payload;
+            window._pendingReply = null;
+            window.attachReplyQuote(p);
+            return;
+        }
+        if (tries >= 100) { // ~8s: give up quietly instead of hanging forever
+            window._pendingReply = null;
+            try { sessionStorage.removeItem('_replyRetry'); } catch (e) {}
+            return;
+        }
+        setTimeout(() => _ensureReplyAttached(payload, tries + 1), 80);
+    }
+
     window.attachReplyQuote = function ({ messageId, sender, text }) {
-        let textarea = document.getElementById('messageContent');
+        // Guard against being called with no payload at all (would previously
+        // throw a TypeError and make the menu click look dead).
+        if (!arguments.length || arguments[0] == null) return;
+        messageId = messageId ?? '';
+        const textarea = document.getElementById('messageContent');
         const panel = document.getElementById('chatPanel');
         // On mobile the chat panel is toggled via inline display styles
         // (showChatPanel in chat.html) - open it so the reply chip and input
@@ -1035,95 +1107,45 @@
         } else if (panel && !panel.classList.contains('open')) {
             panel.classList.add('open');
         }
-        // If no chat is opened yet, "reply" opens the conversation that owns
-        // the quoted message first (WhatsApp behaviour). The payload stays in
-        // _pendingReply and is consumed by attachReplyQuote itself once the
-        // messages of that chat have been rendered.
+
         const chatAddress = window.State?.currentChatAddress;
-        const ownMessage = document.querySelector(
-            `.message[data-message-id="${CSS.escape(String(messageId))}"]`);
-        const convItem = (!chatAddress && ownMessage) ? ownMessage.closest('.conversation-item') : null;
-        if ((!chatAddress || chatAddress === 'ai_bot') && (window.selectConversation || convItem)) {
-            let targetAddr = '', targetName = '', targetGroup = false;
-            if (convItem) {
-                targetAddr = convItem.dataset.address || '';
-                targetName = convItem.querySelector('.name')?.textContent || '';
-                targetGroup = convItem.dataset.isGroup === '1';
-            } else if (ownMessage) {
-                // Message element found but no chat selected - derive sender
-                targetAddr = ownMessage.classList.contains('sent')
-                    ? '' : (ownMessage.dataset.sender || '');
-            }
+        // No chat open (or the AI assistant is open, where replies make no
+        // sense): open the conversation that owns the quoted message first,
+        // then attach the chip. We do NOT require the message itself to be
+        // rendered - only the input must exist (see _ensureReplyAttached).
+        if (!textarea || !chatAddress || chatAddress === 'ai_bot') {
+            const targetAddr = resolveMessageChatAddress(messageId);
             if (targetAddr) {
                 window._pendingReply = { messageId, sender, text };
-                const waitMsg = () => {
-                    let tries = 0;
-                    const iv = setInterval(() => {
-                        tries++;
-                        const el = document.querySelector(
-                            `.message[data-message-id="${CSS.escape(String(messageId))}"]`);
-                        if (el) {
-                            clearInterval(iv);
-                            const p = window._pendingReply;
-                            window._pendingReply = null;
-                            window.attachReplyQuote(p || { messageId, sender, text });
-                        } else if (tries > 100) { // ~5s: chat loaded without that msg
-                            clearInterval(iv);
-                            const ta = document.getElementById('messageContent');
-                            if (ta) {
-                                const p = window._pendingReply;
-                                window._pendingReply = null;
-                                window.attachReplyQuote(p || { messageId, sender, text });
-                            }
-                        }
-                    }, 50);
-                };
                 if (window.selectConversation) {
-                    Promise.resolve(window.selectConversation(targetAddr, targetName, targetGroup))
-                        .then(waitMsg).catch(waitMsg);
+                    Promise.resolve(window.selectConversation(
+                        targetAddr,
+                        (document.querySelector(`.conversation-item[data-address="${CSS.escape(targetAddr)}"]`)?.querySelector('.name')?.textContent) || '',
+                        targetAddr.startsWith('group:')
+                    )).finally(() => _ensureReplyAttached({ messageId, sender, text }));
                 } else {
                     window.location.href = '/chat?start_with=' + encodeURIComponent(targetAddr);
                 }
                 return;
             }
-        }
-        if (!textarea) {
-            // The page has no chat markup at all (contacts/groups/etc.) or a
-            // stale cached script bundle is loaded - open /chat and attach the
-            // quote once the input exists. If the installed code is outdated
-            // (attachReplyQuote missing after SPA re-entry), fall back to a
-            // full page reload which always fetches fresh scripts.
-            const payload = { messageId, sender, text };
-            const goChat = () => {
+            if (!textarea) {
+                // The page has no chat markup at all (contacts/groups/etc.):
+                // navigate to /chat (SPA if possible) and attach once ready.
+                const payload = { messageId, sender, text };
+                window._pendingReply = payload;
+                try { sessionStorage.setItem('_replyRetry', JSON.stringify(payload)); } catch (e) {}
                 try {
                     if (window.spaNavigate) window.spaNavigate('/chat');
-                    else window.location.href = '/chat';
-                } catch (e) { window.location.href = '/chat'; }
-            };
-            goChat();
-            window._pendingReply = payload;
-            let tries = 0;
-            const waitInput = setInterval(() => {
-                tries++;
-                const ta = document.getElementById('messageContent');
-                if (ta) {
-                    clearInterval(waitInput);
-                    if (typeof window.attachReplyQuote === 'function') {
-                        const p = window._pendingReply || payload;
-                        window._pendingReply = null;
-                        window.attachReplyQuote(p);
-                    } else {
-                        // Old cached actions.js still active on this page -
-                        // hard reload so the browser fetches the new file.
-                        clearInterval(waitInput);
-                        try { sessionStorage.setItem('_replyRetry', JSON.stringify(payload)); } catch (e) {}
-                        window.location.href = '/chat?reply=' + encodeURIComponent(messageId || '');
-                    }
+                    else window.location.href = '/chat?reply=' + encodeURIComponent(messageId || '');
+                } catch (e) {
+                    window.location.href = '/chat?reply=' + encodeURIComponent(messageId || '');
                 }
-                else if (tries > 40) clearInterval(waitInput); // ~4s timeout
-            }, 100);
-            return;
+                _ensureReplyAttached(payload);
+                return;
+            }
+            // Chat address unknown and input exists - just attach locally.
         }
+        if (!textarea) return; // safety: input vanished mid-flow
         if (textarea.offsetParent === null) {
             // Input exists but is inside a hidden container - make it visible:
             // clear legacy inline display:none set by AI-chat switching,
@@ -1215,19 +1237,37 @@
     setTimeout(() => { try { window._tryConsumePendingReply(); } catch (e) {} }, 600);
     setTimeout(() => { try { window._tryConsumePendingReply(); } catch (e) {} }, 2500);
 
+    // Consume a pin request saved when "Pin" was used from a preview / closed
+    // chat: applies it to the owning conversation once that chat is open.
+    window._tryConsumePendingPin = function () {
+        let req = null;
+        try { req = JSON.parse(localStorage.getItem('_pendingPin') || 'null'); } catch (e) {}
+        if (!req || !req.chat) return false;
+        const cur = (window.State && State.currentChatAddress) || '';
+        if (cur !== req.chat) return false;
+        try { localStorage.removeItem('_pendingPin'); } catch (e) {}
+        const el = findMessageEl(req.messageId);
+        const content = el ? getMessageText(el) : '';
+        window.setPinnedForChat(req.chat, {
+            messageId: String(req.messageId),
+            content: content.substring(0, 100),
+            timestamp: Date.now()
+        });
+        if (el) {
+            document.querySelectorAll('.message.pinned').forEach(x => x.classList.remove('pinned'));
+            el.classList.add('pinned');
+        }
+        window.NotificationManager?.showToast(t('pinned_message'), 'success');
+        return true;
+    };
+    setTimeout(() => { try { window._tryConsumePendingPin(); } catch (e) {} }, 800);
+    setTimeout(() => { try { window._tryConsumePendingPin(); } catch (e) {} }, 2800);
+
     // Scroll to a message and highlight it. If the message is not rendered yet
     // (old history page), reuse jumpToPinnedMessage which loads older pages.
     window.scrollToAndHighlightMessage = async function (msgId) {
         if (!msgId) return;
-        let el = document.getElementById('msg-' + msgId);
-        if (!el) {
-            const container = document.getElementById('messagesContainer');
-            if (container) {
-                for (const m of container.querySelectorAll('.message')) {
-                    if (String(m.dataset.messageId) === String(msgId)) { el = m; break; }
-                }
-            }
-        }
+        const el = findMessageEl(msgId);
         if (el) {
             el.scrollIntoView({ behavior: 'smooth', block: 'center' });
             el.classList.add('msg-highlight');
