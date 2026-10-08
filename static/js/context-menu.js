@@ -93,6 +93,14 @@
                     labelSpan.textContent = it.label || '';
                     btn.innerHTML = `<span class="ctx-icon">${iconHtml}</span>`;
                     btn.appendChild(labelSpan);
+                    // Пункты без текста (например, «Копировать»/«Удалить» в чате)
+                    // остаются доступными: подпись уезжает в title/aria-label.
+                    const a11yLabel = it.title || it.label || '';
+                    if (a11yLabel) {
+                        btn.title = a11yLabel;
+                        btn.setAttribute('aria-label', a11yLabel);
+                    }
+                    if (!labelSpan.textContent) btn.classList.add('icon-only');
                     btn.addEventListener('click', (e) => {
                         e.stopPropagation();
                         closeMenu();

@@ -470,5 +470,7 @@
   "open_group": "Открыть группу",
   "group_info": "Информация о группе",
   "unhide_chat": "Показать чат",
-  "delete_chat": "Удалить чат"
+  "delete_chat": "Удалить чат",
+  "copy_message": "Копировать сообщение",
+  "delete_message": "Удалить сообщение"
 }

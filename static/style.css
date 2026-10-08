@@ -3232,6 +3232,25 @@ body.light-theme .bottom-nav { background: rgba(255, 255, 255, 0.94); }
 .ctx-item .ctx-icon img {
   display: none !important;
 }
+/* Иконочные пункты без текста (Копировать/Удалить в чате):
+   не растягиваем кнопку на всю ширину меню, подпись — в title/aria-label */
+.ctx-item.icon-only {
+  width: auto;
+  gap: 0;
+  padding: 8px 12px;
+}
+.ctx-item.icon-only .ctx-label {
+  display: none;
+}
+.ctx-item.icon-only .ctx-icon {
+  width: 20px;
+  height: 20px;
+  flex-basis: 20px;
+}
+.ctx-item.icon-only .ctx-icon svg {
+  width: 20px;
+  height: 20px;
+}
 /* Safety: menu label is always a single line of plain text (no emoji duplicates) */
 .ctx-item .ctx-label {
   flex: 1;
