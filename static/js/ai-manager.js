@@ -62,6 +62,13 @@
                 </div>
             `;
             item.onclick = ((addr) => () => window.selectConversation(addr, session.name, false))(session.id);
+            // Меню «Удалить» по правому клику / долгому нажатию (как у обычных бесед)
+            if (window.ContextMenu) {
+                window.ContextMenu.bind(item, () => [
+                    { icon: AI_TRASH_ICON, label: _aiT('delete_chat', 'Delete chat'), danger: true,
+                      onClick: () => _deleteAiSessionFromList(session.id, session.name) }
+                ]);
+            }
             container.appendChild(item);
         });
     }
@@ -317,6 +324,31 @@ function removeAiSession(sessionId) {
 }
 
 // В _clearAiHistory, после очистки истории, вызываем removeAiSession:
+const AI_TRASH_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>';
+
+function _aiT(key, fallback) {
+    try { return (window.i18next && i18next.t(key)) || fallback; } catch (e) { return fallback; }
+}
+
+// Удаление AI-чата из списка. Если чат открыт — используем существующую
+// логику _clearAiHistory (переход к обычной беседе и сброс панели).
+// Если нет — удаляем историю и сессию без переключения панели.
+function _deleteAiSessionFromList(sessionId, name) {
+    if (sessionId === _currentAiSessionId) { _clearAiHistory(); return; }
+    const doDelete = () => {
+        localStorage.removeItem('ai_chat_history_' + sessionId);
+        localStorage.removeItem('ai_stream_partial_' + sessionId);
+        removeAiSession(sessionId);
+        _showToast('Chat deleted', 'success');
+    };
+    if (typeof window.showConfirmModal === 'function') {
+        window.showConfirmModal('Delete AI chat', 'Delete "' + name + '" and its history?')
+            .then((ok) => { if (ok) doDelete(); });
+    } else if (confirm('Delete "' + name + '" and its history?')) {
+        doDelete();
+    }
+}
+
 function _clearAiHistory() {
     if (!_currentAiSessionId) {
         _showToast('No active AI session', 'warning');

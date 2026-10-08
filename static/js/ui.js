@@ -410,7 +410,9 @@
             const res = await fetch('/get_conversations');
             const data = await res.json();
             if (!res.ok || !data.conversations?.length) {
+                // ИИ-сессии живут в localStorage: добавляем их и в пустой список
                 container.innerHTML = `<div class="empty-state"><div class="icon">💬</div><p>${t('no_conversations')}</p><button class="btn-primary-oval" onclick="openNewChatModal()">${t('start_one')}</button></div>`;
+                window.loadAiSessionsIntoConversations && window.loadAiSessionsIntoConversations();
                 return;
             }
             container.innerHTML = '';
@@ -454,6 +456,9 @@
                 container.appendChild(toggle);
                 archivedItems.forEach(el => container.appendChild(el));
             }
+            // Чаты с ИИ (localStorage) добавляем СИНХРОННО после перестроения списка.
+            // Раньше их добавлял таймер из ai-manager, и эта функция их стирала.
+            window.loadAiSessionsIntoConversations && window.loadAiSessionsIntoConversations();
             const addressesToCheck = convElements.filter(c => !c.isGroup && c.address !== State.userAddress).map(c => c.address);
             if (addressesToCheck.length) {
                 const statuses = await fetchUserStatuses(addressesToCheck);
