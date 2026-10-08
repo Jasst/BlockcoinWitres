@@ -13,7 +13,10 @@
     // Per-element hold state (a single global timer broke the menu when two
     // elements were touched/pressed close together - mobile bug).
     const holdState = new WeakMap();
-    let suppressClickUntil = 0;   // блокируем «фантомный» клик после долгого нажатия
+    let suppressClickUntil = 0;   // блокируем contextmenu сразу после долгого нажатия
+    // Флаг вместо окна по времени: после долгого нажатия браузер может прислать click
+    // позже любого окна (при долгом удержании). Гасим его один раз, до следующего касания.
+    let holdFired = false;
 
     function sanitizeIcon(raw) {
         raw = String(raw || '');
@@ -55,6 +58,58 @@
         const vw = window.innerWidth, vh = window.innerHeight;
         if (rect.right > vw - 8)  menu.style.left = Math.max(8, x - rect.width) + 'px';
         if (rect.bottom > vh - 8) menu.style.top = Math.max(8, y - rect.height) + 'px';
+    }
+
+    // ---------- Мобильный жест: свайп в сторону открывает меню ----------
+    // Только для устройств с тачскрином (pointer: coarse). На ПК ничего не меняется:
+    // там остаётся правый клик. Долгое нажатие на телефоне тоже сохранено.
+    function bindSwipe(el, buildItems) {
+        const SWIPE_MIN = 56;   // минимальный сдвиг, px, чтобы открыть меню
+        const LOCK = 10;        // сначала определяем направление жеста
+        let sx = 0, sy = 0, dx = 0, active = false, locked = false, horizontal = false;
+
+        el.addEventListener('touchstart', (e) => {
+            if (!e.touches || e.touches.length !== 1) { active = false; return; }
+            if (e.target.closest('button, a, input, textarea, select, audio, .no-hold')) { active = false; return; }
+            const t0 = e.touches[0];
+            sx = t0.clientX; sy = t0.clientY;
+            dx = 0; locked = false; horizontal = false; active = true;
+        }, { passive: true });
+
+        el.addEventListener('touchmove', (e) => {
+            if (!active || !e.touches || !e.touches.length) return;
+            const t0 = e.touches[0];
+            const x = t0.clientX - sx, y = t0.clientY - sy;
+            if (!locked && (Math.abs(x) > LOCK || Math.abs(y) > LOCK)) {
+                locked = true;
+                horizontal = Math.abs(x) > Math.abs(y) * 1.5;
+            }
+            if (locked && horizontal) {
+                dx = x;
+                // лёгкое «подтягивание» карточки за пальцем, максимум 90px
+                el.style.transition = 'none';
+                el.style.transform = 'translateX(' + Math.max(-90, Math.min(90, dx * 0.5)) + 'px)';
+            }
+        }, { passive: true });
+
+        function reset() {
+            active = false;
+            el.style.transition = 'transform 0.2s ease';
+            el.style.transform = '';
+        }
+
+        el.addEventListener('touchend', () => {
+            if (!active) return;
+            const doOpen = locked && horizontal && Math.abs(dx) >= SWIPE_MIN;
+            reset();
+            if (!doOpen) return;
+            // Клик, который браузер пришлёт после свайпа, не должен открыть чат
+            holdFired = true;
+            haptic(12);
+            const items = buildItems(el, { x: sx, y: sy });
+            if (items) ContextMenu.open(items, { x: sx, y: sy }, { target: el });
+        });
+        el.addEventListener('touchcancel', reset);
     }
 
     // ---------- Публичный API ----------
@@ -174,6 +229,7 @@
                     if (!items) return;
                     haptic(15);
                     suppressClickUntil = Date.now() + 700;
+                    holdFired = true;
                     // подсветка-«отклик»: цель слегка сжимается перед появлением меню
                     el.classList.add('ctx-press');
                     setTimeout(() => el.classList.remove('ctx-press'), 200);
@@ -222,15 +278,27 @@
             el.addEventListener('contextmenu', (e) => {
                 if (Date.now() < suppressClickUntil || activeMenu) e.preventDefault();
             });
+
+            // Свайп — только на сенсорных устройствах
+            const coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+            if (coarse) bindSwipe(el, buildItems);
         }
     };
 
     // Глобально: клик вне открытого меню закрывает его (страховка).
     // Фаза capture: браузер шлёт «хвостовой» click после долгого нажатия —
     // глушим его ДО onclick беседы/сообщения, иначе меню закрывается сразу.
+    // Касание вне открытого меню только закрывает его: клик под ним гасим.
+    // Новое касание сбрасывает флаг, поэтому «лишний» клик не съест следующий тап.
+    function armClickGuard(e) {
+        holdFired = !!(activeMenu && !e.target.closest('.ctx-menu'));
+    }
+    document.addEventListener('pointerdown', armClickGuard, true);
+    document.addEventListener('touchstart', armClickGuard, { capture: true, passive: true });
     document.addEventListener('click', (e) => {
         const inMenu = !!e.target.closest('.ctx-menu');
-        if (!inMenu && Date.now() < suppressClickUntil) {
+        if (!inMenu && holdFired) {
+            holdFired = false;
             e.preventDefault();
             e.stopPropagation();
             return;
