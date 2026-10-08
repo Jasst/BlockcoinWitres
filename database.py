@@ -352,6 +352,36 @@ async def _apply_migrations(conn: asyncpg.Connection):
             ON CONFLICT (version) DO NOTHING
         """)
         current_version = 12
+    # ──────────────────────────────────────────────────────────────
+    # МИГРАЦИЯ (версия 13) – ответ на сообщение и серверное закрепление
+    # ──────────────────────────────────────────────────────────────
+    if current_version < 13:
+        await conn.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reply_to_id BIGINT")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_pins (
+                chat_key        TEXT PRIMARY KEY,
+                message_id      BIGINT NOT NULL,
+                content_preview TEXT,
+                pinned_by       TEXT NOT NULL,
+                pinned_at       DOUBLE PRECISION DEFAULT extract(epoch from now())
+            )
+        """)
+        await conn.execute("""
+            INSERT INTO schema_version (version, applied_at)
+            VALUES (13, extract(epoch from now()))
+            ON CONFLICT (version) DO NOTHING
+        """)
+        current_version = 13
+    # МИГРАЦИЯ (версия 14) – архив и удаление чатов для каждого пользователя
+    if current_version < 14:
+        await conn.execute("ALTER TABLE hidden_conversations ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT TRUE")
+        await conn.execute("ALTER TABLE hidden_conversations ADD COLUMN IF NOT EXISTS cleared_at DOUBLE PRECISION")
+        await conn.execute("""
+            INSERT INTO schema_version (version, applied_at)
+            VALUES (14, extract(epoch from now()))
+            ON CONFLICT (version) DO NOTHING
+        """)
+        current_version = 14
 
 
 async def _create_indexes(conn: asyncpg.Connection):

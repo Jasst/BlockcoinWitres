@@ -232,13 +232,15 @@
     let content = contentEl ? contentEl.value.trim() : '';
     // WhatsApp-style reply: the quote is attached BEFORE the empty-check so that
     // "Reply" + pressing send on an empty input still sends the quoted message.
+    const replyRef = window.getReplyQuote ? window.getReplyQuote() : null;
     if (window.consumeReplyQuote) content = window.consumeReplyQuote(content);
-    if (!content && !pendingFile) {
+    if (!content && !pendingFile && !replyRef) {
         window.NotificationManager?.showToast(t('enter_message_or_attach'), 'warning');
         return;
     }
 
     window.isSending = true;
+    const replyToId = replyRef ? (parseInt(replyRef.messageId, 10) || null) : null;
     const recipient = State.currentChatAddress;
     const isGroup = State.currentChatIsGroup;
     const groupId = isGroup && recipient.startsWith('group:') ? recipient.split(':')[1] : null;
@@ -371,7 +373,7 @@
         const res = await fetch('/send_message', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
+            body: JSON.stringify({ ...payload, reply_to_id: replyToId })
         });
         const data = await res.json();
         if (res.ok) {
@@ -383,7 +385,8 @@
                 timestamp: Date.now() / 1000,
                 is_mine: true,
                 status: 'sent',
-                isDecrypted: true
+                isDecrypted: true,
+                reply_to_id: replyToId
             };
 
             // ✅ ДОБАВЛЯЕМ ДАННЫЕ ПРИКРЕПЛЁННОГО ФАЙЛА (если был)
@@ -542,7 +545,7 @@
                 if (!State.currentChatAddress) return;
                 const confirmed = await window.showConfirmModal(t('clear_chat_title'), t('clear_chat_confirm'));
                 if (confirmed) {
-                    const res = await fetch('/clear_conversation', {
+                    const res = await fetch('/delete_conversation', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ chat_with: State.currentChatAddress })
@@ -784,6 +787,42 @@
         if (data) localStorage.setItem(key, JSON.stringify(data));
         else localStorage.removeItem(key);
         if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(chatAddress);
+        if (window.syncPinToServer) window.syncPinToServer(chatAddress, data);
+    };
+
+    // Серверная синхронизация закрепа: один закреп на чат, виден обоим участникам
+    window.syncPinToServer = function (chatAddress, data) {
+        fetch('/pin_message', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_with: chatAddress,
+                message_id: data ? parseInt(data.messageId, 10) : null,
+                content_preview: ''   // текст не отправляем: сообщения зашифрованы
+            })
+        }).catch(err => console.warn('pin sync failed:', err));
+    };
+
+    // При открытии чата подтягиваем закреп с сервера (локальная копия — запасной вариант)
+    window.loadPinFromServer = async function (chatAddress) {
+        if (!chatAddress || chatAddress === 'ai_bot') return;
+        try {
+            const res = await fetch('/get_pin?chat_with=' + encodeURIComponent(chatAddress));
+            if (!res.ok) return;
+            const data = await res.json();
+            if (data && data.message_id) {
+                const local = window.getPinnedForChat(chatAddress);
+                const sameLocal = local && String(local.messageId) === String(data.message_id);
+                localStorage.setItem('pinned_' + chatAddress, JSON.stringify({
+                    messageId: String(data.message_id),
+                    content: (sameLocal ? local.content : '') || (window.i18next ? i18next.t('pinned_message') : 'Pinned message'),
+                    timestamp: Date.now()
+                }));
+            } else {
+                localStorage.removeItem('pinned_' + chatAddress);
+            }
+            window.updatePinnedMessageBar(chatAddress);
+        } catch (e) { /* офлайн: остаёмся на локальной копии */ }
     };
 
     function buildMessageMenuItems(messageEl) {
@@ -802,7 +841,7 @@
         return [
             {
                 icon: CTX_ICONS.copy,
-                // ��� ������ � ������: ������ ������� � � title/aria-label.
+                // Ѓез текста в пункте: полнаЯ подпись С в title/aria-label.
                 title: t('copy_message'),
                 label: '',
                 onClick: () => {
@@ -888,29 +927,16 @@
                         if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(chatAddress);
                         window.NotificationManager?.showToast(t('unpinned_message'), 'success');
                     } else {
-                        // Закрепление (заменяет предыдущее закреплённое в этом чате)
+                        // Закрепление: один закреп на чат (сохраняется и на сервере)
                         window.setPinnedForChat(chatAddress, {
                             messageId: msgId,
                             content: messageContent.substring(0, 100),
                             timestamp: Date.now()
                         });
-                        // Telegram-style: persistent marker on the message itself
-                        const _pinInner = document.querySelector('#pinnedMessagesBar .pinned-bar-inner');
-                        if (_pinInner) {
-                            _pinInner.querySelectorAll('[data-pin-marker]').forEach(m => m.remove());
-                            const marker = document.createElement('span');
-                            marker.className = 'pinned-msg-author';
-                            marker.dataset.pinMarker = '1';
-                            marker.textContent = t('pinned_by') || 'Pinned';
-                            const txt = _pinInner.querySelector('.pinned-bar-text');
-                            if (txt) txt.prepend(marker);
-                        }
                         document.querySelectorAll('.message.pinned').forEach(el => el.classList.remove('pinned'));
                         messageEl.classList.add('pinned');
                         messageEl.classList.add('pinned-highlight');
                         setTimeout(() => messageEl.classList.remove('pinned-highlight'), 2000);
-                        // Re-render the floating pinned pill (Telegram behaviour)
-                        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(chatAddress);
                         window.NotificationManager?.showToast(t('pinned_message'), 'success');
                     }
                 }
@@ -961,17 +987,14 @@
         }
     };
 
-    // Unpin button handler
-    document.addEventListener('DOMContentLoaded', function() {
-        const unpinBtn = document.getElementById('unpinMessageBtn');
-        if (unpinBtn) {
-            unpinBtn.addEventListener('click', () => {
-                const chatAddress = State.currentChatAddress;
-                if (chatAddress) {
-                    window.unpinMessage(chatAddress);
-                }
-            });
-        }
+    // Unpin button: делегирование от document. Прямой обработчик на кнопке
+    // терялся, потому что updatePinnedMessageBar клонирует .pinned-bar-inner.
+    document.addEventListener('click', function (e) {
+        const btn = e.target && e.target.closest ? e.target.closest('#unpinMessageBtn') : null;
+        if (!btn) return;
+        e.preventDefault();
+        const chatAddress = State.currentChatAddress;
+        if (chatAddress) window.unpinMessage(chatAddress);
     });
 
     document.addEventListener('DOMContentLoaded', initChatActions);
@@ -982,14 +1005,13 @@
     window.startNewChat = startNewChat;
     window.autoResizeTextarea = autoResizeTextarea;
     window.updateSendButtonVisibility = updateSendButtonVisibility;
-    window.unpinMessage = unpinMessage;
-    
+
     // Theme toggle function
     window.toggleTheme = function() {
         const body = document.body;
         const isLight = body.classList.toggle('light-theme');
         localStorage.setItem('theme', isLight ? 'light' : 'dark');
-        
+
         // Update icon visibility
         const sunIcon = document.querySelector('.sun-icon');
         const moonIcon = document.querySelector('.moon-icon');
@@ -998,7 +1020,7 @@
             moonIcon.classList.toggle('hidden', !isLight);
         }
     };
-    
+
     // Add event listener for theme toggle button
     document.addEventListener('DOMContentLoaded', function() {
         const themeBtn = document.getElementById('themeToggleBtn');
@@ -1006,7 +1028,7 @@
             themeBtn.addEventListener('click', window.toggleTheme);
         }
     });
-    
+
     // Initialize theme from localStorage
     (function initTheme() {
         const savedTheme = localStorage.getItem('theme') || 'dark';
@@ -1020,14 +1042,14 @@
             }
         }
     })();
-    
+
     // Search chats function
     window.filterChats = function(query) {
         const list = document.getElementById('conversationsList');
         if (!list) return;
         const items = list.querySelectorAll('.conversation-item');
         const lowerQuery = query.toLowerCase();
-        
+
         items.forEach(item => {
             const name = item.querySelector('.name')?.textContent?.toLowerCase() || '';
             const meta = item.querySelector('.meta')?.textContent?.toLowerCase() || '';
@@ -1038,7 +1060,7 @@
             }
         });
     };
-    
+
     // ========== Reply quote (WhatsApp-style) ==========
     // Attaches a clickable quote chip above the input; clicking scrolls to and
     // highlights the original message. The quoted text is sent together with
@@ -1283,14 +1305,11 @@
     };
 
     // Compose outgoing text with the quote prefix, then clear the chip
+    // Ответ теперь передаётся полем reply_to_id (см. sendMessage), а не текстом-цитатой.
     window.consumeReplyQuote = function (userText) {
         if (!_replyQuote) return userText;
-        const q = _replyQuote;
         window.clearReplyQuote();
-        const quotedLines = (q.text || '').split('\n').map(l => '> ' + l).join('\n');
-        const prefix = (q.sender ? q.sender + ':\n' : '') + quotedLines;
-        // Empty user text: send just the quote (WhatsApp-style quick reply)
-        return userText ? prefix + '\n\n' + userText : prefix;
+        return userText;
     };
 
     // Pinned message bar (single source of truth: localStorage pinned_<chat>)
@@ -1393,7 +1412,6 @@
     };
 
     window.unpinMessage = function(chatAddress) {
-        localStorage.removeItem('pinned_' + chatAddress);
-        window.updatePinnedMessageBar(chatAddress);
+        window.setPinnedForChat(chatAddress, null);
     };
 })();

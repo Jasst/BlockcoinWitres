@@ -472,5 +472,14 @@
   "unhide_chat": "Unhide chat",
   "delete_chat": "Delete chat",
   "copy_message": "Copy message",
-  "delete_message": "Delete message"
+  "delete_message": "Delete message",
+  "archive": "Archive",
+  "archive_chat": "Archive chat",
+  "unarchive_chat": "Unarchive chat",
+  "chat_archived": "Chat moved to archive",
+  "chat_unarchived": "Chat restored from archive",
+  "action_failed": "Action failed",
+  "message": "Message",
+  "confirm_delete_chat": "Delete your history with \"{{name}}\"? The contact keeps their messages. The chat will reappear when a new message arrives.",
+  "chat_deleted": "Chat deleted"
 }

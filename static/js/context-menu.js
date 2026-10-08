@@ -225,10 +225,18 @@
         }
     };
 
-    // Глобально: клик вне любого открытого меню закрывает его (страховка)
+    // Глобально: клик вне открытого меню закрывает его (страховка).
+    // Фаза capture: браузер шлёт «хвостовой» click после долгого нажатия —
+    // глушим его ДО onclick беседы/сообщения, иначе меню закрывается сразу.
     document.addEventListener('click', (e) => {
-        if (activeMenu && !e.target.closest('.ctx-menu')) closeMenu();
-    });
+        const inMenu = !!e.target.closest('.ctx-menu');
+        if (!inMenu && Date.now() < suppressClickUntil) {
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+        }
+        if (activeMenu && !inMenu) closeMenu();
+    }, true);
     // Safety net: any native context menu opened on a bound element (e.g. text
     // selection bubble on some Android keyboards) closes our custom menu too.
     document.addEventListener('contextmenu', () => { if (activeMenu) closeMenu(); });

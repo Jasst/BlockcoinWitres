@@ -13,49 +13,94 @@
         call:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>',
         user:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
         copy:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+        archive:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg>',
+        unarchive: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>',
+        trash:     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>',
         eyeOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
     };
 
+    // ========== АРХИВ БЕСЕД ==========
+    // Серверное хранение: таблица hidden_conversations (миграция 12).
+    // «В архив» = скрытая беседа; вернуть её можно из раздела «Архив».
     function hiddenChatsKey() {
         return 'hidden_chats_' + ((window.State && State.userAddress) || 'anon');
     }
-    function getHiddenChats() {
-        try { return JSON.parse(localStorage.getItem(hiddenChatsKey()) || '[]'); } catch (e) { return []; }
-    }
-    window.isChatHidden = function (address) {
-        return getHiddenChats().some(a => String(a).toLowerCase() === String(address).toLowerCase());
-    };
 
-    async function hideConversation(address, name) {
-        const confirmed = await window.showConfirmModal(t('hide_chat'), t('confirm_hide_chat', { name: name || '' }));
+    // Однократная миграция: беседы, скрытые раньше только в localStorage,
+    // переносятся на сервер (станут видны на всех устройствах и их можно вернуть).
+    async function migrateLegacyHiddenChats() {
+        let legacy = [];
+        try { legacy = JSON.parse(localStorage.getItem(hiddenChatsKey()) || '[]'); } catch (e) {}
+        if (!legacy.length) return;
+        let allOk = true;
+        for (const addr of legacy) {
+            try {
+                const res = await fetch('/hide_conversation', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chat_with: addr })
+                });
+                if (!res.ok) allOk = false;
+            } catch (e) { allOk = false; }
+        }
+        if (allOk) localStorage.removeItem(hiddenChatsKey());
+    }
+
+    // Удалить чат ТОЛЬКО у себя: история скрывается для этого пользователя,
+    // собеседник ничего не теряет. Чат вернётся, когда придёт новое сообщение.
+    async function deleteConversation(address, name) {
+        const confirmed = await window.showConfirmModal(t('delete_chat'), t('confirm_delete_chat', { name: name || '' }));
         if (!confirmed) return;
         try {
-            const res = await fetch('/hide_conversation', {
+            const res = await fetch('/delete_conversation', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ chat_with: address })
             });
             if (!res.ok) throw new Error('HTTP ' + res.status);
         } catch (err) {
-            console.warn('hide_conversation server error, hiding locally:', err);
+            console.error('delete error:', err);
+            window.NotificationManager?.showToast(t('action_failed'), 'error');
+            return;
         }
-        const key = hiddenChatsKey();
-        const list = getHiddenChats();
-        if (!list.some(a => String(a).toLowerCase() === String(address).toLowerCase())) list.push(address);
-        localStorage.setItem(key, JSON.stringify(list));
-        const el = document.querySelector(`.conversation-item[data-address="${CSS.escape(address)}"]`);
-        if (el) el.remove();
         if (window.State && State.currentChatAddress === address) {
             State.currentChatAddress = null;
-            const panel = document.getElementById('chatPanel');
-            if (panel) panel.classList.remove('open');
+            document.getElementById('chatPanel')?.classList.remove('open');
+            const box = document.getElementById('messagesContainer');
+            if (box) box.innerHTML = '';
         }
-        if (window.NotificationManager) window.NotificationManager.showToast(t('chat_hidden'), 'success');
+        window.clearMessageCache?.(address);
+        window.NotificationManager?.showToast(t('chat_deleted'), 'success');
+        loadConversations();
     }
+
+    async function setArchived(address, archived) {
+        const url = archived ? '/hide_conversation' : '/unhide_conversation';
+        try {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_with: address })
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+        } catch (err) {
+            console.error('archive error:', err);
+            window.NotificationManager?.showToast(t('action_failed'), 'error');
+            return;
+        }
+        window.NotificationManager?.showToast(t(archived ? 'chat_archived' : 'chat_unarchived'), 'success');
+        if (archived && window.State && State.currentChatAddress === address) {
+            State.currentChatAddress = null;
+            document.getElementById('chatPanel')?.classList.remove('open');
+        }
+        loadConversations();
+    }
+
 
     function bindConversationHold(item, address, displayName, isGroup) {
         if (!window.ContextMenu || !address || address === 'ai_bot') return;
         ContextMenu.bind(item, () => {
+            const archived = item.dataset.archived === '1';
             const items = [
                 { icon: CONV_ICONS.open, label: t('open_chat'), onClick: () => window.selectConversation(address, displayName, isGroup) },
             ];
@@ -80,7 +125,11 @@
                     else done();
                 } },
                 { separator: true },
-                { icon: CONV_ICONS.eyeOff, label: t('hide_chat'), danger: true, onClick: () => hideConversation(address, displayName) }
+                { icon: archived ? CONV_ICONS.unarchive : CONV_ICONS.archive,
+                  label: archived ? t('unarchive_chat') : t('archive_chat'),
+                  onClick: () => setArchived(address, !archived) },
+                { icon: CONV_ICONS.trash, label: t('delete_chat'), danger: true,
+                  onClick: () => deleteConversation(address, displayName) }
             );
             return items;
         });
@@ -218,6 +267,10 @@
         messageDiv.dataset.id = msg.id;
         if (msg.is_mine) messageDiv.dataset.status = msg.status || 'sent';
         else messageDiv.dataset.status = msg.status || 'delivered';
+        try {
+            const pin = window.getPinnedForChat && window.getPinnedForChat(State.currentChatAddress);
+            if (pin && String(pin.messageId) === String(msg.id)) messageDiv.classList.add('pinned');
+        } catch (e) {}
 
         const initials = (msg.sender || 'U').slice(0, 1).toUpperCase();
         const senderName = msg.is_mine || !State.currentChatIsGroup
@@ -242,6 +295,25 @@
             setTimeout(() => decryptAndShowAttachment(messageDiv), 0);
         }
 
+        // Ответ на сообщение: цитата, ссылка на исходное (текст берём из уже отрисованных сообщений)
+        let replyHtml = '';
+        if (msg.reply_to_id) {
+            const refEl = document.getElementById('msg-' + msg.reply_to_id);
+            const refText = refEl ? (refEl.querySelector('.content p')?.textContent || '') : '';
+            let refSender = refEl ? (refEl.querySelector('.content strong')?.textContent || '') : '';
+            // В личном чате имени в сообщении нет: подставляем «Вы» или имя собеседника
+            if (!refSender && refEl) {
+                refSender = (refEl.classList.contains('sent') || refEl.classList.contains('message-own'))
+                    ? t('you')
+                    : (document.getElementById('currentChatName')?.textContent || '');
+            }
+            replyHtml = `<div class="reply-ref" data-reply-to="${Utils.escapeHtml(String(msg.reply_to_id))}">` +
+                `<div class="reply-ref-bar"></div><div class="reply-ref-body">` +
+                `<div class="reply-ref-sender">${Utils.escapeHtml(refSender || t('reply'))}</div>` +
+                `<div class="reply-ref-text">${Utils.escapeHtml(refText.slice(0, 120) || t('message'))}</div>` +
+                `</div></div>`;
+        }
+
         const timeStr = Utils.formatTimestamp(msg.timestamp);
         const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" title="${t('delete')}"><img src="/static/icons/Remove.png" width="16" height="16" alt="Delete"></button>` : '';
         let statusHtml = '';
@@ -254,7 +326,7 @@
         }
 
         messageDiv.innerHTML = `<div class="avatar">${Utils.escapeHtml(initials)}</div>
-                               <div class="content">${senderName}<p>${Utils.escapeHtml(msg.content || '')}</p>
+                               <div class="content">${senderName}${replyHtml}<p>${Utils.escapeHtml(msg.content || '')}</p>
                                ${mediaHtml}
                                <div class="meta">
                                  <span class="meta-time">${timeStr}</span>
@@ -263,6 +335,11 @@
                                </div></div>`;
         // Long press (touch) opens the same context menu as right click
         if (window.bindMessageHold) window.bindMessageHold(messageDiv);
+        const refBtn = messageDiv.querySelector('.reply-ref');
+        if (refBtn) refBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            window.scrollToAndHighlightMessage && window.scrollToAndHighlightMessage(msg.reply_to_id);
+        });
         return messageDiv;
     }
 
@@ -329,6 +406,7 @@
         const container = document.getElementById('conversationsList');
         if (!container) return;
         try {
+            migrateLegacyHiddenChats();
             const res = await fetch('/get_conversations');
             const data = await res.json();
             if (!res.ok || !data.conversations?.length) {
@@ -337,6 +415,7 @@
             }
             container.innerHTML = '';
             const convElements = [];
+            const archivedItems = [];
             for (const conv of data.conversations) {
                 const isGroup = !!conv.is_group;
                 const address = conv.address || '';
@@ -350,11 +429,30 @@
                 let previewText = Utils.escapeHtml(conv.last_preview || t('no_messages'));
                 item.innerHTML = `<div class="avatar ${isGroup ? 'group' : ''}">${Utils.escapeHtml(initials)}</div>
                     <div class="info"><div class="name truncate">${Utils.escapeHtml(shortName)}</div><div class="meta"><span class="status"></span><span class="truncate">${previewText}</span></div></div>`;
-                if (window.isChatHidden(address)) continue;
                 item.onclick = ((addr, name, group) => () => window.selectConversation(addr, name, group))(address, conv.name || address, isGroup);
                 bindConversationHold(item, address, displayName, isGroup);
-                container.appendChild(item);
+                item.dataset.archived = conv.archived ? '1' : '0';
+                if (conv.archived) {
+                    item.style.display = 'none';
+                    archivedItems.push(item);
+                } else {
+                    container.appendChild(item);
+                }
                 convElements.push({ el: item, address, isGroup });
+            }
+            if (archivedItems.length) {
+                const toggle = document.createElement('button');
+                toggle.type = 'button';
+                toggle.className = 'archive-toggle';
+                toggle.innerHTML = `<span class="archive-title">${t('archive')} (${archivedItems.length})</span><span class="archive-chevron" aria-hidden="true">›</span>`;
+                let expanded = false;
+                toggle.addEventListener('click', () => {
+                    expanded = !expanded;
+                    toggle.classList.toggle('open', expanded);
+                    archivedItems.forEach(el => { el.style.display = expanded ? '' : 'none'; });
+                });
+                container.appendChild(toggle);
+                archivedItems.forEach(el => container.appendChild(el));
             }
             const addressesToCheck = convElements.filter(c => !c.isGroup && c.address !== State.userAddress).map(c => c.address);
             if (addressesToCheck.length) {
@@ -407,6 +505,7 @@
         // // Clear pinned bar and reply quote for the newly opened chat
         if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(address);
         if (window.clearReplyQuote) window.clearReplyQuote();
+        if (window.loadPinFromServer) window.loadPinFromServer(address);
 
         const callBtn = document.getElementById('callButton');
         if (callBtn) {
