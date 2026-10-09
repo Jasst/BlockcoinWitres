@@ -23,13 +23,6 @@
   </div>
 
   <div class="chat-panel" id="chatPanel">
-    <div class="pinned-messages-bar" id="pinnedMessagesBar">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.41 3.59L18.83 6.17 22 9.34 20.59 10.76 17.41 7.59 3 22l-1-1L16.41 6.59 13.24 3.41 14.66 2l3.17 3.17 2.58-2.58z"/></svg>
-      <span class="pinned-message-preview" id="pinnedMessagePreview"></span>
-      <button class="pinned-close-btn" id="unpinMessageBtn" title="Unpin message">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-      </button>
-    </div>
     <div class="chat-panel-header">
       <button class="back-button" id="backToConversationsBtn" aria-label="Back">←</button>
       <div class="title">
@@ -52,6 +45,20 @@
       </div>
     </div>
 
+    <!-- Telegram-style floating pinned bar: stays under the header while scrolling -->
+    <div class="pinned-messages-bar" id="pinnedMessagesBar">
+      <div class="pinned-bar-inner">
+        <svg class="pinned-pin-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.8V4h6v6.8l2 2.2H7l2-2.2Z"/></svg>
+        <div class="pinned-bar-text">
+          <span class="pinned-bar-label" id="pinnedMessageLabel">Pinned message</span>
+          <span class="pinned-message-preview" id="pinnedMessagePreview"></span>
+        </div>
+        <button class="pinned-close-btn" id="unpinMessageBtn" title="Unpin message" aria-label="Unpin message">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+    </div>
+
     <div class="messages" id="messagesContainer" role="log" aria-live="polite">
       <div class="empty-state" id="emptyState"><div class="icon">👋</div><p data-i18n="select_conversation">Select a conversation to start chatting</p></div>
     </div>
@@ -67,7 +74,7 @@
           <button type="button" class="btn-icon-oval" id="recordAudioButton" disabled title="Record voice message">
             <img src="/static/icons/Mic.png" width="20" height="20" alt="Record" style="filter: invert(1);">
           </button>
-          <button type="submit" class="btn-primary-oval" id="sendButton" disabled style="display: none;" data-i18n="send">➤</button>
+          <button type="submit" class="btn-primary-oval" id="sendButton" disabled style="display: none;" title="Send" aria-label="Send"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg></button>
         </div>
       </div>
     </form>
@@ -106,7 +113,7 @@
   <button type="button" id="aiAttachBtn" class="btn-icon-oval" title="Attach image">
     <img src="/static/icons/Attach.png" width="20" height="20" alt="Attach" style="filter: invert(1);">
   </button>
-  <button type="submit" id="aiSendBtn" class="btn-primary-oval" data-i18n="send">➤</button>
+  <button type="submit" id="aiSendBtn" class="btn-primary-oval" title="Send" aria-label="Send"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg></button>
   <!-- Новая кнопка стоп – будет видна только во время генерации -->
   <button type="button" id="aiStopBtn" class="btn-icon-oval stop-btn" title="Stop generation" style="display:none;">⏹</button>
 </div>
@@ -170,6 +177,7 @@
 <script>window.process = window.process || { env: {} };</script>
 
 <!-- Подключаем скрипты (основные уже в base.html, но оставляем для наглядности) -->
+<script src="{{ url_for('static', path='js/context-menu.js') }}"></script>
 <script src="{{ url_for('static', path='js/ui.js') }}"></script>
 <script src="{{ url_for('static', path='js/actions.js') }}"></script>
 <!-- call-manager.js загружается из base.html с defer -->

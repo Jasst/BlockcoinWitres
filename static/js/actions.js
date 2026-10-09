@@ -213,8 +213,9 @@
         const messageInput = document.getElementById('messageContent');
         const hasText = messageInput && messageInput.value.trim() !== '';
         const hasFile = pendingFile !== null;
+        const hasReply = !!(window.getReplyQuote && window.getReplyQuote());
 
-        if (hasText || hasFile) {
+        if (hasText || hasFile || hasReply) {
             sendBtn.style.display = 'flex';
             recordBtn.style.display = 'none';
         } else {
@@ -229,12 +230,17 @@
     if (window.isSending) return;
     const contentEl = document.getElementById('messageContent');
     let content = contentEl ? contentEl.value.trim() : '';
-    if (!content && !pendingFile) {
+    // WhatsApp-style reply: the quote is attached BEFORE the empty-check so that
+    // "Reply" + pressing send on an empty input still sends the quoted message.
+    const replyRef = window.getReplyQuote ? window.getReplyQuote() : null;
+    if (window.consumeReplyQuote) content = window.consumeReplyQuote(content);
+    if (!content && !pendingFile && !replyRef) {
         window.NotificationManager?.showToast(t('enter_message_or_attach'), 'warning');
         return;
     }
 
     window.isSending = true;
+    const replyToId = replyRef ? (parseInt(replyRef.messageId, 10) || null) : null;
     const recipient = State.currentChatAddress;
     const isGroup = State.currentChatIsGroup;
     const groupId = isGroup && recipient.startsWith('group:') ? recipient.split(':')[1] : null;
@@ -367,7 +373,7 @@
         const res = await fetch('/send_message', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
+            body: JSON.stringify({ ...payload, reply_to_id: replyToId })
         });
         const data = await res.json();
         if (res.ok) {
@@ -379,7 +385,8 @@
                 timestamp: Date.now() / 1000,
                 is_mine: true,
                 status: 'sent',
-                isDecrypted: true
+                isDecrypted: true,
+                reply_to_id: replyToId
             };
 
             // ✅ ДОБАВЛЯЕМ ДАННЫЕ ПРИКРЕПЛЁННОГО ФАЙЛА (если был)
@@ -538,7 +545,7 @@
                 if (!State.currentChatAddress) return;
                 const confirmed = await window.showConfirmModal(t('clear_chat_title'), t('clear_chat_confirm'));
                 if (confirmed) {
-                    const res = await fetch('/clear_conversation', {
+                    const res = await fetch('/delete_conversation', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ chat_with: State.currentChatAddress })
@@ -662,64 +669,210 @@
         }
     });
 
-    // Контекстное меню по правому клику
-    document.addEventListener('contextmenu', async (e) => {
-        const messageEl = e.target.closest('.message');
-        if (!messageEl) return;
+    // ========== Контекстное меню сообщений ==========
+    // Единый движок: правый клик (ПК) + долгое нажатие (тач) — context-menu.js.
 
-        e.preventDefault();
-        const msgId = messageEl.dataset.messageId || messageEl.dataset.id;
-        if (!msgId) return;
+    function getMessageText(messageEl) {
+        const p = messageEl.querySelector('.content p');
+        if (!p) return '';
+        // Сохраняем переносы строк (<br>) при копировании
+        const withBreaks = p.innerHTML.replace(/<br\s*\/?>/gi, '\n');
+        const tmp = document.createElement('div');
+        tmp.innerHTML = withBreaks;
+        let text = tmp.textContent || '';
+        // Убираем пометку "(изменено)" / "(edited)", добавляемую при редактировании
+        text = text.replace(/\s*[（(]?(изменено|отредактировано|edited)[）)]?\s*$/i, '');
+        return text.trim();
+    }
 
-        // Закрыть другие открытые меню
-        document.querySelectorAll('.message-context-menu').forEach(menu => menu.remove());
+    function findCachedMessage(msgId) {
+        const chatId = State.currentChatAddress;
+        if (!chatId || !window.getCachedMessages) return null;
+        return window.getCachedMessages(chatId).find(m => String(m.id) === String(msgId)) || null;
+    }
 
-        // Создать контекстное меню
-        const menu = document.createElement('div');
-        menu.className = 'message-context-menu active';
-        menu.style.left = e.pageX + 'px';
-        menu.style.top = e.pageY + 'px';
+    function applyMessageEditLocally(msgId, newText) {
+        const sel = `.message[data-message-id="${msgId}"], .message[data-id="${msgId}"]`;
+        document.querySelectorAll(sel).forEach(el => {
+            const p = el.querySelector('.content p');
+            if (p) {
+                p.textContent = newText;
+                if (!el.querySelector('.msg-edited-tag')) {
+                    p.insertAdjacentHTML('afterend', `<span class="msg-edited-tag">${t('edited')}</span>`);
+                }
+            }
+        });
+        const cached = findCachedMessage(msgId);
+        if (cached) cached.content = newText;
+    }
 
-        const isOwnMessage = messageEl.classList.contains('sent') || messageEl.classList.contains('message-own');
-        const messageContent = messageEl.querySelector('.content p')?.textContent || '';
-
-        menu.innerHTML = `
-            <button class="copy-action"><img src="/static/icons/Copy.png" width="16" height="16" alt=""> ${t('copy')}</button>
-            ${isOwnMessage ? `<button class="edit-action"><img src="/static/icons/Edit.png" width="16" height="16" alt=""> ${t('edit')}</button>` : ''}
-            <button class="reply-action">↩️ ${t('reply')}</button>
-            <button class="pin-action">📌 ${t('pin_message')}</button>
-            <div class="separator"></div>
-            ${isOwnMessage ? `<button class="delete-action danger"><img src="/static/icons/Remove.png" width="16" height="16" alt=""> ${t('delete')}</button>` : ''}
-        `;
-
-        document.body.appendChild(menu);
-
-        // Позиционирование с учётом краёв экрана
-        const rect = menu.getBoundingClientRect();
-        if (rect.right > window.innerWidth) {
-            menu.style.left = (e.pageX - rect.width) + 'px';
-        }
-        if (rect.bottom > window.innerHeight) {
-            menu.style.top = (e.pageY - rect.height) + 'px';
-        }
-
-        // Обработчики действий
-        menu.querySelector('.copy-action').onclick = () => {
-            navigator.clipboard.writeText(messageContent).then(() => {
-                window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
-                menu.remove();
-            }).catch(err => {
-                console.error('Copy failed:', err);
-                window.NotificationManager?.showToast(t('copy_failed'), 'error');
+    async function doDeleteMessage(msgId) {
+        const confirmed = await window.showConfirmModal(t('delete_message_title'), t('delete_message_confirm'));
+        if (!confirmed) return;
+        try {
+            const res = await fetch('/delete_message', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message_id: parseInt(msgId) })
             });
-        };
+            if (res.ok) {
+                const msgDiv = document.getElementById('msg-' + msgId);
+                if (msgDiv) {
+                    msgDiv.querySelectorAll('[data-object-url]').forEach(el => URL.revokeObjectURL(el.dataset.objectUrl));
+                    msgDiv.remove();
+                }
+                if (window.clearMessageCacheForId) window.clearMessageCacheForId(State.currentChatAddress, msgId);
+                // If the deleted message was pinned - unpin it automatically
+                try {
+                    const _pr = localStorage.getItem('pinned_' + State.currentChatAddress);
+                    if (_pr && String(JSON.parse(_pr).messageId) === String(msgId)) {
+                        window.unpinMessage(State.currentChatAddress);
+                    }
+                } catch (e) {}
+                window.loadConversations();
+                window.NotificationManager?.showToast(t('message_deleted'), 'success');
+            } else {
+                window.NotificationManager?.showToast(t('delete_failed'), 'error');
+            }
+        } catch (err) {
+            console.error('Delete error:', err);
+            window.NotificationManager?.showToast(t('delete_failed'), 'error');
+        }
+    }
 
-        const editBtn = menu.querySelector('.edit-action');
-        if (editBtn) {
-            editBtn.onclick = async () => {
-                menu.remove();
-                const newText = prompt(t('edit_message_prompt'), messageContent);
-                if (newText !== null && newText.trim() !== '') {
+    function fallbackCopy(text, done) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;opacity:0;left:-9999px;';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); done && done(); }
+        catch (e) { window.NotificationManager?.showToast(t('copy_failed'), 'error'); }
+        ta.remove();
+    }
+
+    // Единый набор SVG-иконок для контекстных меню (stroke через CSS).
+    // ВАЖНО: иконки — только SVG, без PNG <img>, иначе в меню появляются «двойные» иконки.
+    let _replyQuote = null; // active reply quote state
+    const escapeHtml = (str) => Utils.escapeHtml(str);
+
+    const CTX_ICONS = {
+        copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+        reply: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 5 5v1a5 5 0 0 1-5 5h-3"/></svg>',
+        edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+        pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.8V4h6v6.8l2 2.2H7l2-2.2Z"/></svg>',
+        unpin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.8V4h6v6.8l2 2.2H7l2-2.2Z"/><path d="M4 4l16 16"/></svg>',
+        trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>',
+        open: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+        contact: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+        call: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .7 2.9a2 2 0 0 1-.4 2.1L8.1 10a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.9.6 2.9.7a2 2 0 0 1 1.6 1.9z"/></svg>',
+        info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>',
+        hide: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c7 0 10 8 10 8a18 18 0 0 1-2.16 3.19"/><path d="M6.61 6.61A18 18 0 0 0 2 12s3 8 10 8a9 9 0 0 0 5.39-1.61"/><path d="M14.12 14.12A3 3 0 1 1 9.88 9.88"/><path d="M2 2l20 20"/></svg>'
+    };
+    window.CTX_ICONS = CTX_ICONS; // shared set for ui.js / contacts / groups
+    // Shared loading spinner (SVG, no emoji) for inline button states
+    window.CTX_SPINNER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9" /></svg>';
+
+    // --- Единое хранилище закреплённых сообщений (по одному на чат) ---
+    window.getPinnedForChat = function (chatAddress) {
+        if (!chatAddress) return null;
+        try {
+            const raw = localStorage.getItem('pinned_' + chatAddress);
+            return raw ? JSON.parse(raw) : null;
+        } catch (e) { return null; }
+    };
+    window.setPinnedForChat = function (chatAddress, data) {
+        if (!chatAddress) return;
+        const key = 'pinned_' + chatAddress;
+        if (data) localStorage.setItem(key, JSON.stringify(data));
+        else localStorage.removeItem(key);
+        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(chatAddress);
+        if (window.syncPinToServer) window.syncPinToServer(chatAddress, data);
+    };
+
+    // Серверная синхронизация закрепа: один закреп на чат, виден обоим участникам
+    window.syncPinToServer = function (chatAddress, data) {
+        fetch('/pin_message', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_with: chatAddress,
+                message_id: data ? parseInt(data.messageId, 10) : null,
+                content_preview: ''   // текст не отправляем: сообщения зашифрованы
+            })
+        }).catch(err => console.warn('pin sync failed:', err));
+    };
+
+    // При открытии чата подтягиваем закреп с сервера (локальная копия — запасной вариант)
+    window.loadPinFromServer = async function (chatAddress) {
+        if (!chatAddress || chatAddress === 'ai_bot') return;
+        try {
+            const res = await fetch('/get_pin?chat_with=' + encodeURIComponent(chatAddress));
+            if (!res.ok) return;
+            const data = await res.json();
+            if (data && data.message_id) {
+                const local = window.getPinnedForChat(chatAddress);
+                const sameLocal = local && String(local.messageId) === String(data.message_id);
+                localStorage.setItem('pinned_' + chatAddress, JSON.stringify({
+                    messageId: String(data.message_id),
+                    content: (sameLocal ? local.content : '') || (window.i18next ? i18next.t('pinned_message') : 'Pinned message'),
+                    timestamp: Date.now()
+                }));
+            } else {
+                localStorage.removeItem('pinned_' + chatAddress);
+            }
+            window.updatePinnedMessageBar(chatAddress);
+        } catch (e) { /* офлайн: остаёмся на локальной копии */ }
+    };
+
+    function buildMessageMenuItems(messageEl) {
+        const msgId = messageEl.dataset.messageId || messageEl.dataset.id;
+        if (!msgId || String(msgId).startsWith('temp')) return null; // временные сообщения — без меню
+
+        const isOwn = messageEl.classList.contains('sent') || messageEl.classList.contains('message-own');
+        const messageContent = getMessageText(messageEl);
+        let isPinned = false;
+        try {
+            const _addr = (window.State && State.currentChatAddress) || '';
+            const pinnedData = (_addr && window.getPinnedForChat) ? window.getPinnedForChat(_addr) : null;
+            isPinned = !!(pinnedData && String(pinnedData.messageId) === String(msgId));
+        } catch (e) {}
+
+        return [
+            {
+                icon: CTX_ICONS.copy,
+                // Ѓез текста в пункте: полнаЯ подпись С в title/aria-label.
+                title: t('copy_message'),
+                label: '',
+                onClick: () => {
+                    const done = () => window.NotificationManager?.showToast(t('copied_to_clipboard'), 'success');
+                    if (navigator.clipboard?.writeText) {
+                        navigator.clipboard.writeText(messageContent).then(done).catch(() => fallbackCopy(messageContent, done));
+                    } else {
+                        fallbackCopy(messageContent, done);
+                    }
+                }
+            },
+            {
+                icon: CTX_ICONS.reply,
+                label: t('reply'),
+                onClick: () => {
+                    // WhatsApp-style: attach a quote chip above the input + highlight the source message
+                    const senderName = messageEl.querySelector('.content strong')?.textContent || '';
+                    window.attachReplyQuote({
+                        messageId: msgId,
+                        sender: senderName,
+                        text: messageContent
+                    });
+                }
+            },
+            {
+                icon: CTX_ICONS.edit,
+                label: t('edit'),
+                hidden: !isOwn,
+                onClick: async () => {
+                    const newText = await window.showPromptModal(t('edit'), t('edit_message_prompt'), messageContent);
+                    if (newText === null || newText.trim() === '' || newText.trim() === messageContent.trim()) return;
                     try {
                         const res = await fetch('/edit_message', {
                             method: 'POST',
@@ -727,11 +880,7 @@
                             body: JSON.stringify({ message_id: parseInt(msgId), content: newText.trim() })
                         });
                         if (res.ok) {
-                            const msgDiv = document.getElementById('msg-' + msgId);
-                            if (msgDiv) {
-                                const contentP = msgDiv.querySelector('.content p');
-                                if (contentP) contentP.textContent = newText.trim();
-                            }
+                            applyMessageEditLocally(msgId, newText.trim());
                             window.NotificationManager?.showToast(t('message_edited'), 'success');
                         } else {
                             window.NotificationManager?.showToast(t('edit_failed'), 'error');
@@ -741,84 +890,111 @@
                         window.NotificationManager?.showToast(t('edit_failed'), 'error');
                     }
                 }
-            };
-        }
-
-        menu.querySelector('.reply-action').onclick = () => {
-            menu.remove();
-            const senderName = messageEl.querySelector('.content strong')?.textContent || '';
-            const replyText = `${senderName ? senderName + ': ' : ''}${messageContent}`;
-            const textarea = document.getElementById('messageContent');
-            if (textarea) {
-                textarea.value = replyText + '\n';
-                textarea.focus();
-                if (window.autoResizeTextarea) window.autoResizeTextarea(textarea);
-            }
-        };
-
-        const deleteAction = menu.querySelector('.delete-action');
-        if (deleteAction) {
-            deleteAction.onclick = async () => {
-                const confirmed = await window.showConfirmModal(t('delete_message_title'), t('delete_message_confirm'));
-                if (confirmed) {
-                    const res = await fetch('/delete_message', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ message_id: parseInt(msgId) })
-                    });
-                    if (res.ok) {
-                        const msgDiv = document.getElementById('msg-' + msgId);
-                        if (msgDiv) {
-                            msgDiv.querySelectorAll('[data-object-url]').forEach(el => {
-                                URL.revokeObjectURL(el.dataset.objectUrl);
-                            });
-                            msgDiv.remove();
+            },
+            { separator: true },
+            {
+                icon: isPinned ? CTX_ICONS.unpin : CTX_ICONS.pin,
+                label: isPinned ? t('unpin_message') : t('pin_message'),
+                onClick: () => {
+                    const chatAddress = (window.State && State.currentChatAddress) || '';
+                    // Pinning from a preview / closed chat: remember the request
+                    // and open the owning conversation first - the pin is then
+                    // applied automatically (see _tryConsumePendingPin).
+                    if (!chatAddress || chatAddress === 'ai_bot') {
+                        const targetAddr = resolveMessageChatAddress(msgId);
+                        if (targetAddr) {
+                            try { localStorage.setItem('_pendingPin', JSON.stringify({ chat: targetAddr, messageId: msgId })); } catch (e) {}
+                            if (window.selectConversation) {
+                                Promise.resolve(window.selectConversation(
+                                    targetAddr,
+                                    (document.querySelector(`.conversation-item[data-address="${CSS.escape(targetAddr)}"]`)?.querySelector('.name')?.textContent) || '',
+                                    targetAddr.startsWith('group:')
+                                )).then(() => window._tryConsumePendingPin());
+                            } else {
+                                window.location.href = '/chat?start_with=' + encodeURIComponent(targetAddr);
+                            }
+                        } else {
+                            window.NotificationManager?.showToast(t('open_chat_first'), 'warning');
                         }
-                        window.loadConversations();
-                        window.NotificationManager?.showToast(t('message_deleted'), 'success');
+                        return;
+                    }
+                    if (isPinned) {
+                        // Открепление текущего сообщения
+                        window.setPinnedForChat(chatAddress, null);
+                        messageEl.classList.remove('pinned-highlight');
+                        messageEl.classList.remove('pinned');
+                        // Refresh the floating pinned bar so it disappears immediately.
+                        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(chatAddress);
+                        window.NotificationManager?.showToast(t('unpinned_message'), 'success');
                     } else {
-                        window.NotificationManager?.showToast(t('delete_failed'), 'error');
+                        // Закрепление: один закреп на чат (сохраняется и на сервере)
+                        window.setPinnedForChat(chatAddress, {
+                            messageId: msgId,
+                            content: messageContent.substring(0, 100),
+                            timestamp: Date.now()
+                        });
+                        document.querySelectorAll('.message.pinned').forEach(el => el.classList.remove('pinned'));
+                        messageEl.classList.add('pinned');
+                        messageEl.classList.add('pinned-highlight');
+                        setTimeout(() => messageEl.classList.remove('pinned-highlight'), 2000);
+                        window.NotificationManager?.showToast(t('pinned_message'), 'success');
                     }
                 }
-                menu.remove();
-            };
-        }
+            },
+            {
+                icon: CTX_ICONS.trash,
+                title: t('delete_message'),
+                label: '',
+                danger: true,
+                hidden: !isOwn,
+                onClick: () => doDeleteMessage(msgId)
+            }
+        ];
+    }
 
-        // Pin message action
-        const pinAction = menu.querySelector('.pin-action');
-        if (pinAction) {
-            pinAction.onclick = async () => {
-                menu.remove();
-                const chatAddress = State.currentChatAddress;
-                if (!chatAddress) return;
-                
-                // Store pinned message in localStorage
-                const storageKey = `pinned_${chatAddress}`;
-                const pinnedData = {
-                    messageId: msgId,
-                    content: messageContent.substring(0, 100),
-                    timestamp: Date.now()
-                };
-                localStorage.setItem(storageKey, JSON.stringify(pinnedData));
-                
-                // Update UI
-                window.updatePinnedMessageBar(chatAddress);
-                window.NotificationManager?.showToast(t('pinned_message'), 'success');
-            };
-        }
-    });
+    // Правый клик по сообщению (делегирование — работает и для новых сообщений из WebSocket)
+    document.addEventListener('contextmenu', (e) => {
+        const messageEl = e.target.closest('.message');
+        if (!messageEl || !window.ContextMenu) return;
+        // Never open a second menu when one is already active (fixes the
+        // "double context menu" seen on some Android long-press combos).
+        if (window.ContextMenu.isOpen()) return;
+        e.preventDefault();
+        const items = buildMessageMenuItems(messageEl);
+        if (!items) return;
+        window.ContextMenu.open(items, { x: e.clientX, y: e.clientY }, { target: messageEl });
+    }, { passive: false });
 
-    // Unpin button handler
-    document.addEventListener('DOMContentLoaded', function() {
-        const unpinBtn = document.getElementById('unpinMessageBtn');
-        if (unpinBtn) {
-            unpinBtn.addEventListener('click', () => {
-                const chatAddress = State.currentChatAddress;
-                if (chatAddress) {
-                    window.unpinMessage(chatAddress);
-                }
-            });
+    // Долгое нажатие по сообщению (тач/стикус) — вешаем при создании элемента
+    window.bindMessageHold = function (messageEl) {
+        if (!messageEl || !window.ContextMenu || messageEl._ctxBound) return;
+        messageEl._ctxBound = true;
+        window.ContextMenu.bind(messageEl, () => {
+            if (window.ContextMenu.isOpen()) return null;
+            return buildMessageMenuItems(messageEl);
+        });
+    };
+
+    // Очистка кэша сообщений при удалении
+    window.clearMessageCacheForId = function (chatId, msgId) {
+        if (!chatId || !window.messagesCache) return;
+        const arr = window.messagesCache.get(chatId);
+        if (arr) {
+            const idx = arr.findIndex(m => String(m.id) === String(msgId));
+            if (idx >= 0) arr.splice(idx, 1);
+            const idSet = window._messageIdSets?.get(chatId);
+            if (idSet) { idSet.delete(parseInt(msgId)); idSet.delete(msgId); }
         }
+    };
+
+    // Unpin button: делегирование от document. Прямой обработчик на кнопке
+    // терялся, потому что updatePinnedMessageBar клонирует .pinned-bar-inner.
+    document.addEventListener('click', function (e) {
+        const btn = e.target && e.target.closest ? e.target.closest('#unpinMessageBtn') : null;
+        if (!btn) return;
+        e.preventDefault();
+        const chatAddress = State.currentChatAddress;
+        if (chatAddress) window.unpinMessage(chatAddress);
     });
 
     document.addEventListener('DOMContentLoaded', initChatActions);
@@ -829,14 +1005,13 @@
     window.startNewChat = startNewChat;
     window.autoResizeTextarea = autoResizeTextarea;
     window.updateSendButtonVisibility = updateSendButtonVisibility;
-    window.unpinMessage = unpinMessage;
-    
+
     // Theme toggle function
     window.toggleTheme = function() {
         const body = document.body;
         const isLight = body.classList.toggle('light-theme');
         localStorage.setItem('theme', isLight ? 'light' : 'dark');
-        
+
         // Update icon visibility
         const sunIcon = document.querySelector('.sun-icon');
         const moonIcon = document.querySelector('.moon-icon');
@@ -845,7 +1020,7 @@
             moonIcon.classList.toggle('hidden', !isLight);
         }
     };
-    
+
     // Add event listener for theme toggle button
     document.addEventListener('DOMContentLoaded', function() {
         const themeBtn = document.getElementById('themeToggleBtn');
@@ -853,7 +1028,7 @@
             themeBtn.addEventListener('click', window.toggleTheme);
         }
     });
-    
+
     // Initialize theme from localStorage
     (function initTheme() {
         const savedTheme = localStorage.getItem('theme') || 'dark';
@@ -867,14 +1042,14 @@
             }
         }
     })();
-    
+
     // Search chats function
     window.filterChats = function(query) {
         const list = document.getElementById('conversationsList');
         if (!list) return;
         const items = list.querySelectorAll('.conversation-item');
         const lowerQuery = query.toLowerCase();
-        
+
         items.forEach(item => {
             const name = item.querySelector('.name')?.textContent?.toLowerCase() || '';
             const meta = item.querySelector('.meta')?.textContent?.toLowerCase() || '';
@@ -885,38 +1060,358 @@
             }
         });
     };
-    
-    // Pinned message bar functions
+
+    // ========== Reply quote (WhatsApp-style) ==========
+    // Attaches a clickable quote chip above the input; clicking scrolls to and
+    // highlights the original message. The quoted text is sent together with
+    // the new message as a markdown blockquote prefixed by the sender name.
+    window.getReplyQuote = function () { return _replyQuote; };
+
+    // Robustly find the message element by id (supports data-message-id,
+    // data-id and the #msg-<id> convention used across the app).
+    function findMessageEl(msgId) {
+        if (msgId === undefined || msgId === null || msgId === '') return null;
+        const s = String(msgId);
+        let el = document.getElementById('msg-' + s);
+        if (!el) el = document.querySelector(`.message[data-message-id="${CSS.escape(s)}"]`);
+        if (!el) el = document.querySelector(`.message[data-id="${CSS.escape(s)}"]`);
+        return el;
+    }
+    window.findMessageEl = findMessageEl;
+
+    // Resolve the conversation address a message belongs to: the currently
+    // open chat first, then the owning list item (contacts preview), then the
+    // message's own sender dataset.
+    function resolveMessageChatAddress(msgId) {
+        const cur = window.State?.currentChatAddress;
+        if (cur && cur !== 'ai_bot') return cur;
+        const el = findMessageEl(msgId);
+        if (el) {
+            const item = el.closest('.conversation-item');
+            if (item && item.dataset.address) return item.dataset.address;
+            if (el.dataset.chatAddress) return el.dataset.chatAddress;
+            if (el.dataset.sender) return el.dataset.sender;
+        }
+        return '';
+    }
+
+    // Attach the reply chip as soon as the message input exists. Used after
+    // an SPA navigation or a full page reload (the old code waited for the
+    // quoted message to be *rendered*, which never happens for messages from
+    // older history pages - that was the main reason "Reply" silently did
+    // nothing). Also consumes any pending pin request saved before a reload.
+    function _ensureReplyAttached(payload, tries) {
+        tries = tries || 0;
+        const ta = document.getElementById('messageContent');
+        if (ta && typeof window.attachReplyQuote === 'function') {
+            const p = window._pendingReply || payload;
+            window._pendingReply = null;
+            window.attachReplyQuote(p);
+            return;
+        }
+        if (tries >= 100) { // ~8s: give up quietly instead of hanging forever
+            window._pendingReply = null;
+            try { sessionStorage.removeItem('_replyRetry'); } catch (e) {}
+            return;
+        }
+        setTimeout(() => _ensureReplyAttached(payload, tries + 1), 80);
+    }
+
+    window.attachReplyQuote = function ({ messageId, sender, text }) {
+        // Guard against being called with no payload at all (would previously
+        // throw a TypeError and make the menu click look dead).
+        if (!arguments.length || arguments[0] == null) return;
+        messageId = messageId ?? '';
+        const textarea = document.getElementById('messageContent');
+        const panel = document.getElementById('chatPanel');
+        // On mobile the chat panel is toggled via inline display styles
+        // (showChatPanel in chat.html) - open it so the reply chip and input
+        // are actually visible before attaching the quote.
+        if (panel && window.innerWidth < 768 && typeof window.showChatPanel === 'function') {
+            window.showChatPanel();
+        } else if (panel && !panel.classList.contains('open')) {
+            panel.classList.add('open');
+        }
+
+        const chatAddress = window.State?.currentChatAddress;
+        // No chat open (or the AI assistant is open, where replies make no
+        // sense): open the conversation that owns the quoted message first,
+        // then attach the chip. We do NOT require the message itself to be
+        // rendered - only the input must exist (see _ensureReplyAttached).
+        if (!textarea || !chatAddress || chatAddress === 'ai_bot') {
+            const targetAddr = resolveMessageChatAddress(messageId);
+            if (targetAddr) {
+                window._pendingReply = { messageId, sender, text };
+                if (window.selectConversation) {
+                    Promise.resolve(window.selectConversation(
+                        targetAddr,
+                        (document.querySelector(`.conversation-item[data-address="${CSS.escape(targetAddr)}"]`)?.querySelector('.name')?.textContent) || '',
+                        targetAddr.startsWith('group:')
+                    )).finally(() => _ensureReplyAttached({ messageId, sender, text }));
+                } else {
+                    window.location.href = '/chat?start_with=' + encodeURIComponent(targetAddr);
+                }
+                return;
+            }
+            if (!textarea) {
+                // The page has no chat markup at all (contacts/groups/etc.):
+                // navigate to /chat (SPA if possible) and attach once ready.
+                const payload = { messageId, sender, text };
+                window._pendingReply = payload;
+                try { sessionStorage.setItem('_replyRetry', JSON.stringify(payload)); } catch (e) {}
+                try {
+                    if (window.spaNavigate) window.spaNavigate('/chat');
+                    else window.location.href = '/chat?reply=' + encodeURIComponent(messageId || '');
+                } catch (e) {
+                    window.location.href = '/chat?reply=' + encodeURIComponent(messageId || '');
+                }
+                _ensureReplyAttached(payload);
+                return;
+            }
+            // Chat address unknown and input exists - just attach locally.
+        }
+        if (!textarea) return; // safety: input vanished mid-flow
+        if (textarea.offsetParent === null) {
+            // Input exists but is inside a hidden container - make it visible:
+            // clear legacy inline display:none set by AI-chat switching,
+            // force-open the chat panel, and fall back to enabling the field.
+            const area = textarea.closest('.input-area');
+            if (area) area.style.display = '';
+            textarea.style.display = '';
+            if (panel) {
+                panel.style.display = '';
+                panel.classList.add('open');
+            }
+            if (window.innerWidth < 768 && typeof window.showChatPanel === 'function') {
+                window.showChatPanel();
+            }
+        }
+        // The input may be disabled until a chat is fully opened - enable it so
+        // the user can type the reply immediately (WhatsApp behaviour).
+        textarea.disabled = false;
+        textarea.readOnly = false;
+        _replyQuote = { messageId: String(messageId || ''), sender: sender || '', text: text || '' };
+
+        let box = document.getElementById('replyQuoteBox');
+        if (!box) {
+            box = document.createElement('div');
+            box.id = 'replyQuoteBox';
+            box.className = 'reply-quote-box';
+            // Insert as the FIRST child of the .input-area form so the chip
+            // sits inside the rounded input bubble, above the text line.
+            const area = textarea.closest('.input-area');
+            const wrapper = textarea.closest('.input-wrapper');
+            const container = area || (wrapper ? wrapper.parentNode : textarea.parentNode);
+            container.insertBefore(box, container.firstChild);
+        }
+        const shortText = (_replyQuote.text || '').replace(/\s+/g, ' ').slice(0, 120);
+        box.innerHTML = `
+            <div class="reply-quote-bar"></div>
+            <div class="reply-quote-body">
+                <div class="reply-quote-sender">${escapeHtml(_replyQuote.sender || t('reply'))}</div>
+                <div class="reply-quote-text truncate">${escapeHtml(shortText)}</div>
+            </div>
+            <button type="button" class="reply-quote-close" aria-label="Cancel reply">&times;</button>`;
+        box.classList.add('active');
+        box.querySelector('.reply-quote-body').addEventListener('click', () => {
+            window.scrollToAndHighlightMessage(_replyQuote.messageId);
+        });
+        box.querySelector('.reply-quote-close').addEventListener('click', () => window.clearReplyQuote());
+
+        textarea.focus();
+        if (window.autoResizeTextarea) window.autoResizeTextarea(textarea);
+        if (window.updateSendButtonVisibility) window.updateSendButtonVisibility();
+
+        // Highlight the source message like WhatsApp does when replying
+        window.scrollToAndHighlightMessage(_replyQuote.messageId);
+    };
+
+    window.clearReplyQuote = function () {
+        _replyQuote = null;
+        const box = document.getElementById('replyQuoteBox');
+        if (box) { box.remove(); }
+        if (window.updateSendButtonVisibility) window.updateSendButtonVisibility();
+    };
+
+    // Consume a reply request saved before a fallback full page reload
+    // (?reply=<id> or sessionStorage payload) once the chat page is ready.
+    window._tryConsumePendingReply = function () {
+        let id = '';
+        try { id = new URLSearchParams(location.search).get('reply') || ''; } catch (e) {}
+        let payload = null;
+        try { payload = JSON.parse(sessionStorage.getItem('_replyRetry') || 'null'); } catch (e) {}
+        if (!id && !payload) return false;
+        const el = id ? (document.getElementById('msg-' + id) ||
+            Array.from(document.querySelectorAll('.message')).find(m => String(m.dataset.messageId) === String(id))) : null;
+        if (el) {
+            const content = (window.getMessageText ? window.getMessageText(el) : (el.querySelector('.message-content')?.textContent || ''));
+            const sender = el.querySelector('.content strong')?.textContent || '';
+            try { sessionStorage.removeItem('_replyRetry'); } catch (e) {}
+            window.attachReplyQuote({ messageId: el.dataset.messageId || id, sender, text: content });
+            try { history.replaceState({}, '', '/chat'); } catch (e) {}
+            return true;
+        }
+        if (payload) {
+            try { sessionStorage.removeItem('_replyRetry'); } catch (e) {}
+            window.attachReplyQuote(payload);
+            try { history.replaceState({}, '', '/chat'); } catch (e) {}
+            return true;
+        }
+        return false;
+    };
+    setTimeout(() => { try { window._tryConsumePendingReply(); } catch (e) {} }, 600);
+    setTimeout(() => { try { window._tryConsumePendingReply(); } catch (e) {} }, 2500);
+
+    // Consume a pin request saved when "Pin" was used from a preview / closed
+    // chat: applies it to the owning conversation once that chat is open.
+    window._tryConsumePendingPin = function () {
+        let req = null;
+        try { req = JSON.parse(localStorage.getItem('_pendingPin') || 'null'); } catch (e) {}
+        if (!req || !req.chat) return false;
+        const cur = (window.State && State.currentChatAddress) || '';
+        if (cur !== req.chat) return false;
+        try { localStorage.removeItem('_pendingPin'); } catch (e) {}
+        const el = findMessageEl(req.messageId);
+        const content = el ? getMessageText(el) : '';
+        window.setPinnedForChat(req.chat, {
+            messageId: String(req.messageId),
+            content: content.substring(0, 100),
+            timestamp: Date.now()
+        });
+        if (el) {
+            document.querySelectorAll('.message.pinned').forEach(x => x.classList.remove('pinned'));
+            el.classList.add('pinned');
+        }
+        window.NotificationManager?.showToast(t('pinned_message'), 'success');
+        return true;
+    };
+    setTimeout(() => { try { window._tryConsumePendingPin(); } catch (e) {} }, 800);
+    setTimeout(() => { try { window._tryConsumePendingPin(); } catch (e) {} }, 2800);
+
+    // Scroll to a message and highlight it. If the message is not rendered yet
+    // (old history page), reuse jumpToPinnedMessage which loads older pages.
+    window.scrollToAndHighlightMessage = async function (msgId) {
+        if (!msgId) return;
+        const el = findMessageEl(msgId);
+        if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.classList.add('msg-highlight');
+            setTimeout(() => el.classList.remove('msg-highlight'), 2200);
+            return;
+        }
+        if (window.jumpToPinnedMessage) {
+            try { await window.jumpToPinnedMessage(msgId); } catch (e) {}
+        }
+    };
+
+    // Compose outgoing text with the quote prefix, then clear the chip
+    // Ответ теперь передаётся полем reply_to_id (см. sendMessage), а не текстом-цитатой.
+    window.consumeReplyQuote = function (userText) {
+        if (!_replyQuote) return userText;
+        window.clearReplyQuote();
+        return userText;
+    };
+
+    // Pinned message bar (single source of truth: localStorage pinned_<chat>)
+    // Telegram-style floating pill under the chat header. Clicking it scrolls
+    // to the pinned message; if the message is not loaded yet (old history),
+    // the chat is reloaded from the server so the message can be found.
     window.updatePinnedMessageBar = function(chatAddress) {
         const bar = document.getElementById('pinnedMessagesBar');
         const preview = document.getElementById('pinnedMessagePreview');
+        const label = document.getElementById('pinnedMessageLabel');
         if (!bar || !preview) return;
-        
-        const storageKey = `pinned_${chatAddress}`;
-        const pinnedData = localStorage.getItem(storageKey);
-        
-        if (pinnedData) {
-            const data = JSON.parse(pinnedData);
-            preview.textContent = data.content;
+
+        let data = null;
+        try {
+            const raw = localStorage.getItem('pinned_' + chatAddress);
+            data = raw ? JSON.parse(raw) : null;
+        } catch (e) { data = null; }
+
+        if (data && data.messageId) {
+            if (label) label.textContent = t('pinned_message') || 'Pinned message';
+            preview.textContent = data.content || '';
             bar.classList.add('active');
-            
-            // Scroll to pinned message on click
-            preview.onclick = () => {
-                const msgEl = document.getElementById('msg-' + data.messageId);
-                if (msgEl) {
-                    msgEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    msgEl.classList.add('pinned-highlight');
-                    setTimeout(() => msgEl.classList.remove('pinned-highlight'), 2000);
-                }
-            };
+            bar.dataset.pinnedMessageId = data.messageId;
+
+            const inner = bar.querySelector('.pinned-bar-inner');
+            // Remove old handler before attaching a new one (avoid duplicates)
+            const fresh = inner.cloneNode(true);
+            inner.parentNode.replaceChild(fresh, inner);
+            const textBtn = fresh.querySelector('.pinned-bar-text');
+            if (textBtn) {
+                textBtn.style.cursor = 'pointer';
+                textBtn.addEventListener('click', () => jumpToMessage(data.messageId));
+            }
         } else {
             bar.classList.remove('active');
+            delete bar.dataset.pinnedMessageId;
         }
     };
-    
+
+    // Scroll to a message by id. If it isn't rendered yet (old history, only
+    // the last page is loaded), fetch older pages until found (max 10).
+    async function jumpToMessage(messageId) {
+        const scrollToEl = (el) => {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.classList.add('pinned-highlight');
+            setTimeout(() => el.classList.remove('pinned-highlight'), 2000);
+        };
+
+        const findEl = () => {
+            let el = document.getElementById('msg-' + messageId);
+            if (!el) {
+                const container = document.getElementById('messagesContainer');
+                const msgs = container ? container.querySelectorAll('.message') : [];
+                for (const m of msgs) {
+                    if (String(m.dataset.messageId) === String(messageId)) { el = m; break; }
+                }
+            }
+            return el;
+        };
+
+        let el = findEl();
+        if (el) { scrollToEl(el); return; }
+
+        const chatAddress = State.currentChatAddress;
+        if (!chatAddress || !window.loadOlderMessages) return;
+
+        for (let attempt = 0; attempt < 10; attempt++) {
+            const container = document.getElementById('messagesContainer');
+            const first = container ? container.querySelector('.message') : null;
+            if (!first) break;
+            const oldestId = parseInt(first.dataset.messageId);
+            if (!oldestId) break;
+            try {
+                await window.loadOlderMessages(chatAddress, oldestId);
+            } catch (e) { break; }
+            el = findEl();
+            if (el) { scrollToEl(el); return; }
+            // Stop if no older messages were added (beginning of history reached)
+            const newFirst = document.getElementById('messagesContainer')?.querySelector('.message');
+            if (newFirst && parseInt(newFirst.dataset.messageId) === oldestId) break;
+        }
+        window.NotificationManager?.showToast(t('message_not_found') || 'Message not found', 'warning');
+    }
+    window.jumpToPinnedMessage = jumpToMessage;
+
+    // Keep messages-container padding so the floating pinned pill never covers
+    // the first message line (Telegram behaviour).
+    function adjustPinnedBarPadding() {
+        const container = document.getElementById('messagesContainer');
+        const bar = document.getElementById('pinnedMessagesBar');
+        if (!container || !bar) return;
+        const active = bar.classList.contains('active');
+        container.style.paddingTop = active ? '60px' : '';
+    }
+    window.adjustPinnedBarPadding = adjustPinnedBarPadding;
+    const _origUpdatePinnedBar = window.updatePinnedMessageBar;
+    window.updatePinnedMessageBar = function (chatAddress) {
+        _origUpdatePinnedBar(chatAddress);
+        adjustPinnedBarPadding();
+    };
+
     window.unpinMessage = function(chatAddress) {
-        const storageKey = `pinned_${chatAddress}`;
-        localStorage.removeItem(storageKey);
-        window.updatePinnedMessageBar(chatAddress);
+        window.setPinnedForChat(chatAddress, null);
     };
 })();

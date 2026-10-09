@@ -94,6 +94,9 @@ CURIOSITY_UNCERTAINTY_THRESHOLD = 0.7
 CURIOSITY_NOVELTY_THRESHOLD = 0.6
 CURIOSITY_RESEARCH_INTERVAL = 600
 RESOURCE_BUDGET_LLM_CALLS = 100
+# BUGFIX: флаг был False, из-за чего AutonomyEngine (enqueue_topic/_pump_queue)
+# молча отклонял/вычищал все темы — фоновое исследование не работало вообще.
+# Legacy _auto_research по-прежнему гасится этим флагом в ai_assistant._periodic_research.
 AUTO_RESEARCH_ENABLED = True
 
 # -------------------------------
@@ -406,6 +409,16 @@ RERANK_ENABLED = True
 RERANK_CANDIDATE_MULTIPLIER = 3
 RERANK_MAX_CANDIDATES = 20
 
+# Таймаут LLM-реранка памяти (сек). При превышении — откат на порядок по _score.
+RERANK_TIMEOUT = 4.0
+# Soft-switch отключения thinking (Qwen3: " /no_think"). Добавляется к последнему
+# user-сообщению во ВСЕХ вызовах без режима рассуждений (служебные вызовы, tool-decide,
+# обычный стрим), чтобы модель не тратила токены на скрытое reasoning.
+# Пустая строка "" — отключить (если модель не поддерживает такой переключатель).
+LLM_NO_THINK_SUFFIX = " /no_think"
+# Температура финального ответа, когда он опирается на инструменты/поиск (меньше выдумок).
+GROUNDED_ANSWER_TEMP = 0.4
+
 # -------------------------------
 # Верификация финального ответа (критик) — пункт №3
 # -------------------------------
@@ -429,7 +442,7 @@ VERIFICATION_MAX_TOKENS = 150
 # в tool_router.py), делаем один дешёвый предварительный вызов, который
 # раскладывает запрос на список подзадач, и передаём этот список как
 # ориентир в промпт выбора инструмента на каждом раунде.
-TOOL_PLANNING_ENABLED = True
+TOOL_PLANNING_ENABLED = False  # отключено: 2 доп. LLM-вызова на каждый составной запрос
 TOOL_PLANNING_MIN_LEN = 140
 MAX_SUBTASKS = 4
 
@@ -482,12 +495,6 @@ SEARCH_FACT_SANITIZER_ENABLED = True
 # C. Подзапросный retrieval для составных вопросов (retrieve по subqueries).
 SUBQUERY_RETRIEVAL_ENABLED = True
 MAX_RETRIEVE_SUBQUERIES = 3
-# D. LLM-подтверждение эвристических противоречий в KnowledgeIngestion.
-#    При сбое/таймауте верификатора система откатывается на эвристику.
-# False: один механизм LLM-проверки противоречий — периодический
-# _verify_pending_contradictions в ai_assistant. Включение сюда
-# дублировало проверку двумя разными промптами (ingestion + controller).
-CONTRADICTION_LLM_VERIFY_ENABLED = False
 # E. Финальный критик: сверка ответа с планом подзадач и добор пропущенного.
 PLAN_CRITIC_ENABLED = True
 PLAN_CRITIC_MAX_MISSED = 3
@@ -570,3 +577,14 @@ IDENTITY_CONSISTENCY_THRESHOLD = 0.35
 
 # Сколько фактов составлять "Ядро" (несущие стены графа)
 IDENTITY_CORE_SIZE = 7
+
+
+# [fast-path-patch]
+# ===== Быстрый / медленный контур (fast_router.py) =====
+FAST_ROUTER_ENABLED = True        # False -> всё как раньше (всегда ReAct)
+FAST_ROUTER_THRESHOLD = 0.5       # p >= порога -> ToolRouter; ниже -> сразу стрим
+FAST_ROUTER_EXPLORE = 0.05        # доля пограничных запросов, которые принудительно идут в TOOLS (сбор меток)
+DEFER_POSTPROCESS = True          # plan_critic/verify/identity ПОСЛЕ [DONE], замечания -> уведомления
+DEFER_MIN_RESPONSE_LEN = 400      # короткие ответы без поиска/инструментов вообще не проверяются
+BG_LLM_MAX_WAIT = 300.0           # макс. ожидание «тишины» фоновым LLM-вызовом, сек
+BG_LLM_COOLDOWN = 3.0             # сколько секунд тишины после ответа нужно фону, сек

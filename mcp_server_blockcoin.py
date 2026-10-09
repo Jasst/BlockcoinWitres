@@ -9,7 +9,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Literal, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 import os
 import base64
 import re
@@ -24,8 +24,8 @@ from pydantic import Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from GCN.config_ai import MEMORY_BASE_DIR, GENERATED_IMAGES_DIR, EASYDIFFUSION_ENABLED
-from GCN.memory_service import get_memory_service, MemoryService
+from GCN.config_ai import GENERATED_IMAGES_DIR, EASYDIFFUSION_ENABLED
+from GCN.memory_graph import get_memory_service, MemoryService
 from GCN.web_search import deep_search
 from GCN.image_utils import enhance_prompt, generate_image as gen_image
 from routes.ai_assistant import get_assistant
@@ -69,11 +69,6 @@ _ENV_DEFAULT_USER = os.getenv("BLOCKCOIN_USER_ID", "").strip()
 _STDIO_VERIFIED_USER: "Optional[str]" = None
 _STDIO_VERIFIED_SIGNER: "Optional[str]" = None
 
-# Не используется. Оставлено для обратной совместимости импортов, если где-то
-# в коде есть ссылки на старое имя.
-_VERIFIED_USER: "Optional[str]" = None
-_VERIFIED_SIGNER: "Optional[str]" = None
-
 _LOGIN_NONCES: Dict[str, Tuple[str, float]] = {}  # nonce -> (canon_user_id, expires_at)
 
 
@@ -96,31 +91,6 @@ def _is_http_transport(ctx: "Optional[Context]") -> bool:
         return False
 
 
-def _session_id_from_ctx(ctx: "Optional[Context]") -> "Optional[str]":
-    """
-    Возвращает стабильный идентификатор сессии для HTTP-транспорта.
-    (Задел на будущее; сейчас не используется, но полезно для отладки.)
-    """
-    if ctx is None:
-        return None
-    for attr in ("session_id", "client_id"):
-        try:
-            sid = getattr(ctx, attr, None)
-            if sid:
-                return str(sid)
-        except Exception:
-            pass
-    try:
-        req = ctx.request_context.request
-        if req is not None:
-            sid = req.headers.get("mcp-session-id")
-            if sid:
-                return sid
-    except Exception:
-        pass
-    return None
-
-
 def _cleanup_expired_nonces(now: Optional[float] = None) -> None:
     """Удаляет просроченные nonce из словаря."""
     now = now or time.time()
@@ -129,23 +99,194 @@ def _cleanup_expired_nonces(now: Optional[float] = None) -> None:
         _LOGIN_NONCES.pop(n, None)
 
 
-def _user_from_ctx(ctx: "Optional[Context]") -> "Optional[str]":
-    """Идентификатор пользователя из HTTP-запроса (streamable HTTP transport).
+# =====================================================================
+# Вход внешних ИИ (HTTP) по одноразовому коду из веб-чата
+# =====================================================================
+# Веб-чат работает с памятью напрямую (user_id = адрес из require_auth), а
+# внешний ИИ-клиент по HTTP получает доступ только после login(code):
+#   1) пользователь, вошедший в веб-чат, жмёт «Подключить ИИ» в профиле
+#      -> POST /ai/mcp_code -> issue_login_code(address);
+#   2) говорит внешнему ИИ: «войди с кодом XXXXXXXX»;
+#   3) ИИ вызывает login(code) -> mcp-session-id привязывается к адресу.
+# Состояние в памяти процесса: рассчитано на ОДИН воркер (встроенный /mcp).
+# код -> (user_id, expires_at).
+# expires_at == _CODE_PERSISTENT (float('inf')) → бессрочный код до отзыва.
+# expires_at < now → legacy one-time код с TTL, подчищается _prune_login_state.
+_LOGIN_CODES: Dict[str, Tuple[str, float]] = {}
+_CODE_PERSISTENT = float("inf")
+_HTTP_SESSIONS: Dict[str, Tuple[str, float]] = {}   # mcp-session-id -> (user_id, срок)
+# NEW: резервный индекс ip -> (user_id, срок). Многие облачные MCP-клиенты
+# открывают новую MCP-сессию на КАЖДЫЙ tools/call, и mcp-session-id, выданный
+# при login, в следующий вызов не приходит. Проверяется ВТОРЫМ — после sid.
+_HTTP_IP_SESSIONS: Dict[str, Tuple[str, float]] = {}
+_LOGIN_FAILS: Dict[str, List[float]] = {}           # ip -> времена неудачных попыток
+_LOGIN_CODE_TTL = 600
+_HTTP_SESSION_TTL = int(os.getenv("MCP_HTTP_SESSION_TTL", str(12 * 3600)))
+_HTTP_SESSIONS_MAX = 5000
+_HTTP_IP_SESSIONS_MAX = 500
+_LOGIN_FAIL_LIMIT = 10          # неудачных попыток ...
+_LOGIN_FAIL_WINDOW = 600        # ... за 10 минут с одного IP
+_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+# 8 знаков = 2^40 ≈ 10^12 вариантов. Для одноразового 10-минутного кода
+# хватало с запасом, для бессрочного ключа поднимаем до 12 знаков (2^60).
+# Длину можно переопределить через env MCP_LOGIN_CODE_LENGTH.
+_CODE_LENGTH = int(os.getenv("MCP_LOGIN_CODE_LENGTH", "12"))
 
-    Хост/шлюз платформы обязан передавать заголовок X-User-Id с кошельком
-    текущей сессии. Для stdio-транспорта сырого HTTP-запроса нет — None.
-    Любая ошибка доступа к контексту гасится: идентификация не должна ронять тул.
-    """
+# Старое поведение (HTTP без входа: берётся args.user_id или default_user).
+# Небезопасно — включайте только временно: MCP_ALLOW_LEGACY_HTTP=1.
+_ALLOW_LEGACY_HTTP = os.getenv("MCP_ALLOW_LEGACY_HTTP", "0") == "1"
+# Доверять заголовку X-User-Id по HTTP. nginx ОБЯЗАН его обнулять для внешних
+# клиентов, иначе заголовок подделывается. По умолчанию выключено.
+_TRUST_X_USER_ID = os.getenv("MCP_TRUST_X_USER_ID", "0") == "1"
+
+_LOGIN_HINT = (
+    "Требуется вход. Откройте веб-чат -> Профиль -> «Подключить ИИ», "
+    "получите код доступа (действует, пока вы не отзовёте его в Профиле) "
+    "и вызовите инструмент login(code)."
+)
+
+
+def _http_request(ctx: "Optional[Context]"):
+    """Starlette-запрос для HTTP-транспорта или None (stdio / вне запроса)."""
     if ctx is None:
         return None
     try:
-        req = getattr(ctx.request_context, "request", None)
-        if req is None:
-            return None
-        uid = req.headers.get("x-user-id")
-        return uid.strip() if uid else None
+        return getattr(ctx.request_context, "request", None)
     except Exception:
         return None
+
+
+def _prune_login_state(now: Optional[float] = None) -> None:
+    now = now or time.time()
+    # exp < now (не <=) — persistent-коды с exp == float('inf') никогда не истекают.
+    for k in [k for k, (_, exp) in _LOGIN_CODES.items() if exp < now]:
+        _LOGIN_CODES.pop(k, None)
+    for k in [k for k, (_, exp) in _HTTP_SESSIONS.items() if exp <= now]:
+        _HTTP_SESSIONS.pop(k, None)
+    if len(_HTTP_SESSIONS) > _HTTP_SESSIONS_MAX:
+        oldest = sorted(_HTTP_SESSIONS.items(), key=lambda kv: kv[1][1])
+        for k, _ in oldest[: len(_HTTP_SESSIONS) - _HTTP_SESSIONS_MAX]:
+            _HTTP_SESSIONS.pop(k, None)
+    # NEW: чистим IP-индекс по TTL и по размеру
+    for k in [k for k, (_, exp) in _HTTP_IP_SESSIONS.items() if exp <= now]:
+        _HTTP_IP_SESSIONS.pop(k, None)
+    if len(_HTTP_IP_SESSIONS) > _HTTP_IP_SESSIONS_MAX:
+        oldest = sorted(_HTTP_IP_SESSIONS.items(), key=lambda kv: kv[1][1])
+        for k, _ in oldest[: len(_HTTP_IP_SESSIONS) - _HTTP_IP_SESSIONS_MAX]:
+            _HTTP_IP_SESSIONS.pop(k, None)
+    for ip in list(_LOGIN_FAILS):
+        _LOGIN_FAILS[ip] = [t for t in _LOGIN_FAILS[ip] if now - t < _LOGIN_FAIL_WINDOW]
+        if not _LOGIN_FAILS[ip]:
+            _LOGIN_FAILS.pop(ip, None)
+
+
+def issue_login_code(user_id: str, persistent: bool = True) -> str:
+    """Выдаёт код входа для внешнего ИИ. Прежние коды этого пользователя аннулируются.
+
+    persistent=True (по умолчанию) — код действует бессрочно, пока не будет
+    явно отозван через revoke_login_code() (кнопка «Отозвать» в профиле).
+    persistent=False — legacy one-time код с TTL _LOGIN_CODE_TTL.
+    """
+    uid = _canon_user_id(user_id) or user_id.strip().lower()
+    _prune_login_state()
+    for k in [k for k, (u, _) in _LOGIN_CODES.items() if u == uid]:
+        _LOGIN_CODES.pop(k, None)
+    code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
+    expires = _CODE_PERSISTENT if persistent else time.time() + _LOGIN_CODE_TTL
+    _LOGIN_CODES[code] = (uid, expires)
+    logger.info(f"[auth] issue код для {uid[:16]}… (persistent={persistent})")
+    return code
+
+
+def get_login_code_for_user(user_id: str) -> Optional[Tuple[str, float]]:
+    """Возвращает (code, expires_at) текущий активный код пользователя или None."""
+    uid = _canon_user_id(user_id) or user_id.strip().lower()
+    _prune_login_state()
+    for code, (u, exp) in _LOGIN_CODES.items():
+        if u == uid:
+            return code, exp
+    return None
+
+
+def revoke_login_code(user_id: str) -> Dict[str, int]:
+    """Отзывает все коды пользователя + сбрасывает все его активные сессии.
+
+    Без сброса сессий отзыв кода был бы фиктивным: внешний ИИ, уже вошедший
+    по этому коду, продолжил бы читать память через свой mcp-session-id /
+    IP-привязку. Поэтому отзыв кода = немедленный разлогин всех клиентов
+    этого пользователя.
+    """
+    uid = _canon_user_id(user_id) or user_id.strip().lower()
+    _prune_login_state()
+    codes_removed = [k for k, (u, _) in _LOGIN_CODES.items() if u == uid]
+    for k in codes_removed:
+        _LOGIN_CODES.pop(k, None)
+    sids_removed = [s for s, (u, _) in _HTTP_SESSIONS.items() if u == uid]
+    for s in sids_removed:
+        _HTTP_SESSIONS.pop(s, None)
+    ips_removed = [i for i, (u, _) in _HTTP_IP_SESSIONS.items() if u == uid]
+    for i in ips_removed:
+        _HTTP_IP_SESSIONS.pop(i, None)
+    logger.info(
+        f"[auth] revoke для {uid[:16]}…: codes={len(codes_removed)}, "
+        f"sids={len(sids_removed)}, ips={len(ips_removed)}"
+    )
+    return {
+        "codes": len(codes_removed),
+        "sessions": len(sids_removed),
+        "ips": len(ips_removed),
+        "total": len(codes_removed) + len(sids_removed) + len(ips_removed),
+    }
+
+
+def _user_from_ctx(ctx: "Optional[Context]") -> "Optional[str]":
+    """Пользователь, подтверждённый для ТЕКУЩЕГО HTTP-запроса.
+
+    Источники (в порядке приоритета):
+      1) X-User-Id — только при MCP_TRUST_X_USER_ID=1 (по умолчанию выкл.);
+      2) привязка mcp-session-id -> user_id, созданная login(code);
+      3) NEW: привязка ip -> user_id (fallback, если клиент не шлёт стабильный
+         mcp-session-id между вызовами — типично для облачных MCP-клиентов).
+
+    Для stdio (нет HTTP-запроса) возвращает None.
+    """
+    req = _http_request(ctx)
+    if req is None:
+        return None
+    try:
+        if _TRUST_X_USER_ID:
+            uid = req.headers.get("x-user-id")
+            if uid and uid.strip():
+                return uid.strip()
+
+        sid = req.headers.get("mcp-session-id")
+        if sid:
+            entry = _HTTP_SESSIONS.get(sid)
+            if entry:
+                uid, exp = entry
+                if exp > time.time():
+                    return uid
+                _HTTP_SESSIONS.pop(sid, None)
+            logger.info(
+                f"[auth] sid={sid[:8]!r} не найден в _HTTP_SESSIONS "
+                f"(known={len(_HTTP_SESSIONS)}) — пробую IP-fallback"
+            )
+
+        # NEW: IP-fallback
+        ip = req.headers.get("x-real-ip") or (
+            req.client.host if getattr(req, "client", None) else None
+        )
+        if ip:
+            entry = _HTTP_IP_SESSIONS.get(ip)
+            if entry:
+                uid, exp = entry
+                if exp > time.time():
+                    logger.info(f"[auth] IP-fallback сработал: ip={ip} uid={uid[:16]}…")
+                    return uid
+                _HTTP_IP_SESSIONS.pop(ip, None)
+    except Exception as e:
+        logger.warning(f"[auth] _user_from_ctx error: {e}")
+    return None
 
 
 # Два допустимых формата идентификатора пользователя:
@@ -214,8 +355,11 @@ def _resolve_user(user_id: "Optional[str]", ctx: "Optional[Context]" = None) -> 
                     return None
             return canon_header
 
-        # Заголовка нет — падать не будем, но используем только явный user_id
-        # или env. Никакой глобальной сессии.
+        # Подтверждённой идентичности нет. Раньше здесь использовался
+        # args.user_id/env/default_user — то есть ЛЮБОЙ клиент мог читать
+        # чужую память, зная id. Теперь по HTTP нужен login(code).
+        if not _ALLOW_LEGACY_HTTP:
+            raise PermissionError(_LOGIN_HINT)
         if user_id:
             return _canon_user_id(user_id) or user_id.strip()
         if _ENV_DEFAULT_USER:
@@ -241,8 +385,8 @@ def _safe_resolve_user(user_id: "Optional[str]", ctx: "Optional[Context]" = None
     try:
         uid = _resolve_user(user_id, ctx)
         if uid is None:
-            return None, ("Этот MCP-сервер привязан к другому идентификатору "
-                          "(вход подтверждён подписью). Вызов от имени указанного user_id запрещён.")
+            return None, ("Сессия привязана к другому пользователю. Вызов от имени "
+                          "указанного user_id запрещён.")
         return uid, None
     except Exception as e:
         return None, str(e)
@@ -347,6 +491,76 @@ def _prune_last_commands(now: float) -> None:
     stale = [k for k, ts in _last_commands.items() if now - ts >= _DEDUP_WINDOW_SECONDS]
     for k in stale:
         _last_commands.pop(k, None)
+
+
+@mcp.tool()
+async def login(
+        code: str = Field(...,
+                          description="Код доступа из веб-чата: Профиль -> «Подключить ИИ». "
+                                      "Действует, пока пользователь не отзовёт его в Профиле."),
+        ctx: Context = None,
+) -> Dict[str, Any]:
+    """Вход внешнего ИИ в вашу память по коду доступа из веб-чата (HTTP).
+
+    Код, выданный кнопкой «Получить код подключения», действует бессрочно,
+    пока пользователь не нажмёт «Отозвать» в профиле. Один и тот же код можно
+    использовать много раз (переподключение после перезапуска клиента, работа
+    с нескольких устройств и т.п.). Отзыв немедленно сбрасывает все активные
+    MCP-сессии этого пользователя.
+    """
+    req = _http_request(ctx)
+    if req is None:
+        return {"status": "error",
+                "message": "login() нужен только для HTTP-подключений. В stdio используйте identify()/verify_login()."}
+    sid = req.headers.get("mcp-session-id")
+    if not sid:
+        return {"status": "error",
+                "message": "Нет mcp-session-id: клиент должен работать в stateful-сессии MCP."}
+    ip = req.headers.get("x-real-ip") or (req.client.host if getattr(req, "client", None) else "?")
+    now = time.time()
+    _prune_login_state(now)
+    if len(_LOGIN_FAILS.get(ip, [])) >= _LOGIN_FAIL_LIMIT:
+        return {"status": "error", "message": "Слишком много неверных кодов. Повторите через 10 минут."}
+
+    normalized = (code or "").strip().upper().replace("-", "").replace(" ", "")
+    # .get, а не .pop: persistent-код не потребляем — им можно войти много раз.
+    entry = _LOGIN_CODES.get(normalized)
+    if not entry or entry[1] < now:  # < now, не <=: inf-код никогда не истекает
+        _LOGIN_FAILS.setdefault(ip, []).append(now)
+        return {"status": "error", "message": "Код неверный или отозван. Получите новый в Профиле."}
+
+    uid, exp = entry
+    # Legacy-код с TTL потребляем (одноразовый). Persistent оставляем в словаре.
+    if exp != _CODE_PERSISTENT:
+        _LOGIN_CODES.pop(normalized, None)
+    _HTTP_SESSIONS[sid] = (uid, now + _HTTP_SESSION_TTL)
+    # NEW: пишем и IP-индекс — резервный путь для клиентов, которые меняют
+    # mcp-session-id между вызовами. Переменная ip уже посчитана выше в login.
+    if ip and ip != "?":
+        _HTTP_IP_SESSIONS[ip] = (uid, now + _HTTP_SESSION_TTL)
+    logger.info(
+        f"[login] MCP-сессия {sid[:8]}… привязана к {uid[:16]}… "
+        f"(ip={ip}, ip_sessions={len(_HTTP_IP_SESSIONS)})"
+    )
+    return {"status": "ok", "user_id": uid,
+            "message": "Вход выполнен. Дальше user_id передавать не нужно."}
+
+
+@mcp.tool()
+async def logout(ctx: Context = None) -> Dict[str, Any]:
+    """Завершает вход внешнего ИИ (HTTP): память снова недоступна без нового кода."""
+    req = _http_request(ctx)
+    sid = req.headers.get("mcp-session-id") if req is not None else None
+    if sid:
+        _HTTP_SESSIONS.pop(sid, None)
+    # NEW: чистим и IP-индекс, иначе после logout старый IP останется валидным
+    if req is not None:
+        ip = req.headers.get("x-real-ip") or (
+            req.client.host if getattr(req, "client", None) else None
+        )
+        if ip:
+            _HTTP_IP_SESSIONS.pop(ip, None)
+    return {"status": "ok"}
 
 
 @mcp.tool()
@@ -627,9 +841,6 @@ async def remember(
     return {"status": "ok", **result}
 
 
-import numpy as np  # Убедитесь, что numpy импортирован в начале файла (он там есть, но на всякий случай)
-
-
 def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     """Быстрый расчет косинусного сходства."""
     v1, v2 = np.array(vec1), np.array(vec2)
@@ -727,7 +938,7 @@ async def contribute_to_identity(
     явно показать пользователю/модели, а не проигнорировать; либо используйте
     merge_identity_branches() для явного слияния.
     """
-    from GCN.identity_core import append_snapshot
+    from GCN.GCN import append_snapshot
 
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
@@ -762,7 +973,7 @@ async def merge_identity_branches(
     (это не ошибка, просто нечего сводить). merged_heads_count в ответе
     показывает, сколько голов было объединено.
     """
-    from GCN.identity_core import merge_heads
+    from GCN.GCN import merge_heads
 
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
@@ -788,7 +999,7 @@ async def search_identity_chain(
     в FAISS и не находятся через semantic_search/recall. Это единственный
     способ найти "что говорилось про X" без ручного чтения всей цепочки.
     """
-    from GCN.identity_core import search_chain
+    from GCN.GCN import search_chain
     from dataclasses import asdict
 
     uid, err = _safe_resolve_user(user_id, ctx)
@@ -836,7 +1047,7 @@ async def invalidate_identity(
         неточна, уточняю так: ..."). Выбирайте, если содержание звена
         не мусор, а лишь спорная формулировка.
     """
-    from GCN.identity_core import invalidate_snapshot
+    from GCN.GCN import invalidate_snapshot
 
     uid, err = _safe_resolve_user(user_id, ctx)
     if err:
@@ -865,7 +1076,7 @@ async def get_identity_chain(
     heads содержит только ВАЛИДНЫЕ головы: аннулированные сюда не попадают.
     Если их больше одной — цепочка разошлась и требует сверки.
     """
-    from GCN.identity_core import get_chain, get_heads
+    from GCN.GCN import get_chain, get_heads
     from dataclasses import asdict
 
     uid, err = _safe_resolve_user(user_id, ctx)
@@ -906,9 +1117,13 @@ async def web_search(
         queries: Optional[List[str]] = Field(
             None, description="Несколько поисковых запросов для составного вопроса — выполняются параллельно"
         ),
-        max_results: int = Field(5, description="Максимальное число страниц для анализа на каждый запрос", ge=1, le=10)
+        max_results: int = Field(5, description="Максимальное число страниц для анализа на каждый запрос", ge=1, le=10),
+        ctx: Context = None
 ) -> Dict[str, Any]:
     """Выполняет поиск в DuckDuckGo (один или несколько запросов параллельно)."""
+    _gate_uid, _gate_err = _safe_resolve_user(None, ctx)
+    if _gate_err:
+        return {"status": "error", "error": "forbidden", "message": _gate_err}
     query_list: List[str]
     if queries:
         query_list = [q.strip() for q in queries if q and q.strip()][:4]
@@ -1024,9 +1239,13 @@ async def fetch_github_file(
         path: str = Field(..., description="Путь к файлу в репозитории, например 'GCN/config_ai.py'"),
         repo: str = Field("Jasst/BlockcoinWitres", description="Репозиторий в формате owner/repo"),
         branch: str = Field("main", description="Ветка"),
-        max_lines: int = Field(500, description="Максимальное количество строк для возврата (для больших файлов)")
+        max_lines: int = Field(500, description="Максимальное количество строк для возврата (для больших файлов)"),
+        ctx: Context = None
 ) -> Dict[str, Any]:
     """Загружает содержимое файла из публичного репозитория GitHub через raw-ссылку."""
+    _gate_uid, _gate_err = _safe_resolve_user(None, ctx)
+    if _gate_err:
+        return {"status": "error", "error": "forbidden", "message": _gate_err}
     url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path.lstrip('/')}"
     try:
         import aiohttp
@@ -1161,7 +1380,21 @@ async def add_goal(
     if err:
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
-    return await service.add_goal(description, priority)
+    result = await service.add_goal(description, priority)
+
+    # Сразу синхронизируем SelfModel, чтобы get_self_state() показывал
+    # свежую цель, не дожидаясь тика AutonomyEngine.
+    try:
+        gcn_goals = await service.get_goals()
+        if gcn_goals:  # защита от затирания active_goals пустым списком при сбое чтения GCN
+            assistant = await get_assistant(uid)
+            sm = getattr(assistant, "self_model", None)
+            if sm is not None:
+                sm.sync_from_gcn(gcn_goals)
+    except Exception as e:
+        logger.debug(f"sync_from_gcn after add_goal failed: {e}")
+
+    return result
 
 
 @mcp.tool()
@@ -1408,7 +1641,7 @@ async def session_start(
         return {"status": "error", "error": "forbidden", "message": err}
     service = await get_memory_service(uid)
 
-    from GCN.identity_core import needs_consolidation, get_heads
+    from GCN.GCN import needs_consolidation, get_heads
 
     def _identity_status() -> Dict[str, Any]:
         try:
@@ -1566,8 +1799,12 @@ async def update_fact(
 async def read_code_file(
         file_path: str = Field(..., description="Относительный путь от корня проекта, например 'GCN/config_ai.py'"),
         max_lines: int = Field(500, description="Максимум строк для возврата", ge=10, le=2000),
+        ctx: Context = None
 ) -> Dict[str, Any]:
     """Читает файл исходного кода проекта с проверкой безопасности."""
+    _gate_uid, _gate_err = _safe_resolve_user(None, ctx)
+    if _gate_err:
+        return {"status": "error", "error": "forbidden", "message": _gate_err}
     analyzer = get_analyzer()
     content = await analyzer.read_file(file_path, max_lines=max_lines)
     ok = not content.startswith("Ошибка")
@@ -1583,8 +1820,12 @@ async def read_code_file(
 async def search_in_code(
         pattern: str = Field(..., description="Строка или регулярное выражение для поиска в коде проекта"),
         max_results: int = Field(20, description="Максимум результатов", ge=1, le=50),
+        ctx: Context = None
 ) -> Dict[str, Any]:
     """Ищет паттерн (строку или regex) по всем файлам кода проекта."""
+    _gate_uid, _gate_err = _safe_resolve_user(None, ctx)
+    if _gate_err:
+        return {"status": "error", "error": "forbidden", "message": _gate_err}
     analyzer = get_analyzer()
     result = await analyzer.search_in_code(pattern, max_results=max_results)
     found = not result.startswith("Ничего не найдено") and not result.startswith("Ошибка")
@@ -1598,8 +1839,12 @@ async def search_in_code(
 @mcp.tool()
 async def get_project_structure(
         max_depth: int = Field(3, description="Максимальная глубина обхода директорий", ge=1, le=5),
+        ctx: Context = None
 ) -> Dict[str, Any]:
     """Возвращает дерево файлов проекта — только разрешённые расширения кода."""
+    _gate_uid, _gate_err = _safe_resolve_user(None, ctx)
+    if _gate_err:
+        return {"status": "error", "error": "forbidden", "message": _gate_err}
     analyzer = get_analyzer()
     tree = await analyzer.get_project_structure(max_depth=max_depth)
     return {
@@ -1614,8 +1859,12 @@ async def analyze_error(
         error_message: str = Field(..., description="Текст ошибки (например, 'KeyError: config not found')"),
         traceback_str: str = Field("",
                                    description="Полная трассировка стека из Python (необязательно, но улучшает анализ)"),
+        ctx: Context = None
 ) -> Dict[str, Any]:
     """Анализирует Python-ошибку: извлекает файлы и строки из traceback."""
+    _gate_uid, _gate_err = _safe_resolve_user(None, ctx)
+    if _gate_err:
+        return {"status": "error", "error": "forbidden", "message": _gate_err}
     analyzer = get_analyzer()
     analysis = await analyzer.analyze_error_location(error_message, traceback_str)
     return {
@@ -1628,7 +1877,8 @@ async def analyze_error(
 # ============================================================
 # РЕСУРСЫ
 # ============================================================
-@mcp.resource("memory://{user_id}/facts")
+# ОТКЛЮЧЕНО: ресурс читал память ЛЮБОГО user_id без аутентификации.
+# Для чтения фактов используйте инструменты recall/get_memory_stats после login().
 async def list_facts(user_id: str) -> Dict[str, Any]:
     canon = _canon_user_id(user_id) or user_id
     service = await get_memory_service(canon)
@@ -1641,7 +1891,7 @@ async def list_facts(user_id: str) -> Dict[str, Any]:
     }
 
 
-@mcp.resource("memory://{user_id}/fact/{fact_id}")
+# ОТКЛЮЧЕНО по той же причине (см. выше).
 async def get_fact(user_id: str, fact_id: str) -> Dict[str, Any]:
     canon = _canon_user_id(user_id) or user_id
     service = await get_memory_service(canon)

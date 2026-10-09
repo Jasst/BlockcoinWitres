@@ -8,13 +8,13 @@
   :root {
     --glass-bg: rgba(20, 20, 30, 0.6);
     --glass-border: rgba(255, 255, 255, 0.08);
-    --accent-color: #6c5ce7;
-    --accent-glow: rgba(108, 92, 231, 0.4);
-    --success-color: #00b894;
-    --danger-color: #d63031;
-    --text-main: #f5f6fa;
-    --text-muted: #a4b0be;
-    --bg-primary: #0a0a0f; /* добавим для фона */
+    --accent-color: #565d68;
+    --accent-glow: rgba(86, 93, 104, 0.4);
+    --success-color: #4cc38a;
+    --danger-color: #e5544f;
+    --text-main: #eceef1;
+    --text-muted: #a6abb5;
+    --bg-primary: #0d0e11; /* добавим для фона */
   }
 
   /* Общие анимации */
@@ -153,7 +153,7 @@
   }
 
   .btn-primary-oval {
-    background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
+    background: linear-gradient(135deg, var(--accent-color), #565d68);
     box-shadow: 0 4px 15px var(--accent-glow);
   }
 
@@ -170,7 +170,7 @@
 
   .btn-oval.outline:hover,
   .btn-action.outline:hover {
-    background: rgba(108, 92, 231, 0.1);
+    background: rgba(86, 93, 104, 0.1);
   }
 
   /* Иконки-кнопки */
@@ -204,12 +204,12 @@
   }
 
   .status-success {
-    background: rgba(0, 184, 148, 0.2);
+    background: rgba(76, 195, 138, 0.2);
     color: var(--success-color);
   }
 
   .status-warning {
-    background: rgba(214, 48, 49, 0.2);
+    background: rgba(229, 84, 79, 0.2);
     color: var(--danger-color);
   }
 
@@ -354,6 +354,31 @@
     align-items: center;
   }
 
+  /* Подключение внешнего ИИ */
+  .ai-code-box {
+    margin-top: 16px;
+    padding: 18px;
+    border-radius: 16px;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--glass-border);
+    text-align: center;
+  }
+  .ai-code-value {
+    font-family: monospace;
+    font-size: 30px;
+    font-weight: 700;
+    letter-spacing: 6px;
+    color: var(--text-main);
+    user-select: all;
+  }
+  .ai-code-hint {
+    margin-top: 10px;
+  }
+  .ai-code-timer {
+    color: var(--accent-color);
+    font-weight: 600;
+  }
+
   /* Адаптив */
   @media (max-width: 768px) {
     .profile-row {
@@ -387,7 +412,7 @@
           <svg class="moon-icon hidden" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
         </button>
         <button id="langToggle" class="btn-oval outline" data-i18n="lang_toggle" style="min-width: 60px;">EN</button>
-        <button class="btn-icon-oval" onclick="forceReload()" title="Reload page (refresh JS)">
+        <button class="btn-icon-oval" onclick="forceReload()" title="Обновить приложение (сбросить кэш)">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.66 0 3-4.03 3-9s-1.34-9-3-9m0 18c-1.66 0-3-4.03-3-9s1.34-9 3-9"/>
             </svg>
@@ -445,6 +470,28 @@
     </div>
     <p class="text-muted form-hint" data-i18n="warning_mnemonic">⚠️ Keep this phrase secret. Never share it with anyone.</p>
     <button class="btn-primary-oval full-width" onclick="exportMnemonicSecure()" data-i18n="export_mnemonic">🔐 Export Mnemonic</button>
+</div>
+
+<!-- Connect external AI Card -->
+<div class="profile-card" id="aiConnectCard">
+    <h3 id="aiConnectTitle">Connect an AI</h3>
+    <p class="text-muted" id="aiConnectDesc">Let an outside assistant (Claude, ChatGPT, Cursor…) work with this wallet's memory. Get a code and tell the assistant: “log in with code …”. The code stays valid until you revoke it here.</p>    <button class="btn-primary-oval full-width" id="aiConnectBtn">Get connection code</button>
+    <div class="ai-code-box hidden" id="aiCodeBox">
+        <div class="ai-code-value" id="aiCodeValue" aria-live="polite"></div>
+        <div class="flex-row" style="justify-content:center; margin-top:14px;">
+            <button class="btn-oval outline" id="aiCodeCopyBtn">Copy</button>
+            <button class="btn-oval outline" id="aiCodeRevokeBtn"
+                    style="border-color: var(--danger-color); color: var(--danger-color);">
+                Revoke
+            </button>
+        </div>
+        <p class="text-muted ai-code-hint">
+            <span id="aiCodePersistentHint">
+                This code stays valid until you revoke it.
+            </span>
+        </p>
+    </div>
+    <p id="aiConnectError" class="hidden error"></p>
 </div>
 
 <!-- Security Info Card -->
@@ -661,8 +708,26 @@
     return false;
   }
 
-  function forceReload() {
-    location.reload(true);
+  // Полное обновление приложения: сбрасываем service worker и его кэш (Cache Storage),
+  // затем перезагружаем страницу с уникальным URL, чтобы обойти HTTP-кэш.
+  // base.html заново зарегистрирует service worker, и JS подтянется с сервера.
+  // localStorage/sessionStorage НЕ трогаем: там мнемоника и данные входа.
+  async function forceReload() {
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map(r => r.unregister()));
+      }
+      if ('caches' in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map(k => caches.delete(k)));
+      }
+    } catch (e) {
+      console.warn('Cache reset failed:', e);
+    }
+    const url = new URL(location.href);
+    url.searchParams.set('_upd', Date.now());
+    location.replace(url.toString());
   }
   window.forceReload = forceReload;
 
@@ -697,6 +762,137 @@
   window.exportMnemonicSecure = exportMnemonicSecure;
   window.downloadQR = downloadQR;
   window.shareQR = shareQR;
+})();
+</script>
+
+<!-- Connect external AI script -->
+<script>
+(function() {
+  if (window._aiConnectLoaded) return;
+  window._aiConnectLoaded = true;
+
+  function tr(key, fallbackEn, fallbackRu) {
+    const lang = (window.i18next && i18next.language) || localStorage.getItem('app_lang') || 'en';
+    const fallback = lang.startsWith('ru') ? fallbackRu : fallbackEn;
+    try {
+      const v = window.i18next ? i18next.t(key, { defaultValue: fallback }) : fallback;
+      return (!v || v === key) ? fallback : v;
+    } catch (e) { return fallback; }
+  }
+
+  function applyTexts() {
+    const set = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+    set('aiConnectTitle', tr('ai_connect_title', 'Connect an AI', 'Подключить ИИ'));
+    set('aiConnectDesc', tr('ai_connect_desc',
+      'Let an outside assistant (Claude, ChatGPT, Cursor…) work with this wallet\'s memory. Get a code and tell the assistant: “log in with code …”. The code stays valid until you revoke it here.',
+      'Дайте внешнему ассистенту (Claude, ChatGPT, Cursor…) доступ к памяти этого кошелька. Получите код и скажите ассистенту: «войди с кодом …». Код действует, пока вы не отзовёте его здесь.'));
+    set('aiConnectBtn', tr('ai_connect_get_code', 'Get connection code', 'Получить код подключения'));
+    set('aiCodeCopyBtn', tr('copy', 'Copy', 'Копировать'));
+    set('aiCodeRevokeBtn', tr('ai_connect_revoke', 'Revoke', 'Отозвать'));
+    set('aiCodePersistentHint', tr('ai_connect_persistent',
+      'This code stays valid until you revoke it.',
+      'Код действует до отмены.'));
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('aiConnectError');
+    if (!el) return;
+    el.textContent = msg;
+    el.classList.remove('hidden');
+  }
+
+  function showCode(code) {
+    const box = document.getElementById('aiCodeBox');
+    const val = document.getElementById('aiCodeValue');
+    const btn = document.getElementById('aiConnectBtn');
+    val.textContent = code || '';
+    if (code) {
+      box.classList.remove('hidden');
+      btn.textContent = tr('ai_connect_new_code', 'Get a new code', 'Создать новый код');
+    } else {
+      box.classList.add('hidden');
+      btn.textContent = tr('ai_connect_get_code', 'Get connection code', 'Получить код подключения');
+    }
+  }
+
+  async function loadCode() {
+    try {
+      const res = await fetch('/ai/mcp_code', { method: 'GET', credentials: 'same-origin' });
+      if (!res.ok) return;
+      const data = await res.json();
+      showCode(data.code || null);
+    } catch (e) { /* молча — код просто не показываем */ }
+  }
+
+  async function requestCode() {
+    const btn = document.getElementById('aiConnectBtn');
+    const err = document.getElementById('aiConnectError');
+    err.classList.add('hidden');
+    const hasCode = !document.getElementById('aiCodeBox').classList.contains('hidden');
+    if (hasCode && !confirm(tr('ai_connect_replace_confirm',
+        'A new code will invalidate the current one and log out all connected assistants. Continue?',
+        'Новый код отменит текущий и разлогинит всех подключённых ассистентов. Продолжить?'))) {
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const res = await fetch('/ai/mcp_code', { method: 'POST', credentials: 'same-origin' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!data.code) throw new Error('empty code');
+      showCode(data.code);
+    } catch (e) {
+      console.error('mcp_code failed', e);
+      showError(tr('ai_connect_failed',
+        'Could not get a code. Check that you are logged in and try again.',
+        'Не удалось получить код. Проверьте, что вы вошли в аккаунт, и повторите.'));
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function revokeCode() {
+    if (!confirm(tr('ai_connect_revoke_confirm',
+        'Revoke the code? All connected assistants will lose access immediately.',
+        'Отозвать код? Все подключённые ассистенты немедленно потеряют доступ.'))) {
+      return;
+    }
+    const btn = document.getElementById('aiCodeRevokeBtn');
+    btn.disabled = true;
+    try {
+      const res = await fetch('/ai/mcp_code', { method: 'DELETE', credentials: 'same-origin' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      showCode(null);
+      window.NotificationManager?.showToast(
+        tr('ai_connect_revoked', 'Code revoked', 'Код отозван'), 'success');
+    } catch (e) {
+      showError(tr('ai_connect_revoke_failed',
+        'Could not revoke the code. Try again.',
+        'Не удалось отозвать код. Попробуйте ещё раз.'));
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function copyCode() {
+    const code = document.getElementById('aiCodeValue')?.textContent?.trim();
+    if (!code) return;
+    navigator.clipboard.writeText(code)
+      .then(() => window.NotificationManager?.showToast(tr('copied', 'Copied', 'Скопировано'), 'success'))
+      .catch(() => window.NotificationManager?.showToast(tr('copy_failed', 'Copy failed', 'Не удалось скопировать'), 'error'));
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    applyTexts();
+    if (window.i18next && i18next.on) {
+      i18next.on('languageChanged', applyTexts);
+      i18next.on('loaded', applyTexts);
+    }
+    loadCode();  // показать текущий код, если он уже был выдан
+    document.getElementById('aiConnectBtn')?.addEventListener('click', requestCode);
+    document.getElementById('aiCodeCopyBtn')?.addEventListener('click', copyCode);
+    document.getElementById('aiCodeRevokeBtn')?.addEventListener('click', revokeCode);
+  });
 })();
 </script>
 

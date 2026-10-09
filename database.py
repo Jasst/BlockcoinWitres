@@ -56,7 +56,8 @@ async def close_db():
 
 @asynccontextmanager
 async def get_db_cursor():
-    async with _pool.acquire() as conn:
+    # timeout: если пул занят, запрос падает с ошибкой, а не висит бесконечно
+    async with _pool.acquire(timeout=15) as conn:
         async with conn.transaction():
             yield conn
 
@@ -332,6 +333,56 @@ async def _apply_migrations(conn: asyncpg.Connection):
                 VALUES (11, extract(epoch from now()))
                 ON CONFLICT (version) DO NOTHING
             """)
+
+    # ──────────────────────────────────────────────────────────────
+    # МИГРАЦИЯ (версия 12) – таблица hidden_conversations
+    # (пользователь скрывает чат из списка через контекстное меню)
+    # ──────────────────────────────────────────────────────────────
+    if current_version < 12:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS hidden_conversations (
+                user_address TEXT NOT NULL,
+                chat_id      TEXT NOT NULL,
+                hidden_at    DOUBLE PRECISION DEFAULT extract(epoch from now()),
+                PRIMARY KEY (user_address, chat_id)
+            )
+        """)
+        await conn.execute("""
+            INSERT INTO schema_version (version, applied_at)
+            VALUES (12, extract(epoch from now()))
+            ON CONFLICT (version) DO NOTHING
+        """)
+        current_version = 12
+    # ──────────────────────────────────────────────────────────────
+    # МИГРАЦИЯ (версия 13) – ответ на сообщение и серверное закрепление
+    # ──────────────────────────────────────────────────────────────
+    if current_version < 13:
+        await conn.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reply_to_id BIGINT")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_pins (
+                chat_key        TEXT PRIMARY KEY,
+                message_id      BIGINT NOT NULL,
+                content_preview TEXT,
+                pinned_by       TEXT NOT NULL,
+                pinned_at       DOUBLE PRECISION DEFAULT extract(epoch from now())
+            )
+        """)
+        await conn.execute("""
+            INSERT INTO schema_version (version, applied_at)
+            VALUES (13, extract(epoch from now()))
+            ON CONFLICT (version) DO NOTHING
+        """)
+        current_version = 13
+    # МИГРАЦИЯ (версия 14) – архив и удаление чатов для каждого пользователя
+    if current_version < 14:
+        await conn.execute("ALTER TABLE hidden_conversations ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT TRUE")
+        await conn.execute("ALTER TABLE hidden_conversations ADD COLUMN IF NOT EXISTS cleared_at DOUBLE PRECISION")
+        await conn.execute("""
+            INSERT INTO schema_version (version, applied_at)
+            VALUES (14, extract(epoch from now()))
+            ON CONFLICT (version) DO NOTHING
+        """)
+        current_version = 14
 
 
 async def _create_indexes(conn: asyncpg.Connection):

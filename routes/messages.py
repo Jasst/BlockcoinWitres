@@ -14,7 +14,7 @@ from cache import (
 )
 from config import MESSAGE_FEE, COIN, COIN_NAME, STAKING_FEE_POOL_ADDRESS, ENABLE_STAKING
 from dependencies import require_auth, make_rate_limit_dep
-from models import SendMessageRequest, MarkReadRequest, MessageStatusesRequest
+from models import SendMessageRequest, MarkReadRequest, MessageStatusesRequest, HideConversationRequest
 from services.messaging import get_conversations_list_cached, invalidate_conversations_cache
 from services.wallet import staking_manager
 from setup import message_limiter
@@ -23,6 +23,26 @@ from services.push import send_push
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=['messages'])
+
+
+async def _attach_reply(conn, tx_id, reply_to_id, sender, recipient, group=False):
+    """Сохраняет ссылку на сообщение-ответ, только если исходное сообщение
+    принадлежит этой же беседе (иначе ссылку не сохраняем)."""
+    if not reply_to_id or not tx_id:
+        return None
+    if group:
+        row = await conn.fetchrow(
+            'SELECT id FROM transactions WHERE id = $1 AND recipient = $2',
+            reply_to_id, recipient)
+    else:
+        row = await conn.fetchrow(
+            'SELECT id FROM transactions WHERE id = $1 AND '
+            '((sender = $2 AND recipient = $3) OR (sender = $3 AND recipient = $2))',
+            reply_to_id, sender, recipient)
+    if not row:
+        return None
+    await conn.execute('UPDATE transactions SET reply_to_id = $1 WHERE id = $2', reply_to_id, tx_id)
+    return reply_to_id
 
 
 @router.post('/send_message', status_code=201,
@@ -93,6 +113,8 @@ async def send_message(body: SendMessageRequest, request: Request, address: str 
         tx_id = None
         group = None
         message_obj = None
+        reply_to = None
+        pending_notify = []   # уведомления шлём ПОСЛЕ транзакции (не держим соединение БД)
         if msg_type == 'group' and body.group_id:
             if not body.encrypted_map:
 
@@ -108,9 +130,12 @@ async def send_message(body: SendMessageRequest, request: Request, address: str 
                 sender_pubkey=body.sender_pubkey,
                 metadata={'encryption': 'group-ecdh-v4', 'group_id': body.group_id}
             )
+            reply_to = await _attach_reply(conn, tx_id, body.reply_to_id, sender,
+                                           f"group:{body.group_id}", group=True)
             message_obj = {
                 'id': tx_id, 'sender': sender, 'sender_name': None,
                 'chatId': f"group:{body.group_id}", 'isGroup': True,
+                'reply_to_id': reply_to,
                 'recipient': f"group:{body.group_id}",
                 'preview': '💬 Новое сообщение в группе',
                 'timestamp': time.time(),
@@ -122,7 +147,7 @@ async def send_message(body: SendMessageRequest, request: Request, address: str 
 
 
             for member in group['members']:
-                await message_notifier.add_message(member, message_obj)
+                pending_notify.append((member, message_obj))
 
             for member in group['members']:
                 if member != sender:
@@ -151,9 +176,11 @@ async def send_message(body: SendMessageRequest, request: Request, address: str 
                 sender_pubkey=body.sender_pubkey,
                 metadata={'encryption': 'hybrid-v2'}
             )
+            reply_to = await _attach_reply(conn, tx_id, body.reply_to_id, sender, recipient)
             message_obj = {
                 'id': tx_id, 'sender': sender, 'sender_name': None,
                 'chatId': recipient, 'isGroup': False,
+                'reply_to_id': reply_to,
                 'recipient': recipient,
                 'preview': '💬 Новое сообщение',
                 'timestamp': time.time(),
@@ -162,7 +189,7 @@ async def send_message(body: SendMessageRequest, request: Request, address: str 
                 'status': 'sent'
             }
 
-            await message_notifier.add_message(recipient, message_obj)
+            pending_notify.append((recipient, message_obj))
 
             asyncio.create_task(
                 send_push(
@@ -172,6 +199,10 @@ async def send_message(body: SendMessageRequest, request: Request, address: str 
                     url=f"/chat?start_with={sender}"
                 )
             )
+
+    # Доставка после коммита транзакции: соединение с БД уже возвращено в пул
+    for _uid, _obj in pending_notify:
+        await message_notifier.add_message(_uid, _obj)
 
     await invalidate_conversations_cache(sender)
     if msg_type == 'group' and body.group_id and group:
@@ -197,14 +228,19 @@ async def get_conversation(
     limit = min(limit, 50)
     from database import get_db_cursor
     async with get_db_cursor() as conn:
+        cut = await conn.fetchval(
+            'SELECT cleared_at FROM hidden_conversations WHERE user_address = $1 AND chat_id = $2',
+            address, chat_with)
+        # cut - число из нашей БД (float), не пользовательский ввод
+        cut_sql = f' AND timestamp > {float(cut)}' if cut else ''
         if chat_with.startswith('group:'):
             group_id = chat_with.split(':', 1)[1]
             groups = await get_user_groups_cached(address, cache_version=await get_groups_cache_version())
             if not any(g['id'] == group_id and address in g['members'] for g in groups):
                 raise HTTPException(403, 'No access')
             # Добавлено поле status
-            query = ('SELECT id, sender, recipient, content, image, timestamp, metadata, status '
-                     'FROM transactions WHERE recipient = $1')
+            query = ('SELECT id, sender, recipient, content, image, timestamp, metadata, status, reply_to_id '
+                     'FROM transactions WHERE recipient = $1' + cut_sql)
             params = [chat_with]
             if last_message_id:
                 row_ts = await conn.fetchrow("SELECT timestamp FROM transactions WHERE id = $1", last_message_id)
@@ -222,13 +258,17 @@ async def get_conversation(
         else:
             # Добавлено поле status
             base_query = """
-                SELECT id, sender, recipient, content, image, timestamp, metadata, status
+                SELECT id, sender, recipient, content, image, timestamp, metadata, status, reply_to_id
                 FROM (
                     SELECT * FROM transactions WHERE sender = $1 AND recipient = $2
                     UNION ALL
                     SELECT * FROM transactions WHERE sender = $3 AND recipient = $4
                 ) AS t
             """
+            base_query = base_query.replace('WHERE sender = $1 AND recipient = $2\n',
+                                            'WHERE sender = $1 AND recipient = $2' + cut_sql + '\n')
+            base_query = base_query.replace('WHERE sender = $3 AND recipient = $4\n',
+                                            'WHERE sender = $3 AND recipient = $4' + cut_sql + '\n')
             params = [address, chat_with, chat_with, address]
             conditions = []
             if last_message_id:
@@ -254,6 +294,7 @@ async def get_conversation(
             'sender_pubkey': None,
             'metadata':     r[6],
             'status':       r[7] if len(r) > 7 else 'sent',   # добавлено
+            'reply_to_id':  r[8] if len(r) > 8 else None,
             'sender_name':  (await get_contact_name_cached(address, r[1],
                              cache_version=await get_contact_cache_version()) or r[1][:10] + '...'),
             'recipient_name': (await get_contact_name_cached(address, r[2],
@@ -267,7 +308,79 @@ async def get_conversation(
 
 @router.get('/get_conversations')
 async def get_conversations(address: str = Depends(require_auth)):
-    return {'conversations': await get_conversations_list_cached(address)}
+    conversations = await get_conversations_list_cached(address)
+    state = {}
+    try:
+        from database import get_db_cursor
+        async with get_db_cursor() as conn:
+            rows = await conn.fetch(
+                'SELECT chat_id, archived, cleared_at FROM hidden_conversations WHERE user_address = $1',
+                address)
+        state = {r['chat_id']: (bool(r['archived']), r['cleared_at']) for r in rows}
+    except Exception as e:
+        logger.warning(f'hidden_conversations lookup failed (non-critical): {e}')
+    result = []
+    for c in conversations:
+        key = c.get('address') or c.get('chat_with')
+        archived, cleared_at = state.get(key, (False, None))
+        # удалённый чат скрыт, пока в нём нет сообщений новее момента удаления
+        if cleared_at and (c.get('last_ts') or 0) <= cleared_at:
+            continue
+        result.append(dict(c, archived=archived))
+    return {'conversations': result}
+
+
+@router.post('/hide_conversation')
+async def hide_conversation(body: HideConversationRequest, address: str = Depends(require_auth)):
+    """Скрыть беседу из списка чатов (контекстное меню -> «Скрыть чат»)."""
+    chat_with = body.chat_with.strip()
+    if not chat_with:
+        raise HTTPException(400, 'Missing chat_with')
+    from database import get_db_cursor
+    async with get_db_cursor() as conn:
+        await conn.execute('''
+            INSERT INTO hidden_conversations (user_address, chat_id, hidden_at, archived)
+            VALUES ($1, $2, $3, TRUE)
+            ON CONFLICT (user_address, chat_id) DO UPDATE SET archived = TRUE
+        ''', address, chat_with, time.time())
+    await invalidate_conversations_cache(address)
+    return {'status': 'ok'}
+
+
+@router.post('/unhide_conversation')
+async def unhide_conversation(body: HideConversationRequest, address: str = Depends(require_auth)):
+    """Показать ранее скрытую беседу."""
+    chat_with = body.chat_with.strip()
+    if not chat_with:
+        raise HTTPException(400, 'Missing chat_with')
+    from database import get_db_cursor
+    async with get_db_cursor() as conn:
+        await conn.execute(
+            'UPDATE hidden_conversations SET archived = FALSE WHERE user_address = $1 AND chat_id = $2',
+            address, chat_with)
+    await invalidate_conversations_cache(address)
+    return {'status': 'ok'}
+
+
+@router.post('/delete_conversation')
+async def delete_conversation(body: HideConversationRequest, address: str = Depends(require_auth)):
+    """Удалить чат ТОЛЬКО у себя: вся история до этого момента скрывается для
+    текущего пользователя. Собеседник и группа ничего не теряют.
+    Чат снова появится в списке, когда придёт новое сообщение."""
+    chat_with = body.chat_with.strip()
+    if not chat_with:
+        raise HTTPException(400, 'Missing chat_with')
+    now = time.time()
+    from database import get_db_cursor
+    async with get_db_cursor() as conn:
+        await conn.execute('''
+            INSERT INTO hidden_conversations (user_address, chat_id, hidden_at, archived, cleared_at)
+            VALUES ($1, $2, $3, FALSE, $3)
+            ON CONFLICT (user_address, chat_id)
+            DO UPDATE SET archived = FALSE, cleared_at = EXCLUDED.cleared_at
+        ''', address, chat_with, now)
+    await invalidate_conversations_cache(address)
+    return {'status': 'ok'}
 
 
 @router.post('/mark_conversation_read')

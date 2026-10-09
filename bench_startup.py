@@ -10,7 +10,7 @@ async def main():
     import GCN.config_ai
     print(f"[{time.time()-t0:6.1f}s] config_ai imported")
 
-    from GCN.memory_service import MemoryService
+    from GCN.memory_graph import MemoryService
     print(f"[{time.time()-t0:6.1f}s] memory_service module imported")
 
     t_ms = time.time()

@@ -7,6 +7,25 @@ import json
 
 logger = logging.getLogger(__name__)
 
+try:
+    from GCN.config_ai import LLM_NO_THINK_SUFFIX
+except ImportError:  # старый config_ai без константы — поведение как раньше
+    LLM_NO_THINK_SUFFIX = ""
+
+
+def _no_think(messages: List[Dict]) -> List[Dict]:
+    """Добавляет soft-switch отключения thinking к последнему текстовому user-сообщению
+    (копия, исходный список не мутируется). Мультимодальные content-списки не трогаем."""
+    if not LLM_NO_THINK_SUFFIX:
+        return messages
+    msgs = [dict(m) for m in messages]
+    for m in reversed(msgs):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            if not m["content"].rstrip().endswith(LLM_NO_THINK_SUFFIX.strip()):
+                m["content"] += LLM_NO_THINK_SUFFIX
+            break
+    return msgs
+
 # Переиспользуемая сессия с пулом соединений (keep-alive) к локальному LM
 # Studio вместо нового TCP-хендшейка на каждый вызов — это самый горячий
 # путь в проекте (каждое сообщение чата, каждый tool-call реранкинг,
@@ -43,7 +62,8 @@ async def call_llm_raw(
     temp: float = 0.7,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     tools: Optional[List[Dict]] = None,
-    retries: int = 3
+    retries: int = 3,
+    think: bool = False,
 ) -> Dict:
     """
     Возвращает сырой объект message от LLM целиком (не только content), чтобы
@@ -54,7 +74,7 @@ async def call_llm_raw(
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
     payload = {
         "model": "local-model",
-        "messages": messages,
+        "messages": messages if think else _no_think(messages),
         "temperature": temp,
         "max_tokens": max_tokens
     }
@@ -110,7 +130,7 @@ async def call_llm(
     чтобы reasoning не путал парсеры.
     """
     msg = await call_llm_raw(messages, temp=temp, max_tokens=max_tokens,
-                             tools=None, retries=retries)
+                             tools=None, retries=retries, think=include_reasoning)
     content = msg.get("content", "") or ""
     if not include_reasoning:
         return content
@@ -153,7 +173,8 @@ async def call_llm_stream(
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LM_STUDIO_API_KEY}"}
     payload = {
         "model": "local-model",
-        "messages": messages,
+        # Ход без режима рассуждений — модель не должна «думать» скрыто (экономия TTFT).
+        "messages": messages if include_reasoning else _no_think(messages),
         "temperature": temp,
         "max_tokens": max_tokens,
         "stream": True,

@@ -132,6 +132,8 @@
 
         // ========== Инициализация ==========
         async init() {
+            window.addEventListener('online', () => this._flushCallLogs());
+            setTimeout(() => this._flushCallLogs(), 2000);
             if (this._initialized) {
                 console.log('[CallManager] Already initialized, skipping');
                 return;
@@ -849,6 +851,7 @@
         // ========== Ответ на входящий звонок ==========
         async answerCall(callId, fromAddress, offerSdp, partnerName = '', isVideo = false) {
             console.log('[answerCall] start, callId:', callId, 'from:', fromAddress);
+            this._pendingIncoming = null;
             this.stopIncomingSound();
             await this.unlockAudioContext();
 
@@ -1011,6 +1014,7 @@
                 return;
             }
             console.log('[CallManager] Reconnecting call', this.lastCallId);
+            if (this._pendingIncoming) this._pendingIncoming.answered = true;
             this.hideIncomingModal();
             this.answerCall(this.lastCallId, this.lastFrom, this.lastOffer, this.lastFromName);
         }
@@ -1018,25 +1022,60 @@
         // ======================================================================
         // ========== НОВЫЙ МЕТОД – СОХРАНЕНИЕ ИСТОРИИ ЗВОНКОВ ==================
         // ======================================================================
+        // Запись истории. keepalive переживает уход со страницы; при сбое сети
+        // запись уходит в очередь localStorage и отправится при следующей возможности.
         async _saveCallHistory(address, name, direction, status, duration) {
+            const entry = {
+                address, name, direction, status, duration,
+                timestamp: Math.floor(Date.now() / 1000)
+            };
+            const ok = await this._postCallLog(entry);
+            if (!ok) this._queueCallLog(entry);
+            window.dispatchEvent(new Event('call-history-updated'));
+        }
+
+        async _postCallLog(entry) {
             try {
                 const res = await fetch('/calls/log', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        address,          // адрес собеседника
-                        name,             // его имя (если есть)
-                        direction,        // 'incoming' или 'outgoing'
-                        status,           // 'answered', 'missed', 'rejected'
-                        duration,         // длительность в секундах
-                        timestamp: Math.floor(Date.now() / 1000)
-                    })
+                    body: JSON.stringify(entry),
+                    keepalive: true
                 });
-                if (!res.ok) console.warn('Failed to save call history:', await res.text());
+                return res.ok;
             } catch (e) {
-                console.warn('Error saving call history:', e);
+                return false;
             }
         }
+
+        // Очередь привязана к адресу пользователя: на одном устройстве могут быть разные аккаунты
+        _callLogKey() {
+            const me = document.querySelector('meta[name="user-address"]')?.content || window.State?.userAddress || 'anon';
+            return 'pending_call_logs:' + me;
+        }
+
+        _queueCallLog(entry) {
+            try {
+                const key = this._callLogKey();
+                const q = JSON.parse(localStorage.getItem(key) || '[]');
+                q.push(entry);
+                localStorage.setItem(key, JSON.stringify(q.slice(-50)));
+            } catch (e) {}
+        }
+
+        async _flushCallLogs() {
+            const key = this._callLogKey();
+            let q;
+            try { q = JSON.parse(localStorage.getItem(key) || '[]'); } catch (e) { q = []; }
+            if (!q.length) return;
+            const rest = [];
+            for (const entry of q) {
+                if (!(await this._postCallLog(entry))) rest.push(entry);
+            }
+            localStorage.setItem(key, JSON.stringify(rest));
+            if (rest.length < q.length) window.dispatchEvent(new Event('call-history-updated'));
+        }
+
 
         // ========== Завершение звонка (с сохранением истории) ==========
         endCall() {
@@ -1101,6 +1140,7 @@
         // ========== Отклонение входящего звонка ==========
         rejectCall(callId, from) {
             window.wsClient?.send({ type: 'call_reject', target: from, call_id: callId });
+            if (this._pendingIncoming) this._pendingIncoming.status = 'rejected';
             this.hideIncomingModal();
             window.NotificationManager?.showToast(this.t('call_rejected'), 'info');
         }
@@ -1260,6 +1300,13 @@
             this.playIncomingSound();
             const modal = document.getElementById('incomingCallModal');
             if (!modal) return;
+            // Запоминаем входящий звонок: если его не примут, запишем как пропущенный
+            this._pendingIncoming = {
+                callId, from,
+                name: fromName || (from ? from.slice(0, 10) + '…' : ''),
+                answered: false,
+                status: 'missed'
+            };
             if (this._incomingModalObserver) {
                 this._incomingModalObserver.disconnect();
                 this._incomingModalObserver = null;
@@ -1311,6 +1358,7 @@
                     const actualCallId   = modal.dataset.callId   || callId;
                     const actualFrom     = modal.dataset.from      || from;
                     const videoFlag = modal.dataset.video === 'true';
+                    if (this._pendingIncoming) this._pendingIncoming.answered = true;
                     this.hideIncomingModal();
                     this.answerCall(actualCallId, actualFrom, actualOffer, fromName, videoFlag);
                 };
@@ -1372,6 +1420,11 @@
         }
 
         hideIncomingModal() {
+            const p = this._pendingIncoming;
+            this._pendingIncoming = null;
+            if (p && !p.answered && p.from) {
+                this._saveCallHistory(p.from, p.name, 'incoming', p.status || 'missed', 0);
+            }
             if (this.activeModal === 'incoming') this.activeModal = null;
             if (this._incomingModalObserver) {
                 this._incomingModalObserver.disconnect();

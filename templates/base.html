@@ -5,7 +5,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
   <meta name="description" content="Decentralized encrypted messenger">
-  <meta name="theme-color" content="#0a0a0a">
+  <meta name="theme-color" content="#0d0e11">
   <meta name="color-scheme" content="dark">
   <meta name="user-address" content="{{ address|default('', true) }}">
 
@@ -23,13 +23,13 @@
     :root {
       --glass-bg: rgba(20, 20, 30, 0.6);
       --glass-border: rgba(255, 255, 255, 0.08);
-      --accent-color: #6c5ce7;
-      --accent-glow: rgba(108, 92, 231, 0.4);
-      --success-color: #00b894;
-      --danger-color: #d63031;
-      --text-main: #f5f6fa;
-      --text-muted: #a4b0be;
-      --bg-primary: #0a0a0f;
+      --accent-color: #565d68;
+      --accent-glow: rgba(86, 93, 104, 0.4);
+      --success-color: #4cc38a;
+      --danger-color: #e5544f;
+      --text-main: #eceef1;
+      --text-muted: #a6abb5;
+      --bg-primary: #0d0e11;
     }
 
     /* Анимации */
@@ -118,7 +118,7 @@
     .call-control-btn.call-end-btn {
       background: var(--danger-color);
       color: white;
-      box-shadow: 0 4px 15px rgba(214, 48, 49, 0.4);
+      box-shadow: 0 4px 15px rgba(229, 84, 79, 0.4);
     }
 
     .call-control-btn.call-end-btn:hover {
@@ -238,7 +238,7 @@
       font-weight: 600;
       cursor: pointer;
       transition: all 0.2s;
-      background: linear-gradient(135deg, var(--accent-color), #6c5ce7);
+      background: linear-gradient(135deg, var(--accent-color), #565d68);
       color: white;
       font-size: 14px;
       display: inline-flex;
@@ -274,6 +274,84 @@
       background: rgba(255, 255, 255, 0.1);
       transform: translateY(-1px);
     }
+/* mobile-fixes.css — подключить в base.html ПОСЛЕ основных стилей.
+   1) На мобильном долгое нажатие не выделяет текст и не вызывает системное меню.
+   2) Стили для ответа (reply-ref), закрепа и раздела «Архив». */
+
+.message,
+.conversation-item {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.ctx-menu {
+  max-width: calc(100vw - 16px);
+}
+
+/* Цитата в сообщении-ответе */
+.reply-ref {
+  display: flex;
+  gap: 8px;
+  padding: 6px 8px;
+  margin: 2px 0 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+  min-width: 0;
+}
+.reply-ref-bar {
+  width: 3px;
+  border-radius: 2px;
+  background: var(--accent-color, #6c8cff);
+  flex-shrink: 0;
+}
+.reply-ref-body { min-width: 0; }
+.reply-ref-sender {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-color, #8fa6ff);
+}
+.reply-ref-text {
+  font-size: 12px;
+  opacity: 0.8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Закреплённое сообщение */
+.message.pinned .content {
+  box-shadow: inset 3px 0 0 var(--accent-color, #6c8cff);
+}
+
+/* Подсветка исходного сообщения при переходе по цитате */
+.message.msg-highlight .content {
+  box-shadow: 0 0 0 2px var(--accent-color, #6c8cff);
+  transition: box-shadow 0.3s ease;
+}
+
+/* Раздел «Архив» внизу списка бесед */
+.archive-toggle {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  padding: 12px 16px;
+  background: none;
+  border: 0;
+  color: var(--text-muted, #a6abb5);
+  font-size: 14px;
+  cursor: pointer;
+}
+.archive-chevron {
+  display: inline-block;
+  transition: transform 0.2s;
+}
+.archive-toggle.open .archive-chevron {
+  transform: rotate(90deg);
+}
+
 
     /* Скрытый класс для пропуска навигации */
     .sr-only {
@@ -286,6 +364,7 @@
       clip: rect(0,0,0,0);
       border: 0;
     }
+
   </style>
 
   {% block head_extra %}{% endblock %}

@@ -42,7 +42,6 @@ class CodeAnalyzer:
     def __init__(self, root_path: Optional[Path] = None):
         self.root = root_path or CODE_ACCESS_ROOT
         self._file_cache: Dict[str, str] = {}  # кэш содержимого файлов
-        self._structure_cache: Optional[Dict] = None  # кэш структуры проекта
 
     def _is_safe_path(self, file_path: str) -> bool:
         """Проверяет, что файл находится в разрешённой директории и имеет безопасное расширение.
@@ -359,7 +358,6 @@ class CodeAnalyzer:
     def clear_cache(self):
         """Очищает кэш файлов."""
         self._file_cache.clear()
-        self._structure_cache = None
 
 
 # Глобальный экземпляр (ленивая инициализация)

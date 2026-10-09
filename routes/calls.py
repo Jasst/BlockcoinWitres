@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import time
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from dependencies import require_auth
 from config import (
     TURN_ENABLED, TURN_SERVER, STUN_SERVER,
@@ -52,7 +52,8 @@ async def get_turn_credentials(address: str = Depends(require_auth)):
     turn_urls = [f"{TURN_SERVER}?transport=udp", f"{TURN_SERVER}?transport=tcp"]
     creds = generate_turn_credentials(address)
 
-    logger.warning(f"TURN credentials for {address[:8]}...: user={creds['username']}, cred={creds['credential']}")
+    # Учётные данные TURN в логи не пишем (только факт выдачи)
+    logger.info(f"TURN credentials issued for {address[:8]}...")
 
     ice_servers.append({
         "urls": turn_urls,
@@ -82,10 +83,13 @@ async def log_call(entry: CallLogEntry, address: str = Depends(require_auth)):
 
 @router.get('/history')
 async def get_call_history(
+    response: Response,
     address: str = Depends(require_auth),
-    limit: int = 100
+    limit: int = Query(default=100, ge=1, le=500)
 ):
     """Возвращает историю звонков текущего пользователя."""
+    # Персональные данные: запрещаем общие кэши (прокси), чтобы ответ не ушёл другому пользователю
+    response.headers['Cache-Control'] = 'private, no-store'
     async with get_db_cursor() as conn:
         rows = await conn.fetch("""
             SELECT id, contact_address, contact_name, direction, status, duration, timestamp

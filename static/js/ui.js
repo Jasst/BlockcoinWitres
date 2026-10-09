@@ -6,6 +6,136 @@
     // Helper for i18n
     function t(key, opts) { return i18next.t(key, opts); }
 
+    // ========== КОНТЕКСТНОЕ МЕНЮ БЕСЕД (ПКМ + долгое нажатие) ==========
+    const SHARED = window.CTX_ICONS || {};
+    const CONV_ICONS = {
+        open:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+        call:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>',
+        user:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+        copy:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+        archive:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg>',
+        unarchive: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>',
+        trash:     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>',
+        eyeOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
+    };
+
+    // ========== АРХИВ БЕСЕД ==========
+    // Серверное хранение: таблица hidden_conversations (миграция 12).
+    // «В архив» = скрытая беседа; вернуть её можно из раздела «Архив».
+    function hiddenChatsKey() {
+        return 'hidden_chats_' + ((window.State && State.userAddress) || 'anon');
+    }
+
+    // Однократная миграция: беседы, скрытые раньше только в localStorage,
+    // переносятся на сервер (станут видны на всех устройствах и их можно вернуть).
+    async function migrateLegacyHiddenChats() {
+        let legacy = [];
+        try { legacy = JSON.parse(localStorage.getItem(hiddenChatsKey()) || '[]'); } catch (e) {}
+        if (!legacy.length) return;
+        let allOk = true;
+        for (const addr of legacy) {
+            try {
+                const res = await fetch('/hide_conversation', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chat_with: addr })
+                });
+                if (!res.ok) allOk = false;
+            } catch (e) { allOk = false; }
+        }
+        if (allOk) localStorage.removeItem(hiddenChatsKey());
+    }
+
+    // Удалить чат ТОЛЬКО у себя: история скрывается для этого пользователя,
+    // собеседник ничего не теряет. Чат вернётся, когда придёт новое сообщение.
+    async function deleteConversation(address, name) {
+        const confirmed = await window.showConfirmModal(t('delete_chat'), t('confirm_delete_chat', { name: name || '' }));
+        if (!confirmed) return;
+        try {
+            const res = await fetch('/delete_conversation', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_with: address })
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+        } catch (err) {
+            console.error('delete error:', err);
+            window.NotificationManager?.showToast(t('action_failed'), 'error');
+            return;
+        }
+        if (window.State && State.currentChatAddress === address) {
+            State.currentChatAddress = null;
+            document.getElementById('chatPanel')?.classList.remove('open');
+            const box = document.getElementById('messagesContainer');
+            if (box) box.innerHTML = '';
+        }
+        window.clearMessageCache?.(address);
+        window.NotificationManager?.showToast(t('chat_deleted'), 'success');
+        loadConversations();
+    }
+
+    async function setArchived(address, archived) {
+        const url = archived ? '/hide_conversation' : '/unhide_conversation';
+        try {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_with: address })
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+        } catch (err) {
+            console.error('archive error:', err);
+            window.NotificationManager?.showToast(t('action_failed'), 'error');
+            return;
+        }
+        window.NotificationManager?.showToast(t(archived ? 'chat_archived' : 'chat_unarchived'), 'success');
+        if (archived && window.State && State.currentChatAddress === address) {
+            State.currentChatAddress = null;
+            document.getElementById('chatPanel')?.classList.remove('open');
+        }
+        loadConversations();
+    }
+
+
+    function bindConversationHold(item, address, displayName, isGroup) {
+        if (!window.ContextMenu || !address || address === 'ai_bot') return;
+        ContextMenu.bind(item, () => {
+            const archived = item.dataset.archived === '1';
+            const items = [
+                { icon: CONV_ICONS.open, label: t('open_chat'), onClick: () => window.selectConversation(address, displayName, isGroup) },
+            ];
+            if (!isGroup) {
+                items.push(
+                    { icon: CONV_ICONS.call, label: t('call'), onClick: () => {
+                        if (window.CallManager && typeof window.CallManager.makeCall === 'function') {
+                            window.CallManager.makeCall(address, false, displayName);
+                        } else if (window.NotificationManager) {
+                            window.NotificationManager.showToast(t('calls_not_available'), 'warning');
+                        }
+                    } },
+                    { icon: CONV_ICONS.user, label: t('add_to_contacts'), onClick: () => {
+                        window.location.href = '/contacts?start_with=' + encodeURIComponent(address) + '&name=' + encodeURIComponent(displayName);
+                    } }
+                );
+            }
+            items.push(
+                { icon: CONV_ICONS.copy, label: t('copy_address'), onClick: () => {
+                    const done = () => window.NotificationManager && window.NotificationManager.showToast(t('copied_to_clipboard'), 'success');
+                    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(address).then(done).catch(done);
+                    else done();
+                } },
+                { separator: true },
+                { icon: archived ? CONV_ICONS.unarchive : CONV_ICONS.archive,
+                  label: archived ? t('unarchive_chat') : t('archive_chat'),
+                  onClick: () => setArchived(address, !archived) },
+                { icon: CONV_ICONS.trash, label: t('delete_chat'), danger: true,
+                  onClick: () => deleteConversation(address, displayName) }
+            );
+            return items;
+        });
+    }
+    window.bindConversationHold = bindConversationHold;
+
     // ========== ФОРМАТИРОВАНИЕ ДАТ ДЛЯ РАЗДЕЛИТЕЛЕЙ ==========
     function formatDateDivider(timestamp) {
         const date = new Date(timestamp * 1000);
@@ -99,6 +229,13 @@
                     const firstChild = container.firstChild;
                     if (firstChild) container.insertBefore(fragment, firstChild);
                     else container.appendChild(fragment);
+                    try {
+                        const pin = window.getPinnedForChat ? window.getPinnedForChat(chatId) : null;
+                        if (pin) {
+                            const pe = document.getElementById('msg-' + pin.messageId);
+                            if (pe) pe.classList.add('pinned');
+                        }
+                    } catch (e) {}
                     const firstMsgId = olderMessages[0]?.id;
                     if (firstMsgId) State.lastKnownMessageId = Math.min(State.lastKnownMessageId, firstMsgId);
                     setupTopObserver();
@@ -130,6 +267,10 @@
         messageDiv.dataset.id = msg.id;
         if (msg.is_mine) messageDiv.dataset.status = msg.status || 'sent';
         else messageDiv.dataset.status = msg.status || 'delivered';
+        try {
+            const pin = window.getPinnedForChat && window.getPinnedForChat(State.currentChatAddress);
+            if (pin && String(pin.messageId) === String(msg.id)) messageDiv.classList.add('pinned');
+        } catch (e) {}
 
         const initials = (msg.sender || 'U').slice(0, 1).toUpperCase();
         const senderName = msg.is_mine || !State.currentChatIsGroup
@@ -154,6 +295,25 @@
             setTimeout(() => decryptAndShowAttachment(messageDiv), 0);
         }
 
+        // Ответ на сообщение: цитата, ссылка на исходное (текст берём из уже отрисованных сообщений)
+        let replyHtml = '';
+        if (msg.reply_to_id) {
+            const refEl = document.getElementById('msg-' + msg.reply_to_id);
+            const refText = refEl ? (refEl.querySelector('.content p')?.textContent || '') : '';
+            let refSender = refEl ? (refEl.querySelector('.content strong')?.textContent || '') : '';
+            // В личном чате имени в сообщении нет: подставляем «Вы» или имя собеседника
+            if (!refSender && refEl) {
+                refSender = (refEl.classList.contains('sent') || refEl.classList.contains('message-own'))
+                    ? t('you')
+                    : (document.getElementById('currentChatName')?.textContent || '');
+            }
+            replyHtml = `<div class="reply-ref" data-reply-to="${Utils.escapeHtml(String(msg.reply_to_id))}">` +
+                `<div class="reply-ref-bar"></div><div class="reply-ref-body">` +
+                `<div class="reply-ref-sender">${Utils.escapeHtml(refSender || t('reply'))}</div>` +
+                `<div class="reply-ref-text">${Utils.escapeHtml(refText.slice(0, 120) || t('message'))}</div>` +
+                `</div></div>`;
+        }
+
         const timeStr = Utils.formatTimestamp(msg.timestamp);
         const deleteBtn = msg.is_mine ? `<button class="delete-btn" data-id="${msg.id}" title="${t('delete')}"><img src="/static/icons/Remove.png" width="16" height="16" alt="Delete"></button>` : '';
         let statusHtml = '';
@@ -166,13 +326,20 @@
         }
 
         messageDiv.innerHTML = `<div class="avatar">${Utils.escapeHtml(initials)}</div>
-                               <div class="content">${senderName}<p>${Utils.escapeHtml(msg.content || '')}</p>
+                               <div class="content">${senderName}${replyHtml}<p>${Utils.escapeHtml(msg.content || '')}</p>
                                ${mediaHtml}
                                <div class="meta">
                                  <span class="meta-time">${timeStr}</span>
                                  ${deleteBtn}
                                  ${statusHtml}
                                </div></div>`;
+        // Long press (touch) opens the same context menu as right click
+        if (window.bindMessageHold) window.bindMessageHold(messageDiv);
+        const refBtn = messageDiv.querySelector('.reply-ref');
+        if (refBtn) refBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            window.scrollToAndHighlightMessage && window.scrollToAndHighlightMessage(msg.reply_to_id);
+        });
         return messageDiv;
     }
 
@@ -239,14 +406,18 @@
         const container = document.getElementById('conversationsList');
         if (!container) return;
         try {
+            migrateLegacyHiddenChats();
             const res = await fetch('/get_conversations');
             const data = await res.json();
             if (!res.ok || !data.conversations?.length) {
+                // ИИ-сессии живут в localStorage: добавляем их и в пустой список
                 container.innerHTML = `<div class="empty-state"><div class="icon">💬</div><p>${t('no_conversations')}</p><button class="btn-primary-oval" onclick="openNewChatModal()">${t('start_one')}</button></div>`;
+                window.loadAiSessionsIntoConversations && window.loadAiSessionsIntoConversations();
                 return;
             }
             container.innerHTML = '';
             const convElements = [];
+            const archivedItems = [];
             for (const conv of data.conversations) {
                 const isGroup = !!conv.is_group;
                 const address = conv.address || '';
@@ -261,9 +432,33 @@
                 item.innerHTML = `<div class="avatar ${isGroup ? 'group' : ''}">${Utils.escapeHtml(initials)}</div>
                     <div class="info"><div class="name truncate">${Utils.escapeHtml(shortName)}</div><div class="meta"><span class="status"></span><span class="truncate">${previewText}</span></div></div>`;
                 item.onclick = ((addr, name, group) => () => window.selectConversation(addr, name, group))(address, conv.name || address, isGroup);
-                container.appendChild(item);
+                bindConversationHold(item, address, displayName, isGroup);
+                item.dataset.archived = conv.archived ? '1' : '0';
+                if (conv.archived) {
+                    item.style.display = 'none';
+                    archivedItems.push(item);
+                } else {
+                    container.appendChild(item);
+                }
                 convElements.push({ el: item, address, isGroup });
             }
+            if (archivedItems.length) {
+                const toggle = document.createElement('button');
+                toggle.type = 'button';
+                toggle.className = 'archive-toggle';
+                toggle.innerHTML = `<span class="archive-title">${t('archive')} (${archivedItems.length})</span><span class="archive-chevron" aria-hidden="true">›</span>`;
+                let expanded = false;
+                toggle.addEventListener('click', () => {
+                    expanded = !expanded;
+                    toggle.classList.toggle('open', expanded);
+                    archivedItems.forEach(el => { el.style.display = expanded ? '' : 'none'; });
+                });
+                container.appendChild(toggle);
+                archivedItems.forEach(el => container.appendChild(el));
+            }
+            // Чаты с ИИ (localStorage) добавляем СИНХРОННО после перестроения списка.
+            // Раньше их добавлял таймер из ai-manager, и эта функция их стирала.
+            window.loadAiSessionsIntoConversations && window.loadAiSessionsIntoConversations();
             const addressesToCheck = convElements.filter(c => !c.isGroup && c.address !== State.userAddress).map(c => c.address);
             if (addressesToCheck.length) {
                 const statuses = await fetchUserStatuses(addressesToCheck);
@@ -311,6 +506,11 @@
         State.currentChatAddress = address;
         State.currentChatIsGroup = !!isGroup;
         State.currentChatPartnerAddress = isGroup ? '' : (address === State.userAddress ? '' : address);
+
+        // // Clear pinned bar and reply quote for the newly opened chat
+        if (window.updatePinnedMessageBar) window.updatePinnedMessageBar(address);
+        if (window.clearReplyQuote) window.clearReplyQuote();
+        if (window.loadPinFromServer) window.loadPinFromServer(address);
 
         const callBtn = document.getElementById('callButton');
         if (callBtn) {
@@ -415,6 +615,14 @@
                 if (displayMsg.id > lastKnownId) lastKnownId = displayMsg.id;
             }
             renderMessagesWithSeparators(container, decryptedCache);
+            // Re-attach the pinned marker to its message after re-render
+            try {
+                const _pin = window.getPinnedForChat ? window.getPinnedForChat(chatWithAddress) : null;
+                if (_pin) {
+                    const _pe = document.getElementById('msg-' + _pin.messageId);
+                    if (_pe) _pe.classList.add('pinned');
+                }
+            } catch (e) {}
             const wasAtBottom = isUserAtBottom(container, 30);
             if (wasAtBottom || forceScroll) {
                 container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
@@ -661,6 +869,7 @@
     window.loadConversations = loadConversations;
     window.selectConversation = selectConversation;
     window.loadMessagesForConversation = loadMessagesForConversation;
+    window.loadOlderMessages = loadOlderMessages;
     window.createMessageElement = createMessageElement;
     window.updateStatusIcon = updateStatusIcon;
     window.updateConversationPreview = updateConversationPreview;
@@ -676,6 +885,16 @@
 
     // ========== ИНИЦИАЛИЗАЦИЯ ==========
     document.addEventListener('DOMContentLoaded', () => {
+        if (window.ResizeObserver) {
+            const messagesEl = document.getElementById('messagesContainer');
+            const aiMsgsEl = document.getElementById('aiMessagesContainer');
+            [messagesEl, aiMsgsEl].forEach(el => {
+                if (!el) return;
+                const ro = new ResizeObserver(() => adjustMessagesPadding());
+                ro.observe(el);
+            });
+        }
+
         const inputArea = document.querySelector('.chat-panel .input-area');
         if (inputArea && window.ResizeObserver) {
             const resizeObserver = new ResizeObserver(() => adjustMessagesPadding());

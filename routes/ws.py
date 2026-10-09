@@ -25,6 +25,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=['websocket'])
 
 
+# Таймаут отправки: зависший клиент (например, телефон в фоне) не должен
+# останавливать обработку сообщений и сигналов звонков для других пользователей
+SEND_TIMEOUT = 5
+
+
+async def _safe_send(ws, message: dict) -> bool:
+    try:
+        await asyncio.wait_for(ws.send_json(message), timeout=SEND_TIMEOUT)
+        return True
+    except Exception:
+        return False
+
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
@@ -76,28 +89,29 @@ class ConnectionManager:
             if ws.client_state == WebSocketState.DISCONNECTED:
                 await self.disconnect(user_id)
                 return False
-            try:
-                await ws.send_json(message)
+            if await _safe_send(ws, message):
                 return True
-            except Exception as e:
-                logger.error(f"Failed to send to {user_id}: {e}")
-                await self.disconnect(user_id)
+            logger.error(f"Failed to send to {user_id} (timeout or error)")
+            await self.disconnect(user_id)
         return False
 
     async def broadcast(self, message: dict, exclude: str = None):
         async with self._conn_lock:
             connections = list(self.active_connections.items())
 
+        targets = []
         for user_id, ws in connections:
             if user_id == exclude:
                 continue
             if ws.client_state == WebSocketState.DISCONNECTED:
                 await self.disconnect(user_id)
                 continue
-            try:
-                await ws.send_json(message)
-            except Exception as e:
-                logger.error(f"Broadcast to {user_id} failed: {e}")
+            targets.append((user_id, ws))
+        # параллельно и с таймаутом: один медленный клиент не задерживает остальных
+        results = await asyncio.gather(*(_safe_send(ws, message) for _, ws in targets))
+        for (user_id, _), ok in zip(targets, results):
+            if not ok:
+                logger.error(f"Broadcast to {user_id} failed (timeout or error)")
                 await self.disconnect(user_id)
 
     async def broadcast_status_update(self, address: str, status: str):
@@ -272,26 +286,43 @@ async def websocket_endpoint(
                         'from_name': from_name,
                         'ice_candidates': []
                     }
-                await manager.send_personal_message(target, {
+                delivered = await manager.send_personal_message(target, {
                     'type': 'incoming_call',
                     'call_id': call_id,
                     'from': user_id,
                     'sdp': sdp,
                     'from_name': from_name
                 })
-                try:
-                    await send_push(
-                        user_address=target,
-                        title="Входящий звонок",
-                        body=f"{from_name} звонит вам",
-                        push_type="incoming_call",
-                        call_id=call_id,
-                        from_name=from_name,
-                        from_address=user_id
-                    )
-                    logger.info(f"Call offer {call_id}: push sent to {target[:16]}")
-                except Exception as e:
-                    logger.error(f"Push failed: {e}")
+                if not delivered:
+                    # Адресат не в сети: клиент не сможет записать пропущенный звонок сам,
+                    # поэтому фиксируем его на сервере
+                    try:
+                        from database import get_db_cursor
+                        async with get_db_cursor() as conn:
+                            await conn.execute(
+                                "INSERT INTO call_logs (user_address, contact_address, contact_name, "
+                                "direction, status, duration, timestamp) "
+                                "VALUES ($1, $2, $3, 'incoming', 'missed', 0, $4)",
+                                target, user_id, from_name, int(time.time()))
+                    except Exception as e:
+                        logger.error(f"Failed to log missed call for offline {target[:8]}: {e}")
+                # Push в фоне: иначе медленная или неудачная отправка задерживает
+                # обработку сообщений самого звонящего
+                async def _notify_callee(target=target, user_id=user_id, from_name=from_name, call_id=call_id):
+                    try:
+                        await send_push(
+                            user_address=target,
+                            title="Входящий звонок",
+                            body=f"{from_name} звонит вам",
+                            push_type="incoming_call",
+                            call_id=call_id,
+                            from_name=from_name,
+                            from_address=user_id
+                        )
+                        logger.info(f"Call offer {call_id}: push sent to {target[:16]}")
+                    except Exception as e:
+                        logger.error(f"Push failed: {e}")
+                asyncio.create_task(_notify_callee())
 
             elif msg_type == 'get_call':
                 call_id = data.get('call_id')

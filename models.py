@@ -213,6 +213,7 @@ class SendMessageRequest(BaseModel):
     group_id:       Optional[str] = None
     encrypted_map:  Optional[dict] = None
     sender_pubkey: Optional[str] = None
+    reply_to_id:    Optional[int] = None   # ответ на сообщение (id исходного)
 
     @field_validator('message_type')
     @classmethod
@@ -243,6 +244,20 @@ class SendMessageRequest(BaseModel):
 class MarkReadRequest(BaseModel):
     chat_with:       str
     last_message_id: Optional[int] = None
+
+
+class HideConversationRequest(BaseModel):
+    chat_with: str
+
+
+class UnhideConversationRequest(BaseModel):
+    chat_with: str
+
+
+class PinMessageRequest(BaseModel):
+    chat_with:       str
+    message_id:      Optional[int] = None     # None = открепить
+    content_preview: Optional[str] = ''
 
 
 class MessageStatusesRequest(BaseModel):
